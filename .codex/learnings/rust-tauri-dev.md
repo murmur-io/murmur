@@ -68,6 +68,44 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-08-31 build/test perf] a `rerun-if-changed` on a path that DOES NOT EXIST is permanent staleness
+- **Pattern:** `build.rs::build_swift_helper` printed `cargo:rerun-if-changed={src_rel}` BEFORE its
+  own `if !src.exists() { return; }` guard. One of the five helpers is `afm/afm.swift`, deliberately
+  absent (needs the macOS 26 SDK) and documented in-file as a "HARMLESS NO-OP". Cargo reports a
+  missing watched path as `StaleItem::MissingFile`, which never clears — so the build script re-ran
+  on EVERY cargo invocation (recompiling 4 Swift helpers × 2 arches, ~12 s) and dragged a full
+  recompile + relink of the 330k-line app crate with it. Measured: a no-op `cargo test --lib
+  --no-run` cost **18.6 s**; with the declaration moved below the guard, **0.33 s**. It was paid by
+  every `cargo test`/`clippy`/`build`, every dev-watcher rebuild, every harness check, every agent
+  loop iteration and three steps of `scripts/ci.sh`.
+- **Caught by:** `CARGO_LOG=cargo::core::compiler::fingerprint=trace cargo test --lib --no-run`,
+  which names the offending path outright (`stale: missing ".../afm/afm.swift"` →
+  `dirty: FsStatusOutdated(StaleItem(MissingFile { … }))`).
+- **Lesson:** when a build "feels slow", FIRST measure a no-op build. A no-op that is not
+  sub-second is a fingerprint bug, not crate size, and the fingerprint log names the cause in one
+  command — do not start tuning profiles, linkers, codegen-units or `--jobs` before that check.
+  Never declare `rerun-if-changed` on a conditional/optional path; put the declaration after the
+  existence guard. Regression oracle: the incremental-no-op check in `scripts/ci.sh` fails when an
+  unchanged tree recompiles anything.
+
+### [2026-08-31 build/test perf] `cipher_memory_security` cost 5x, and the test suite runs FASTER single-threaded
+- **Pattern:** two independent findings from profiling the 3548-test suite (699 s serial). (a) Every
+  `Db::open_with_key` set `PRAGMA cipher_memory_security = ON`, which swaps SQLite's allocator for
+  SQLCipher's: `mlock()` on every malloc, `memset(0)` + `munlock()` on every free. On the 399-test
+  `storage::db` module that was 124.2 s vs 24.0 s without it. (b) `--test-threads=1` is FASTER than
+  the default: 199 s serial vs 296 s parallel on 16 cores, because SQLite/SQLCipher serialize on
+  global mutexes (memstatus allocator lock, SQLCipher's provider/rand mutex). Full suite after both
+  the pragma removal and `[profile.dev.package.libsqlite3-sys] opt-level = 3`: **699 s → 199 s**.
+- **Caught by:** per-module timing against the built test binary directly
+  (`target/debug/deps/meetnotes_lib-<hash> --test-threads=1 <module>`), plus
+  `RUSTC_BOOTSTRAP=1 <binary> -Z unstable-options --report-time` for per-test times on stable.
+- **Lesson:** a uniform ~300 ms per test is a fixed SETUP cost, not test logic — bisect it by
+  timing one trivial test in the module, then diff that module's helper against a cheap one
+  (`mem_db()` in-memory was 15 ms; the file-backed `open_with_key` helper was 300 ms). Two
+  plausible-sounding causes were measured and REJECTED: `PRAGMA synchronous = OFF` changed nothing
+  (123.9 s vs 124.2 s — it was never fsync), and clippy/test do NOT thrash a shared `target/`
+  (both no-op at 0.33 s once warm). Measure before you optimise, and record what you disproved.
+
 ### [2026-07-20 documents as link targets — PR #415] `documents.updated_at` is NULL → recency ORDER BY silently degrades
 - **Pattern:** added a documents leg to `list_link_candidates_visible` mirroring the notes leg,
   incl. `ORDER BY d.updated_at DESC, d.id ASC`. But `insert_document` only writes `created_at`

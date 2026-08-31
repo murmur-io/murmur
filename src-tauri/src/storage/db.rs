@@ -405,14 +405,30 @@ impl Db {
         conn.pragma_update(None, "key", key_pragma.as_str())
             .map_err(map_err)?;
         drop(key_pragma); // explicit: wipe the hex key string now.
-                          // Harden SQLCipher's transient memory (B2/B10): keep temp tables / indices / materialized
-                          // subqueries in RAM (never spilled to an unencrypted temp FILE), and have SQLCipher wipe its
-                          // internal allocations (page buffers, KDF state) when freed. These MUST follow `PRAGMA key`
-                          // on EVERY connection (the keyed handle is what they harden). Enforce FK cascades
-                          // (segments/notes → meetings) and use WAL for concurrent reads while a write is in progress.
+                          // `temp_store = MEMORY` is the load-bearing half of the old B2/B10 pair and STAYS: temp
+                          // tables / indices / materialized subqueries live in RAM and are never spilled to an
+                          // UNENCRYPTED temp FILE. It must follow `PRAGMA key` on EVERY connection (the keyed handle
+                          // is what it hardens). Enforce FK cascades (segments/notes → meetings) and use WAL for
+                          // concurrent reads while a write is in progress.
+                          //
+                          // `cipher_memory_security = ON` was REMOVED here on 2026-08-31, deliberately and with the
+                          // owner's decision on the trade-off. What it did: swap SQLite's allocator for SQLCipher's,
+                          // which `mlock()`s every allocation and `memset(0)` + `munlock()`s every free (see
+                          // `sqlcipher_mem_malloc`/`sqlcipher_mem_free` in the vendored SQLCipher 4.5.7 amalgamation).
+                          // SQLite allocates continuously, so that is two syscalls plus a wipe on the hottest path in
+                          // the app. Measured on the 399-test `storage::db` module: 124.2 s with it vs 24.0 s without
+                          // (5.2x); across the whole 3548-test suite 699.1 s -> 199.1 s together with the dev-profile
+                          // SQLCipher optimisation. Production pays the same multiplier on every DB read and write.
+                          //
+                          // What is GIVEN UP: SQLCipher no longer zeroes or wires its own transient buffers (decrypted
+                          // page images, KDF state) — freed heap pages may retain plaintext until reused, and are
+                          // swappable. What is UNCHANGED: the database stays fully SQLCipher-encrypted at rest; the
+                          // per-folder CK/KEK seal is untouched; macOS encrypts swap by default; and the DEK is
+                          // resident in this process for the whole session regardless, so this pragma was never the
+                          // boundary that kept key material out of RAM. Secret material we own is still scrubbed
+                          // explicitly (`zeroize` on the KEK/CK/pragma strings above).
         conn.execute_batch(
-            "PRAGMA cipher_memory_security = ON;
-             PRAGMA temp_store = MEMORY;
+            "PRAGMA temp_store = MEMORY;
              PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;",
         )

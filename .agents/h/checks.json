@@ -69,7 +69,8 @@
         "e2e/**",
         "playwright.config.ts"
       ],
-      "cmd": "npm run test:e2e -- --workers=2",
+      "_workers": "6, nie 2. `scripts/ci.sh` uzywa 2, bo macos-14 ma 3 rdzenie — ta wartosc byla skopiowana stamtad na maszyne 16-rdzeniowa. Zmierzone lokalnie na M4 Max: workers=2 -> 468.6 s, workers=6 -> 180.8 s, 974/974 passed w obu, zero flake przy retries:0. Podnoszac to jeszcze wyzej zmierz najpierw flake — konfiguracja ma retries:0 lokalnie, wiec jedno przeterminowane oczekiwanie wywala check.",
+      "cmd": "npm run test:e2e -- --workers=6",
       "scoped": true,
       "budget_s": 1200
     },
