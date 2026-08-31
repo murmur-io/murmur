@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   OnInit,
   computed,
   inject,
@@ -57,6 +58,7 @@ const RETENTION_CHOICES = [7, 14, 30, 60, 90] as const;
 })
 export class TrashComponent implements OnInit {
   readonly store = inject(TrashService);
+  private readonly destroyRef = inject(DestroyRef);
   private readonly toast = inject(ToastService);
 
   readonly retentionChoices = RETENTION_CHOICES;
@@ -95,6 +97,9 @@ export class TrashComponent implements OnInit {
   );
 
   ngOnInit(): void {
+    // Tell the store a view is mounted, so trash events refresh the ROWS (not just
+    // the badge count) while this screen is open — and stop doing so once it is not.
+    this.destroyRef.onDestroy(this.store.watch());
     void this.store.reload();
     // Reconcile expired entries on open rather than waiting up to an hour for the
     // background tick — otherwise the view can show a row that is already past its
