@@ -59,7 +59,6 @@ async function open(page: Page): Promise<void> {
     { list_workspace_tree: FOREST, get_container: CONTAINER },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
 }
 
 /**
@@ -105,7 +104,6 @@ test("a note row opens the note route that actually exists", async ({ page }) =>
     },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
 
   await page.getByRole("button", { name: "Expand Acme" }).click();
   await page.getByRole("button", { name: "Plan", exact: true }).click();

@@ -97,7 +97,6 @@ async function open(page: Page, forest: unknown[]): Promise<void> {
     { list_workspace_tree: forest },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(page.getByRole("tree", { name: "Workspaces" })).toBeVisible();
 }
 
@@ -165,7 +164,6 @@ test("a create failure stays in the sheet with the chosen context visible", asyn
     { list_workspace_tree: [OPEN_PROJECT] },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
   await page.getByRole("button", { name: "Create in Workspaces" }).click();
 
   const sheet = page.getByRole("dialog", { name: "Create in Workspaces" });
@@ -194,7 +192,6 @@ test("global New creates multiple peer Workspaces even when there are no destina
     { list_workspace_tree: [], list_container_items: { kind: "meeting", items: [], total: 0 } },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(page.getByText("No Workspaces yet", { exact: true })).toBeVisible();
 
   const createSpace = async (name: string): Promise<void> => {

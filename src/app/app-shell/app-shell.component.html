@@ -112,6 +112,28 @@
         </button>
       </div>
 
+      <!-- "File recordings with Brain" moved with the tree it acts on. The old
+           Spaces panel carried it in its header; dropping it in the rewrite left
+           `planWorkspaceOrganization()` and the organize sheet with no trigger,
+           i.e. the whole filing-review feature unreachable. -->
+      <button
+        type="button"
+        class="brain-action"
+        [disabled]="workspaceOrganizeDisabled()"
+        [attr.aria-busy]="workspaceOrganizePlanning()"
+        (click)="planWorkspaceOrganization()"
+        aria-label="Review filing moves with Brain"
+        title="Review filing moves with Brain"
+      >
+        @if (workspaceOrganizePlanning()) {
+          <span class="context-spinner" aria-hidden="true"></span>
+          <span>Planning filing suggestions…</span>
+        } @else {
+          <mur-icon icon="brain" />
+          <span>File recordings with Brain</span>
+        }
+      </button>
+
       <div class="sb-tree">
         <app-workspace-tree [currentPath]="currentPath()" />
       </div>

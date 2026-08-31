@@ -141,9 +141,8 @@ async function openSidebar(
     },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(
-    page.getByRole("complementary", { name: "Workspaces sidebar" }),
+    page.getByRole("navigation", { name: "Primary navigation" }),
   ).toBeVisible();
 }
 
@@ -291,7 +290,6 @@ test("a received Workspace can be filed under a local Workspace, privately", asy
     },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
 
   const partners = page.getByRole("treeitem", { name: /Partners/ });
   await partners.getByRole("button", { name: /Actions for shared/ }).click();
@@ -351,7 +349,6 @@ test("a nested received folder can be filed too, and renders in exactly one plac
     },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
 
   // Expand both possible hosts, then assert the row exists exactly once.
   await page
@@ -402,7 +399,6 @@ test("a received loose item and an own standalone share each carry the marker", 
     },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
   await page
     .getByRole("treeitem", { name: /Acme/ })
     .getByRole("button", { name: /Expand/ })

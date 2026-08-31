@@ -165,7 +165,8 @@ test("degraded filing recovery stays visible, refreshes on focus, and keeps one 
   await expect(banner).toContainText("2 attempts · 1 projection · 1 snapshot");
   await expect(banner).not.toContainText("opaque-issue-1");
   await expect(banner.getByRole("button", { name: /dismiss/i })).toHaveCount(0);
-  await page.getByRole("button", { name: "Workspaces", exact: true }).click();
+  // The "Lock all" footer control needs no preamble: the one sidebar shows the
+  // Workspaces tree and its footer together, with no panel to open first.
   await page
     .getByRole("button", { name: "Re-seal all 1 unlocked folder now" })
     // The fixed recovery warning deliberately remains above shell chrome. Use
