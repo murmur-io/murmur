@@ -7,6 +7,7 @@ import {
   computed,
   inject,
   input,
+  linkedSignal,
   output,
   signal,
   viewChild,
@@ -17,10 +18,23 @@ import type { WorkspaceDestination } from "../workspace-destination";
 
 export type WorkspaceCreateKind = "space" | "note" | "folder" | "dashboard";
 
+/** A destination the user wants but that does not exist yet. */
+export interface WorkspaceCreateNewContainer {
+  readonly kind: "space" | "folder";
+  readonly name: string;
+}
+
 export interface WorkspaceCreateRequest {
   readonly kind: WorkspaceCreateKind;
   readonly name: string;
   readonly target: WorkspaceDestination | null;
+  /**
+   * When set, the caller creates THIS container first and puts the item inside
+   * it. `target` then means the PARENT the new folder goes under, and is null
+   * for a new top-level Workspace. Only ever set for an item kind (note /
+   * dashboard) — see `canCreateDestination`.
+   */
+  readonly newContainer: WorkspaceCreateNewContainer | null;
 }
 
 /** Explicit create flow for the Workspaces header; opening it never writes anything. */
@@ -37,14 +51,26 @@ export class WorkspaceCreateSheetComponent {
   readonly targets = input.required<readonly WorkspaceDestination[]>();
   readonly busy = input(false);
   readonly error = input<string | null>(null);
+  /** What the opener came here to make — the Workspaces header says Workspace, "New note" says note. */
+  readonly initialKind = input<WorkspaceCreateKind>("space");
   readonly create = output<WorkspaceCreateRequest>();
   readonly cancelled = output<void>();
 
   private readonly nameInput = viewChild<ElementRef<HTMLInputElement>>("nameInput");
-  readonly kind = signal<WorkspaceCreateKind>("space");
+  /**
+   * `linkedSignal`, not `signal(this.initialKind())`: a signal input is not bound
+   * yet when a field initializer runs, so the plain form would freeze the DEFAULT
+   * instead of what the opener asked for. The source is constant for one open —
+   * the sheet is created fresh each time — so the reset semantics never fire
+   * under the user's hands mid-edit.
+   */
+  readonly kind = linkedSignal(() => this.initialKind());
   readonly name = signal("");
   readonly query = signal("");
   readonly selectedTargetId = signal<string | null>(null);
+  /** Which brand-new container the item should land in, if the user armed one. */
+  readonly newContainerKind = signal<"space" | "folder" | null>(null);
+  readonly newContainerName = signal("");
 
   readonly filteredTargets = computed(() => {
     if (this.kind() === "space") {
@@ -76,6 +102,34 @@ export class WorkspaceCreateSheetComponent {
     }
   });
 
+  /**
+   * Only an ITEM lands inside a container, so only an item can bring a brand-new
+   * container with it. A Workspace has no parent to invent, and offering "a new
+   * folder to hold this new folder" is rope nobody asked for.
+   */
+  readonly canCreateDestination = computed(
+    () => this.kind() === "note" || this.kind() === "dashboard",
+  );
+
+  readonly newContainerDefaultName = computed(() =>
+    this.newContainerKind() === "space" ? "New Workspace" : "New folder",
+  );
+
+  /** A new Workspace needs no parent; a new folder needs one; otherwise pick a destination. */
+  readonly createBlocked = computed(() => {
+    if (this.busy()) {
+      return true;
+    }
+    switch (this.newContainerKind()) {
+      case "space":
+        return false;
+      case "folder":
+        return !this.selectedTarget();
+      default:
+        return this.kind() !== "space" && !this.selectedTarget();
+    }
+  });
+
   constructor() {
     afterNextRender(() => this.nameInput()?.nativeElement.focus(), {
       injector: this.injector,
@@ -88,17 +142,44 @@ export class WorkspaceCreateSheetComponent {
     }
     this.kind.set(kind);
     this.selectedTargetId.set(null);
+    this.disarmNewContainer();
+  }
+
+  /** Toggle "put this in a container that does not exist yet". */
+  armNewContainer(kind: "space" | "folder"): void {
+    if (this.busy()) {
+      return;
+    }
+    if (this.newContainerKind() === kind) {
+      this.disarmNewContainer();
+      return;
+    }
+    this.newContainerKind.set(kind);
+    this.newContainerName.set("");
+  }
+
+  disarmNewContainer(): void {
+    this.newContainerKind.set(null);
+    this.newContainerName.set("");
   }
 
   onCreate(): void {
-    const target = this.selectedTarget();
-    if ((this.kind() !== "space" && !target) || this.busy()) {
+    if (this.createBlocked()) {
       return;
     }
+    const pending = this.newContainerKind();
     this.create.emit({
       kind: this.kind(),
       name: this.name().trim() || this.defaultName(),
-      target,
+      // A new top-level Workspace has no parent; every other shape carries the
+      // row the user selected.
+      target: pending === "space" ? null : this.selectedTarget(),
+      newContainer: pending
+        ? {
+            kind: pending,
+            name: this.newContainerName().trim() || this.newContainerDefaultName(),
+          }
+        : null,
     });
   }
 

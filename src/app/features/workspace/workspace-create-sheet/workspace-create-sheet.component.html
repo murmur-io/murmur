@@ -83,47 +83,100 @@
         </div>
       </div>
     } @else {
-      <div class="destination-head">
-        <span>Destination</span>
-        <label class="destination-search">
-          <mur-icon icon="search" />
-          <input
-            #destinationSearch
-            type="search"
-            [value]="query()"
-            [disabled]="busy()"
-            (input)="query.set(destinationSearch.value)"
-            placeholder="Filter…"
-            aria-label="Filter destinations"
-          />
-        </label>
-      </div>
-
-      <div class="destination-list" aria-label="Destinations">
-        @for (target of filteredTargets(); track target.container.id) {
+      @if (canCreateDestination()) {
+        <div class="new-destination" aria-label="Create a new destination">
           <button
             type="button"
-            class="destination"
-            [class.is-selected]="selectedTargetId() === target.container.id"
-            [attr.aria-pressed]="selectedTargetId() === target.container.id"
+            [class.is-armed]="newContainerKind() === 'space'"
+            [attr.aria-pressed]="newContainerKind() === 'space'"
             [disabled]="busy()"
-            (click)="selectedTargetId.set(target.container.id)"
+            (click)="armNewContainer('space')"
           >
-            <mur-icon [icon]="target.container.level === 'project' ? 'spaces' : 'folder'" />
-            <span>
-              <strong>{{ target.label }}</strong>
-              <small>{{ target.container.level === "project" ? "Workspace" : "Folder" }}</small>
-            </span>
-            @if (selectedTargetId() === target.container.id) {
-              <span class="selected-mark" aria-hidden="true">✓</span>
-            }
+            <mur-icon icon="spaces" />
+            New Workspace
           </button>
-        } @empty {
-          <p class="empty-copy">
-            {{ kind() === "note" ? "No open note folder matches." : "No open destination matches." }}
+          <button
+            type="button"
+            [class.is-armed]="newContainerKind() === 'folder'"
+            [attr.aria-pressed]="newContainerKind() === 'folder'"
+            [disabled]="busy()"
+            (click)="armNewContainer('folder')"
+          >
+            <mur-icon icon="folder-add" />
+            New folder
+          </button>
+        </div>
+
+        @if (newContainerKind(); as pending) {
+          <label class="field-label" for="workspace-create-destination-name">
+            {{ pending === "space" ? "New Workspace name" : "New folder name" }}
+          </label>
+          <input
+            #newContainerInput
+            id="workspace-create-destination-name"
+            class="name-field"
+            type="text"
+            [value]="newContainerName()"
+            [placeholder]="newContainerDefaultName()"
+            [disabled]="busy()"
+            (input)="newContainerName.set(newContainerInput.value)"
+          />
+          <p class="new-destination-hint">
+            @if (pending === "space") {
+              A brand-new top-level Workspace, and the {{ kind() }} goes straight into it.
+            } @else if (selectedTarget(); as parent) {
+              A new folder inside <strong>{{ parent.label }}</strong>, and the
+              {{ kind() }} goes straight into it.
+            } @else {
+              Pick below which Workspace or folder should hold the new folder.
+            }
           </p>
         }
-      </div>
+      }
+
+      @if (newContainerKind() !== "space") {
+        <div class="destination-head">
+          <span>Destination</span>
+          <label class="destination-search">
+            <mur-icon icon="search" />
+            <input
+              #destinationSearch
+              type="search"
+              [value]="query()"
+              [disabled]="busy()"
+              (input)="query.set(destinationSearch.value)"
+              placeholder="Filter…"
+              aria-label="Filter destinations"
+            />
+          </label>
+        </div>
+
+        <div class="destination-list" aria-label="Destinations">
+          @for (target of filteredTargets(); track target.container.id) {
+            <button
+              type="button"
+              class="destination"
+              [class.is-selected]="selectedTargetId() === target.container.id"
+              [attr.aria-pressed]="selectedTargetId() === target.container.id"
+              [disabled]="busy()"
+              (click)="selectedTargetId.set(target.container.id)"
+            >
+              <mur-icon [icon]="target.container.level === 'project' ? 'spaces' : 'folder'" />
+              <span>
+                <strong>{{ target.label }}</strong>
+                <small>{{ target.container.level === "project" ? "Workspace" : "Folder" }}</small>
+              </span>
+              @if (selectedTargetId() === target.container.id) {
+                <span class="selected-mark" aria-hidden="true">✓</span>
+              }
+            </button>
+          } @empty {
+            <p class="empty-copy">
+              {{ kind() === "note" ? "No open note folder matches." : "No open destination matches." }}
+            </p>
+          }
+        </div>
+      }
     }
 
     <footer class="sheet-actions">
@@ -138,7 +191,7 @@
       <button
         type="button"
         class="btn btn-primary"
-        [disabled]="busy() || (kind() !== 'space' && !selectedTarget())"
+        [disabled]="createBlocked()"
         (click)="onCreate()"
       >
         {{ busy() ? "Creating…" : kind() === "space" ? "Create Workspace" : "Create " + kind() }}
