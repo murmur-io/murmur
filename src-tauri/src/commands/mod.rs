@@ -4607,18 +4607,15 @@ async fn delete_meeting_inner_notifying(
         "could not remove an exported image before deleting the meeting",
     )?;
 
-    // Capture + remove on-disk files before the rows disappear (best-effort).
-    // C4: the playback audio may exist as BOTH the plaintext WAV *and* its sealed `.enc` at once —
-    // during a session-unlock, `session_unseal` decrypts the `.enc` to a plaintext WAV for playback
-    // but KEEPS the `.enc`. So `audio_path` (plaintext form) alone would orphan the `.enc` on
-    // record→lock→unlock→delete. Remove BOTH forms, exactly as the masters block below already does.
-    // TRASH: the audio files are DELIBERATELY LEFT ON DISK. They are the recording's only copy and
-    // the snapshot captured above references them by path, so unlinking here would make the trash
-    // entry unrestorable the instant it was created. `trash::purge_one` removes every on-disk form
-    // (plaintext WAV, `.enc` twin, both masters) when the entry is finally purged — the same
-    // cleanup this block used to do, moved to the moment the content actually stops being
-    // recoverable. `trash::seal_trash_meeting_audio` encrypts them if the folder is locked
-    // meanwhile, since `lock_folder` walks `meeting_ids_in_folder` and this row is gone.
+    // AUDIO IS DELIBERATELY LEFT ON DISK. The files are the recording's only copy and the snapshot
+    // captured above references them by path, so unlinking here would make the trash entry
+    // unrestorable the instant it was created. This block used to remove every on-disk form
+    // (plaintext WAV, its `.enc` twin, and both masters — the C4 fix, because a session-unlock
+    // leaves BOTH forms present); `trash::purge_one` does exactly that now, moved to the moment the
+    // content actually stops being recoverable. And because `lock_folder` finds a folder's audio by
+    // walking `meeting_ids_in_folder` — which can no longer see this row —
+    // `trash::seal_trash_meeting_audio` is what encrypts these files if the folder is locked
+    // meanwhile, so a trashed recording's audio never sits in plaintext behind a lock.
     if let Some(note) = state.db.get_latest_note_for_meeting(meeting_id)? {
         if let Some(path) = note.exported_path.as_deref() {
             let _ = std::fs::remove_file(path);
