@@ -304,7 +304,33 @@
       overflow: hidden;
     }
     .shot img { display: block; width: 100%; height: auto; }
+    .shot video { display: block; width: 100%; height: auto; background: #07070b; }
     .shot-glow { position: relative; }
+
+    /* The play affordance sits OVER the poster and is removed from the DOM flow
+       the moment playback starts, so the native controls are never fighting a
+       decorative overlay for the same clicks. */
+    /* Icon ABOVE the label, not beside it: side by side, the label crowds the
+       disc at every width the hero can take, and centring the pair leaves the
+       disc off the optical centre of the frame. */
+    .hero-play {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+      border: 0; cursor: pointer; color: var(--text-primary);
+      font: inherit; font-size: 15px; font-weight: 600; letter-spacing: -0.01em;
+      text-shadow: 0 2px 14px rgba(0,0,0,.8);
+      background: linear-gradient(to top, rgba(4,4,8,.55), rgba(4,4,8,.12) 46%, rgba(4,4,8,0));
+      transition: opacity .18s ease;
+    }
+    .hero-play svg {
+      width: 62px; height: 62px; flex: none; padding: 18px 16px 18px 20px;
+      border-radius: 999px; color: #fff;
+      background: rgba(110,118,255,.94);
+      box-shadow: 0 12px 34px rgba(0,0,0,.55);
+    }
+    .hero-play:hover { opacity: .88; }
+    .hero-play[hidden] { display: none; }
+    @media (prefers-reduced-motion: reduce) { .hero-play { transition: none; } }
 
     /* ── Trust strip ─────────────────────────────────────────── */
     .trust { border-top: 1px solid var(--border-subtle); border-bottom: 1px solid var(--border-subtle); padding: 26px 0; margin-top: 44px; }
@@ -502,7 +528,25 @@
       </div>
       <div class="shot-glow">
         <div class="shot">
-          <img src="./assets/record-brain.png" alt="Asking Murmur a question mid-meeting and getting a grounded answer with its sources listed — while the recording keeps rolling" loading="eager" />
+          <!-- The one-minute tour, built from the real UI by scripts/promo (see
+               its README). CLICK-TO-PLAY, not autoplay: the film carries a
+               message, and a message that starts talking at a visitor who did
+               not ask reads as an ad. The poster is a frame of the film itself,
+               so the hero still shows the product before anyone presses play. -->
+          <video
+            id="heroVideo"
+            class="hero-video"
+            poster="./assets/promo-poster.jpg"
+            preload="none"
+            playsinline
+            aria-label="A one-minute tour of Murmur: recording a meeting, the on-device transcript, asking across your vault with citations, the brain graph, and locking a Space">
+            <source src="./assets/promo-web.webm" type="video/webm" />
+            <source src="./assets/promo-web.mp4" type="video/mp4" />
+          </video>
+          <button class="hero-play" type="button" aria-controls="heroVideo" aria-label="Play the one-minute tour">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.14v13.72a1 1 0 0 0 1.54.84l10.3-6.86a1 1 0 0 0 0-1.68L9.54 4.3A1 1 0 0 0 8 5.14Z"/></svg>
+            <span>Watch the 1-minute tour</span>
+          </button>
         </div>
       </div>
     </div>
@@ -949,6 +993,27 @@
           el.hidden = false;
         })
         .catch(function () { /* rate-limited or offline — leave the plain Star button */ });
+    })();
+
+    // Hero tour: press play once, then get out of the way. `preload="none"` on
+    // the <video> means nothing is fetched until this fires, so the film costs a
+    // visitor who never watches it exactly zero bytes.
+    (function () {
+      var v = document.getElementById('heroVideo');
+      var btn = document.querySelector('.hero-play');
+      if (!v || !btn) return;
+      btn.addEventListener('click', function () {
+        btn.hidden = true;
+        // Controls appear WITH playback. Declaring them in the markup paints the
+        // native scrubber across the poster underneath this button, so the hero
+        // shows two competing affordances before the visitor has pressed
+        // anything.
+        v.controls = true;
+        var p = v.play();
+        // A rejected play() (autoplay policy, decode failure) must not leave the
+        // visitor staring at a poster with no way back to the button.
+        if (p && p.catch) p.catch(function () { btn.hidden = false; v.controls = false; });
+      });
     })();
   </script>
 </body>
