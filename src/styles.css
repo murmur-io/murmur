@@ -350,6 +350,28 @@ app-shell {
   height: 100vh;
   padding: var(--space-2);
   overflow: hidden;
+
+  /* Where the content pane actually begins: the shell's own padding, the
+     sidebar, and the flex gap between them. A view that takes itself OUT of
+     flow (`position: fixed`, to escape `.app-main`'s padding) can no longer
+     read that offset from the box model, so it reads it from here.
+
+     This has to be a variable rather than a literal because the sidebar has
+     two widths now. `/settings` hardcoded the OLD 64px icon rail
+     (8 + 64 + 8 + 8 = 88px) and, once the rail became a 256px sidebar, its
+     section list rendered UNDERNEATH the sidebar: still "visible" to a
+     `toBeVisible()` assertion, but every click landed on `.sb-scroll`
+     instead — which is why ~30 settings e2e tests timed out on a click
+     rather than failing an assertion. */
+  --shell-content-inset: calc(
+    var(--space-2) + var(--shell-sidebar-w) + var(--space-2)
+  );
+}
+
+app-shell.sidebar-collapsed {
+  --shell-content-inset: calc(
+    var(--space-2) + var(--shell-sidebar-w-collapsed) + var(--space-2)
+  );
 }
 
 

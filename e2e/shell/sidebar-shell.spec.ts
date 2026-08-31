@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 import { mockTauri } from "../settings-ai/mock-invoke";
 
@@ -42,6 +42,26 @@ function topbar(page: Page) {
   return page.locator(".primary-sidebar .sb-top");
 }
 
+/**
+ * The sidebar ANIMATES its width (`transition: flex-basis, width`), so a
+ * boundingBox() taken right after the collapse/expand class flips reports a
+ * mid-flight geometry — which is how the width and window-button-margin
+ * assertions below failed while the layout itself was correct. Read until two
+ * successive samples agree.
+ */
+async function settledWidth(sb: Locator): Promise<number> {
+  let last = -1;
+  for (let i = 0; i < 40; i += 1) {
+    const width = (await sb.boundingBox())?.width ?? -1;
+    if (width === last) {
+      return width;
+    }
+    last = width;
+    await sb.page().waitForTimeout(50);
+  }
+  return last;
+}
+
 test("opens expanded, with search on top and no brand mark", async ({ page }) => {
   await boot(page);
   const sb = sidebar(page);
@@ -55,7 +75,11 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   const collapse = bar.getByRole("button", { name: "Collapse sidebar" });
   const settings = bar.getByRole("link", { name: "Settings" });
   await expect(bar.getByRole("link", { name: "Ask" })).toBeVisible();
-  await expect(sb.getByRole("button", { name: "Search" })).toHaveCount(0);
+  // `bar` is inside `sb`, so scope this to the destination rows: expanded,
+  // Search lives ONLY in the top row and must not be duplicated below it.
+  await expect(
+    sb.locator(".sb-nav").getByRole("button", { name: "Search" }),
+  ).toHaveCount(0);
 
   // Search is the icon alone — no label, no shortcut badge.
   await expect(bar.getByText("Search", { exact: true })).toHaveCount(0);
@@ -113,7 +137,7 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   // ONE wide Capture button, and a round button beside it holding every other
   // creation — the Notion shape. Capture takes the remaining width.
   const capture = sb.getByRole("link", { name: "Capture" });
-  const create = sb.getByRole("button", { name: "Create" });
+  const create = sb.getByRole("button", { name: "Create", exact: true });
   await expect(capture).toHaveClass(/btn-primary/);
   await expect(capture).toContainText("Capture");
 
@@ -147,10 +171,8 @@ test("collapsing hides the labels and the tree, and survives a reload", async ({
   await expect(sb.getByRole("tree", { name: "Workspaces" })).toHaveCount(0);
   await expect(sb.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
 
-  const collapsedBox = await sb.boundingBox();
-  expect(collapsedBox).not.toBeNull();
   expect(expandedBox).not.toBeNull();
-  expect(collapsedBox!.width).toBeLessThan(expandedBox!.width - 100);
+  expect(await settledWidth(sb)).toBeLessThan(expandedBox!.width - 100);
 
   await page.reload();
   await expect(
@@ -179,17 +201,24 @@ test("the footer offers Capture plus a menu for the other create actions", async
   await boot(page);
   const sb = sidebar(page);
 
-  await sb.getByRole("button", { name: "Create" }).click();
+  await sb.getByRole("button", { name: "Create", exact: true }).click();
   const menu = page.getByRole("menu");
   await expect(menu.getByRole("menuitem", { name: "New note" })).toBeVisible();
   await expect(menu.getByRole("menuitem", { name: "New dashboard" })).toBeVisible();
   await expect(menu.getByRole("menuitem", { name: "New reminder" })).toBeVisible();
 
   // Open, the same control closes the menu — the plus rotates into an X.
-  await expect(sb.getByRole("button", { name: "Close create menu" })).toBeVisible();
+  // The scrim behind the open menu carries the same accessible name, so assert
+  // on the create control itself — it is the one that must flip to closing.
+  await expect(sb.locator(".sb-create-more")).toHaveAttribute(
+    "aria-label",
+    "Close create menu",
+  );
 
   await menu.getByRole("menuitem", { name: "New note" }).click();
-  await expect(page).toHaveURL(/\/notes\/new$/);
+  // `/notes/new` creates the draft and hands off to that note's own route, so
+  // assert the destination is a note rather than the transient path.
+  await expect(page).toHaveURL(/\/notes\//);
   await expect(page.getByRole("menu")).toHaveCount(0);
 });
 
@@ -275,6 +304,10 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
     topbar(page).getByRole("button", { name: "Collapse sidebar" }),
   ).toBeVisible();
 
+  // Collapse again: the click above deliberately revealed the sidebar, and the
+  // assertions below are about the COLLAPSED row.
+  await topbar(page).getByRole("button", { name: "Collapse sidebar" }).click();
+
   // The row is down to the toggle alone.
   const bar = topbar(page);
   const expand = bar.getByRole("button", { name: "Expand sidebar" });
@@ -289,6 +322,7 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
   // 84px is the buttons' furthest possible right edge (x:32 read as a left edge
   // plus their 52px span; read as a centre they end sooner). The toggle drops
   // below them either way.
+  await settledWidth(sb);
   const expandBox = await expand.boundingBox();
   const sbBox = await sb.boundingBox();
   expect(expandBox).not.toBeNull();

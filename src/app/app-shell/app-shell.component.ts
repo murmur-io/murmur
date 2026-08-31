@@ -116,6 +116,10 @@ const BROWSE_EXPANDED_KEY = "murmur.shell.browseExpanded";
     FilingRecoveryBannerComponent,
   ],
   host: {
+    // Publishes the sidebar's CURRENT width to `--shell-content-inset` in
+    // styles.css, so a `position: fixed` view (/settings) knows where the
+    // content pane really starts instead of hardcoding a rail width.
+    "[class.sidebar-collapsed]": "!sidebarExpanded()",
     "(document:keydown)": "onGlobalKeydown($event)",
     "(window:keydown.escape)": "onWindowEscape($event)",
   },

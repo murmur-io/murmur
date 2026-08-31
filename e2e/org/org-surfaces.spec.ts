@@ -254,18 +254,16 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     await page.goto("/library");
 
     await expect(page.locator("app-library .library")).toBeVisible();
-    await page
-      .getByRole("navigation", { name: "Primary navigation" })
-      .getByRole("button", { name: "Workspaces", exact: true })
-      .click();
     await expect(page).toHaveURL(/\/library$/);
     await expect(page.locator("app-library .library")).toBeVisible();
 
     // The contextual tree exposes the lock menu without replacing the mounted
     // meetings surface. The shares gate remains unchanged: probe first, then
     // put the blocking dialog in front of the seal.
-    const spacesSidebar = page.getByRole("complementary", {
-      name: "Workspaces sidebar",
+    // The Workspaces tree is a section of the ONE sidebar now, rather than a
+    // separate "Workspaces sidebar" panel opened from a rail button.
+    const spacesSidebar = page.getByRole("navigation", {
+      name: "Primary navigation",
     });
     await expect(spacesSidebar).toBeVisible();
     const project = spacesSidebar.getByRole("treeitem").first();

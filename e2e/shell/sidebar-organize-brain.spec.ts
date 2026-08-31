@@ -178,9 +178,8 @@ async function openWorkspace(page: Page): Promise<string[]> {
     (window as unknown as { __plan: unknown }).__plan = plan;
   }, PLAN);
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(
-    page.getByRole("complementary", { name: "Workspaces sidebar" }),
+    page.getByRole("navigation", { name: "Primary navigation" }),
   ).toBeVisible();
   return runtimeErrors;
 }
@@ -221,7 +220,7 @@ test("the scroller snaps a partial first row below the fixed Workspaces header",
   page,
 }) => {
   const runtimeErrors = await openWorkspace(page);
-  const body = page.locator(".spaces-sidebar .context-body");
+  const body = page.locator(".primary-sidebar .sb-scroll");
 
   await body.evaluate((element) => {
     element.scrollTop = 56;
@@ -396,7 +395,6 @@ test("the visible Brain action exposes its planning state while the plan is pend
     { list_workspace_tree: FOREST, list_container_items: UNFILED },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
 
   const organize = page.getByRole("button", {
     name: "Review filing moves with Brain",

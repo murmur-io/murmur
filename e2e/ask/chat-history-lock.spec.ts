@@ -92,21 +92,19 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
     page.getByText("Sensitive Ask message", { exact: true }),
   ).toBeVisible();
 
-  // Open the hierarchy without leaving the mounted Ask route. The loaded
-  // conversation and its sensitive source must remain present until locking
-  // publishes the invalidation that scrubs them.
-  await page
-    .getByRole("navigation", { name: "Primary navigation" })
-    .getByRole("button", { name: "Workspaces", exact: true })
-    .click();
+  // The hierarchy is on screen already, beside the mounted Ask route. The
+  // loaded conversation and its sensitive source must remain present until
+  // locking publishes the invalidation that scrubs them.
   await expect(page).toHaveURL(/\/ask$/);
   await expect(page.locator("mur-chat-history")).toBeVisible();
   await expect(
     page.getByText("Sensitive Ask message", { exact: true }),
   ).toBeVisible();
 
-  const spacesSidebar = page.getByRole("complementary", {
-    name: "Workspaces sidebar",
+  // The Workspaces tree is a section of the one sidebar now, not a separate
+  // "Workspaces sidebar" panel that had to be opened first.
+  const spacesSidebar = page.getByRole("navigation", {
+    name: "Primary navigation",
   });
   await expect(spacesSidebar).toBeVisible();
   await spacesSidebar
@@ -202,19 +200,17 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
     page.getByText("Meeting-derived secret", { exact: true }),
   ).toBeVisible();
 
-  // Opening Workspaces is contextual navigation: it must not unmount Ask or scrub
-  // the message before the actual lock transition occurs.
-  await page
-    .getByRole("navigation", { name: "Primary navigation" })
-    .getByRole("button", { name: "Workspaces", exact: true })
-    .click();
+  // The Workspaces tree sits beside Ask: it must not unmount Ask or scrub the
+  // message before the actual lock transition occurs.
   await expect(page).toHaveURL(/\/ask$/);
   await expect(
     page.getByText("Meeting-derived secret", { exact: true }),
   ).toBeVisible();
 
-  const spacesSidebar = page.getByRole("complementary", {
-    name: "Workspaces sidebar",
+  // The Workspaces tree is a section of the one sidebar now, not a separate
+  // "Workspaces sidebar" panel that had to be opened first.
+  const spacesSidebar = page.getByRole("navigation", {
+    name: "Primary navigation",
   });
   await expect(spacesSidebar).toBeVisible();
   await spacesSidebar

@@ -201,9 +201,8 @@ async function expectMenuItemAtHitPoint(
 async function openWorkspace(page: Page): Promise<void> {
   await mockTauri(page, {}, { list_workspace_tree: FOREST });
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(
-    page.getByRole("complementary", { name: "Workspaces sidebar" }),
+    page.getByRole("navigation", { name: "Primary navigation" }),
   ).toBeVisible();
 }
 
@@ -243,8 +242,8 @@ test("audits the complete sidebar at tall and short viewports", async ({
     await page.setViewportSize(viewport);
     await page.goto("/meeting/m-standup");
 
-    const sidebar = page.getByRole("complementary", { name: "Workspaces sidebar" });
-    const body = sidebar.locator(".context-body");
+    const sidebar = page.getByRole("navigation", { name: "Primary navigation" });
+    const body = sidebar.locator(".sb-scroll");
     const selected = sidebar.getByRole("treeitem", { name: "Standup" });
     await expect(sidebar).toBeVisible();
     await expect(selected).toHaveAttribute("aria-selected", "true");
@@ -289,7 +288,7 @@ test("audits the complete sidebar at tall and short viewports", async ({
       .toEqual({ atBottom: true, scrolled: true });
 
     const footer = sidebar.getByRole("button", {
-      name: "Collapse Workspaces sidebar",
+      name: "Collapse sidebar",
     });
     await expect(footer).toBeVisible();
     await expect
@@ -320,7 +319,7 @@ test("audits the complete sidebar at tall and short viewports", async ({
           withinBoundary: (() => {
             const panel = menu.getBoundingClientRect();
             const scroller = document
-              .querySelector<HTMLElement>(".spaces-sidebar .context-body")!
+              .querySelector<HTMLElement>(".primary-sidebar .sb-scroll")!
               .getBoundingClientRect();
             return (
               panel.top >= scroller.top && panel.bottom <= scroller.bottom + 1
@@ -404,7 +403,7 @@ test("keeps the single contextual container menu above following tree rows", asy
     );
   });
   expect(gapBefore).not.toBeNull();
-  const contextBody = page.locator(".spaces-sidebar .context-body");
+  const contextBody = page.locator(".primary-sidebar .sb-scroll");
   await contextBody.evaluate((element) => element.scrollBy({ top: 16 }));
   await expect
     .poll(() => contextBody.evaluate((element) => element.scrollTop))
@@ -494,7 +493,6 @@ test("rename and delete use explicit contextual confirmation instead of native p
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
 
   await page.getByRole("button", { name: "Actions for Acme" }).click();
   await page.getByRole("menuitem", { name: "Rename space" }).click();
@@ -565,7 +563,6 @@ test("shows unfiled recordings as a real inbox and opens the complete meetings l
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
 
   const inbox = page.getByRole("treeitem", { name: /Unfiled recordings/ });
   await expect(inbox).toBeVisible();
@@ -616,7 +613,6 @@ test("shows unfiled recordings as a real inbox and opens the complete meetings l
     ),
   ).toBe("false");
   await page.reload();
-  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(unfiledRows).toHaveCount(0);
   await page.getByRole("button", { name: "Expand Unfiled recordings" }).click();
   await expect(unfiledRows).toHaveCount(8);
@@ -695,7 +691,6 @@ test("scrubs unfiled titles synchronously and drops a late pre-invalidation page
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(
     page.getByText("Mounted private recording", { exact: true }),
   ).toBeVisible();
