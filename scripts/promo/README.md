@@ -57,37 +57,91 @@ Deterministic: same input, same output, and a busy machine drops nothing.
 **3. `encode.sh` — delivery.** H.264 High / yuv420p / `+faststart` (plays everywhere), a VP9
 alternate, and a poster frame.
 
+## The composition model
+
+The window is a **keyframed object**, not a fixed plate. `compose.html` `LAYOUTS` defines where it
+sits and how it is tilted; `film.frame(mode)` moves it, on the same easing curve as everything else.
+
+| mode | the window | the type |
+| --- | --- | --- |
+| `full` | large and centred | none — this is the shot for when the UI is the point |
+| `lower` | parked high, ~190 px band beneath | a lower third, left-aligned to the window's edge |
+| `title` | pushed right, tilted −13°, bleeding off frame | a column on the LEFT |
+| `titleR` | mirrored: bleeding off the left | a column on the RIGHT |
+| `card` | pushed back and down | a full-frame chapter caption |
+
+**Why this exists.** The first cut used one fixed geometry for its whole length and reserved a dead
+~190 px band underneath for type. That band is empty for most of the running time — about 18% of
+every frame wasted — and, worse, it meant a caption could only ever be centred *underneath* the
+product, which is the grammar of a SUBTITLE. Titles sit beside or over their subject. The layout
+moving between beats is also the film's cheapest source of motion: the frame re-composes, so a cut
+never lands on a picture the same shape as the one before it.
+
+Two consequences worth knowing:
+
+- **At rest the transform is the identity**, so the window really is where `LAYOUTS` puts it. As the
+  camera pushes in, the anchor eases to the centre of frame and the containment clamp takes over.
+  An earlier draft anchored to the centre *always*, which silently re-centred the window and made
+  `title` produce a centred product with the headline lying across the app's own sidebar.
+- **`lower` is 1440 px wide for a reason.** The tallest lower third (kicker + headline + rule + a
+  two-line sub) begins at y≈862, so the window's bottom edge has to clear it.
+
+Scene boundaries have a vocabulary rather than one cross-dissolve — `dissolve`, `push`, `pushUp`,
+`whip`, `through`. Dissolving every boundary is the video equivalent of ending every sentence the
+same way: by the third one the viewer stops registering that anything happened.
+
 ## Directing a scene
 
-Scenes live in `SCENES` in `record.mjs`. The `film` object is the authoring surface:
+Scenes live in `SCENES` in `record.mjs`. Each entry declares the transition it ENTERS on
+(`dissolve` · `push` · `pushUp` · `whip` · `through`) plus a `run` that performs the take. The
+`film` object is the authoring surface:
 
 | call | does |
 | --- | --- |
-| `film.goto(path)` | navigate (re-installs the drawn cursor) |
+| `film.goto(path)` | navigate (re-installs the drawn cursor, and marks the roll point) |
 | `film.click(sel)` / `film.type(sel, text)` | act, with the cursor gliding there first |
+| `film.cursorTo(sel)` | glide the cursor without clicking |
+| `film.reveal(sel)` | scroll a target to the middle of the app viewport |
 | `film.focus(target, {scale, ms, bias})` | push the camera in on a **region** |
 | `film.wide({ms})` | pull back out to the whole window |
-| `film.title(text, {sub, dur, kind})` | a caption — `kind: "hero"` or `"lower"` |
+| `film.frame(mode, {ms})` | move the WINDOW: `full` · `lower` · `title` · `titleR` · `card` |
+| `film.title(text, {kicker, sub, dur, kind, align})` | a caption — `kind` matches the frame mode |
+| `film.spotlight(target, {dur, label})` | ring a region and shade everything else down |
 | `film.liveCaption(text)` / `film.emit(...)` | drive the mocked backend |
 | `film.assertClean(where)` | run the privacy gate on what is on screen right now |
 
+In a caption's `text`, `*starred words*` take the accent gradient and `|` is a hard line break. Use
+the break — the good split in "Nothing leaves your Mac." is after *leaves*, and no column width
+produces it reliably.
+
 ### Things that will bite you
 
+- **Say it wide, then push in.** A caption authored *after* a `focus` lands on whatever the push-in
+  filled the frame with, and over a dense panel — action items, a board brief — 46 px type turns the
+  shot to mush. Author the caption, hold a beat, then move the camera.
 - **Aim the camera at regions, not at small controls.** The compositor clamps the frame to stay
   inside the app screen, so a target near an edge is only reachable at a deep zoom; ask for a modest
-  scale on a corner button and the camera quietly settles mid-screen instead. The clamp is what
-  keeps half the shot from being empty background.
+  scale on a corner button and the camera quietly settles mid-screen instead. A `spotlight` is the
+  right tool for something small — it points anywhere without moving the camera at all.
 - **Zoom deep enough to read, wide enough to fit.** At scale `s` you see about `2000/s` app pixels
   across. A 1360-wide bar at 1.8× does not fit — it did not, and the first cut clipped both ends.
-- **Captions own the bottom band.** The window is parked high and the ~190 px beneath it belongs to
-  the captions. At rest they never overlap; a deep push-in does put type over pixels, so do not
-  schedule a caption over the beat where the viewer must read the UI.
+- **Scroll before you frame.** The action items, the speaker timeline and the graph canvas all start
+  above 900 px and run below it. The camera cannot leave the app screen, so a `focus` on a target
+  whose centre is off the bottom silently settles somewhere else and photographs the wrong thing.
+  `film.reveal(sel)` first.
+- **A static route hands you almost no footage.** The screencast emits on a *paint*: an un-driven
+  take of `/dashboards` captured six frames in seven seconds, and `/people` five. Drive the UI — a
+  click, or even a cursor glide — or the scene is one held still.
 - **Photograph the thing you are claiming.** The caption "one brain" over `/graph` was a lie by
   framing: that route is the entity *browser* and photographs as a list of chips. The actual map is
   behind the "Full brain graph" disclosure on `/brain` — and it needs its **canvas** scrolled into
   view, not its component host, or the map sits below the fold.
 - **Type no faster than the renderer samples.** The `/ask` scene captures at ~19 fps; at 30 cps
   three characters land between frames and it reads as a stutter, not as typing.
+- **Re-run `record` after any shell change.** The scenes address the live DOM. The first cut was
+  still aiming at `nav.global-rail`, which the 2026-08-31 sidebar rewrite deleted — 54 commits after
+  the film shipped it was describing a UI that no longer existed, and nothing failed until a take
+  was attempted.
 
 ## Two properties enforced by the tool
 

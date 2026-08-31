@@ -35,46 +35,78 @@ Everything lands in `.promo/` (gitignored). Copy to `landing/assets/` only what 
 **Iterate cheaply.** Never re-render at 60 fps to check a framing decision:
 
 ```bash
-node scripts/promo/render.mjs --fps 2 --out .promo/probe      # ~100 frames, ~20 s
-node scripts/promo/render.mjs --fps 2 --scenes graph --no-endcard --out .promo/g
+node scripts/promo/render.mjs --fps 3 --out .promo/probe                 # ~280 frames, ~60 s
+node scripts/promo/render.mjs --fps 3 --scenes brain --no-endcard --out .promo/g
+node scripts/promo/render.mjs --fps 3 --no-blur --out .promo/probe       # skip the motion blur
 ```
 
 Then LOOK at the PNGs. A green run is not evidence — every framing bug in this harness's history
-was found by opening a frame, never by reading a log.
+was found by opening a frame, never by reading a log. Four of them were found this way in the
+2026-09-01 re-cut alone: a centred window in the title layout, a full stop orphaned a word-space
+from its sentence, a lower third sitting on the app's own footer, and a spotlight label landing on
+body copy.
+
+A partial re-record keeps the scenes it is not re-shooting (`record.mjs boards people lock`), so
+fixing one beat costs ~20 s rather than the whole three-minute take.
 
 ---
 
 ## 2. Direct a scene
 
-Scenes are `SCENES` in `record.mjs`. The `film` object records a *mark* every time you move the
-camera or place a caption, so the edit is a by-product of performing the scene:
+Scenes are `SCENES` in `record.mjs`. Each declares the transition it ENTERS on — `dissolve`,
+`push`, `pushUp`, `whip`, `through` — and a `run` that performs the take. The `film` object records
+a *mark* every time you move the camera, move the window or place a caption, so the edit is a
+by-product of performing the scene:
 
 | call | does |
 | --- | --- |
-| `film.goto(path)` | navigate (re-installs the drawn cursor) |
+| `film.goto(path)` | navigate (re-installs the cursor, marks the roll point) |
 | `film.click(sel)` / `film.type(sel, text, {cps})` | act, cursor glides there first |
+| `film.cursorTo(sel)` | glide the cursor without clicking |
+| `film.reveal(sel)` | scroll a target to the middle of the app viewport |
 | `film.focus(target, {scale, ms, bias})` | push in on a **region** |
 | `film.wide({ms})` | pull back to the whole window |
-| `film.title(text, {sub, dur, kind})` | caption — `kind: "hero"` or `"lower"` |
+| `film.frame(mode, {ms})` | move the WINDOW: `full`·`lower`·`title`·`titleR`·`card` |
+| `film.title(text, {kicker, sub, dur, kind})` | caption — `kind` matches the frame mode |
+| `film.spotlight(target, {dur, label})` | ring a region, shade everything else down |
 | `film.liveCaption(text)` / `film.emit(evt, payload)` | drive the mocked backend |
 | `film.assertClean(where)` | privacy-gate whatever is on screen right now |
 
+In caption text, `*starred words*` take the accent gradient and `|` is a hard line break.
+
+**The window is a keyframed object, not a fixed plate.** `full` is large and centred; `lower` parks
+it high for a lower third; `title` / `titleR` push it to one side, tilt it and let it bleed off
+frame so the type gets a column. The 2026-09-01 re-cut exists largely because the first one used ONE
+geometry throughout and reserved a permanent dead band for type — which wastes ~18% of every frame
+and can only ever produce a centred *subtitle*, never a title. Re-composing between beats is also
+the cheapest motion in the film.
+
 **The rules that are not obvious:**
 
+- **Say it wide, then push in.** A caption authored *after* a `focus` lands on whatever the push-in
+  filled the frame with. Over the action-items panel or a board brief, 46 px type turns the shot to
+  mush. Author the caption, hold a beat, then move the camera.
 - **Aim at regions, not at controls.** The compositor clamps the frame inside the app screen, so a
   target near an edge is only reachable at a deep zoom; ask for a modest scale on a corner button
   and the camera quietly settles mid-screen instead. Pass a rect
-  (`{x, y, width, height}` in 1600×900 app coordinates) when no single element is the subject.
+  (`{x, y, width, height}` in 1600×900 app coordinates) when no single element is the subject — or
+  use a `spotlight`, which points at something small without moving the camera at all.
 - **Zoom deep enough to read, wide enough to fit.** At scale `s` roughly `2000/s` app pixels are in
   frame. A 1360-wide bar at 1.8× does not fit.
-- **Captions own the bottom band.** The window is parked high; the ~190 px beneath it is theirs. At
-  rest they never overlap the app — a deep push-in does, so do not schedule a caption over the beat
-  where the viewer must read the UI.
+- **Scroll before you frame.** The action items, the speaker timeline and the graph canvas start
+  above 900 px and run below it; the camera cannot leave the app screen, so a `focus` on a target
+  centred off the bottom silently settles elsewhere and photographs the wrong thing. `reveal` first.
+- **A static route hands you no footage.** The screencast emits on a paint: un-driven takes of
+  `/dashboards` and `/people` captured six and five frames for ~7 s each. Drive the UI — a click, or
+  a cursor glide — or the scene is a single held still.
 - **Type no faster than the renderer samples.** The `/ask` scene captures ~19 fps; at 30 cps three
   characters land between frames and it reads as a stutter. Use `cps: 17`.
 - **A scene with its own motion is worth more than a camera move.** The brain graph's force layout
-  settles on screen (897 frames at 83 fps); a static list gave 7 fps and needed the camera to
+  settles on screen (~1100 frames at ~90 fps); a static list gave 7 fps and needed the camera to
   manufacture interest it did not have.
+- **Re-run `record` after any shell change.** The scenes address the live DOM. The first cut still
+  aimed at `nav.global-rail`, deleted by the 2026-08-31 sidebar rewrite — 54 commits after the film
+  shipped it described a UI that no longer existed, and nothing failed until a take was attempted.
 
 ---
 
@@ -92,7 +124,21 @@ Follow the research, not instinct (`docs/research/2026-08-31-app-promo-video.md`
 - **Lengths:** 60–90 s narrative demo; 4–20 s for an ambient hero loop; 2–3 min only for an
   evaluator who opted in.
 
-Shipped shape: hook → problem → solution → proof → ownership → CTA.
+Shipped shape (2026-09-01, ~93 s, nine scenes): **capture** (the hook — already recording, with a
+companion note) → **note** (what is waiting afterwards: title, tags, Related, action items) →
+**speakers** (the dual-stream timeline) → **ask** (a grounded answer, with its sources ringed) →
+**brain** (the map settling) → **workspace** (the Workspaces rail, collapsed and restored) →
+**boards** (a board opened, its standing answer and evidence) → **people** → **lock** (the sealed
+workspace, and the files being yours) → end card.
+
+**Say only what the frame shows.** This is not a style note, it is the failure mode with the
+shortest fuse: a draft of the hook claimed "recording, transcription *and reasoning* run locally"
+while the film itself photographs a `claude-opus-4-8` model chip, and `DEFAULT_PROVIDER_ID` is
+`claude_code` — cloud. The caption was disproven by its own footage. Check every claim against the
+code before it is rendered, not after: the unconditionally true version of that line is CLAUDE.md's
+first constraint (audio and transcript stay on the device), and it is just as strong. Two more from
+the same pass: "every claim cites the second of audio it came from" over source chips that carry a
+date, and a "one keystroke" kicker over a sidebar toggle that has no accelerator bound to it.
 
 ---
 
@@ -126,6 +172,10 @@ gate at every authored beat, and `assertSupersampled` on the capture scale — b
 | **Renderer decay** | Chromium retains decoded bitmaps across thousands of 3200×1800 frames: 10 → 0.6 fps at 2.6 GB RSS with 10 GB free. Hence a fresh context every `--recycle` (default 400) frames. |
 | **Resume** | `--from N` keeps what is on disk. A long render that dies does not start over. |
 | **Concurrency** | `encode.sh` takes a lock. Two encodes into one directory interleave into a file that probes fine and plays one frame. |
+| **Render cost** | ~4.3 frames/s at 1920×1080 with motion blur on, so a 93 s film at 60 fps is ~22 min. Probe at `--fps 3` (~1 min for the whole cut) and add `--no-blur` when only framing is in question. |
+| **Partial re-record** | `record.mjs <scene…>` re-shoots only those scenes and merges them into the existing manifest, in `SCENES` order. Fixing one beat costs ~20 s, not the whole take. But durations shift, so the RENDER still restarts from the first changed scene. |
+| **Roll point** | `film.goto` marks the moment the app is on screen; frames before it are the blank page painting in, and are dropped. The last pre-roll frame is kept and re-stamped, because a static route may never repaint again — filtering strictly deleted a whole opening beat and took a 10 s scene down to 5. |
+| **Poster** | `PROMO_POSTER_SEC` picks the frame. The default of 2 s is only a safe default — it is whatever the film happens to be doing then, and with `preload="none"` the poster is the only frame most visitors ever see. |
 
 ---
 

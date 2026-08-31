@@ -7,10 +7,11 @@
       STAGE 2 of scripts/promo (see ./README.md). This page IS the edit.
 
       It takes the raw footage recorded by ./record.mjs (a numbered JPEG sequence
-      per scene, plus the camera and caption marks that scene authored) and lays
-      it out as the finished film: the app inside a macOS window on the product's
-      own aurora field, a keyframed camera, kinetic captions in the product's own
-      typeface, cross-dissolves between scenes, and an end card.
+      per scene, plus the camera, layout, caption and spotlight marks that scene
+      authored) and lays it out as the finished film: the app inside a macOS
+      window on the product's own aurora field, a keyframed camera AND a keyframed
+      window layout, kinetic captions in the product's own typeface, a vocabulary
+      of scene transitions, and an end card.
 
       It renders ONE frame at a time on demand — `await window.seek(ms)` paints
       the film at that instant and resolves when it is safe to screenshot. So the
@@ -22,6 +23,22 @@
       (src/design-tokens/colors.css) and the app's own typeface, for the same
       reason banner.html does it: a marketing asset that invents its own palette
       drifts away from the product within one release.
+
+      ── What changed in the 2026-09-01 re-cut, and why ─────────────────────────
+      The first cut parked the window at ONE fixed size and position for its whole
+      length and reserved a dead ~190 px band underneath for type. Two things
+      followed from that single decision, and both of them are why it read as
+      "a screenshot with a subtitle" rather than as a film:
+
+        - the band is empty for most of the running time, so ~18% of every frame
+          is wasted, and the window is smaller than it needs to be throughout;
+        - a caption could only ever be centred underneath the product, which is
+          the grammar of a SUBTITLE. Titles sit *beside* or *over* the subject.
+
+      So the window is now a keyframed object in its own right (`LAYOUTS` +
+      `layoutAt`) and the type has real positions to occupy. The layout moving is
+      itself a transition, which is what buys motion between beats without
+      inventing another camera push.
     -->
     <style>
       /* The product's self-hosted type, by relative path — same trick as
@@ -43,13 +60,14 @@
         --text-muted: #6c6c7d;
         --accent: #6e76ff;
         --accent-hover: #8a90ff;
+        --accent-soft: #b9bcff;
         --border: rgba(255, 255, 255, 0.09);
         --font-sans: "Hanken Grotesk", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
 
         /* The one easing curve the whole film uses — a hard ease-in-out that
            leaves slowly, crosses fast and settles gently. Sharing it across the
-           camera, the captions and the recorded cursor is what makes the motion
-           read as one rhythm rather than three animations. */
+           camera, the layout, the captions and the recorded cursor is what makes
+           the motion read as one rhythm rather than five animations. */
         --ease: cubic-bezier(0.62, 0, 0.16, 1);
       }
 
@@ -68,7 +86,8 @@
       /* ── The ground: the aurora field the app's chrome rides on ──────────── */
       #bg {
         position: absolute;
-        inset: 0;
+        inset: -10%;
+        will-change: transform;
         background:
           radial-gradient(46% 62% at 8% 6%, rgba(110, 118, 255, 0.20), transparent 62%),
           radial-gradient(42% 54% at 94% 96%, rgba(157, 123, 255, 0.15), transparent 64%),
@@ -84,16 +103,23 @@
       }
 
       /* ── The camera stage ────────────────────────────────────────────────── */
-      /* Each scene gets its own layer so a cross-dissolve can hold two framings
-         at once — the outgoing scene keeps its camera while the incoming one
-         fades in over the top with its own. */
+      /* Each scene gets its own layer so a transition can hold two framings at
+         once — the outgoing scene keeps its camera while the incoming one enters
+         over the top with its own. `perspective` here is what lets the window
+         take a real 3-D tilt in the title layouts instead of a flat skew. */
+      #stage { position: absolute; inset: 0; perspective: 2200px; perspective-origin: 50% 46%; }
       .layer {
         position: absolute;
         inset: 0;
         opacity: 0;
-        will-change: transform, opacity;
+        will-change: transform, opacity, filter;
         transform-origin: 0 0;
+        transform-style: preserve-3d;
       }
+      /* The transition transform (slide / scale-through) is applied to a WRAPPER
+         so it composes with the camera transform on .layer without the two
+         fighting over one matrix. */
+      .shift { position: absolute; inset: 0; will-change: transform, opacity; transform-origin: 50% 50%; }
 
       /* The macOS window. `titleBarStyle: Overlay` + `hiddenTitle` in
          src-tauri/tauri.conf.json means the real app has NO title strip — the
@@ -106,6 +132,8 @@
         overflow: hidden;
         background: #07070b;
         border: 1px solid rgba(255, 255, 255, 0.11);
+        transform-origin: 50% 50%;
+        will-change: transform;
         box-shadow:
           0 2px 5px rgba(0, 0, 0, 0.5),
           0 26px 60px rgba(0, 0, 0, 0.62),
@@ -143,36 +171,110 @@
       .lights i:nth-child(2) { background: #febc2e; }
       .lights i:nth-child(3) { background: #28c840; }
 
-      /* ── Captions ────────────────────────────────────────────────────────── */
-      /* A scrim, only while a caption is up: white type over a screenshot needs
-         contrast, and a permanent vignette would darken the product. */
-      #scrim {
+      /* ── Spotlight ───────────────────────────────────────────────────────── */
+      /* Points at a REGION of the UI without spending a 2× push-in on it. The
+         huge outer box-shadow is what dims everything outside the ring, so the
+         eye goes where the film is pointing even in a wide shot. Lives inside
+         .layer, so it rides the camera and stays locked to the pixels it marks. */
+      .spot {
         position: absolute;
-        inset: 0;
-        pointer-events: none;
+        border-radius: 12px;
         opacity: 0;
-        background: linear-gradient(to top, rgba(4, 4, 8, 0.92) 0%, rgba(4, 4, 8, 0.55) 22%, rgba(4, 4, 8, 0) 46%);
+        pointer-events: none;
+        will-change: transform, opacity, box-shadow;
+        border: 2px solid var(--accent-hover);
+      }
+      .spot .halo {
+        position: absolute;
+        inset: -5px;
+        border-radius: 16px;
+        box-shadow: 0 0 0 1px rgba(138, 144, 255, 0.35), 0 0 34px 4px rgba(110, 118, 255, 0.42);
+      }
+      /* The label sits above the ring by default and flips below when the ring
+         is high on the app screen — above a panel near the top of the window
+         there is usually body copy, and a label landing on it is the one thing
+         that makes a spotlight look like a mistake rather than a pointer. */
+      .spot .tag {
+        position: absolute;
+        left: 0;
+        top: -40px;
+      }
+      .spot.below .tag {
+        top: auto;
+        bottom: -40px;
+        font-size: 19px;
+        font-weight: 650;
+        letter-spacing: 0.01em;
+        color: var(--text-primary);
+        background: rgba(110, 118, 255, 0.92);
+        padding: 5px 13px;
+        border-radius: 8px;
+        white-space: nowrap;
+        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
       }
 
-      #captions { position: absolute; inset: 0; pointer-events: none; }
+      /* ── Captions ────────────────────────────────────────────────────────── */
+      /* A scrim, only while a caption is up: type over a screenshot needs
+         contrast, and a permanent vignette would darken the product. It is
+         DIRECTIONAL — a side caption gets a side gradient — because a bottom
+         scrim under a left-hand title darkens the wrong half of the frame. */
+      #scrim { position: absolute; inset: 0; pointer-events: none; opacity: 0; }
+      #scrim.from-bottom {
+        background: linear-gradient(to top, rgba(4, 4, 8, 0.90) 0%, rgba(4, 4, 8, 0.46) 20%, rgba(4, 4, 8, 0) 42%);
+      }
+      /* The side scrims die BEFORE the window starts (the title layouts put its
+         near edge at ~45% of frame), because a gradient that runs under the
+         product is just a dimmer on the thing the viewer came to look at — the
+         first probe of this cut had a perfectly legible title over a murky app. */
+      #scrim.from-left {
+        background: linear-gradient(to right, rgba(4, 4, 8, 0.88) 0%, rgba(4, 4, 8, 0.52) 24%, rgba(4, 4, 8, 0) 44%);
+      }
+      #scrim.from-right {
+        background: linear-gradient(to left, rgba(4, 4, 8, 0.88) 0%, rgba(4, 4, 8, 0.52) 24%, rgba(4, 4, 8, 0) 44%);
+      }
+      #scrim.full { background: rgba(4, 4, 9, 0.90); }
 
-      /* The caption band is the ~190 px under the window (see the SW/SH note in
-         the script). These sizes are chosen so a caption's full stack — line,
-         rule, subtitle — fits inside that band and never lands on the app's own
-         bottom chrome while the camera is at rest. */
-      .cap { position: absolute; left: 0; right: 0; text-align: center; }
-      .cap.lower { bottom: 62px; }
-      .cap.hero { bottom: 46px; }
+      #captions { position: absolute; inset: 0; pointer-events: none; }
+      .cap { position: absolute; will-change: transform, opacity; }
+
+      /* Lower third — a compact band under the window. Left-aligned by default:
+         centred type under a centred window is the grammar of a subtitle track,
+         and it is the single thing that made the first cut read as one. */
+      /* The lower third's left edge aligns with the window's (LAYOUTS.lower.x),
+         so the type and the product share a margin instead of floating apart. */
+      .cap.lower { left: 240px; right: 240px; bottom: 52px; text-align: left; }
+      .cap.lower.center { text-align: center; }
+      /* Title layouts — type in a column BESIDE the tilted window. */
+      .cap.title  { left: 112px; width: 690px; top: 50%; transform: translateY(-50%); text-align: left; }
+      .cap.titleR { right: 112px; width: 690px; top: 50%; transform: translateY(-50%); text-align: left; }
+      /* Chapter card — the full frame, product pushed back behind it. */
+      .cap.card { left: 0; right: 0; top: 50%; transform: translateY(-50%); text-align: center; }
+
+      /* The kicker is where the brand colour lives at the top of the type stack.
+         It also gives the headline something to rise out of, which is what makes
+         a two-line caption land as a designed title instead of a line of text. */
+      .cap .kicker {
+        font-size: 20px;
+        font-weight: 700;
+        letter-spacing: 0.19em;
+        text-transform: uppercase;
+        color: var(--accent-soft);
+        margin-bottom: 18px;
+        opacity: 0;
+        will-change: transform, opacity;
+      }
+      .cap.card .kicker { font-size: 23px; margin-bottom: 26px; }
 
       .cap .line {
         font-weight: 600;
-        letter-spacing: -0.022em;
-        line-height: 1.12;
+        letter-spacing: -0.028em;
+        line-height: 1.06;
         color: var(--text-primary);
-        text-shadow: 0 2px 22px rgba(0, 0, 0, 0.75);
+        text-shadow: 0 2px 26px rgba(0, 0, 0, 0.8);
       }
-      .cap.hero .line { font-size: 58px; }
-      .cap.lower .line { font-size: 42px; }
+      .cap.title .line, .cap.titleR .line { font-size: 66px; }
+      .cap.lower .line { font-size: 46px; letter-spacing: -0.024em; }
+      .cap.card .line { font-size: 96px; }
 
       /* Per-word spans are what make the caption land as motion rather than as a
          block appearing. Each word rises and fades on the shared curve, offset
@@ -183,27 +285,45 @@
         transform: translateY(0.42em);
         will-change: transform, opacity;
       }
-
-      .cap .sub {
-        margin-top: 14px;
-        font-size: 23px;
-        font-weight: 500;
-        color: var(--text-secondary);
-        letter-spacing: -0.005em;
-        opacity: 0;
-        transform: translateY(0.4em);
-        text-shadow: 0 2px 18px rgba(0, 0, 0, 0.7);
+      /* `*starred*` words in the authored string. The gradient is the one place
+         the film says the brand colour LOUDLY, and it is on the word that
+         carries the claim — which is what the flat white first cut had no way
+         to do. */
+      .cap .w.hl {
+        background: linear-gradient(96deg, var(--accent-hover) 8%, var(--accent-soft) 92%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        text-shadow: none;
       }
 
-      /* The accent rule under a hero caption — the one place the brand colour
-         appears over footage. */
-      .cap.hero .rule {
+      .cap .rule {
         width: 0;
         height: 3px;
-        margin: 20px auto 0;
+        margin-top: 20px;
         border-radius: 999px;
-        background: linear-gradient(90deg, transparent, var(--accent), transparent);
+        background: linear-gradient(90deg, var(--accent), rgba(110, 118, 255, 0));
       }
+      .cap.lower.center .rule, .cap.card .rule { margin-left: auto; margin-right: auto; background: linear-gradient(90deg, transparent, var(--accent), transparent); }
+
+      .cap .sub {
+        margin-top: 20px;
+        font-size: 26px;
+        font-weight: 500;
+        color: var(--text-secondary);
+        letter-spacing: -0.006em;
+        line-height: 1.34;
+        opacity: 0;
+        transform: translateY(0.4em);
+        text-shadow: 0 2px 18px rgba(0, 0, 0, 0.75);
+        will-change: transform, opacity;
+      }
+      .cap.lower .sub { font-size: 23px; margin-top: 14px; }
+      .cap.card .sub { font-size: 31px; margin-top: 28px; }
+
+      /* ── Dip-to-black veil, for the one transition that needs the frame to go
+            away entirely (act breaks). ─────────────────────────────────────── */
+      #veil { position: absolute; inset: 0; background: #04040a; opacity: 0; pointer-events: none; }
 
       /* ── End card ────────────────────────────────────────────────────────── */
       #endcard {
@@ -281,6 +401,7 @@
     <div id="stage"></div>
     <div id="scrim"></div>
     <div id="captions"></div>
+    <div id="veil"></div>
     <div id="endcard">
       <div class="inner">
         <!-- The five-bar waveform from the shell's `mur-icon "murmur"` glyph
@@ -309,28 +430,43 @@
       // ── Composition geometry ───────────────────────────────────────────────
       const W = 1920;
       const H = 1080;
-      /*
-       * The app screen inside the window, and where it sits.
-       *
-       * Two constraints fight here and both are load-bearing:
-       *
-       *  - The window should be big (it IS the content), but the captions must
-       *    not sit on top of the app's own bottom chrome. The first cut centred
-       *    a 1664-wide window and the hero caption landed across the Stop button
-       *    and the Ask Brain pill. So the window is parked HIGH and a ~190 px
-       *    band below it belongs to the captions alone. At rest they never
-       *    overlap; only a deep push-in puts type over pixels, which is normal.
-       *  - 1536 against a 1600 px capture is 0.96 CSS px per app px, and the
-       *    FOOTAGE is 2×. So a push-in stays pixel-native all the way to ~2.0×
-       *    (2.0 output px per app px vs 2 captured) — the headroom is the whole
-       *    reason to capture at 2× and deliver at 1×.
-       */
-      const SW = 1536;
-      const SH = 864;
-      const SX = (W - SW) / 2;
-      const SY = 22;
 
-      const XFADE = 620; // scene cross-dissolve, ms
+      /*
+       * The window LAYOUTS, in composition pixels. Every one is 16:9 (the height
+       * is derived, never authored) because the footage is 16:9 and `object-fit:
+       * fill` would otherwise stretch the UI — a distortion that is very hard to
+       * see in a still and very obvious in motion.
+       *
+       * Two constraints shape these numbers, and both are load-bearing:
+       *
+       *  - In `lower`, the window is parked high and the ~180 px band beneath it
+       *    belongs to the caption alone. At rest they never overlap; only a deep
+       *    push-in puts type over pixels, which is normal and fine.
+       *  - `title` / `titleR` deliberately let the window BLEED off frame. A
+       *    product shot that is fully contained reads as a slide; one that runs
+       *    off the edge reads as a camera looking at something bigger than the
+       *    frame. The tilt is small (±10°) — enough to feel dimensional, not
+       *    enough to make the UI unreadable, which is the whole reason anyone is
+       *    watching.
+       *
+       * `full` at 1664 wide against a 1600 px capture is 1.04 output px per app
+       * px, and the FOOTAGE is 2×. So a push-in stays pixel-native to ~1.9× —
+       * the headroom is the whole reason to capture at 2× and deliver at 1×.
+       */
+      const LAYOUTS = {
+        full:   { w: 1664, x: 128,  y: 72,  tilt: 0,   rise: 0 },
+        // 1440 is not arbitrary: the tallest lower third (kicker + headline +
+        // rule + a two-line sub) begins at y≈862, so the window's bottom edge
+        // has to sit above that or the kicker lands on the app's own footer.
+        lower:  { w: 1440, x: 240,  y: 40,  tilt: 0,   rise: 0 },
+        title:  { w: 1210, x: 872,  y: 206, tilt: -13, rise: 0 },
+        titleR: { w: 1210, x: -162, y: 206, tilt: 13,  rise: 0 },
+        card:   { w: 1180, x: 370,  y: 300, tilt: 0,   rise: -70 },
+      };
+      const LAYOUT_REST = "full";
+      const geomOf = (L) => ({ w: L.w, h: (L.w * 9) / 16, x: L.x, y: L.y, tilt: L.tilt, rise: L.rise });
+
+      const XFADE = 620;      // default scene transition, ms
       const ENDCARD_MS = 5200;
 
       // The film's one easing curve, matching the CSS `--ease` and the drawn
@@ -358,13 +494,59 @@
       const EASE = bezier(0.62, 0, 0.16, 1);
       const EASE_OUT = bezier(0.16, 0.84, 0.28, 1);
       const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+      const lerp = (a, b, p) => a + (b - a) * p;
+
+      /*
+       * ── The transition vocabulary ─────────────────────────────────────────
+       *
+       * The first cut cross-dissolved every boundary, which is the video
+       * equivalent of ending every sentence the same way: after the third one
+       * the viewer stops registering that anything happened. Each entry returns
+       * the transform contribution for the INCOMING scene (`enter`, p: 0→1) and
+       * for the OUTGOING one (`exit`, p: 0→1) over the same window.
+       *
+       * Later scenes are appended later, so the incoming layer is already on top
+       * of the outgoing one — which is what makes `push` and `whip` read as one
+       * object displacing another rather than two things fading.
+       */
+      const TRANSITIONS = {
+        dissolve: {
+          ms: 620,
+          enter: (p) => ({ o: EASE(p) }),
+          exit: () => ({ o: 1 }),
+        },
+        // Both windows travel together; the new one shoulders the old one out.
+        push: {
+          ms: 760,
+          enter: (p) => ({ o: clamp01(p * 2.6), tx: (1 - EASE(p)) * W * 0.42 }),
+          exit: (p) => ({ o: 1 - clamp01((p - 0.62) / 0.38), tx: -EASE(p) * W * 0.30 }),
+        },
+        pushUp: {
+          ms: 760,
+          enter: (p) => ({ o: clamp01(p * 2.6), ty: (1 - EASE(p)) * H * 0.40 }),
+          exit: (p) => ({ o: 1 - clamp01((p - 0.62) / 0.38), ty: -EASE(p) * H * 0.26 }),
+        },
+        // A hard, fast displacement with directional blur — the act break.
+        whip: {
+          ms: 460,
+          enter: (p) => ({ o: clamp01(p * 3), tx: (1 - EASE(p)) * W * 0.66, blur: (1 - EASE(p)) * 16 }),
+          exit: (p) => ({ o: 1 - clamp01((p - 0.4) / 0.6), tx: -EASE(p) * W * 0.5, blur: EASE(p) * 16 }),
+        },
+        // The camera moves THROUGH the outgoing frame into the incoming one.
+        through: {
+          ms: 700,
+          enter: (p) => ({ o: EASE_OUT(p), scale: lerp(1.10, 1, EASE(p)) }),
+          exit: (p) => ({ o: 1 - EASE(p), scale: lerp(1, 0.94, EASE(p)) }),
+        },
+      };
+      const transitionOf = (s) => TRANSITIONS[s.transition] || TRANSITIONS.dissolve;
 
       // ── The timeline ───────────────────────────────────────────────────────
       // __promoManifest is injected by ./render.mjs (addInitScript), because a
       // file:// page cannot fetch its own sibling JSON.
       const M = window.__promoManifest;
       const OPT = Object.assign(
-        { captions: true, endcard: true, framesBase: "", scenes: null },
+        { captions: true, endcard: true, framesBase: "", scenes: null, blur: true },
         window.__promoOptions || {},
       );
 
@@ -372,13 +554,16 @@
       if (OPT.scenes) scenes = scenes.filter((s) => OPT.scenes.includes(s.id));
       if (!scenes.length) throw new Error("compose: no scenes with footage");
 
-      // Consecutive scenes overlap by XFADE, so the film has no hard cuts.
+      // Consecutive scenes overlap by their OWN transition length, so the film
+      // has no hard cuts and a whip costs less screen time than a dissolve.
       let cursor = 0;
       for (const s of scenes) {
+        s.xf = transitionOf(s).ms;
         s.start = cursor;
-        cursor += s.dur - XFADE;
+        cursor += s.dur - s.xf;
       }
-      const footageEnd = scenes[scenes.length - 1].start + scenes[scenes.length - 1].dur;
+      const last = scenes[scenes.length - 1];
+      const footageEnd = last.start + last.dur;
       // The end card fades up under the tail of the last scene.
       const DURATION = OPT.endcard ? footageEnd + ENDCARD_MS - XFADE : footageEnd;
       window.__promoDuration = DURATION;
@@ -388,7 +573,7 @@
       const captions = [];
       if (OPT.captions) {
         for (const s of scenes) {
-          for (const c of s.captions) captions.push(Object.assign({}, c, { t: c.t + s.start }));
+          for (const c of s.captions || []) captions.push(Object.assign({}, c, { t: c.t + s.start }));
         }
       }
 
@@ -397,25 +582,44 @@
       const layers = scenes.map((s) => {
         const layer = document.createElement("div");
         layer.className = "layer";
+        const shift = document.createElement("div");
+        shift.className = "shift";
         const device = document.createElement("div");
         device.className = "device";
-        device.style.left = SX + "px";
-        device.style.top = SY + "px";
-        device.style.width = SW + "px";
-        device.style.height = SH + "px";
         const img = document.createElement("img");
         img.decoding = "sync";
         device.appendChild(img);
         const lights = document.createElement("div");
         lights.className = "lights";
         // Standard macOS placement, in app-screen coordinates.
-        lights.style.left = 21 + "px";
-        lights.style.top = 20 + "px";
+        lights.style.left = "21px";
+        lights.style.top = "20px";
         lights.innerHTML = "<i></i><i></i><i></i>";
         device.appendChild(lights);
-        layer.appendChild(device);
+        shift.appendChild(device);
+
+        // One spotlight node per authored mark, positioned per frame.
+        const spots = (s.spots || []).map((sp) => {
+          const el = document.createElement("div");
+          // `sp.y` is in app-viewport coordinates; the upper 45% of the screen
+          // is where a panel reliably has copy above it.
+          el.className = sp.y < M.viewport.height * 0.45 ? "spot below" : "spot";
+          const halo = document.createElement("div");
+          halo.className = "halo";
+          el.appendChild(halo);
+          if (sp.label) {
+            const tag = document.createElement("div");
+            tag.className = "tag";
+            tag.textContent = sp.label;
+            el.appendChild(tag);
+          }
+          shift.appendChild(el);
+          return { mark: sp, el };
+        });
+
+        layer.appendChild(shift);
         stage.appendChild(layer);
-        return { scene: s, el: layer, img, shown: null };
+        return { scene: s, el: layer, shift, device, img, spots, shown: null };
       });
 
       /** The last frame whose timestamp is <= local time — i.e. hold the frame
@@ -431,28 +635,74 @@
       }
 
       /**
-       * Camera state at `local` ms into a scene. Keyframes are absolute targets
-       * authored during the take ({t, cx, cy, scale, ms}); between two of them
-       * the framing eases from the previous target to the next on the film's one
-       * curve. `cx/cy` are APP viewport coordinates — the point that should end
-       * up dead centre of the composition.
+       * Generic keyframe walk, shared by the camera and the window layout.
+       * Keyframes are absolute targets authored during the take ({t, ms, ...});
+       * between two of them the value eases from the previous target to the next
+       * on the film's one curve.
        */
-      function cameraAt(scene, local) {
-        const rest = { cx: M.viewport.width / 2, cy: M.viewport.height / 2, scale: 1 };
+      function trackAt(keys, local, rest, blend) {
         let from = rest;
         let cur = rest;
-        for (const kf of scene.camera) {
+        for (const kf of keys || []) {
           if (local < kf.t) break;
           const p = EASE(clamp01((local - kf.t) / Math.max(1, kf.ms)));
-          cur = {
-            cx: from.cx + (kf.cx - from.cx) * p,
-            cy: from.cy + (kf.cy - from.cy) * p,
-            scale: from.scale + (kf.scale - from.scale) * p,
-          };
-          if (p >= 1) from = { cx: kf.cx, cy: kf.cy, scale: kf.scale };
+          cur = blend(from, kf, p);
+          if (p >= 1) from = kf;
           else break;
         }
         return cur;
+      }
+
+      /** Camera state at `local` ms into a scene. `cx/cy` are APP viewport
+       *  coordinates — the point that should end up dead centre of frame. */
+      function cameraAt(scene, local) {
+        const rest = { cx: M.viewport.width / 2, cy: M.viewport.height / 2, scale: 1 };
+        return trackAt(scene.camera, local, rest, (a, b, p) => ({
+          cx: lerp(a.cx, b.cx, p),
+          cy: lerp(a.cy, b.cy, p),
+          scale: lerp(a.scale, b.scale, p),
+        }));
+      }
+
+      /** Window layout at `local` ms into a scene. */
+      function layoutAt(scene, local) {
+        const rest = geomOf(LAYOUTS[LAYOUT_REST]);
+        const g = trackAt(
+          (scene.layout || []).map((k) => Object.assign({}, geomOf(LAYOUTS[k.mode] || LAYOUTS[LAYOUT_REST]), { t: k.t, ms: k.ms })),
+          local,
+          rest,
+          (a, b, p) => ({
+            w: lerp(a.w, b.w, p),
+            x: lerp(a.x, b.x, p),
+            y: lerp(a.y, b.y, p),
+            tilt: lerp(a.tilt, b.tilt, p),
+            rise: lerp(a.rise, b.rise, p),
+          }),
+        );
+        g.h = (g.w * 9) / 16;
+        return g;
+      }
+
+      /**
+       * A slow, continuous drift applied to every shot.
+       *
+       * Nothing in this film is ever perfectly static, because a perfectly
+       * static frame of a screenshot IS a screenshot — the eye reads it as a
+       * still and stops watching. This is deliberately tiny (a few pixels and
+       * ~1% of scale over ten seconds); it is felt rather than seen, and being a
+       * pure function of t it costs the renderer's determinism nothing.
+       *
+       * It is applied AFTER the camera clamp, as a translation of the whole
+       * layer, so it works at rest — where the clamp pins the camera dead centre
+       * and a drift expressed in camera coordinates would do nothing at all.
+       */
+      function driftAt(t, seed) {
+        const a = (t + seed * 2200) / 1000;
+        return {
+          dx: Math.sin(a / 6.1) * 9 + Math.sin(a / 2.7) * 2.5,
+          dy: Math.cos(a / 7.3) * 7 + Math.cos(a / 3.1) * 2,
+          ds: 1 + Math.sin(a / 9.7) * 0.006,
+        };
       }
 
       /**
@@ -465,28 +715,86 @@
        *
        * The clamp keeps the visible rectangle inside the app screen, and it
        * degenerates gracefully: below the scale at which the screen can fill the
-       * frame (W/SW), `min > max`, so the camera sits dead centre and the whole
-       * window is in shot. As the push-in passes that threshold the legal range
-       * opens outward from the centre, so the camera earns its freedom to pan
+       * frame, `min > max`, so the camera sits dead centre and the whole window
+       * is in shot. As the push-in passes that threshold the legal range opens
+       * outward from the centre, so the camera earns its freedom to pan
        * continuously rather than snapping into it.
        *
        * Consequence worth knowing when directing: a deep-edge target needs a
        * deep zoom to reach. Aim at regions, not at 40 px controls.
        */
-      function transformFor(cam) {
-        const k = SW / M.viewport.width;
+      function transformFor(cam, g) {
+        const k = g.w / M.viewport.width;
         const s = cam.scale;
-        let px = SX + cam.cx * k;
-        let py = SY + cam.cy * k;
+        let px = g.x + cam.cx * k;
+        let py = g.y + cam.cy * k;
 
+        /*
+         * The ANCHOR: where the focal point should land on screen.
+         *
+         * At rest it lands exactly where it already is, so the transform is the
+         * identity and the window sits where `LAYOUTS` put it. This is the part
+         * the first draft got wrong: it always anchored to the centre of frame,
+         * which silently re-centred the window and made `title` / `titleR` — the
+         * whole point of which is to push the product to one side and give the
+         * type a column — produce a centred window with the headline lying
+         * across the app's own sidebar.
+         *
+         * As the camera pushes in, the anchor eases to the centre of frame, so a
+         * push-in still puts its subject in the middle. `fit` is the scale at
+         * which the window finally fills the frame, and it is also where the
+         * containment clamp below starts to bite — so the two hand over to each
+         * other continuously instead of the shot jumping.
+         */
+        const fit = W / g.w;
+        const z = fit > 1.0001 ? clamp01((s - 1) / (fit - 1)) : 1;
+        const e = EASE(z);
+        const ax = lerp(px, W / 2, e);
+        const ay = lerp(py, H / 2, e);
+
+        /*
+         * Containment is the difference between "a camera" and "a transform".
+         * Once the window can fill the frame, keep the visible rectangle inside
+         * the app screen — without it, focusing anything near an edge swings the
+         * shot off the window and fills half the frame with empty background.
+         *
+         * Consequence worth knowing when directing: a deep-edge target needs a
+         * deep zoom to reach. Aim at regions, not at 40 px controls.
+         */
         const halfW = W / (2 * s);
         const halfH = H / (2 * s);
-        const minX = SX + halfW, maxX = SX + SW - halfW;
-        const minY = SY + halfH, maxY = SY + SH - halfH;
-        px = minX > maxX ? SX + SW / 2 : Math.min(Math.max(px, minX), maxX);
-        py = minY > maxY ? SY + SH / 2 : Math.min(Math.max(py, minY), maxY);
+        const minX = g.x + halfW, maxX = g.x + g.w - halfW;
+        const minY = g.y + halfH, maxY = g.y + g.h - halfH;
+        if (minX <= maxX) px = Math.min(Math.max(px, minX), maxX);
+        if (minY <= maxY) py = Math.min(Math.max(py, minY), maxY);
 
-        return `translate(${W / 2}px, ${H / 2}px) scale(${s}) translate(${-px}px, ${-py}px)`;
+        return { ax, ay, px, py, s };
+      }
+      const matrixFor = (f, drift) =>
+        `translate(${f.ax + drift.dx}px, ${f.ay + drift.dy}px) scale(${f.s * drift.ds}) translate(${-f.px}px, ${-f.py}px)`;
+
+      /**
+       * Velocity-proportional blur.
+       *
+       * A camera that moves fast and stays perfectly sharp reads as a slideshow
+       * transition, not as a camera; every real lens smears while it travels.
+       * This samples the composition-space position one frame earlier and blurs
+       * in proportion, with a dead zone so a resting or slowly drifting shot
+       * stays pixel-crisp — the whole reason for capturing at 2× is legibility,
+       * and it must not be spent on a permanent softening.
+       */
+      function motionBlur(scene, local, g) {
+        if (!OPT.blur) return 0;
+        const dt = 16.7;
+        const a = transformFor(cameraAt(scene, Math.max(0, local - dt)), g);
+        const b = transformFor(cameraAt(scene, local), g);
+        // Compare the SCREEN translation the two matrices apply, not the app-space
+        // focal point: with the anchor easing as well as the scale, the focal
+        // point can be still while the picture is very much moving.
+        const dx = (b.ax - b.px * b.s) - (a.ax - a.px * a.s);
+        const dy = (b.ay - b.py * b.s) - (a.ay - a.py * a.s);
+        const v = Math.hypot(dx, dy) + Math.abs(b.s - a.s) * 900;
+        return Math.min(5, Math.max(0, (v - 1.4) * 0.20));
       }
 
       // ── Captions ───────────────────────────────────────────────────────────
@@ -495,21 +803,68 @@
       const IN_MS = 460;      // per-word rise
       const STAGGER = 38;     // per-word offset
       const OUT_MS = 340;
+      const SCRIM_CLASS = { lower: "from-bottom", title: "from-left", titleR: "from-right", card: "full" };
 
       const capNodes = captions.map((c) => {
+        const kind = SCRIM_CLASS[c.kind] ? c.kind : "lower";
         const el = document.createElement("div");
-        el.className = `cap ${c.kind === "hero" ? "hero" : "lower"}`;
+        el.className = `cap ${kind}${c.align === "center" ? " center" : ""}`;
+
+        let kicker = null;
+        if (c.kicker) {
+          kicker = document.createElement("div");
+          kicker.className = "kicker";
+          kicker.textContent = c.kicker;
+          el.appendChild(kicker);
+        }
+
         const line = document.createElement("div");
         line.className = "line";
-        for (const word of c.text.split(" ")) {
-          const w = document.createElement("span");
-          w.className = "w";
-          w.textContent = word;
-          line.appendChild(w);
-          line.appendChild(document.createTextNode(" "));
-        }
+        /*
+         * Tokenise the authored headline into per-word spans.
+         *
+         * `*starred*` runs are the accent-coloured words, and `|` is a hard line
+         * break — an author needs that, because the good break in "Nothing
+         * leaves your Mac." is after "leaves" and no width the column can be
+         * given will reliably produce it.
+         *
+         * The fiddly part is punctuation. A naive split on the `*` marker turns
+         * "*your Mac*." into the tokens ["your", "Mac", "."] and renders a
+         * floating full stop a word-space away from the sentence — which the
+         * first probe of this cut did, in 66 px type, in the hero shot. So a
+         * chunk that does not begin with whitespace, following one that did not
+         * end with it, is GLUED onto the previous word instead of starting a new
+         * one.
+         */
+        let hot = false;
+        let prev = null;
+        let prevTail = " ";
+        c.text.split("*").forEach((chunk, ci) => {
+          chunk.split("|").forEach((seg, si) => {
+            if (si > 0) {
+              line.appendChild(document.createElement("br"));
+              prev = null;
+            }
+            const glue = prev && ci > 0 && si === 0 && !/^\s/.test(seg) && !/\s$/.test(prevTail);
+            seg.split(/\s+/).filter(Boolean).forEach((word, wi) => {
+              if (wi === 0 && glue) {
+                prev.textContent += word;
+                return;
+              }
+              const w = document.createElement("span");
+              w.className = hot ? "w hl" : "w";
+              w.textContent = word;
+              line.appendChild(w);
+              line.appendChild(document.createTextNode(" "));
+              prev = w;
+            });
+            prevTail = seg;
+          });
+          hot = !hot;
+        });
         el.appendChild(line);
-        if (c.kind === "hero") {
+
+        if (c.rule !== false) {
           const rule = document.createElement("div");
           rule.className = "rule";
           el.appendChild(rule);
@@ -522,16 +877,20 @@
         }
         capRoot.appendChild(el);
         return {
-          c,
-          el,
+          c, el, kind,
+          kicker,
           words: [...el.querySelectorAll(".w")],
           sub: el.querySelector(".sub"),
           rule: el.querySelector(".rule"),
+          // The side layouts are vertically centred with a transform, so their
+          // group move has to preserve it.
+          base: kind === "title" || kind === "titleR" || kind === "card" ? "translateY(-50%) " : "",
         };
       });
 
       function paintCaptions(t) {
         let scrimAlpha = 0;
+        let scrimKind = "lower";
         for (const n of capNodes) {
           const { c } = n;
           const inDur = IN_MS + STAGGER * Math.max(0, n.words.length - 1);
@@ -547,34 +906,76 @@
           // Fade-out is a block move: the whole caption leaves together.
           const outP = t > end ? clamp01((t - end) / OUT_MS) : 0;
           const groupOpacity = 1 - outP;
-          const groupLift = -10 * EASE_OUT(outP);
+          const groupLift = -12 * EASE_OUT(outP);
           n.el.style.opacity = String(groupOpacity);
-          n.el.style.transform = `translateY(${groupLift}px)`;
+          n.el.style.transform = `${n.base}translateY(${groupLift}px)`;
 
+          if (n.kicker) {
+            const p = EASE_OUT(clamp01(local / 380));
+            n.kicker.style.opacity = String(p * 0.96);
+            n.kicker.style.transform = `translateY(${(1 - p) * 8}px)`;
+          }
+          const wordDelay = n.kicker ? 170 : 0;
           n.words.forEach((w, i) => {
-            const p = EASE_OUT(clamp01((local - i * STAGGER) / IN_MS));
+            const p = EASE_OUT(clamp01((local - wordDelay - i * STAGGER) / IN_MS));
             w.style.opacity = String(p);
             w.style.transform = `translateY(${(1 - p) * 0.42}em)`;
           });
           if (n.rule) {
-            const p = EASE(clamp01((local - inDur * 0.35) / 620));
-            n.rule.style.width = `${p * 280}px`;
+            const p = EASE(clamp01((local - wordDelay - inDur * 0.3) / 640));
+            n.rule.style.width = `${p * (n.kind === "lower" ? 190 : 300)}px`;
           }
           if (n.sub) {
-            const p = EASE_OUT(clamp01((local - inDur * 0.55) / IN_MS));
+            const p = EASE_OUT(clamp01((local - wordDelay - inDur * 0.5) / IN_MS));
             n.sub.style.opacity = String(p);
             n.sub.style.transform = `translateY(${(1 - p) * 0.4}em)`;
           }
 
-          // The scrim tracks the strongest caption on screen.
+          // The scrim tracks the strongest caption on screen, and takes its
+          // DIRECTION from that caption — a bottom scrim under a left-hand title
+          // darkens the half of the frame the type is not in.
           const rise = EASE_OUT(clamp01(local / 300));
-          scrimAlpha = Math.max(scrimAlpha, rise * groupOpacity);
+          const a = rise * groupOpacity;
+          if (a >= scrimAlpha) { scrimAlpha = a; scrimKind = n.kind; }
         }
-        scrim.style.opacity = String(scrimAlpha * 0.96);
+        const cls = SCRIM_CLASS[scrimKind] || "from-bottom";
+        if (scrim.className !== cls) scrim.className = cls;
+        scrim.style.opacity = String(scrimAlpha * (scrimKind === "card" ? 1 : 0.96));
+      }
+
+      // ── Spotlights ─────────────────────────────────────────────────────────
+      /** Paint one scene's spotlights. Rects are authored in APP viewport
+       *  coordinates and mapped through the live window geometry, so a spotlight
+       *  stays locked to its pixels while the layout animates underneath it. */
+      function paintSpots(L, local, g) {
+        const k = g.w / M.viewport.width;
+        for (const s of L.spots) {
+          const m = s.mark;
+          const inP = clamp01((local - m.t) / 420);
+          const outP = clamp01((local - m.t - m.dur) / 320);
+          if (local < m.t - 40 || outP >= 1) {
+            if (s.el.style.opacity !== "0") s.el.style.opacity = "0";
+            continue;
+          }
+          const p = EASE_OUT(inP);
+          const o = p * (1 - outP);
+          s.el.style.opacity = String(o);
+          s.el.style.left = `${g.x + m.x * k}px`;
+          s.el.style.top = `${g.y + m.y * k}px`;
+          s.el.style.width = `${m.width * k}px`;
+          s.el.style.height = `${m.height * k}px`;
+          // The ring lands from slightly oversize, and the outer shade comes up
+          // with it. Shade lifts before the ring does on the way out.
+          const grow = lerp(1.05, 1, p);
+          s.el.style.transform = `scale(${grow})`;
+          s.el.style.boxShadow = `0 0 0 9999px rgba(4, 4, 10, ${0.52 * o})`;
+        }
       }
 
       // ── End card ───────────────────────────────────────────────────────────
       const endcard = document.getElementById("endcard");
+      const veil = document.getElementById("veil");
+      const bgEl = document.getElementById("bg");
       const ecMark = endcard.querySelector(".mark");
       const ecH1 = endcard.querySelector("h1");
       const ecTag = endcard.querySelector(".tag");
@@ -614,7 +1015,8 @@
        */
       window.seek = async function seek(t) {
         const pending = [];
-        for (const L of layers) {
+        for (let i = 0; i < layers.length; i++) {
+          const L = layers[i];
           const s = L.scene;
           const local = t - s.start;
           const active = local >= -1 && local < s.dur + 1;
@@ -622,20 +1024,59 @@
             if (L.el.style.opacity !== "0") L.el.style.opacity = "0";
             continue;
           }
-          // The incoming scene fades up over the outgoing one; the first scene
-          // (and any scene past its dissolve) sits at full.
-          const isFirst = L === layers[0];
-          const op = isFirst ? 1 : clamp01(local / XFADE);
-          L.el.style.opacity = String(op);
 
-          const f = frameAt(s, Math.max(0, local));
-          if (L.shown !== f.file) {
-            L.img.src = `${OPT.framesBase}${s.id}/${f.file}`;
-            L.shown = f.file;
+          // ENTER: this scene's own transition, over its own length.
+          const isFirst = i === 0;
+          const tr = transitionOf(s);
+          const eIn = isFirst ? { o: 1 } : tr.enter(clamp01(local / s.xf));
+          // EXIT: the NEXT scene's transition drives how this one leaves, so a
+          // boundary is described in exactly one place.
+          const next = layers[i + 1];
+          let eOut = { o: 1 };
+          if (next) {
+            const nTr = transitionOf(next.scene);
+            const tail = s.dur - next.scene.xf;
+            if (local >= tail) eOut = nTr.exit(clamp01((local - tail) / next.scene.xf));
+          }
+
+          const g = layoutAt(s, Math.max(0, local));
+          const cam = cameraAt(s, Math.max(0, local));
+          const drift = driftAt(t, i);
+          const f = transformFor(cam, g);
+
+          L.el.style.opacity = String(Math.min(eIn.o ?? 1, eOut.o ?? 1));
+          L.el.style.transform = matrixFor(f, drift);
+
+          const blur = motionBlur(s, Math.max(0, local), g) + (eIn.blur || 0) + (eOut.blur || 0);
+          const filter = blur > 0.35 ? `blur(${blur.toFixed(2)}px)` : "";
+          if (L.el.style.filter !== filter) L.el.style.filter = filter;
+
+          const tx = (eIn.tx || 0) + (eOut.tx || 0);
+          const ty = (eIn.ty || 0) + (eOut.ty || 0) + g.rise;
+          const sc = (eIn.scale ?? 1) * (eOut.scale ?? 1);
+          L.shift.style.transform = `translate(${tx}px, ${ty}px) scale(${sc})`;
+
+          L.device.style.left = `${g.x}px`;
+          L.device.style.top = `${g.y}px`;
+          L.device.style.width = `${g.w}px`;
+          L.device.style.height = `${g.h}px`;
+          L.device.style.transform = g.tilt ? `rotateY(${g.tilt.toFixed(2)}deg)` : "";
+
+          if (L.spots.length) paintSpots(L, Math.max(0, local), g);
+
+          const fr = frameAt(s, Math.max(0, local));
+          if (L.shown !== fr.file) {
+            L.img.src = `${OPT.framesBase}${s.id}/${fr.file}`;
+            L.shown = fr.file;
             pending.push(L.img.decode().catch(() => {}));
           }
-          L.el.style.transform = transformFor(cameraAt(s, Math.max(0, local)));
         }
+
+        // The aurora parallaxes a fraction of the drift, so the ground and the
+        // product are not welded together.
+        const bd = driftAt(t, 7);
+        bgEl.style.transform = `translate(${bd.dx * -0.5}px, ${bd.dy * -0.5}px) scale(1.02)`;
+
         paintCaptions(t);
         paintEndcard(t);
         if (pending.length) await Promise.all(pending);
