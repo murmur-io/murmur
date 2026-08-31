@@ -367,15 +367,26 @@ test("the sections run Workspaces, then Shared, then Browse", async ({ page }) =
 });
 
 /**
- * The global "File recordings with Brain" action was removed from the
- * Workspaces section. Filing by Brain is still reachable per container, from a
- * container row's own menu — only the do-it-for-everything entry is gone.
+ * "File recordings with Brain" moved with the tree it acts on, rather than being
+ * dropped.
+ *
+ * This file briefly asserted the OPPOSITE — that the Workspaces section carries
+ * no global Brain filing action — on the reasoning that "filing by Brain is
+ * still reachable per container". That reasoning does not hold: a container
+ * row's "Organize notes with AI" reorganises notes INSIDE one container
+ * (`planOrganize(container.id, …)`), while this action files the workspace's
+ * UNFILED recordings (`planWorkspaceOrganization()`). Different command,
+ * different sheet, different job. With the button gone, that whole path — the
+ * shell's `app-workspace-organize-sheet` included — had no trigger at all.
  */
-test("the Workspaces section carries no global Brain filing action", async ({
+test("the Workspaces section carries the Brain filing action", async ({
   page,
 }) => {
   await boot(page);
   const sb = sidebar(page);
-  await expect(sb.getByText("File recordings with Brain")).toHaveCount(0);
-  await expect(sb.locator(".brain-action")).toHaveCount(0);
+  const filing = sb.getByRole("button", {
+    name: "Review filing moves with Brain",
+  });
+  await expect(filing).toBeVisible();
+  await expect(filing).toContainText("File recordings with Brain");
 });
