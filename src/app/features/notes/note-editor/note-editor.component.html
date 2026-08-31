@@ -115,24 +115,35 @@
           }
         </span>
 
-        <!-- Edit / Preview toggle. -->
+        <!-- Edit / Preview toggle. Icon-only: the pair sits in a crowded sticky
+             header and the two glyphs are unambiguous. `aria-label` carries the
+             name the label used to carry (so the control is still "Edit" /
+             "Preview" to assistive tech and to the suite), and `aria-pressed`
+             carries the state that colour alone would otherwise be the only
+             signal for. -->
         <div class="seg head-seg" role="group" aria-label="Edit or preview">
           <button
             type="button"
-            class="seg-btn"
+            class="seg-btn seg-btn-icon"
             [class.is-active]="!preview()"
+            [attr.aria-pressed]="!preview()"
             (click)="setPreview(false)"
+            aria-label="Edit"
+            title="Edit"
           >
-            Edit
+            <mur-icon icon="edit" />
           </button>
           <button
             type="button"
-            class="seg-btn"
+            class="seg-btn seg-btn-icon"
             [class.is-active]="preview()"
+            [attr.aria-pressed]="preview()"
             (click)="setPreview(true)"
             [disabled]="importingImages() > 0"
+            aria-label="Preview"
+            title="Preview"
           >
-            Preview
+            <mur-icon icon="eye" />
           </button>
         </div>
 
