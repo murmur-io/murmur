@@ -115,6 +115,7 @@ Full runbook: **[`.agents/skills/release-murmur`](.agents/skills/release-murmur/
   - running / understanding / debugging the CI gate (`scripts/ci.sh` + GitHub Actions) → **`ci-maintenance`**
   - adding or changing a check in the CI gate → **`add-ci-gate`**
   - writing / tuning a GitHub Actions workflow → **`github-actions`**
+  - a promo / demo / tour video, a landing hero loop, or footage of a new feature → **`promo-video`**
   - divergent product ideation / "dream up something for Murmur" → **`dreaming`**
   - recording or curating the lessons loop → **`murmur-learn`**, **`murmur-curate-learnings`**
 - **Agents** (`.codex/agents/*.toml`): `rust-tauri-dev`, `angular-zoneless-dev`, `adversarial-verifier`, `lock-security-reviewer`, `release-engineer`, `ci-cd-engineer` (designs & maintains CI — the local `scripts/ci.sh` gate + the GitHub Actions macOS PR-gate that wraps it; CD/notarized release stays with `release-engineer`), `murmur-researcher` — spawn as custom subagents; the implementer never owns the verdict.
