@@ -1202,7 +1202,7 @@ pub(crate) fn list_trash_inner(state: &AppState) -> Result<Vec<TrashEntry>, AppE
 /// How many entries are in the trash — the sidebar badge. Cheap; no payloads read.
 #[tauri::command]
 pub fn count_trash(state: State<'_, AppState>) -> Result<i64, AppError> {
-    Ok(state.inner().db.count_trash_entries()?)
+    state.inner().db.count_trash_entries()
 }
 
 /// The live retention window in days.
