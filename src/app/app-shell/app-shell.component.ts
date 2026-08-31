@@ -35,6 +35,7 @@ import { TilePaletteComponent } from "../features/dashboards/tile-palette/tile-p
 import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialog/lock-shares-dialog.component";
 import { ReminderComposerComponent } from "../features/reminders/reminder-composer/reminder-composer.component";
 import { ReminderComposerService } from "../features/reminders/reminder-composer/reminder-composer.service";
+import { TrashService } from "../services/trash.service";
 import { RemindersStore } from "../features/reminders/reminders.store";
 import { AccountSessionBannerComponent } from "../features/sharing/account-session-banner/account-session-banner.component";
 import { FilingRecoveryBannerComponent } from "../features/workspace/filing-recovery-banner/filing-recovery-banner.component";
@@ -57,12 +58,22 @@ import { NotesService } from "../services/notes.service";
 import { TilePaletteService } from "../services/tile-palette.service";
 import { ToastService, type Toast } from "../services/toast.service";
 
+const BROWSE_GROUPS = ["Work", "Intelligence", "Insights", "Storage"] as const;
+
 interface BrowseItem {
   readonly path: string;
   readonly label: string;
   readonly icon: ShellIcon;
-  readonly group: "Work" | "Intelligence" | "Insights";
+  /**
+   * DERIVED from {@link BROWSE_GROUPS} rather than re-listed here. The union used
+   * to be written out twice, so adding a group to one list and not the other
+   * typechecked in the render loop (which reads BROWSE_GROUPS) while rejecting the
+   * item that needed it. One source of truth, and a new group is one edit.
+   */
+  readonly group: BrowseGroup;
 }
+
+type BrowseGroup = (typeof BROWSE_GROUPS)[number];
 
 const BROWSE_ITEMS: readonly BrowseItem[] = [
   { path: "/library", label: "Meetings", icon: "meetings", group: "Work" },
@@ -84,9 +95,11 @@ const BROWSE_ITEMS: readonly BrowseItem[] = [
   },
   { path: "/graph", label: "Graph", icon: "graph", group: "Insights" },
   { path: "/people", label: "People", icon: "people", group: "Insights" },
+  // Trash sits in its own group at the BOTTOM of Browse. Grouping it under "Work"
+  // would put deleted things next to live ones in the same list, which is exactly
+  // the confusion the separate destination exists to remove.
+  { path: "/trash", label: "Trash", icon: "trash", group: "Storage" },
 ];
-
-const BROWSE_GROUPS = ["Work", "Intelligence", "Insights"] as const;
 /**
  * The sidebar opens EXPANDED by default. It is now the ONLY navigation surface —
  * destinations, the workspace tree and the create actions all live in it — so a
@@ -136,10 +149,18 @@ export class AppShellComponent {
   private readonly router = inject(Router);
   private readonly tabs = inject(TabsService);
   private readonly reminders = inject(RemindersStore);
+  private readonly trash = inject(TrashService);
   private readonly reminderComposer = inject(ReminderComposerService);
   protected readonly workspace = inject(WorkspaceService);
 
   readonly reminderCount = this.reminders.dueInboxCount;
+  /**
+   * Sidebar badge for the Trash. Read from the root {@link TrashService}, which
+   * keeps it live off the content-free `murmur://trash-updated` event even while
+   * `/trash` is closed — so deleting something from Meetings updates the badge
+   * without anyone opening the view.
+   */
+  readonly trashCount = this.trash.count;
   readonly lockFlow = inject(FolderLockFlowService);
   readonly docPreview = inject(DocumentPreviewService);
   readonly tilePalette = inject(TilePaletteService);
@@ -220,6 +241,11 @@ export class AppShellComponent {
       this.scrubWorkspaceOrganization();
     });
     void this.reminders.initSummary();
+    // Seed the Trash badge on a cold start: without this it reads 0 until either
+    // something is deleted (which emits the event) or the user opens `/trash`, so a
+    // relaunch with items already in the trash would show no badge at all. Reads a
+    // COUNT only — no snapshot payloads, nothing gated.
+    void this.trash.refreshCount();
   }
 
   isCaptureActive(): boolean {
