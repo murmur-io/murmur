@@ -117,15 +117,33 @@ def changed_paths(wt: Path) -> list:
 
 
 def rust_filters(paths: list) -> list:
-    """Nazwy modułów z dotkniętych plików .rs — filtry dla `cargo test --lib`."""
+    """Nazwy modułów z dotkniętych plików .rs — filtry dla `cargo test --lib`.
+
+    Zwraca [] (= PEŁNY suite, bez zawężania), gdy ruszony jest korzeń crate'a
+    (`lib.rs`/`main.rs`) albo `build.rs`. Stara wersja brała dla nich nazwę katalogu
+    rodzica albo stem pliku — czyli dosłownie `src` dla `lib.rs` i `build` dla
+    `build.rs`. Zmierzone: `cargo test --lib -- src` odpala 1 test z 3548 i kończy
+    zielono w 0,05 s, a `-- build` odpala 47 przypadkowych trafień po nazwie
+    (`build_params_*`, `build_memory_brief_*`) w 1,6 s, z których żaden nie dotyka
+    build scriptu. `lib.rs` to rejestr `generate_handler!`, a `build.rs` może zmienić
+    `rustc-env`/`link-arg` dla całego cratea — fałszywa zieleń tam jest gorsza niż
+    wolny check.
+    """
     mods = []
     for p in paths:
-        if p.endswith(".rs") and (p.startswith("src-tauri/") or p.startswith("crates/")):
-            stem = Path(p).stem
-            if stem in ("mod", "lib", "main"):
-                stem = Path(p).parent.name
-            if stem and stem not in mods:
-                mods.append(stem)
+        if not (p.endswith(".rs") and (p.startswith("src-tauri/") or p.startswith("crates/"))):
+            continue
+        if Path(p).name in ("lib.rs", "main.rs", "build.rs"):
+            return []
+        stem = Path(p).stem
+        if stem == "mod":
+            stem = Path(p).parent.name
+        # `src` nigdy nie jest nazwą modułu — to katalog źródeł. Gdyby jakaś ścieżka
+        # jednak się na to zmapowała, lecimy pełnym suitem zamiast filtrować w próżni.
+        if stem == "src":
+            return []
+        if stem and stem not in mods:
+            mods.append(stem)
     return mods
 
 
@@ -279,6 +297,10 @@ def phase_check(wt: Path) -> tuple:
     if not picked:
         log("żaden check nie pasuje do zmienionych ścieżek")
         return [], paths
+    # Dopiero teraz — po tym, jak agent skonczyl edytowac — wiadomo, czy zaleznosci FE
+    # sie nie zmienily. Zob. docstring.
+    if any(c[0] in ("ng-lint", "ng-build", "playwright") for c in picked):
+        link_shared_node_modules(wt)
     results = []
     for cid, cmd, cwd, budget in picked:
         results.append(run_check(cid, cmd, cwd, budget, wt))
@@ -331,6 +353,50 @@ def link_shared_target(wt: Path) -> None:
         return
     link.symlink_to(SHARED_TARGET)
     log(f"target -> {SHARED_TARGET} (wspoldzielony, cieply)")
+
+
+def link_shared_node_modules(wt: Path) -> None:
+    """Podepnij `node_modules/` worktree pod drzewo glownego checkoutu.
+
+    Bez tego swiezy worktree NIE MA lokalnego Angulara: `ng` nie jest zainstalowany
+    globalnie, a harness nigdy nie robi `npm ci`, wiec `npx ng lint` / `npx ng build`
+    / `npm run test:e2e` musza isc po CLI do rejestru — wolno i bez zaleznosci
+    projektu. `node_modules/` jest w .gitignore, wiec symlink nie brudzi diffa.
+
+    Podpinamy TYLKO wtedy, gdy lockfile worktree jest bajt w bajt taki sam jak w
+    glownym checkoucie. Inaczej zadanie zmienia zaleznosci i wspoldzielone drzewo
+    byloby klamstwem — wtedy mowimy operatorowi, zeby odpalil `npm ci`.
+
+    Wolane z `phase_check`, NIE z `cmd_run`: gdyby link powstawal przy tworzeniu
+    worktree, agent moglby potem podbic wersje zaleznosci (`new-deps.py` porownuje
+    ZBIORY NAZW, nie wersje), a checki FE i tak lecialyby na starym drzewie —
+    zielony `ng build`, ktory nigdy nie kompilowal sie wobec zadeklarowanych wersji.
+    Sprawdzenie przy kazdej rundzie checkow widzi te zmiane.
+
+    UWAGA dla ludzi: to jest symlink, wiec `npm install` odpalony WEWNATRZ worktree
+    pisze do drzewa glownego checkoutu. Jesli musisz zainstalowac cokolwiek na
+    potrzeby zadania, najpierw usun dowiazanie i zrob `npm ci` lokalnie.
+    """
+    link = wt / "node_modules"
+    if link.is_symlink() and not link.exists():
+        link.unlink()                       # dowiazanie wisi (np. po `clean` glownego drzewa)
+    elif link.is_symlink() or link.exists():
+        return
+    shared = ROOT / "node_modules"
+    if not shared.is_dir():
+        log("uwaga: brak node_modules w glownym checkoucie — checki FE beda zimne")
+        return
+    lock, shared_lock = wt / "package-lock.json", ROOT / "package-lock.json"
+    try:
+        same = lock.read_bytes() == shared_lock.read_bytes()
+    except OSError:
+        same = False
+    if not same:
+        log("package-lock.json rozni sie od glownego — odpal `npm ci` w worktree "
+            "przed checkami FE")
+        return
+    link.symlink_to(shared)
+    log(f"node_modules -> {shared} (wspoldzielony)")
 
 
 def cmd_run(a) -> None:

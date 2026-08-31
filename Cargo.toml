@@ -28,6 +28,15 @@ default-members = ["src-tauri"]
 [profile.dev.package."*"]
 debug = false
 
+# SQLCipher's C amalgamation is the hot path of the test suite and of every app DB read. The `cc`
+# crate compiles it at the profile's OPT_LEVEL, so a dev/test build shipped it at `-O0`. Measured on
+# the 399-test `storage::db` module: 150.5 s at -O0 vs 124.2 s at -O3 (-17%). This is a DEV/TEST-only
+# profile knob — `[profile.release]` already builds every dependency optimized, so the shipped
+# binary is unaffected. Cost is a one-time recompile of libsqlite3-sys (~1 min); it is a leaf C
+# crate, so nothing else rebuilds with it.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
 # Our own workspace crates keep line-level debuginfo (file:line in backtraces) without the full
 # `debug = 2` weight — a light middle ground for the code we actually debug locally.
 [profile.dev]
