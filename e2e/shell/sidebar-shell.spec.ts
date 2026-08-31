@@ -43,23 +43,21 @@ function topbar(page: Page) {
 }
 
 /**
- * The sidebar ANIMATES its width (`transition: flex-basis, width`), so a
- * boundingBox() taken right after the collapse/expand class flips reports a
- * mid-flight geometry — which is how the width and window-button-margin
- * assertions below failed while the layout itself was correct. Read until two
- * successive samples agree.
+ * Wait for the sidebar's collapsed width by POLLING THE INVARIANT, not by
+ * sampling until two reads agree.
+ *
+ * Sampling looks reasonable and is not reliable: the sidebar's width animates
+ * (`transition: flex-basis, width`), and on a loaded runner the animation's
+ * first frame can land more than a sampling interval after the class flips — so
+ * two equal early reads look "settled" while the panel is still at its old
+ * width. That shape made `content-pane-clears-sidebar.spec.ts` flake on CI
+ * (failed twice, passed on the third attempt) until it was rewritten to poll
+ * the property under test. Same fix here.
  */
-async function settledWidth(sb: Locator): Promise<number> {
-  let last = -1;
-  for (let i = 0; i < 40; i += 1) {
-    const width = (await sb.boundingBox())?.width ?? -1;
-    if (width === last) {
-      return width;
-    }
-    last = width;
-    await sb.page().waitForTimeout(50);
-  }
-  return last;
+async function expectWidthBelow(sb: Locator, limit: number): Promise<void> {
+  await expect
+    .poll(async () => Math.round((await sb.boundingBox())?.width ?? Number.MAX_SAFE_INTEGER))
+    .toBeLessThan(Math.round(limit));
 }
 
 test("opens expanded, with search on top and no brand mark", async ({ page }) => {
@@ -172,7 +170,7 @@ test("collapsing hides the labels and the tree, and survives a reload", async ({
   await expect(sb.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
 
   expect(expandedBox).not.toBeNull();
-  expect(await settledWidth(sb)).toBeLessThan(expandedBox!.width - 100);
+  await expectWidthBelow(sb, expandedBox!.width - 100);
 
   await page.reload();
   await expect(
@@ -322,7 +320,24 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
   // 84px is the buttons' furthest possible right edge (x:32 read as a left edge
   // plus their 52px span; read as a centre they end sooner). The toggle drops
   // below them either way.
-  await settledWidth(sb);
+  // Poll the SYMMETRY, not a width threshold. `expectWidthBelow(sb, 150)` was
+  // tried here and reintroduced the flake it was meant to remove: mid-animation
+  // widths like 114 and 133 are already under 150, so the margins got measured
+  // before the panel finished shrinking (observed `after` of 37.9 and 56.7
+  // against an expected 24). The equality below IS the property, so wait for it.
+  //
+  // Not vacuous: at the 96px width that was tried and rejected, `after` is 20
+  // against a `before` of 24, so the difference never reaches 0 and this times
+  // out RED.
+  await expect
+    .poll(async () => {
+      const box = await sb.boundingBox();
+      if (!box) {
+        return Number.NaN;
+      }
+      return Math.round(box.x + box.width - 84 - (32 - box.x));
+    })
+    .toBe(0);
   const expandBox = await expand.boundingBox();
   const sbBox = await sb.boundingBox();
   expect(expandBox).not.toBeNull();
