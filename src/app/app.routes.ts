@@ -57,6 +57,13 @@ export const routes: Routes = [
           ),
       },
       {
+        path: "trash",
+        loadComponent: () =>
+          import("./features/trash/trash/trash.component").then(
+            (m) => m.TrashComponent,
+          ),
+      },
+      {
         path: "reminders",
         loadComponent: () =>
           import("./features/reminders/reminders/reminders.component").then(

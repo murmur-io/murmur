@@ -1,0 +1,214 @@
+:host {
+  display: block;
+  width: 100%;
+}
+
+.trash-page {
+  width: min(var(--content-max), 100%);
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5) var(--space-8);
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-5);
+  margin-bottom: var(--space-5);
+}
+
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+/* The retention picker floats OVER the list, so it is the OPAQUE overlay surface,
+   never the translucent `.card` — see angular-zoneless.md T3. */
+.retention {
+  position: relative;
+}
+
+.retention-menu {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  right: 0;
+  z-index: 30;
+  min-width: 200px;
+  background: var(--surface-overlay);
+  backdrop-filter: none;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: var(--space-1);
+}
+
+.retention-menu .menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  width: 100%;
+}
+
+.retention-menu .menu-item.is-current {
+  color: var(--accent);
+}
+
+/* Sits under the menu to catch the dismissing click without trapping focus. */
+.menu-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: default;
+}
+
+.banner {
+  margin-bottom: var(--space-4);
+  gap: var(--space-3);
+}
+
+.locked-banner,
+.confirm-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.confirm-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.trash-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.trash-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  transition: border-color var(--transition-fast), opacity var(--transition-fast);
+}
+
+.trash-row:hover {
+  border-color: var(--border-strong);
+}
+
+.trash-row.is-busy {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* A locked row carries no title and no detail, so it is rendered visibly inert
+   rather than looking like a row whose actions merely happen to be disabled. */
+.trash-row.is-locked {
+  border-style: dashed;
+}
+
+.trash-row.is-locked .row-label {
+  color: var(--text-secondary);
+}
+
+.trash-row.is-empty {
+  justify-content: center;
+  color: var(--text-secondary);
+}
+
+.row-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+}
+
+.row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.row-label {
+  margin: 0;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 2px 0 0;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  flex-wrap: wrap;
+}
+
+.row-kind {
+  color: var(--text-tertiary);
+}
+
+.row-expiry {
+  flex-shrink: 0;
+  font-size: 0.8125rem;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The last few days get the warning colour: this is the only signal that an item
+   is about to become unrecoverable. */
+.row-expiry.is-soon {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.row-actions,
+.row-confirm {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.row-confirm {
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.row-delete {
+  padding-inline: var(--space-2);
+}
+
+@media (max-width: 720px) {
+  .page-head,
+  .trash-row {
+    flex-wrap: wrap;
+  }
+
+  .row-main {
+    flex-basis: 100%;
+    order: -1;
+  }
+}

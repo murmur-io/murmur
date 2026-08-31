@@ -181,6 +181,9 @@
               @if (item.path === "/reminders" && reminderCount() > 0) {
                 <span class="count">{{ reminderCount() }}</span>
               }
+              @if (item.path === "/trash" && trashCount() > 0) {
+                <span class="count">{{ trashCount() }}</span>
+              }
             </a>
           }
         }

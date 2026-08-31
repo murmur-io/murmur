@@ -175,6 +175,8 @@ import type {
   WhisperRecommendationDto,
   WikiTarget,
   McpStatus,
+  TrashEntry,
+  TrashUpdatedPayload,
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
@@ -229,6 +231,10 @@ export const EVENT_CONTAINER_SHARE_PROGRESS =
 // Delete fan-out fix — a note/meeting delete FULLY succeeded (local rows gone + any org shares
 // revoked); lets OTHER open surfaces (the tab-strip) prune themselves. Content-free (id + kind only).
 export const EVENT_CONTENT_DELETED = "murmur://content-deleted";
+
+// Trash — something was moved in, restored, or purged. CONTENT-FREE (a count only);
+// subscribers refetch through the gated `listTrash`, which masks sealed entries.
+export const EVENT_TRASH_UPDATED = "murmur://trash-updated";
 /** Count-only invalidation for the first-class Murmur reminder inbox. */
 export const EVENT_REMINDERS_UPDATED = "murmur://reminders-updated";
 /** Kind + opaque source id only; Smart cards re-audit through the gated command. */
@@ -1247,9 +1253,70 @@ export class IpcService {
     return invoke<SearchHit[]>("related_meetings", { meetingId });
   }
 
-  /** Permanently delete a meeting (audio + vault note + all DB rows). Irreversible. */
+  /**
+   * Move a meeting to the Trash. RECOVERABLE for the retention window (30 days
+   * by default) via `restoreTrashItem` — the audio stays on disk and a verified
+   * snapshot holds the transcript + notes. Refused for a locked meeting.
+   */
   deleteMeeting(meetingId: string): Promise<void> {
     return invoke<void>("delete_meeting", { meetingId });
+  }
+
+  // --- TRASH (2026-08-31) — the recoverable holding area for deleted content ---
+
+  /**
+   * Everything in the Trash, newest deletion first. A sealed entry comes back
+   * MASKED (`locked: true`) — never assume `label`/`detail` are real content.
+   */
+  listTrash(): Promise<TrashEntry[]> {
+    return invoke<TrashEntry[]>("list_trash");
+  }
+
+  /** How many entries the Trash holds — the sidebar badge. Cheap (no payloads read). */
+  countTrash(): Promise<number> {
+    return invoke<number>("count_trash");
+  }
+
+  /**
+   * Restore one entry: the content comes back and the entry is consumed.
+   * REJECTS with a locked error when the entry's folder is sealed and not
+   * unlocked this session.
+   */
+  restoreTrashItem(entryId: string): Promise<void> {
+    return invoke<void>("restore_trash_item", { entryId });
+  }
+
+  /** Permanently destroy one entry and the content it was holding. Irreversible. */
+  deleteTrashItemForever(entryId: string): Promise<void> {
+    return invoke<void>("delete_trash_item_forever", { entryId });
+  }
+
+  /**
+   * Permanently destroy every entry. Returns how many were purged; LOCKED
+   * entries are left behind (purging one would need its sealed payload), so the
+   * returned count can be lower than the list length.
+   */
+  emptyTrash(): Promise<number> {
+    return invoke<number>("empty_trash");
+  }
+
+  /** Purge expired entries now instead of waiting for the hourly tick. Returns the count. */
+  purgeExpiredTrash(): Promise<number> {
+    return invoke<number>("purge_expired_trash");
+  }
+
+  /** The retention window in days (default 30). */
+  getTrashRetentionDays(): Promise<number> {
+    return invoke<number>("get_trash_retention_days");
+  }
+
+  /**
+   * Set the retention window (1–365). Applies to entries ALREADY in the Trash —
+   * expiry is computed from the live setting — so shortening it can make items
+   * purge on the next tick.
+   */
+  setTrashRetentionDays(days: number): Promise<void> {
+    return invoke<void>("set_trash_retention_days", { days });
   }
 
   // --- Saved views over a list surface (Feature B; Notes added 2026-07-14) ---
@@ -3597,6 +3664,14 @@ export class IpcService {
     return listen<ContentDeletedPayload>(EVENT_CONTENT_DELETED, (e) =>
       cb(e.payload),
     );
+  }
+
+  /**
+   * The Trash changed (something moved in, restored, or purged). CONTENT-FREE —
+   * a count only; the subscriber refetches through the gated `listTrash`.
+   */
+  onTrashUpdated(cb: (p: TrashUpdatedPayload) => void): Promise<UnlistenFn> {
+    return listen<TrashUpdatedPayload>(EVENT_TRASH_UPDATED, (e) => cb(e.payload));
   }
 
   /** Count-only reminder invalidation. Canonical rows are always refetched. */
