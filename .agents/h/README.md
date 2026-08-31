@@ -40,10 +40,45 @@ model niż ten, który pisał. Zmiana: `--planner/--dev/--verifier` albo
 
 ## Checki
 
-`checks.json` mapuje zmienione ścieżki na komendy. Najważniejsze: checki są
-**zawężane do tego, co zmienione**. `cargo test --lib` na całym cracie to 464 s;
-zawężony do dotkniętych modułów — 28 s. Powyżej 6 dotkniętych modułów leci pełny
-suite.
+`checks.json` mapuje zmienione ścieżki na komendy. Checki są **zawężane do tego,
+co zmienione** — ale zawężanie ma granice, które trzeba znać, bo inaczej czytasz
+zielone tam, gdzie nic nie poleciało.
+
+Co realnie kosztuje pełny przebieg (M4 Max, ciepły `target/`, 2026-08-31):
+
+| check | pełny | zawężony |
+| --- | --- | --- |
+| `rust-test` (3548 testów, `--test-threads=1`) | 201 s | kilka sekund |
+| `rust-clippy` | ~45 s (ciepły) | nie zawęża się |
+| `playwright` (974 przebiegi: 487 × chromium + webkit) | 181 s @ `--workers=6` | tylko gdy ruszony `e2e/*.spec.ts` |
+| `ng lint` + `ng build` | 3,5 s + 5,3 s | — |
+
+Dwie liczby, które wyglądają na literówkę, a nie są:
+
+- `rust-test` leci **równolegle wolniej niż szeregowo** (296 s vs 199 s zmierzone) —
+  SQLite i SQLCipher mają globalne muteksy, więc `--test-threads=1` jest tu wyborem
+  wydajnościowym, nie ostrożnością.
+- `playwright` leci u nas na `--workers=6`, a `scripts/ci.sh` na `--workers=2` — i tak
+  ma zostać. CI stoi na macos-14 z 3 rdzeniami; ta maszyna ma 16. Lokalnie zmierzone
+  469 s @ 2 vs 181 s @ 6, 974/974 passed w obu.
+
+Obu nie zmieniaj bez pomiaru.
+
+Granice zawężania:
+
+- **Powyżej 6 dotkniętych modułów** leci pełny suite.
+- **`lib.rs` / `main.rs` → zawsze pełny suite.** Ich „nazwa modułu" to katalog
+  `src`, a `cargo test --lib -- src` odpala 1 test z 3548 i raportuje zielone
+  w 0,05 s. `lib.rs` to rejestr `generate_handler!` — fałszywa zieleń tam jest
+  gorsza niż wolny check.
+- **Zmiana samego `src/app/**` nie zawęża playwrighta.** `playwright_filters`
+  zbiera wyłącznie ścieżki `e2e/*.spec.ts`; typowa zmiana FE ich nie rusza, więc
+  komenda wraca nieskrócona. Jeśli chcesz zawężenia — dotknij speca, który to
+  pokrywa.
+
+Świeży worktree dostaje symlinki do `target/` **i** `node_modules/` głównego
+checkoutu (to drugie tylko przy identycznym `package-lock.json` — inaczej harness
+mówi, żeby odpalić `npm ci`). Bez tego checki FE nie miały lokalnego `ng`.
 
 `protocol-server` i `perf-contracts` są w `manual_only` — w 74 uruchomieniach
 starego harnessu nie złapały nic, więc nie lecą automatycznie.

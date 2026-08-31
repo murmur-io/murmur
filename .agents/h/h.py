@@ -117,15 +117,30 @@ def changed_paths(wt: Path) -> list:
 
 
 def rust_filters(paths: list) -> list:
-    """Nazwy modułów z dotkniętych plików .rs — filtry dla `cargo test --lib`."""
+    """Nazwy modułów z dotkniętych plików .rs — filtry dla `cargo test --lib`.
+
+    Zwraca [] (= PEŁNY suite, bez zawężania), gdy ruszony jest korzeń crate'a
+    (`lib.rs`/`main.rs`). Stara wersja brała dla nich nazwę katalogu rodzica, która
+    dla `src-tauri/src/lib.rs` brzmi dosłownie `src` — a `cargo test --lib -- src`
+    odpala 1 test z 3548 i raportuje ZIELONE w 0,05 s. `lib.rs` to rejestr
+    `generate_handler!`, czyli najbardziej integracyjny plik w repo; fałszywa zieleń
+    tam jest gorsza niż wolny check.
+    """
     mods = []
     for p in paths:
-        if p.endswith(".rs") and (p.startswith("src-tauri/") or p.startswith("crates/")):
-            stem = Path(p).stem
-            if stem in ("mod", "lib", "main"):
-                stem = Path(p).parent.name
-            if stem and stem not in mods:
-                mods.append(stem)
+        if not (p.endswith(".rs") and (p.startswith("src-tauri/") or p.startswith("crates/"))):
+            continue
+        if Path(p).name in ("lib.rs", "main.rs"):
+            return []
+        stem = Path(p).stem
+        if stem == "mod":
+            stem = Path(p).parent.name
+        # `src` nigdy nie jest nazwą modułu — to katalog źródeł. Gdyby jakaś ścieżka
+        # jednak się na to zmapowała, lecimy pełnym suitem zamiast filtrować w próżni.
+        if stem == "src":
+            return []
+        if stem and stem not in mods:
+            mods.append(stem)
     return mods
 
 
@@ -333,6 +348,38 @@ def link_shared_target(wt: Path) -> None:
     log(f"target -> {SHARED_TARGET} (wspoldzielony, cieply)")
 
 
+def link_shared_node_modules(wt: Path) -> None:
+    """Podepnij `node_modules/` worktree pod drzewo glownego checkoutu.
+
+    Bez tego swiezy worktree NIE MA lokalnego Angulara: `ng` nie jest zainstalowany
+    globalnie, a harness nigdy nie robi `npm ci`, wiec `npx ng lint` / `npx ng build`
+    / `npm run test:e2e` musza isc po CLI do rejestru — wolno i bez zaleznosci
+    projektu. `node_modules/` jest w .gitignore, wiec symlink nie brudzi diffa.
+
+    Podpinamy TYLKO wtedy, gdy lockfile worktree jest bajt w bajt taki sam jak w
+    glownym checkoucie. Inaczej zadanie zmienia zaleznosci i wspoldzielone drzewo
+    byloby klamstwem — wtedy mowimy operatorowi, zeby odpalil `npm ci`.
+    """
+    link = wt / "node_modules"
+    if link.is_symlink() or link.exists():
+        return
+    shared = ROOT / "node_modules"
+    if not shared.is_dir():
+        log("uwaga: brak node_modules w glownym checkoucie — checki FE beda zimne")
+        return
+    lock, shared_lock = wt / "package-lock.json", ROOT / "package-lock.json"
+    try:
+        same = lock.read_bytes() == shared_lock.read_bytes()
+    except OSError:
+        same = False
+    if not same:
+        log("package-lock.json rozni sie od glownego — odpal `npm ci` w worktree "
+            "przed checkami FE")
+        return
+    link.symlink_to(shared)
+    log(f"node_modules -> {shared} (wspoldzielony)")
+
+
 def cmd_run(a) -> None:
     task_id, task = a.task_id, a.prompt
     wt = TASKS_ROOT / task_id
@@ -343,6 +390,7 @@ def cmd_run(a) -> None:
     else:
         log(f"worktree istnieje: {wt}")
     link_shared_target(wt)
+    link_shared_node_modules(wt)
     save_state(task_id, task=task, worktree=str(wt), started=time.time())
 
     plan = phase_plan(task_id, task, wt, a.planner) if not a.no_plan else task

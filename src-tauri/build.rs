@@ -219,9 +219,13 @@ fn stage_brain_sidecar() {
 ///      `tauri.conf.json` `bundle.resources`, then resolved at RUNTIME. This is the ONLY path
 ///      that works in a shipped, notarized build.
 ///
-/// Dev is best-effort: missing `swiftc`/SDK or x86_64 falls back to a host slice. Release is strict:
-/// every present/bundled helper source must freshly compile as arm64+x86_64 or the build aborts;
-/// a stale staged helper must never make a nominally universal DMG pass.
+/// Dev builds the HOST SLICE ONLY and never lipos: a dev run executes the `OUT_DIR` binary on this
+/// machine, so the x86_64 slice is pure build cost (measured ~0.6 s per slice, ~2.4 s per build-script
+/// run across the four helpers). It still falls back to a universal compile if the single-arch one
+/// fails. Release is strict and unchanged: every present/bundled helper source must freshly compile
+/// as arm64+x86_64 or the build aborts; a stale staged helper must never make a nominally universal
+/// DMG pass — and release ALWAYS refreshes `binaries/<bin>`, so a single-arch dev artifact left
+/// there cannot survive into a bundle.
 fn build_swift_helper(
     src_rel: &str,
     bin: &str,
@@ -230,11 +234,21 @@ fn build_swift_helper(
     frameworks: &[&str],
 ) {
     let src = Path::new(src_rel);
-    println!("cargo:rerun-if-changed={src_rel}");
     println!("cargo:rerun-if-changed=build.rs");
+    // NEVER declare `rerun-if-changed` on a path that does not exist. Cargo reports a missing
+    // watched path as `StaleItem::MissingFile`, which is PERMANENT staleness: the build script is
+    // re-run on EVERY cargo invocation, and because it can emit `rustc-env`/`rustc-link-arg` the
+    // whole crate is recompiled and relinked with it. `afm/afm.swift` is deliberately absent (it
+    // needs the macOS 26 SDK), and declaring it cost a measured 18.6 s on EVERY `cargo test`,
+    // `cargo clippy`, `cargo build` and dev-watcher rebuild in this repo — a no-op build went from
+    // 18.6 s to 0.33 s once the declaration moved below this guard. The trade-off is deliberate:
+    // creating a helper source later needs a `build.rs` touch (still watched, one line above) to
+    // be picked up, which is unavoidable anyway since a new helper also needs its own
+    // `build_swift_helper` call. Regression oracle: the incremental-no-op check in `scripts/ci.sh`.
     if !src.exists() {
         return;
     }
+    println!("cargo:rerun-if-changed={src_rel}");
     let Ok(out_dir) = std::env::var("OUT_DIR") else {
         return;
     };
@@ -249,8 +263,8 @@ fn build_swift_helper(
                 "release helper {bin} was not freshly built as universal arm64+x86_64; refusing stale/single-arch bundle"
             );
         }
-    } else if !compile_universal(src, &out_dir, &out_bin, deploy_target, frameworks)
-        && !compile_single(src, &out_bin, deploy_target, frameworks)
+    } else if !compile_single(src, &out_bin, deploy_target, frameworks)
+        && !compile_universal(src, &out_dir, &out_bin, deploy_target, frameworks)
     {
         return; // warnings already emitted; this helper is unavailable in dev
     }
