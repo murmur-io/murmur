@@ -1282,8 +1282,14 @@ export class IpcService {
    * REJECTS with a locked error when the entry's folder is sealed and not
    * unlocked this session.
    */
-  restoreTrashItem(entryId: string): Promise<void> {
-    return invoke<void>("restore_trash_item", { entryId });
+  async restoreTrashItem(entryId: string): Promise<void> {
+    await invoke<void>("restore_trash_item", { entryId });
+    // A restore puts a note/recording/folder BACK into the hierarchy, which is exactly
+    // the "content write that changes the mixed Workspace hierarchy without going
+    // through WorkspaceService" this revision exists for. Without the bump the sidebar
+    // tree — which is always mounted and so never remounts to refetch — keeps showing
+    // the pre-restore forest and the item looks like it never came back.
+    this._workspaceMutationRevision.update((revision) => revision + 1);
   }
 
   /** Permanently destroy one entry and the content it was holding. Irreversible. */
