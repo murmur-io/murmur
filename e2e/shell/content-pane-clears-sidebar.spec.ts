@@ -37,26 +37,28 @@ async function insetProbe(page: Page) {
 }
 
 /**
- * Wait for the sidebar's width transition to land.
+ * Poll the invariant itself until it holds: the pane's left edge must sit at or
+ * after the sidebar's right edge.
  *
- * The pane's `left` comes from `--shell-content-inset`, which flips the INSTANT
- * the `sidebar-collapsed` class does, while the sidebar's own width ANIMATES. So
- * for one transition the pane's left edge really does sit inside the shrinking
- * panel, and an assertion taken right after the click fails on a layout that is
- * correct — which is exactly how this spec failed on CI while passing locally.
- * Read until two successive samples agree.
+ * Sampling the sidebar's width until two reads agree is NOT sufficient, and CI
+ * proved it — the test went from hard-failing to merely flaky. The pane's `left`
+ * comes from `--shell-content-inset` and moves the instant the
+ * `sidebar-collapsed` class does, with no transition; the sidebar's width
+ * ANIMATES. On a loaded runner the first animation frame can land more than a
+ * sampling interval after the class flip, so two equal early reads look
+ * "settled" while the panel is still at its old width.
+ *
+ * Polling the invariant is not vacuous: with the old hardcoded
+ * `left: 88px` the pane starts at 88 against a sidebar reaching 264 (expanded)
+ * or 108 (collapsed), so the gap stays negative and the poll times out RED.
  */
-async function settleSidebar(page: Page): Promise<void> {
-  const sidebar = page.getByRole("navigation", { name: "Primary navigation" });
-  let last = -1;
-  for (let i = 0; i < 40; i += 1) {
-    const width = (await sidebar.boundingBox())?.width ?? -1;
-    if (width === last) {
-      return;
-    }
-    last = width;
-    await page.waitForTimeout(50);
-  }
+async function expectPaneClearsSidebar(page: Page): Promise<void> {
+  await expect
+    .poll(async () => {
+      const { sidebarRight, paneLeft } = await insetProbe(page);
+      return Math.round(paneLeft - sidebarRight);
+    })
+    .toBeGreaterThanOrEqual(0);
 }
 
 /** Whether a point at the row's centre reaches the settings pane, or is stolen. */
@@ -79,23 +81,22 @@ test("the fixed settings pane clears the sidebar, expanded and collapsed", async
   await mockTauri(page);
   await page.goto("/settings");
 
-  await settleSidebar(page);
+  await expectPaneClearsSidebar(page);
   const expanded = await insetProbe(page);
-  expect(expanded.paneLeft).toBeGreaterThanOrEqual(expanded.sidebarRight);
   expect(await rowIsHittable(page)).toBe(true);
 
   await page
     .locator(".primary-sidebar .sb-top")
     .getByRole("button", { name: "Collapse sidebar" })
     .click();
-  // Wait for the CLASS first, deterministically: settleSidebar alone could
-  // return two matching samples taken before the flip had even applied.
   await expect(page.locator("app-shell")).toHaveClass(/sidebar-collapsed/);
-  await settleSidebar(page);
 
-  const collapsed = await insetProbe(page);
-  expect(collapsed.paneLeft).toBeLessThan(expanded.paneLeft);
-  expect(collapsed.paneLeft).toBeGreaterThanOrEqual(collapsed.sidebarRight);
+  // The inset must TRACK the collapse — proving it is read from the sidebar's
+  // real width rather than being a second literal that happens to clear it.
+  await expect
+    .poll(async () => Math.round((await insetProbe(page)).paneLeft))
+    .toBeLessThan(Math.round(expanded.paneLeft));
+  await expectPaneClearsSidebar(page);
   expect(await rowIsHittable(page)).toBe(true);
 
   // And the section really is reachable: this is the click that used to time out.
