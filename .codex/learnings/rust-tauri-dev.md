@@ -68,6 +68,27 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-08-31 build/test perf, review round] an oracle is only as general as its SCOPE, and a false green moves one file over
+- **Pattern:** I closed a false green (`lib.rs` -> the test filter `src` -> 1 test of 3548, green in
+  0.05 s) and wrote an oracle for the build-fingerprint bug that caused it. Adversarial verification
+  found the same two classes had simply MOVED. (a) The oracle defaulted to one manifest dir, while
+  `ci.sh` builds `crates/murmur-brain` on the line above it: a planted phantom in that crate's
+  `build.rs` went permanently stale (1.4 s vs 0.26 s no-op) and the oracle printed "ok". (b)
+  `build.rs` is neither `lib.rs` nor `main.rs`, so it still mapped to the filter `build` — 47
+  incidental name matches (`build_params_*`, `build_memory_brief_*`), none touching a build script,
+  green in 1.6 s. And the oracle lived only in `ci.sh`, never in `checks.json`, so the harness could
+  not have caught the very bug it was written for.
+- **Caught by:** adversarial-verifier, with executable repros for both; lock-security-reviewer
+  separately proved my in-code rationale wrong by reading the SQLCipher amalgamation
+  (`cipher_memory_security` does NOT gate SQLCipher's own key buffers — those are always wiped;
+  it gates SQLite's GENERAL heap, so the residue is user CONTENT, wider than I had written).
+- **Lesson:** when you fix a scoping heuristic, enumerate every file the heuristic special-cases and
+  ask which OTHER file falls in the same hole — `lib.rs`/`main.rs`/`build.rs` are one class, not
+  two. When you add a gate, add it in BOTH places that run gates (`scripts/ci.sh` AND
+  `.agents/h/checks.json`), or the harness reports green on the exact defect. And a comment on a
+  crypto path is load-bearing: state the MECHANISM from the vendored source, not from the pragma's
+  name — a plausible-sounding rationale that is wrong understates what the owner is agreeing to.
+
 ### [2026-08-31 build/test perf] a `rerun-if-changed` on a path that DOES NOT EXIST is permanent staleness
 - **Pattern:** `build.rs::build_swift_helper` printed `cargo:rerun-if-changed={src_rel}` BEFORE its
   own `if !src.exists() { return; }` guard. One of the five helpers is `afm/afm.swift`, deliberately

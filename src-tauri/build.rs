@@ -241,11 +241,27 @@ fn build_swift_helper(
     // whole crate is recompiled and relinked with it. `afm/afm.swift` is deliberately absent (it
     // needs the macOS 26 SDK), and declaring it cost a measured 18.6 s on EVERY `cargo test`,
     // `cargo clippy`, `cargo build` and dev-watcher rebuild in this repo — a no-op build went from
-    // 18.6 s to 0.33 s once the declaration moved below this guard. The trade-off is deliberate:
-    // creating a helper source later needs a `build.rs` touch (still watched, one line above) to
-    // be picked up, which is unavoidable anyway since a new helper also needs its own
-    // `build_swift_helper` call. Regression oracle: the incremental-no-op check in `scripts/ci.sh`.
+    // 18.6 s to 0.33 s once the declaration moved below this guard.
+    //
+    // The trade-off, stated honestly: CREATING a source that is currently absent is not picked up
+    // until `build.rs` is touched (it stays watched, one line above). For a brand-new helper that
+    // costs nothing, since it needs its own `build_swift_helper` call anyway — but `afm/afm.swift`
+    // ALREADY has its call below, so writing that file on a macOS 26 machine will look like a no-op
+    // until you `touch build.rs`. Measured and confirmed. That is the price of not re-running the
+    // whole build script on every single cargo command, and it is worth it.
+    // Regression oracle: `scripts/incremental-noop-check`, wired into `scripts/ci.sh`.
     if !src.exists() {
+        // A RELEASE build must never bundle a helper whose source has gone missing. `bundle.resources`
+        // ships `binaries/<bin>` regardless, so returning here would silently pack whatever was staged
+        // by an earlier build — and since dev now stages the HOST SLICE ONLY, that stale file is
+        // likely arm64-only: a nominally universal DMG with a helper that is dead on Intel. Renaming a
+        // `.swift` without updating its `build_swift_helper` call is exactly how that happens.
+        if std::env::var("PROFILE").as_deref() == Ok("release") && Path::new("binaries").join(bin).exists() {
+            panic!(
+                "release: {src_rel} is missing but binaries/{bin} is staged; refusing to bundle a stale \
+                 helper. Delete binaries/{bin} if the helper is retired, or restore its source."
+            );
+        }
         return;
     }
     println!("cargo:rerun-if-changed={src_rel}");
@@ -263,10 +279,26 @@ fn build_swift_helper(
                 "release helper {bin} was not freshly built as universal arm64+x86_64; refusing stale/single-arch bundle"
             );
         }
-    } else if !compile_single(src, &out_bin, deploy_target, frameworks)
-        && !compile_universal(src, &out_dir, &out_bin, deploy_target, frameworks)
-    {
-        return; // warnings already emitted; this helper is unavailable in dev
+    } else {
+        // Dev normally needs only a HOST slice: the dev run executes the `OUT_DIR` binary on this
+        // machine. The exception is the first build on a machine where `binaries/<bin>` is still
+        // absent, because that staged copy is what a bundle would embed AND — for
+        // `binaries/meetnotes-calendar` — is TRACKED in git, so a host-arch file there would show
+        // up as a modified tracked path and could be committed. When we must create it, create it
+        // universal; afterwards stay on the cheap path.
+        let must_stage = !Path::new("binaries").join(bin).exists();
+        let host = || compile_single(src, &out_bin, deploy_target, frameworks);
+        let universal = || compile_universal(src, &out_dir, &out_bin, deploy_target, frameworks);
+        // Preference order, not a correctness requirement — either compile yields a runnable dev
+        // helper, and whichever is tried first, the other is the fallback.
+        let attempts: [&dyn Fn() -> bool; 2] = if must_stage {
+            [&universal, &host]
+        } else {
+            [&host, &universal]
+        };
+        if !attempts.iter().any(|attempt| attempt()) {
+            return; // warnings already emitted; this helper is unavailable in dev
+        }
     }
 
     // Dev fallback path.
