@@ -3868,3 +3868,45 @@ export interface OrgShareTargetRow {
   orgName: string;
   access: OrgAccess;
 }
+
+/**
+ * One entry in the Trash — something the user deleted that is still recoverable.
+ * Mirrors the Rust `TrashEntry` DTO (camelCase asserted by
+ * `trash_tests::trash_entry_dto_is_camel_case`).
+ *
+ * A sealed entry arrives MASKED: `locked: true`, `label: "🔒 Locked"`, empty
+ * `detail`. The backend decides that from the LIVE session unlock set — the FE
+ * must never try to infer it, and must not offer Restore on a locked row (the
+ * backend refuses it anyway).
+ */
+export interface TrashEntry {
+  /** The TRASH ENTRY id — what restore/delete-forever take. Not `sourceId`. */
+  id: string;
+  kind: TrashKind;
+  /** The deleted entity's own id. */
+  sourceId: string;
+  sourceFolderId: string | null;
+  /** Display title, or the lock sentinel when masked. */
+  label: string;
+  /** RFC3339. */
+  deletedAt: string;
+  /** RFC3339 — when this entry is purged. Derived from the LIVE retention setting. */
+  expiresAt: string;
+  /** Whole days remaining; `0` on the final day, never negative. */
+  daysLeft: number;
+  /** Masked: its folder is sealed and not unlocked this session. */
+  locked: boolean;
+  /** Content-FREE one-liner ("30 min · 42 segments"). Empty when masked. */
+  detail: string;
+}
+
+export type TrashKind = "meeting" | "note" | "folder" | "noteFolder";
+
+/**
+ * Payload of `murmur://trash-updated`. CONTENT-FREE by design — a count only, so
+ * the sidebar badge can update without any surface learning a label or payload.
+ * Mirrors the Rust `TrashUpdatedPayload`.
+ */
+export interface TrashUpdatedPayload {
+  count: number;
+}

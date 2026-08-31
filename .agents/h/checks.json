@@ -12,6 +12,17 @@
       "cmd": "python3 .agents/h/new-deps.py",
       "budget_s": 30
     },
+    "build-noop": {
+      "_comment": "Sub-sekundowy na zdrowym drzewie. Lapie klase, ktora kosztowala 18.6 s na KAZDEJ komendzie cargo do 2026-08-31: `rerun-if-changed` na sciezke, ktorej nie ma = trwala nieswiezosc. Zyl tylko w ci.sh, wiec harness reportowal zielone na dokladnie tym bugu.",
+      "when": [
+        "src-tauri/build.rs",
+        "crates/**/build.rs",
+        "src-tauri/tauri.conf.json",
+        "**/*.swift"
+      ],
+      "cmd": "python3 scripts/incremental-noop-check",
+      "budget_s": 300
+    },
     "ng-lint": {
       "when": [
         "src/app/**",
@@ -69,7 +80,8 @@
         "e2e/**",
         "playwright.config.ts"
       ],
-      "cmd": "npm run test:e2e -- --workers=2",
+      "_workers": "6, nie 2. `scripts/ci.sh` uzywa 2, bo macos-14 ma 3 rdzenie — ta wartosc byla skopiowana stamtad na maszyne 16-rdzeniowa. Zmierzone lokalnie na M4 Max: workers=2 -> 468.6 s, workers=6 -> 180.8 s, 974/974 passed w obu, zero flake przy retries:0. Podnoszac to jeszcze wyzej zmierz najpierw flake — konfiguracja ma retries:0 lokalnie, wiec jedno przeterminowane oczekiwanie wywala check.",
+      "cmd": "npm run test:e2e -- --workers=6",
       "scoped": true,
       "budget_s": 1200
     },
