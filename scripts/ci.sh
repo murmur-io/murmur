@@ -230,6 +230,13 @@ rust_gate() {
   echo "── cargo build ──"
   ( cd src-tauri && cargo build )
   cargo build -p murmur-brain
+
+  # An unchanged tree must rebuild NOTHING. Guards the class that cost 18.6 s on EVERY cargo
+  # command until 2026-08-31 (a `cargo:rerun-if-changed` in build.rs on a path that does not
+  # exist = permanent staleness). Runs right after `cargo build`, so the warm-up is already paid;
+  # the check itself is sub-second on a healthy tree. Rationale + diagnosis live in the script.
+  echo "── incremental no-op (nothing may recompile on an unchanged tree) ──"
+  python3 scripts/incremental-noop-check
 }
 
 web_gate() {
@@ -245,7 +252,16 @@ playwright_e2e() {
   # workers=2 (not 1): specs are page-side mocked and hermetic (private port, no server reuse, no
   # shared state), so spec-file-level parallelism is safe. macos-14 has 3 cores; 2 keeps contention
   # mild against the 30s per-test timeout with retries:0. Do NOT go to 3 without config retries:1.
-  npm run test:e2e -- --workers=2
+  #
+  # MURMUR_E2E_SHARD ("i/N") rozbija suite na rownolegle joby CI. Bez niego lecimy calosc, wiec
+  # `bash scripts/ci.sh web` odpalone recznie nadal jest PELNA bramka web — shardowanie jest
+  # wylacznie sposobem, w jaki workflow rozklada ta sama prace na wiecej runnerow.
+  if [ -n "${MURMUR_E2E_SHARD:-}" ]; then
+    echo "  shard ${MURMUR_E2E_SHARD}"
+    npm run test:e2e -- --workers=2 --shard="${MURMUR_E2E_SHARD}"
+  else
+    npm run test:e2e -- --workers=2
+  fi
 }
 
 audio_e2e() {

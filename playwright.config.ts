@@ -40,9 +40,25 @@ export default defineConfig({
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
     colorScheme: "dark",
-    trace: "retain-on-failure",
+    // `retain-on-failure` RECORDS every test and throws the recording away when it passes, which
+    // is pure cost on a suite that is ~99% passing. Measured on the FULL suite, same machine,
+    // `--workers=2`: 7.5 min -> 7.1 / 7.2 min across two runs, i.e. about 5%.
+    //
+    // Do not trust the bigger number a small sample gives you here: a 14-test subset showed
+    // webkit 14.0 s -> 11.2 s and chromium 11.0 s -> 8.7 s, which reads as 20% — but per-test
+    // recording overhead is a larger share of a short run than of the whole suite, and
+    // extrapolating it overstated the win four-fold. 5% is the honest figure.
+    //
+    // CI therefore records on the RETRY instead: it runs `retries: 2`, so anything that actually
+    // fails is re-run and the second attempt carries a full trace and video. Nothing that fails
+    // arrives without artifacts; they just come from attempt #2.
+    //
+    // LOCAL keeps `retain-on-failure`, deliberately: `retries: 0` there, so `on-first-retry` would
+    // capture NOTHING — and the harness's verifier reads exactly these artifacts. Screenshots stay
+    // `only-on-failure` everywhere; they are captured after the fact and cost nothing on a pass.
+    trace: process.env["CI"] ? "on-first-retry" : "retain-on-failure",
     screenshot: "only-on-failure",
-    video: "retain-on-failure",
+    video: process.env["CI"] ? "on-first-retry" : "retain-on-failure",
   },
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"] } },
