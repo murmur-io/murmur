@@ -1,0 +1,206 @@
+<section class="trash-page">
+  <header class="page-head">
+    <div>
+      <p class="page-eyebrow">Workspace</p>
+      <h1>Trash</h1>
+      <p class="page-subtitle">
+        Deleted recordings, notes and folders stay here so you can put them back.
+      </p>
+    </div>
+
+    <div class="head-actions">
+      <div class="retention">
+        <button
+          type="button"
+          class="btn btn-ghost"
+          (click)="toggleRetention()"
+          aria-haspopup="menu"
+          [attr.aria-expanded]="retentionOpen()"
+        >
+          <mur-icon icon="history" />
+          <span>{{ retentionLabel() }}</span>
+        </button>
+        @if (retentionOpen()) {
+          <button
+            type="button"
+            class="menu-scrim"
+            (click)="toggleRetention()"
+            aria-label="Close retention menu"
+            tabindex="-1"
+          ></button>
+          <div class="menu retention-menu" role="menu">
+            @for (days of retentionChoices; track days) {
+              <button
+                type="button"
+                class="menu-item"
+                role="menuitem"
+                [class.is-current]="days === store.retentionDays()"
+                (click)="chooseRetention(days)"
+              >
+                <span>Keep for {{ days }} days</span>
+                @if (days === store.retentionDays()) {
+                  <mur-icon icon="check" />
+                }
+              </button>
+            }
+          </div>
+        }
+      </div>
+
+      @if (!store.isEmpty()) {
+        <button
+          type="button"
+          class="btn btn-danger"
+          [disabled]="store.loading() || store.allLocked()"
+          (click)="askEmpty()"
+        >
+          Empty Trash
+        </button>
+      }
+    </div>
+  </header>
+
+  @if (store.error(); as message) {
+    <div class="banner is-danger" role="alert">
+      <span>{{ message }}</span>
+      <button type="button" class="btn btn-ghost" (click)="store.reload()">
+        Retry
+      </button>
+    </div>
+  }
+
+  @if (store.lockedCount() > 0) {
+    <div class="banner is-warning locked-banner" role="status">
+      <mur-icon icon="lock" />
+      <span>
+        {{ store.lockedCount() }} item{{ store.lockedCount() === 1 ? "" : "s" }} here
+        belong to a locked folder. Unlock the folder to see what they are, restore
+        them, or delete them.
+      </span>
+    </div>
+  }
+
+  @if (confirmingEmpty()) {
+    <div class="banner is-danger confirm-banner" role="alertdialog" aria-live="assertive">
+      <span>
+        Permanently delete
+        {{ store.entries().length - store.lockedCount() }} item{{
+          store.entries().length - store.lockedCount() === 1 ? "" : "s"
+        }}? This cannot be undone.
+      </span>
+      <div class="confirm-actions">
+        <button type="button" class="btn btn-ghost" (click)="cancelEmpty()">
+          Cancel
+        </button>
+        <button
+          type="button"
+          class="btn btn-danger"
+          [disabled]="store.loading()"
+          (click)="confirmEmpty()"
+        >
+          Delete permanently
+        </button>
+      </div>
+    </div>
+  }
+
+  @if (showSpinner()) {
+    <mur-empty-state>
+      <span class="context-spinner" aria-hidden="true"></span>
+      <p>Loading the Trash…</p>
+    </mur-empty-state>
+  } @else if (store.isEmpty()) {
+    <mur-empty-state>
+      <mur-icon icon="trash" />
+      <h2>Trash is empty</h2>
+      <p>
+        Anything you delete lands here for
+        {{ store.retentionDays() }} days before it is removed for good.
+      </p>
+    </mur-empty-state>
+  } @else {
+    <ul class="trash-list">
+      @for (row of rows(); track row.entry.id) {
+        <li
+          class="trash-row"
+          [class.is-locked]="row.entry.locked"
+          [class.is-busy]="isBusy(row.entry.id)"
+        >
+          <span class="row-icon" aria-hidden="true">
+            <mur-icon [icon]="row.entry.locked ? 'lock' : row.icon" />
+          </span>
+
+          <div class="row-main">
+            <p class="row-label">{{ row.entry.label }}</p>
+            <p class="row-meta">
+              <span class="row-kind">{{ row.kindLabel }}</span>
+              <span aria-hidden="true">·</span>
+              <span>{{ row.deletedLabel }}</span>
+              @if (row.entry.detail) {
+                <span aria-hidden="true">·</span>
+                <span>{{ row.entry.detail }}</span>
+              }
+            </p>
+          </div>
+
+          <span
+            class="row-expiry"
+            [class.is-soon]="row.expiringSoon"
+            [title]="'Purged on ' + row.entry.expiresAt"
+          >
+            {{ row.expiryLabel }}
+          </span>
+
+          @if (confirmingDelete() === row.entry.id) {
+            <div class="row-confirm">
+              <span>Delete for good?</span>
+              <button type="button" class="btn btn-ghost" (click)="cancelDelete()">
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-danger"
+                [disabled]="isBusy(row.entry.id)"
+                (click)="confirmDelete(row.entry)"
+              >
+                Delete
+              </button>
+            </div>
+          } @else {
+            <div class="row-actions">
+              <button
+                type="button"
+                class="btn"
+                [disabled]="row.entry.locked || isBusy(row.entry.id)"
+                [title]="
+                  row.entry.locked
+                    ? 'Unlock this item\'s folder to restore it'
+                    : 'Put this back where it was'
+                "
+                (click)="restore(row.entry)"
+              >
+                Restore
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost row-delete"
+                [disabled]="row.entry.locked || isBusy(row.entry.id)"
+                [attr.aria-label]="'Delete ' + row.entry.label + ' permanently'"
+                [title]="
+                  row.entry.locked
+                    ? 'Unlock this item\'s folder to delete it'
+                    : 'Delete permanently'
+                "
+                (click)="askDelete(row.entry.id)"
+              >
+                <mur-icon icon="trash" />
+              </button>
+            </div>
+          }
+        </li>
+      } @empty {
+        <li class="trash-row is-empty">Nothing here.</li>
+      }
+    </ul>
+  }
+</section>
