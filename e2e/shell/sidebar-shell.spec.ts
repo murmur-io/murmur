@@ -220,6 +220,40 @@ test("the footer offers Capture plus a menu for the other create actions", async
   await expect(page.getByRole("menu")).toHaveCount(0);
 });
 
+test("Quick note sits beside Capture and opens a blank note in one click", async ({
+  page,
+}) => {
+  await boot(page);
+  const sb = sidebar(page);
+
+  const capture = sb.getByRole("link", { name: "Capture" });
+  const quick = sb.getByRole("button", { name: "Quick note" });
+  const create = sb.getByRole("button", { name: "Create", exact: true });
+  await expect(quick).toBeVisible();
+
+  // The same round control as the create caret, seated BETWEEN Capture and it,
+  // and carrying no label of its own so Capture keeps the only one in the row.
+  const [captureBox, quickBox, createBox] = await Promise.all([
+    capture.boundingBox(),
+    quick.boundingBox(),
+    create.boundingBox(),
+  ]);
+  expect(captureBox).not.toBeNull();
+  expect(quickBox).not.toBeNull();
+  expect(createBox).not.toBeNull();
+  expect(quickBox!.width).toBeCloseTo(quickBox!.height, 0);
+  expect(quickBox!.width).toBeCloseTo(createBox!.width, 0);
+  expect(quickBox!.x).toBeGreaterThan(captureBox!.x);
+  expect(quickBox!.x).toBeLessThan(createBox!.x);
+  await expect(quick).not.toContainText(/\S/);
+
+  // One click, no menu: it reaches the note route the Create menu's New note
+  // reaches, and it does NOT open that menu on the way.
+  await quick.click();
+  await expect(page).toHaveURL(/\/notes\//);
+  await expect(page.getByRole("menu")).toHaveCount(0);
+});
+
 /**
  * REGRESSION (reported from a real window): with Browse expanded the sidebar
  * column grew past the viewport, so Capture and Settings were pushed off

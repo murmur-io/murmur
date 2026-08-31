@@ -252,6 +252,16 @@ export class AppShellComponent {
     void this.router.navigate(["/notes/new"]);
   }
 
+  /**
+   * The footer's Quick note button — one click from anywhere to a blank note,
+   * with no menu in the way. It lands on the SAME `/notes/new` create flow the
+   * Create menu's "New note" uses (that route creates the draft and replaces
+   * the URL with the real id), so there is one note-creation path, not two.
+   */
+  quickNote(): void {
+    this.newNote();
+  }
+
   openWorkspaceCreate(): void {
     this.workspaceCreateError.set(null);
     this.workspaceCreateOpen.set(true);
