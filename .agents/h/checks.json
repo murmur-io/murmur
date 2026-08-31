@@ -12,6 +12,17 @@
       "cmd": "python3 .agents/h/new-deps.py",
       "budget_s": 30
     },
+    "build-noop": {
+      "_comment": "Sub-sekundowy na zdrowym drzewie. Lapie klase, ktora kosztowala 18.6 s na KAZDEJ komendzie cargo do 2026-08-31: `rerun-if-changed` na sciezke, ktorej nie ma = trwala nieswiezosc. Zyl tylko w ci.sh, wiec harness reportowal zielone na dokladnie tym bugu.",
+      "when": [
+        "src-tauri/build.rs",
+        "crates/**/build.rs",
+        "src-tauri/tauri.conf.json",
+        "**/*.swift"
+      ],
+      "cmd": "python3 scripts/incremental-noop-check",
+      "budget_s": 300
+    },
     "ng-lint": {
       "when": [
         "src/app/**",

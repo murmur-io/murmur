@@ -420,13 +420,27 @@ impl Db {
                           // (5.2x); across the whole 3548-test suite 699.1 s -> 199.1 s together with the dev-profile
                           // SQLCipher optimisation. Production pays the same multiplier on every DB read and write.
                           //
-                          // What is GIVEN UP: SQLCipher no longer zeroes or wires its own transient buffers (decrypted
-                          // page images, KDF state) — freed heap pages may retain plaintext until reused, and are
-                          // swappable. What is UNCHANGED: the database stays fully SQLCipher-encrypted at rest; the
-                          // per-folder CK/KEK seal is untouched; macOS encrypts swap by default; and the DEK is
-                          // resident in this process for the whole session regardless, so this pragma was never the
-                          // boundary that kept key material out of RAM. Secret material we own is still scrubbed
-                          // explicitly (`zeroize` on the KEK/CK/pragma strings above).
+                          // What is GIVEN UP — and it is NOT what it looks like. SQLCipher's OWN buffers (codec key,
+                          // HMAC key, keyspec, raw pass, KDF salt, the per-page cipher scratch) are memset + mlock'd
+                          // UNCONDITIONALLY by `sqlcipher_malloc`/`sqlcipher_free`, which never read this flag. The
+                          // flag gates only SQLite's GENERAL allocator, so what actually loses its wipe is SQLite's
+                          // general heap: the page cache each decrypted page is copied into, the VDBE values carrying
+                          // note markdown / transcript text / timeline JSON out to a caller, and the in-RAM temp pages
+                          // `temp_store = MEMORY` keeps there. Freed heap may therefore retain USER CONTENT until
+                          // reused, and — no longer being mlock'd — is swappable.
+                          //
+                          // One residue this specifically re-opens: `pragma_update` formats the FULL statement
+                          // `PRAGMA key = 'x''<64 hex>'''` into a plain `String` and `sqlite3_prepare_v2` copies that
+                          // SQL text into SQLite-allocated memory. Those copies used to be wiped on free by the
+                          // SQLCipher allocator; now nothing wipes them, so the hex DEK can linger in freed heap. The
+                          // `Zeroizing` above covers only our own value string, not rusqlite's statement text.
+                          //
+                          // What is UNCHANGED: the database stays fully SQLCipher-encrypted at rest; the per-folder
+                          // CK/KEK seal is untouched; macOS encrypts swap by default; SQLCipher keeps the DEK in
+                          // `ctx->pass` (mlock'd, always wiped on free) for the connection's life anyway; and every
+                          // secret WE hold — master KEK, content keys — lives in Rust memory under `Zeroize`, which
+                          // this allocator never covered. Reaching any of the above needs process-memory access, and
+                          // a sealed-not-unlocked folder still needs the biometric KEK.
         conn.execute_batch(
             "PRAGMA temp_store = MEMORY;
              PRAGMA foreign_keys = ON;
