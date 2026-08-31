@@ -3071,7 +3071,9 @@ export class IpcService {
   }
 
   /**
-   * Permanently delete a note (cascade-deletes its chunks + vectors + vault `.md`).
+   * Move a note to the Trash. RECOVERABLE for the retention window (30 days by
+   * default) via `restoreTrashItem` — a verified snapshot holds its body and
+   * inline images, and the restore re-exports the vault `.md`.
    * GATED: a sealed-and-not-session-unlocked folder is refused (`Locked`); an
    * unknown id is an idempotent no-op.
    */
