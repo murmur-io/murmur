@@ -876,8 +876,25 @@ async fn delete_note_inner_notifying(
     // delete (verify-before-destroy inside). The exported vault `.md` IS still removed below: the
     // markdown lives in SQLCipher, so a restore re-exports it, and leaving a plaintext `.md` behind
     // for a "deleted" note would contradict the delete — and leak, for a locked folder.
-    super::trash_commands::capture_note(state, id)?;
+    let trash_entry_id = super::trash_commands::capture_note(state, id)?;
 
+    // Same all-or-nothing rollback as the meeting path: the steps below are fallible and the
+    // snapshot is already durable, so a failure here would leave a trash entry for a note that
+    // still exists (and whose restore would then refuse with "already exists").
+    let deleted = delete_note_after_capture(state, id, &row);
+    if deleted.is_err() {
+        let _ = state.db.delete_trash_entry(&trash_entry_id);
+    }
+    deleted
+}
+
+/// The destructive half of [`delete_note_inner_notifying`], split out so its caller can retire the
+/// trash snapshot if any of it fails. Runs with the lifecycle guard held and the gates satisfied.
+fn delete_note_after_capture(
+    state: &AppState,
+    id: &str,
+    row: &crate::storage::NoteRow,
+) -> Result<(), AppError> {
     let attachment_owner = crate::storage::AttachmentOwner::Document {
         document_id: id.to_string(),
     };

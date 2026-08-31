@@ -4599,8 +4599,24 @@ async fn delete_meeting_inner_notifying(
     // re-parses it; if the content does not round-trip it returns Err and we bail here with NOTHING
     // mutated (verify-before-destroy). It also seals the snapshot immediately when this folder is
     // sealed, so a trashed recording is never at rest in plaintext behind a lock.
-    trash_commands::capture_meeting(state, meeting_id)?;
+    let trash_entry_id = trash_commands::capture_meeting(state, meeting_id)?;
 
+    // The steps below are FALLIBLE, and the snapshot is already durable. Without this rollback a
+    // delete that fails after the capture leaves a trash entry describing content that still
+    // exists: the Trash would offer to restore a meeting still sitting in the Library, and the
+    // restore would then refuse with "already exists". Retire the entry on any error so a failed
+    // delete leaves NOTHING behind — the same all-or-nothing contract `store_and_verify` gives.
+    let deleted = delete_meeting_after_capture(state, meeting_id);
+    if deleted.is_err() {
+        let _ = state.db.delete_trash_entry(&trash_entry_id);
+    }
+    deleted
+}
+
+/// The destructive half of [`delete_meeting_inner_notifying`], split out so its caller can retire
+/// the trash snapshot if any of it fails. Everything here runs with the lifecycle guard held and the
+/// gates already satisfied.
+fn delete_meeting_after_capture(state: &AppState, meeting_id: &str) -> Result<(), AppError> {
     let attachment_rows = state.db.attachments_for_meeting(meeting_id)?;
     remove_attachment_exports(
         &attachment_rows,
