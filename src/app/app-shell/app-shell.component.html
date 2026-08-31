@@ -231,6 +231,15 @@
       </a>
       <button
         type="button"
+        class="btn sb-quick-note"
+        (click)="quickNote()"
+        aria-label="Quick note"
+        title="Quick note"
+      >
+        <mur-icon icon="note-add" />
+      </button>
+      <button
+        type="button"
         class="btn sb-create-more"
         [class.is-open]="createMenuOpen()"
         (click)="toggleCreateMenu()"
