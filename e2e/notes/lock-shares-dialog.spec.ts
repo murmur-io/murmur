@@ -43,18 +43,16 @@ test.describe("Notes — folder lock runs the lock×shares dialog (PK-F1)", () =
     await page.goto("/notes");
     await expect(page.locator(".notes-content")).toBeVisible();
 
-    // Open the hierarchy without navigating away from the mounted Notes list.
-    // Its plaintext stays visible until the user actually confirms a lock.
-    await page
-      .getByRole("navigation", { name: "Primary navigation" })
-      .getByRole("button", { name: "Workspaces", exact: true })
-      .click();
+    // The hierarchy sits beside the mounted Notes list. Its plaintext stays
+    // visible until the user actually confirms a lock.
     await expect(page).toHaveURL(/\/notes$/);
     await expect(page.locator(".notes-content")).toBeVisible();
     await expect(page.getByText("My First Note", { exact: true })).toBeVisible();
 
-    const spacesSidebar = page.getByRole("complementary", {
-      name: "Workspaces sidebar",
+    // The Workspaces tree is a section of the ONE sidebar now, rather than a
+    // separate "Workspaces sidebar" panel opened from a rail button.
+    const spacesSidebar = page.getByRole("navigation", {
+      name: "Primary navigation",
     });
     await expect(spacesSidebar).toBeVisible();
     await spacesSidebar

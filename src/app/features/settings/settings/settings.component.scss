@@ -10,7 +10,7 @@
   top: var(--tabs-strip-height, 0px);
   right: 0;
   bottom: 0;
-  left: calc(var(--space-2) + var(--space-8) + var(--space-2) + var(--space-2));
+  left: var(--shell-content-inset);
   z-index: 5;
   display: block;
   background: var(--surface-base);

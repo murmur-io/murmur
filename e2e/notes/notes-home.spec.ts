@@ -2,8 +2,8 @@ import { test, expect } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
 
 /**
- * Notes home is an exact-list route: the persistent global rail chooses the
- * product surface while the adjacent Browse panel owns list navigation. The
+ * Notes home is an exact-list route: the one sidebar owns navigation, with the
+ * Browse disclosure holding the list destinations. The
  * content pane still renders the note table, including the sealed row, with
  * no console/page errors — the runtime check that catches NG0600 / ɵcmp /
  * forwardRef regressions a green `ng build` misses.
@@ -30,10 +30,16 @@ test("notes home renders Browse navigation + the note table (incl. masked locked
   });
   await expect(globalNavigation).toBeVisible();
 
-  const browseSidebar = page.getByRole("complementary", {
-    name: "Browse sidebar",
+  // Browse is a disclosure group inside the one sidebar (it used to be its own
+  // "Browse sidebar" complementary panel) and it starts collapsed, so the
+  // active-destination assertion has to open it first.
+  const browseSidebar = page.getByRole("navigation", {
+    name: "Browse destinations",
   });
   await expect(browseSidebar).toBeVisible();
+  await browseSidebar
+    .getByRole("button", { name: "Browse", exact: true })
+    .click();
   await expect(
     browseSidebar.getByRole("link", { name: "Notes", exact: true }),
   ).toHaveClass(/active/);
@@ -41,9 +47,12 @@ test("notes home renders Browse navigation + the note table (incl. masked locked
   // The prominent "New note" action.
   await expect(page.locator(".new-note-btn")).toBeVisible();
 
-  // Exact list routes do not mount the hierarchy panel or its former section
-  // wrapper. The hierarchy is reserved for Workspace and leaf routes.
-  await expect(page.locator("mur-sidebar.spaces-sidebar")).toHaveCount(0);
+  // There is exactly ONE sidebar on every route now — the hierarchy is no longer
+  // a second panel that some routes mount and others do not. Asserting the OLD
+  // panel is absent would pass vacuously (its class no longer exists), so assert
+  // the real invariant instead.
+  await expect(page.locator("mur-sidebar.primary-sidebar")).toHaveCount(1);
+  await expect(page.locator("mur-sidebar")).toHaveCount(1);
   await expect(page.locator("mur-sidebar-section")).toHaveCount(0);
 
   // The table renders (thead + the visible note row + its tag pill).
@@ -117,12 +126,10 @@ test("Notes Home hides auto-organize for a session-unlocked sealed folder", asyn
     }),
   });
   await page.goto("/notes");
-  await page
-    .getByRole("navigation", { name: "Primary navigation" })
-    .getByRole("button", { name: "Workspaces", exact: true })
-    .click();
-  const spacesSidebar = page.getByRole("complementary", {
-    name: "Workspaces sidebar",
+  // The Workspaces tree is a section of the ONE sidebar now, rather than a
+  // separate "Workspaces sidebar" panel opened from a rail button.
+  const spacesSidebar = page.getByRole("navigation", {
+    name: "Primary navigation",
   });
   await spacesSidebar.getByRole("button", { name: "Expand Workspace" }).click();
   await spacesSidebar
@@ -237,10 +244,6 @@ test("workspace organizer warns before de-sealing and excludes that move from Se
     }),
   });
   await page.goto("/notes");
-  await page
-    .getByRole("navigation", { name: "Primary navigation" })
-    .getByRole("button", { name: "Workspaces", exact: true })
-    .click();
   await page
     .getByRole("button", { name: "Review filing moves with Brain" })
     .click();
