@@ -7,7 +7,10 @@ import {
   inject,
   signal,
 } from "@angular/core";
-import { MurIconComponent } from "../../../design-system/icon/icon.component";
+import {
+  MurIconComponent,
+  type ShellIcon,
+} from "../../../design-system/icon/icon.component";
 import { MurEmptyStateComponent } from "../../../design-system/empty-state/empty-state.component";
 import { ToastService } from "../../../services/toast.service";
 import { TrashService } from "../../../services/trash.service";
@@ -17,7 +20,7 @@ import type { TrashEntry, TrashKind } from "../../../core/models";
 interface TrashRowVm {
   entry: TrashEntry;
   /** Icon name for the entry's kind. */
-  icon: string;
+  icon: ShellIcon;
   /** "Recording" / "Note" / "Folder" / "Note folder". */
   kindLabel: string;
   /** "Deleted 2 days ago". */
@@ -28,7 +31,7 @@ interface TrashRowVm {
   expiringSoon: boolean;
 }
 
-const KIND_META: Record<TrashKind, { icon: string; label: string }> = {
+const KIND_META: Record<TrashKind, { icon: ShellIcon; label: string }> = {
   meeting: { icon: "meetings", label: "Recording" },
   note: { icon: "notes", label: "Note" },
   folder: { icon: "spaces", label: "Folder" },
@@ -69,7 +72,9 @@ export class TrashComponent implements OnInit {
 
   readonly rows = computed<TrashRowVm[]>(() =>
     this.store.entries().map((entry) => {
-      const meta = KIND_META[entry.kind] ?? {
+      // A `kind` the FE does not know (an older/newer backend) must still render a row rather
+      // than throw — T6's lesson: one bad field must not take the whole view down.
+      const meta: { icon: ShellIcon; label: string } = KIND_META[entry.kind] ?? {
         icon: "notes",
         label: "Item",
       };
