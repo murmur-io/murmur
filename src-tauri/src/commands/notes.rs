@@ -821,7 +821,7 @@ pub async fn delete_note(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), AppError> {
-    delete_note_inner_notifying(state.inner(), &id, Some(&app), Disposition::ToTrash).await?;
+    delete_note_inner_notifying(state.inner(), &id, Some(&app)).await?;
     emit_ask_history_invalidated_fail_closed(&app);
     crate::events::emit_content_deleted(&app, "note", &id);
     // The delete purged its audit findings (id-matched) — ping the FE inbox (count-only).
@@ -833,24 +833,13 @@ pub async fn delete_note(
 /// cascade (network round-trip); the gate + DB delete themselves stay synchronous internally.
 #[cfg(test)]
 pub(crate) async fn delete_note_inner(state: &AppState, id: &str) -> Result<(), AppError> {
-    delete_note_inner_notifying(state, id, None, Disposition::ToTrash).await
-}
-
-/// Bypass the trash and destroy the note outright — the pre-trash behavior, kept for the tests that
-/// assert the destructive cascade itself.
-#[cfg(test)]
-pub(crate) async fn delete_note_permanently_inner(
-    state: &AppState,
-    id: &str,
-) -> Result<(), AppError> {
-    delete_note_inner_notifying(state, id, None, Disposition::Permanent).await
+    delete_note_inner_notifying(state, id, None).await
 }
 
 async fn delete_note_inner_notifying(
     state: &AppState,
     id: &str,
     app: Option<&AppHandle>,
-    disposition: Disposition,
 ) -> Result<(), AppError> {
     let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Ok(()); // unknown id → idempotent no-op.
@@ -887,9 +876,7 @@ async fn delete_note_inner_notifying(
     // delete (verify-before-destroy inside). The exported vault `.md` IS still removed below: the
     // markdown lives in SQLCipher, so a restore re-exports it, and leaving a plaintext `.md` behind
     // for a "deleted" note would contradict the delete — and leak, for a locked folder.
-    if disposition.is_trash() {
-        super::trash_commands::capture_note(state, id)?;
-    }
+    super::trash_commands::capture_note(state, id)?;
 
     let attachment_owner = crate::storage::AttachmentOwner::Document {
         document_id: id.to_string(),

@@ -4514,35 +4514,6 @@ fn index_note_body_chunks(
 // because `list_user_facts_visible` filters by source-meeting `visibility_clause` on the live
 // unlocked snapshot. Forget/clear are bitemporal INVALIDATE (close valid_to), never a silent delete.
 
-/// Where a delete sends the content: into the recoverable trash, or straight to permanent
-/// destruction.
-///
-/// This exists so the destructive cascade stays ONE code path. The pre-trash behavior IS
-/// [`Disposition::Permanent`]; `ToTrash` differs in exactly two ways — a verified snapshot is
-/// captured first, and the meeting's AUDIO FILES are left on disk (the snapshot references them by
-/// path, and they are the only copy). Everything else — the org-share revoke, the gates, the row
-/// cascade, the note `.md` removal — is identical, so trash cannot drift from delete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Disposition {
-    /// Capture a restorable snapshot, keep the on-disk audio, and let the trash own the purge.
-    ToTrash,
-    /// Destroy everything now — the pre-trash behavior.
-    ///
-    /// `#[cfg(test)]` because production has no caller: every user-facing delete goes to the trash,
-    /// and the trash's own purge does NOT re-run this cascade (the rows are already gone by then —
-    /// `trash::purge_one` only has the on-disk audio left to remove). It exists so the tests that
-    /// assert the destructive cascade itself keep testing that cascade rather than the trash path.
-    /// If a "delete permanently, skip the trash" action is ever added, this is the variant it wants.
-    #[cfg(test)]
-    Permanent,
-}
-
-impl Disposition {
-    fn is_trash(self) -> bool {
-        matches!(self, Disposition::ToTrash)
-    }
-}
-
 /// Permanently delete a meeting: its audio file, its exported vault note, and all DB rows
 /// (segments, notes, timeline cascade via FK). Irreversible.
 ///
@@ -4555,8 +4526,7 @@ pub async fn delete_meeting(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<(), AppError> {
-    delete_meeting_inner_notifying(state.inner(), &meeting_id, Some(&app), Disposition::ToTrash)
-        .await?;
+    delete_meeting_inner_notifying(state.inner(), &meeting_id, Some(&app)).await?;
     emit_ask_history_invalidated_fail_closed(&app);
     crate::events::emit_content_deleted(&app, "meeting", &meeting_id);
     // The delete purged its audit findings (id-matched) — ping the FE inbox (count-only).
@@ -4571,24 +4541,13 @@ pub(crate) async fn delete_meeting_inner(
     state: &AppState,
     meeting_id: &str,
 ) -> Result<(), AppError> {
-    delete_meeting_inner_notifying(state, meeting_id, None, Disposition::ToTrash).await
-}
-
-/// Bypass the trash and destroy the meeting outright — the pre-trash behavior, kept for the tests
-/// that assert the destructive cascade itself.
-#[cfg(test)]
-pub(crate) async fn delete_meeting_permanently_inner(
-    state: &AppState,
-    meeting_id: &str,
-) -> Result<(), AppError> {
-    delete_meeting_inner_notifying(state, meeting_id, None, Disposition::Permanent).await
+    delete_meeting_inner_notifying(state, meeting_id, None).await
 }
 
 async fn delete_meeting_inner_notifying(
     state: &AppState,
     meeting_id: &str,
     app: Option<&AppHandle>,
-    disposition: Disposition,
 ) -> Result<(), AppError> {
     // Gate before the network revoke without selecting title/audio/note content. The await below can
     // span a relock, so this is only the early refusal; destructive authority is reacquired below.
@@ -4640,9 +4599,7 @@ async fn delete_meeting_inner_notifying(
     // re-parses it; if the content does not round-trip it returns Err and we bail here with NOTHING
     // mutated (verify-before-destroy). It also seals the snapshot immediately when this folder is
     // sealed, so a trashed recording is never at rest in plaintext behind a lock.
-    if disposition.is_trash() {
-        trash_commands::capture_meeting(state, meeting_id)?;
-    }
+    trash_commands::capture_meeting(state, meeting_id)?;
 
     let attachment_rows = state.db.attachments_for_meeting(meeting_id)?;
     remove_attachment_exports(
@@ -4655,21 +4612,13 @@ async fn delete_meeting_inner_notifying(
     // during a session-unlock, `session_unseal` decrypts the `.enc` to a plaintext WAV for playback
     // but KEEPS the `.enc`. So `audio_path` (plaintext form) alone would orphan the `.enc` on
     // record→lock→unlock→delete. Remove BOTH forms, exactly as the masters block below already does.
-    // TRASH: the audio files are the recording's ONLY copy and the snapshot references them by
-    // path, so a to-trash delete deliberately LEAVES them on disk. `trash::purge_one` removes every
-    // on-disk form (plaintext WAV, `.enc` twin, both masters) when the entry is finally purged —
-    // that is the same cleanup, moved to the moment the content actually stops being recoverable.
-    if !disposition.is_trash() {
-        if let Some(m) = state.db.get_meeting(meeting_id)? {
-            remove_meeting_audio_files(m.audio_path.as_deref());
-        }
-        // Masters too — a master path may be the plaintext WAV or its `.enc`; clear both forms.
-        if let Ok((mic, sys)) = state.db.get_meeting_master_paths(meeting_id) {
-            for p in [mic, sys].into_iter().flatten() {
-                remove_meeting_audio_files(Some(&p));
-            }
-        }
-    }
+    // TRASH: the audio files are DELIBERATELY LEFT ON DISK. They are the recording's only copy and
+    // the snapshot captured above references them by path, so unlinking here would make the trash
+    // entry unrestorable the instant it was created. `trash::purge_one` removes every on-disk form
+    // (plaintext WAV, `.enc` twin, both masters) when the entry is finally purged — the same
+    // cleanup this block used to do, moved to the moment the content actually stops being
+    // recoverable. `trash::seal_trash_meeting_audio` encrypts them if the folder is locked
+    // meanwhile, since `lock_folder` walks `meeting_ids_in_folder` and this row is gone.
     if let Some(note) = state.db.get_latest_note_for_meeting(meeting_id)? {
         if let Some(path) = note.exported_path.as_deref() {
             let _ = std::fs::remove_file(path);
