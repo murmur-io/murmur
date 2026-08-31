@@ -15862,7 +15862,32 @@
                 .unwrap()
                 .is_none());
             assert!(!fixture.mic_path.exists());
-            assert!(!fixture.archive_path.exists());
+
+            // TRASH (2026-08-31) — the contract CHANGED here, so the assertion moved rather than
+            // being dropped. `stage_released_archived_generation` passes `archive_path` to
+            // `finalize_meeting`, which records it as the meeting's `audio_path` — i.e. this file is
+            // the recording's PLAYBACK AUDIO, not a spent generation artifact like `mic_path` above.
+            // A delete now moves the recording to the Trash, and the snapshot references that file
+            // BY PATH, so unlinking it here would make the entry unrestorable the instant it was
+            // created: restore would hand back a silent meeting. The file is retained on purpose,
+            // and PURGING the entry is what reclaims it — which is asserted below, so this test
+            // still pins "the audio eventually goes away" instead of merely dropping the guarantee.
+            assert!(
+                fixture.archive_path.exists(),
+                "a to-trash delete must keep the playback audio — it is the only copy"
+            );
+            let entry = state
+                .db
+                .list_trash_entries()
+                .unwrap()
+                .into_iter()
+                .find(|e| e.source_id == meeting_id)
+                .expect("the delete moved the recording into the trash");
+            block_on(purge_one_for_test(&state, &entry.id)).unwrap();
+            assert!(
+                !fixture.archive_path.exists(),
+                "purging the trash entry reclaims the audio the delete kept"
+            );
         });
         std::fs::remove_dir_all(app_dir).unwrap();
     }
