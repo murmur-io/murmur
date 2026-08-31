@@ -564,3 +564,42 @@ fn received_items_inherit_their_containers_access() {
         "permission is inherited by the whole container, which is the point of sharing one"
     );
 }
+
+#[test]
+fn a_container_this_device_published_does_not_come_back_as_a_second_copy() {
+    // A self-share returns down the feed like anyone else's. Rendering it puts an empty duplicate
+    // of the user's own Space beside the real one — two "Sharing things" rows, one with content
+    // and one without, which is what a user actually hit.
+    let db = fresh_db("self-share");
+    seed_org(&db, "o1", "Siema");
+    received_container(&db, "o1", "c-mine", "Sharing things", "space", None);
+    received_container(&db, "o1", "c-theirs", "Partners", "space", None);
+    db.upsert_container_share(&ContainerShareRow {
+        id: "cs1".into(),
+        org_id: "o1".into(),
+        folder_id: "local-folder".into(),
+        container_id: "c-mine".into(),
+        access: "edit".into(),
+        scrub: true,
+        is_root: true,
+        state: "published".into(),
+        item_id: Some("item-c-mine".into()),
+        rev: 1,
+        generation: 1,
+        content_sha256: None,
+        position: 0,
+        last_error: None,
+        created_at: "t".into(),
+        updated_at: "t".into(),
+    })
+    .unwrap();
+    let state = state_with(db);
+
+    let workspace = build_shared_workspace(&state).unwrap();
+    let names: Vec<String> = workspace.spaces.iter().map(|s| s.name.clone()).collect();
+    assert_eq!(
+        names,
+        vec!["Partners".to_string()],
+        "only a container someone ELSE published belongs in the received forest"
+    );
+}

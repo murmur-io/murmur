@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Murmur — promo compositor</title>
+    <!--
+      STAGE 2 of scripts/promo (see ./README.md). This page IS the edit.
+
+      It takes the raw footage recorded by ./record.mjs (a numbered JPEG sequence
+      per scene, plus the camera and caption marks that scene authored) and lays
+      it out as the finished film: the app inside a macOS window on the product's
+      own aurora field, a keyframed camera, kinetic captions in the product's own
+      typeface, cross-dissolves between scenes, and an end card.
+
+      It renders ONE frame at a time on demand — `await window.seek(ms)` paints
+      the film at that instant and resolves when it is safe to screenshot. So the
+      output is deterministic: identical input gives identical frames, and a busy
+      machine drops nothing (which is exactly what a real-time screen recording
+      cannot promise).
+
+      Everything visual here comes from the app's own design tokens
+      (src/design-tokens/colors.css) and the app's own typeface, for the same
+      reason banner.html does it: a marketing asset that invents its own palette
+      drifts away from the product within one release.
+    -->
+    <style>
+      /* The product's self-hosted type, by relative path — same trick as
+         scripts/screenshots/banner.html. If this fails to load the film silently
+         falls back to the system sans and looks generic, so render.mjs asserts
+         document.fonts.check() before it captures anything. */
+      @font-face {
+        font-family: "Hanken Grotesk";
+        font-style: normal;
+        font-weight: 100 900;
+        src: url("../../src/assets/fonts/hanken-grotesk.woff2") format("woff2");
+      }
+
+      :root {
+        /* Literal values from src/design-tokens/colors.css. */
+        --surface-base: #07070b;
+        --text-primary: #f6f6fa;
+        --text-secondary: #a6a6b6;
+        --text-muted: #6c6c7d;
+        --accent: #6e76ff;
+        --accent-hover: #8a90ff;
+        --border: rgba(255, 255, 255, 0.09);
+        --font-sans: "Hanken Grotesk", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+
+        /* The one easing curve the whole film uses — a hard ease-in-out that
+           leaves slowly, crosses fast and settles gently. Sharing it across the
+           camera, the captions and the recorded cursor is what makes the motion
+           read as one rhythm rather than three animations. */
+        --ease: cubic-bezier(0.62, 0, 0.16, 1);
+      }
+
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+
+      html, body {
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: var(--surface-base);
+        font-family: var(--font-sans);
+        color: var(--text-primary);
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /* ── The ground: the aurora field the app's chrome rides on ──────────── */
+      #bg {
+        position: absolute;
+        inset: 0;
+        background:
+          radial-gradient(46% 62% at 8% 6%, rgba(110, 118, 255, 0.20), transparent 62%),
+          radial-gradient(42% 54% at 94% 96%, rgba(157, 123, 255, 0.15), transparent 64%),
+          radial-gradient(70% 90% at 50% 50%, rgba(20, 21, 38, 0.85), transparent 70%),
+          var(--surface-base);
+      }
+      /* A faint grain, so the large flat gradients do not band on H.264. */
+      #grain {
+        position: absolute;
+        inset: 0;
+        opacity: 0.035;
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/></filter><rect width='140' height='140' filter='url(%23n)'/></svg>");
+      }
+
+      /* ── The camera stage ────────────────────────────────────────────────── */
+      /* Each scene gets its own layer so a cross-dissolve can hold two framings
+         at once — the outgoing scene keeps its camera while the incoming one
+         fades in over the top with its own. */
+      .layer {
+        position: absolute;
+        inset: 0;
+        opacity: 0;
+        will-change: transform, opacity;
+        transform-origin: 0 0;
+      }
+
+      /* The macOS window. `titleBarStyle: Overlay` + `hiddenTitle` in
+         src-tauri/tauri.conf.json means the real app has NO title strip — the
+         traffic lights float over the rail's drag region — so the frame here is
+         a rounded, bordered screen with the lights overlaid, which is what a
+         viewer actually sees on their Mac. */
+      .device {
+        position: absolute;
+        border-radius: 15px;
+        overflow: hidden;
+        background: #07070b;
+        border: 1px solid rgba(255, 255, 255, 0.11);
+        box-shadow:
+          0 2px 5px rgba(0, 0, 0, 0.5),
+          0 26px 60px rgba(0, 0, 0, 0.62),
+          0 70px 150px rgba(0, 0, 0, 0.55);
+      }
+      .device img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: fill;
+      }
+      /* A lensing rim, so the window edge reads as glass rather than a cut-out. */
+      .device::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: 15px;
+        pointer-events: none;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10), inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+      }
+      .lights {
+        position: absolute;
+        display: flex;
+        gap: 8px;
+        z-index: 3;
+      }
+      .lights i {
+        width: 12px;
+        height: 12px;
+        border-radius: 999px;
+        display: block;
+        box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.35);
+      }
+      .lights i:nth-child(1) { background: #ff5f57; }
+      .lights i:nth-child(2) { background: #febc2e; }
+      .lights i:nth-child(3) { background: #28c840; }
+
+      /* ── Captions ────────────────────────────────────────────────────────── */
+      /* A scrim, only while a caption is up: white type over a screenshot needs
+         contrast, and a permanent vignette would darken the product. */
+      #scrim {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        opacity: 0;
+        background: linear-gradient(to top, rgba(4, 4, 8, 0.92) 0%, rgba(4, 4, 8, 0.55) 22%, rgba(4, 4, 8, 0) 46%);
+      }
+
+      #captions { position: absolute; inset: 0; pointer-events: none; }
+
+      /* The caption band is the ~190 px under the window (see the SW/SH note in
+         the script). These sizes are chosen so a caption's full stack — line,
+         rule, subtitle — fits inside that band and never lands on the app's own
+         bottom chrome while the camera is at rest. */
+      .cap { position: absolute; left: 0; right: 0; text-align: center; }
+      .cap.lower { bottom: 62px; }
+      .cap.hero { bottom: 46px; }
+
+      .cap .line {
+        font-weight: 600;
+        letter-spacing: -0.022em;
+        line-height: 1.12;
+        color: var(--text-primary);
+        text-shadow: 0 2px 22px rgba(0, 0, 0, 0.75);
+      }
+      .cap.hero .line { font-size: 58px; }
+      .cap.lower .line { font-size: 42px; }
+
+      /* Per-word spans are what make the caption land as motion rather than as a
+         block appearing. Each word rises and fades on the shared curve, offset
+         by a small stagger — the "kinetic type" the good product videos use. */
+      .cap .w {
+        display: inline-block;
+        opacity: 0;
+        transform: translateY(0.42em);
+        will-change: transform, opacity;
+      }
+
+      .cap .sub {
+        margin-top: 14px;
+        font-size: 23px;
+        font-weight: 500;
+        color: var(--text-secondary);
+        letter-spacing: -0.005em;
+        opacity: 0;
+        transform: translateY(0.4em);
+        text-shadow: 0 2px 18px rgba(0, 0, 0, 0.7);
+      }
+
+      /* The accent rule under a hero caption — the one place the brand colour
+         appears over footage. */
+      .cap.hero .rule {
+        width: 0;
+        height: 3px;
+        margin: 20px auto 0;
+        border-radius: 999px;
+        background: linear-gradient(90deg, transparent, var(--accent), transparent);
+      }
+
+      /* ── End card ────────────────────────────────────────────────────────── */
+      #endcard {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        opacity: 0;
+        background:
+          radial-gradient(48% 60% at 50% 46%, rgba(110, 118, 255, 0.16), transparent 66%),
+          var(--surface-base);
+      }
+      #endcard .inner { text-align: center; }
+      #endcard .mark {
+        width: 108px;
+        height: 108px;
+        margin: 0 auto 34px;
+        display: grid;
+        place-items: center;
+        border-radius: 30px;
+        background: rgba(110, 118, 255, 0.16);
+        border: 1px solid var(--border);
+        color: var(--accent-hover);
+        opacity: 0;
+        transform: scale(0.9);
+      }
+      #endcard .mark svg { width: 66px; height: 66px; }
+      #endcard h1 {
+        font-size: 84px;
+        font-weight: 600;
+        letter-spacing: -0.035em;
+        line-height: 1;
+        opacity: 0;
+        transform: translateY(0.3em);
+      }
+      #endcard .tag {
+        margin-top: 20px;
+        font-size: 30px;
+        font-weight: 500;
+        color: var(--text-secondary);
+        opacity: 0;
+        transform: translateY(0.3em);
+      }
+      #endcard .meta {
+        margin-top: 40px;
+        display: flex;
+        gap: 14px;
+        justify-content: center;
+        opacity: 0;
+        transform: translateY(0.3em);
+      }
+      #endcard .meta span {
+        font-size: 19px;
+        font-weight: 500;
+        color: var(--text-secondary);
+        padding: 9px 18px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.028);
+      }
+      #endcard .url {
+        margin-top: 44px;
+        font-size: 25px;
+        font-weight: 600;
+        color: var(--accent-hover);
+        letter-spacing: -0.01em;
+        opacity: 0;
+        transform: translateY(0.3em);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="bg"></div>
+    <div id="grain"></div>
+    <div id="stage"></div>
+    <div id="scrim"></div>
+    <div id="captions"></div>
+    <div id="endcard">
+      <div class="inner">
+        <!-- The five-bar waveform from the shell's `mur-icon "murmur"` glyph
+             (src/app/design-system/icon/icon.component.html) — the same mark the
+             app and the README banner use. -->
+        <div class="mark">
+          <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+            <rect x="2.4" y="7.9" width="2" height="4.2" rx="1" />
+            <rect x="5.7" y="5.8" width="2" height="8.4" rx="1" />
+            <rect x="9" y="3.7" width="2" height="12.6" rx="1" />
+            <rect x="12.3" y="5.8" width="2" height="8.4" rx="1" />
+            <rect x="15.6" y="7.9" width="2" height="4.2" rx="1" />
+          </svg>
+        </div>
+        <h1>Murmur</h1>
+        <p class="tag">Your meetings get a brain — and it stays on your Mac.</p>
+        <div class="meta">
+          <span>macOS 13.4+</span><span>Free &amp; open source</span><span>AGPL-3.0</span>
+        </div>
+        <p class="url">murmurnotes.io</p>
+      </div>
+    </div>
+
+    <script>
+      /* eslint-disable */
+      // ── Composition geometry ───────────────────────────────────────────────
+      const W = 1920;
+      const H = 1080;
+      /*
+       * The app screen inside the window, and where it sits.
+       *
+       * Two constraints fight here and both are load-bearing:
+       *
+       *  - The window should be big (it IS the content), but the captions must
+       *    not sit on top of the app's own bottom chrome. The first cut centred
+       *    a 1664-wide window and the hero caption landed across the Stop button
+       *    and the Ask Brain pill. So the window is parked HIGH and a ~190 px
+       *    band below it belongs to the captions alone. At rest they never
+       *    overlap; only a deep push-in puts type over pixels, which is normal.
+       *  - 1536 against a 1600 px capture is 0.96 CSS px per app px, and the
+       *    FOOTAGE is 2×. So a push-in stays pixel-native all the way to ~2.0×
+       *    (2.0 output px per app px vs 2 captured) — the headroom is the whole
+       *    reason to capture at 2× and deliver at 1×.
+       */
+      const SW = 1536;
+      const SH = 864;
+      const SX = (W - SW) / 2;
+      const SY = 22;
+
+      const XFADE = 620; // scene cross-dissolve, ms
+      const ENDCARD_MS = 5200;
+
+      // The film's one easing curve, matching the CSS `--ease` and the drawn
+      // cursor in ./cursor.js.
+      function bezier(x1, y1, x2, y2) {
+        const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+        const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+        const sx = (t) => ((ax * t + bx) * t + cx) * t;
+        const sy = (t) => ((ay * t + by) * t + cy) * t;
+        const dx = (t) => (3 * ax * t + 2 * bx) * t + cx;
+        return (x) => {
+          if (x <= 0) return 0;
+          if (x >= 1) return 1;
+          let t = x;
+          for (let i = 0; i < 8; i++) {
+            const err = sx(t) - x;
+            if (Math.abs(err) < 1e-6) break;
+            const d = dx(t);
+            if (Math.abs(d) < 1e-6) break;
+            t -= err / d;
+          }
+          return sy(t);
+        };
+      }
+      const EASE = bezier(0.62, 0, 0.16, 1);
+      const EASE_OUT = bezier(0.16, 0.84, 0.28, 1);
+      const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+      // ── The timeline ───────────────────────────────────────────────────────
+      // __promoManifest is injected by ./render.mjs (addInitScript), because a
+      // file:// page cannot fetch its own sibling JSON.
+      const M = window.__promoManifest;
+      const OPT = Object.assign(
+        { captions: true, endcard: true, framesBase: "", scenes: null },
+        window.__promoOptions || {},
+      );
+
+      let scenes = M.scenes.filter((s) => s.frames && s.frames.length);
+      if (OPT.scenes) scenes = scenes.filter((s) => OPT.scenes.includes(s.id));
+      if (!scenes.length) throw new Error("compose: no scenes with footage");
+
+      // Consecutive scenes overlap by XFADE, so the film has no hard cuts.
+      let cursor = 0;
+      for (const s of scenes) {
+        s.start = cursor;
+        cursor += s.dur - XFADE;
+      }
+      const footageEnd = scenes[scenes.length - 1].start + scenes[scenes.length - 1].dur;
+      // The end card fades up under the tail of the last scene.
+      const DURATION = OPT.endcard ? footageEnd + ENDCARD_MS - XFADE : footageEnd;
+      window.__promoDuration = DURATION;
+
+      // Captions carry absolute times and live above every layer: they are
+      // titles, so they sit in screen space and the camera never touches them.
+      const captions = [];
+      if (OPT.captions) {
+        for (const s of scenes) {
+          for (const c of s.captions) captions.push(Object.assign({}, c, { t: c.t + s.start }));
+        }
+      }
+
+      // ── Layers ─────────────────────────────────────────────────────────────
+      const stage = document.getElementById("stage");
+      const layers = scenes.map((s) => {
+        const layer = document.createElement("div");
+        layer.className = "layer";
+        const device = document.createElement("div");
+        device.className = "device";
+        device.style.left = SX + "px";
+        device.style.top = SY + "px";
+        device.style.width = SW + "px";
+        device.style.height = SH + "px";
+        const img = document.createElement("img");
+        img.decoding = "sync";
+        device.appendChild(img);
+        const lights = document.createElement("div");
+        lights.className = "lights";
+        // Standard macOS placement, in app-screen coordinates.
+        lights.style.left = 21 + "px";
+        lights.style.top = 20 + "px";
+        lights.innerHTML = "<i></i><i></i><i></i>";
+        device.appendChild(lights);
+        layer.appendChild(device);
+        stage.appendChild(layer);
+        return { scene: s, el: layer, img, shown: null };
+      });
+
+      /** The last frame whose timestamp is <= local time — i.e. hold the frame
+       *  through a still period rather than inventing motion. */
+      function frameAt(scene, local) {
+        const f = scene.frames;
+        let lo = 0, hi = f.length - 1, best = 0;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (f[mid].t <= local) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        return f[best];
+      }
+
+      /**
+       * Camera state at `local` ms into a scene. Keyframes are absolute targets
+       * authored during the take ({t, cx, cy, scale, ms}); between two of them
+       * the framing eases from the previous target to the next on the film's one
+       * curve. `cx/cy` are APP viewport coordinates — the point that should end
+       * up dead centre of the composition.
+       */
+      function cameraAt(scene, local) {
+        const rest = { cx: M.viewport.width / 2, cy: M.viewport.height / 2, scale: 1 };
+        let from = rest;
+        let cur = rest;
+        for (const kf of scene.camera) {
+          if (local < kf.t) break;
+          const p = EASE(clamp01((local - kf.t) / Math.max(1, kf.ms)));
+          cur = {
+            cx: from.cx + (kf.cx - from.cx) * p,
+            cy: from.cy + (kf.cy - from.cy) * p,
+            scale: from.scale + (kf.scale - from.scale) * p,
+          };
+          if (p >= 1) from = { cx: kf.cx, cy: kf.cy, scale: kf.scale };
+          else break;
+        }
+        return cur;
+      }
+
+      /**
+       * App-viewport point → composition point, then scale about it.
+       *
+       * The clamp is the difference between "a camera" and "a transform". Without
+       * it, focusing anything near an edge swings the frame off the window and
+       * fills half the shot with empty background — which is exactly what the
+       * first cut did when it pushed in on the Ask pill in the bottom-right.
+       *
+       * The clamp keeps the visible rectangle inside the app screen, and it
+       * degenerates gracefully: below the scale at which the screen can fill the
+       * frame (W/SW), `min > max`, so the camera sits dead centre and the whole
+       * window is in shot. As the push-in passes that threshold the legal range
+       * opens outward from the centre, so the camera earns its freedom to pan
+       * continuously rather than snapping into it.
+       *
+       * Consequence worth knowing when directing: a deep-edge target needs a
+       * deep zoom to reach. Aim at regions, not at 40 px controls.
+       */
+      function transformFor(cam) {
+        const k = SW / M.viewport.width;
+        const s = cam.scale;
+        let px = SX + cam.cx * k;
+        let py = SY + cam.cy * k;
+
+        const halfW = W / (2 * s);
+        const halfH = H / (2 * s);
+        const minX = SX + halfW, maxX = SX + SW - halfW;
+        const minY = SY + halfH, maxY = SY + SH - halfH;
+        px = minX > maxX ? SX + SW / 2 : Math.min(Math.max(px, minX), maxX);
+        py = minY > maxY ? SY + SH / 2 : Math.min(Math.max(py, minY), maxY);
+
+        return `translate(${W / 2}px, ${H / 2}px) scale(${s}) translate(${-px}px, ${-py}px)`;
+      }
+
+      // ── Captions ───────────────────────────────────────────────────────────
+      const capRoot = document.getElementById("captions");
+      const scrim = document.getElementById("scrim");
+      const IN_MS = 460;      // per-word rise
+      const STAGGER = 38;     // per-word offset
+      const OUT_MS = 340;
+
+      const capNodes = captions.map((c) => {
+        const el = document.createElement("div");
+        el.className = `cap ${c.kind === "hero" ? "hero" : "lower"}`;
+        const line = document.createElement("div");
+        line.className = "line";
+        for (const word of c.text.split(" ")) {
+          const w = document.createElement("span");
+          w.className = "w";
+          w.textContent = word;
+          line.appendChild(w);
+          line.appendChild(document.createTextNode(" "));
+        }
+        el.appendChild(line);
+        if (c.kind === "hero") {
+          const rule = document.createElement("div");
+          rule.className = "rule";
+          el.appendChild(rule);
+        }
+        if (c.sub) {
+          const sub = document.createElement("div");
+          sub.className = "sub";
+          sub.textContent = c.sub;
+          el.appendChild(sub);
+        }
+        capRoot.appendChild(el);
+        return {
+          c,
+          el,
+          words: [...el.querySelectorAll(".w")],
+          sub: el.querySelector(".sub"),
+          rule: el.querySelector(".rule"),
+        };
+      });
+
+      function paintCaptions(t) {
+        let scrimAlpha = 0;
+        for (const n of capNodes) {
+          const { c } = n;
+          const inDur = IN_MS + STAGGER * Math.max(0, n.words.length - 1);
+          const start = c.t;
+          const end = c.t + c.dur;
+          const local = t - start;
+          if (local < -50 || t > end + OUT_MS + 50) {
+            if (n.el.style.display !== "none") n.el.style.display = "none";
+            continue;
+          }
+          n.el.style.display = "";
+
+          // Fade-out is a block move: the whole caption leaves together.
+          const outP = t > end ? clamp01((t - end) / OUT_MS) : 0;
+          const groupOpacity = 1 - outP;
+          const groupLift = -10 * EASE_OUT(outP);
+          n.el.style.opacity = String(groupOpacity);
+          n.el.style.transform = `translateY(${groupLift}px)`;
+
+          n.words.forEach((w, i) => {
+            const p = EASE_OUT(clamp01((local - i * STAGGER) / IN_MS));
+            w.style.opacity = String(p);
+            w.style.transform = `translateY(${(1 - p) * 0.42}em)`;
+          });
+          if (n.rule) {
+            const p = EASE(clamp01((local - inDur * 0.35) / 620));
+            n.rule.style.width = `${p * 280}px`;
+          }
+          if (n.sub) {
+            const p = EASE_OUT(clamp01((local - inDur * 0.55) / IN_MS));
+            n.sub.style.opacity = String(p);
+            n.sub.style.transform = `translateY(${(1 - p) * 0.4}em)`;
+          }
+
+          // The scrim tracks the strongest caption on screen.
+          const rise = EASE_OUT(clamp01(local / 300));
+          scrimAlpha = Math.max(scrimAlpha, rise * groupOpacity);
+        }
+        scrim.style.opacity = String(scrimAlpha * 0.96);
+      }
+
+      // ── End card ───────────────────────────────────────────────────────────
+      const endcard = document.getElementById("endcard");
+      const ecMark = endcard.querySelector(".mark");
+      const ecH1 = endcard.querySelector("h1");
+      const ecTag = endcard.querySelector(".tag");
+      const ecMeta = endcard.querySelector(".meta");
+      const ecUrl = endcard.querySelector(".url");
+      const ecStart = footageEnd - XFADE;
+
+      function paintEndcard(t) {
+        if (!OPT.endcard) return;
+        const local = t - ecStart;
+        if (local < 0) {
+          endcard.style.opacity = "0";
+          return;
+        }
+        endcard.style.opacity = String(EASE(clamp01(local / XFADE)));
+        const step = (delay, dur, node, lift = 0.3, scale = false) => {
+          const p = EASE_OUT(clamp01((local - delay) / dur));
+          node.style.opacity = String(p);
+          node.style.transform = scale
+            ? `scale(${0.9 + 0.1 * p})`
+            : `translateY(${(1 - p) * lift}em)`;
+        };
+        step(XFADE * 0.5, 620, ecMark, 0, true);
+        step(XFADE * 0.5 + 180, 560, ecH1);
+        step(XFADE * 0.5 + 320, 560, ecTag);
+        step(XFADE * 0.5 + 520, 560, ecMeta);
+        step(XFADE * 0.5 + 700, 560, ecUrl);
+      }
+
+      // ── seek ───────────────────────────────────────────────────────────────
+      /**
+       * Paint the film at `t` ms and resolve once every image needed for this
+       * frame has actually decoded. Awaiting decode is the whole reason this is
+       * deterministic: a screenshot taken while an <img> is still decoding
+       * captures the PREVIOUS frame, which is exactly the class of bug that
+       * makes a rendered video stutter for reasons nobody can reproduce.
+       */
+      window.seek = async function seek(t) {
+        const pending = [];
+        for (const L of layers) {
+          const s = L.scene;
+          const local = t - s.start;
+          const active = local >= -1 && local < s.dur + 1;
+          if (!active) {
+            if (L.el.style.opacity !== "0") L.el.style.opacity = "0";
+            continue;
+          }
+          // The incoming scene fades up over the outgoing one; the first scene
+          // (and any scene past its dissolve) sits at full.
+          const isFirst = L === layers[0];
+          const op = isFirst ? 1 : clamp01(local / XFADE);
+          L.el.style.opacity = String(op);
+
+          const f = frameAt(s, Math.max(0, local));
+          if (L.shown !== f.file) {
+            L.img.src = `${OPT.framesBase}${s.id}/${f.file}`;
+            L.shown = f.file;
+            pending.push(L.img.decode().catch(() => {}));
+          }
+          L.el.style.transform = transformFor(cameraAt(s, Math.max(0, local)));
+        }
+        paintCaptions(t);
+        paintEndcard(t);
+        if (pending.length) await Promise.all(pending);
+        // Two rAFs: the first commits the style/DOM writes above, the second
+        // fires after the compositor has painted them.
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      };
+
+      window.__promoReady = true;
+    </script>
+  </body>
+</html>
