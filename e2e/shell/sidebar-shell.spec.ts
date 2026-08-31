@@ -214,10 +214,20 @@ test("the footer offers Capture plus a menu for the other create actions", async
   );
 
   await menu.getByRole("menuitem", { name: "New note" }).click();
-  // `/notes/new` creates the draft and hands off to that note's own route, so
-  // assert the destination is a note rather than the transient path.
-  await expect(page).toHaveURL(/\/notes\//);
+
+  // "New note" asks WHERE before it writes anything: the create sheet opens on
+  // the note kind rather than dropping a draft into the default note folder.
+  const sheet = page.getByRole("dialog", { name: "Create in Workspaces" });
+  await expect(sheet).toBeVisible();
   await expect(page.getByRole("menu")).toHaveCount(0);
+  await expect(
+    sheet.getByRole("button", { name: "Note", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(page).not.toHaveURL(/\/notes\//);
+
+  await sheet.getByRole("button", { name: /Acme/ }).click();
+  await sheet.getByRole("button", { name: "Create note" }).click();
+  await expect(page).toHaveURL(/\/notes\/n-new$/);
 });
 
 test("Quick note sits beside Capture and opens a blank note in one click", async ({

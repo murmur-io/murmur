@@ -144,6 +144,57 @@ h3 {
   font-size: 0.75rem;
 }
 
+/* "Somewhere that does not exist yet" — the same two-up shape as the kind
+   picker, one row below it, so arming a new destination reads as a choice about
+   PLACE rather than another item type. */
+.new-destination {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.new-destination button {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 0;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: 34px;
+  padding: 0 var(--space-2);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.new-destination button:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+/* Armed, the border goes solid-accent: a dashed outline says "could be created",
+   a solid one says "will be". */
+.new-destination button.is-armed {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* 0.74rem sits in the =<12px tier, so this takes `--text-tertiary` (5.50:1) and
+   not `--text-muted` (3.62:1) — see the note on the token. */
+.new-destination-hint {
+  color: var(--text-tertiary);
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
+.new-destination-hint strong {
+  color: var(--text-secondary);
+}
+
 .destination-list {
   display: flex;
   min-height: 92px;
