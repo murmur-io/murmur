@@ -64,10 +64,26 @@ export class TrashService {
    */
   private watchers = 0;
 
+  private destroyed = false;
+
   constructor() {
     // ONE subscription for the whole app: the backend emits a content-free count
     // whenever the trash changes, from any surface. Kept here (not in the view) so
     // the sidebar badge stays live while `/trash` is closed.
+    //
+    // The `destroyed` guard handles the destroy-before-resolve race the way
+    // {@link NotesService} does: `listen()` is async, so a service torn down while it
+    // is in flight would otherwise store the unlisten handle AFTER `onDestroy` already
+    // ran and leak the subscription.
+    //
+    // The `.catch()` matters for the E2E suite: its hand-written `invoke`/`listen`
+    // mocks do not know every event, and a rejected registration with no handler
+    // surfaces as an unhandled promise rejection that can fail an unrelated spec. A
+    // trash badge that never updates is the correct degradation here.
+    this.destroyRef.onDestroy(() => {
+      this.destroyed = true;
+      this.unlisten?.();
+    });
     void this.ipc
       .onTrashUpdated((p) => {
         this._count.set(p.count);
@@ -76,9 +92,15 @@ export class TrashService {
         }
       })
       .then((un) => {
-        this.unlisten = un;
+        if (this.destroyed) {
+          un();
+        } else {
+          this.unlisten = un;
+        }
+      })
+      .catch(() => {
+        // No listener: the badge stays at its last value. Never fatal.
       });
-    this.destroyRef.onDestroy(() => this.unlisten?.());
   }
 
   /**
