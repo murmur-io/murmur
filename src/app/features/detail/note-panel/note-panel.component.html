@@ -88,8 +88,9 @@
         <div class="confirm-text">
           <p class="confirm-title">Delete this meeting?</p>
           <p class="confirm-copy">
-            This permanently removes the recording, transcript, summary and the
-            note in your vault. This can’t be undone.
+            It moves to the Trash with its transcript, summary and audio, and is
+            removed for good after 30 days. The vault note is removed now and
+            re-exported if you restore it.
           </p>
           @if (deleteError(); as err) {
             <p class="confirm-error" role="alert">{{ err }}</p>
