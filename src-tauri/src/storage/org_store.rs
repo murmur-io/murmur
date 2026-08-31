@@ -176,7 +176,18 @@ impl Db {
         Ok(())
     }
 
-    #[cfg(test)]
+    /// Retire a source's closure record, making that id WRITABLE again.
+    ///
+    /// The closure exists so a teardown cannot race a concurrent write and so the org-sync tick can
+    /// never re-pull an item the user deleted. It is keyed on the source ID, and the delete path
+    /// leaves it in place — correct while the id is gone for good.
+    ///
+    /// TRASH RESTORE is the one case where a "deleted" id legitimately comes BACK, and the closure
+    /// then blocks the restore outright (`RAISE(ABORT,'meeting source is closing')` from the
+    /// `closing_*_guard` triggers). Clearing it is safe precisely because the delete already
+    /// REVOKED every live org share before destroying the rows (revoke-before-delete), so there is
+    /// no live server item left for the sync tick to re-pull: the restored content is local-only and
+    /// unshared until the user publishes it again.
     pub(crate) fn clear_org_source_closure(
         &self,
         source_kind: &str,

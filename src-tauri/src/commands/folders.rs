@@ -748,6 +748,29 @@ pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result
     // read gate. The note rows below are retained only to locate an optional exported Markdown file.
     let notes = state.db.notes_in_folder(&folder_id)?;
     let meeting_ids = state.db.meeting_ids_in_folder(&folder_id)?;
+
+    // TRASH CAPTURE — before ANY rehoming, because the member ids are what lets a restore put the
+    // contents back, and they stop being discoverable the moment the first meeting is re-filed.
+    //
+    // Re-read the folder row: `remove_lock_inner` above may have cleared `locked`/`wrapped_key`, and
+    // the snapshot must record the row as it now is. Note what this cannot recover: a sealed
+    // container's LOCK is permanently removed by the delete (it must be, or its content would be
+    // orphaned from its key), so a restored folder comes back OPEN — `FolderSnapshot::was_locked`
+    // carries that fact to the FE instead of letting the user assume the lock survived.
+    let snapshot_row = state.db.folder_by_id(&folder_id)?.unwrap_or(folder.clone());
+    let kind = state
+        .db
+        .folder_kind(&folder_id)?
+        .unwrap_or_else(|| "meeting".to_string());
+    let authored_note_ids = state.db.note_ids_in_folder(&folder_id)?;
+    super::trash_commands::capture_folder(
+        state,
+        &snapshot_row,
+        &kind,
+        &meeting_ids,
+        &authored_note_ids,
+    )?;
+
     for meeting_id in meeting_ids {
         // Reassign the canonical owner and every provider row atomically to the root.
         state.db.set_meeting_folder(&meeting_id, None)?;

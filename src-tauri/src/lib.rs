@@ -371,6 +371,16 @@ pub fn run() {
             commands::list_meetings,
             commands::search_meetings,
             commands::delete_meeting,
+            // TRASH — the 30-day recoverable holding area. `delete_meeting` / `delete_note` /
+            // `delete_folder` / `delete_note_folder` now route content HERE instead of destroying it.
+            commands::list_trash,
+            commands::count_trash,
+            commands::restore_trash_item,
+            commands::delete_trash_item_forever,
+            commands::empty_trash,
+            commands::purge_expired_trash,
+            commands::get_trash_retention_days,
+            commands::set_trash_retention_days,
             commands::rename_meeting,
             commands::chat_meeting,
             commands::chat_meeting_persisted,
@@ -1052,6 +1062,38 @@ pub fn run() {
                             crate::commands::ORG_SYNC_TICK_SECS,
                         ))
                         .await;
+                    }
+                });
+            }
+            // TRASH — the expired-entry purge loop. Rides the same shape as the memory/brief loops:
+            // re-reads live AppState each tick, warns-and-continues on any failure, never exits, and
+            // the FIRST tick is a full interval after launch (so a cold start is never competing with
+            // it). Cheap and quiet when the trash is empty. A SEALED entry is skipped by
+            // `purge_expired` rather than force-purged — the lock outranks the schedule, so a locked
+            // folder can hold expired entries past their date until the user unlocks it.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            crate::commands::TRASH_PURGE_TICK_SECS,
+                        ))
+                        .await;
+                        if let Some(state) = handle.try_state::<AppState>() {
+                            match crate::commands::purge_expired(state.inner(), Some(&handle)).await
+                            {
+                                Ok(n) if n > 0 => {
+                                    crate::events::emit_trash_updated(
+                                        &handle,
+                                        state.inner().db.count_trash_entries().unwrap_or(0),
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(target: "trash", error = %e, "expired-trash purge tick failed");
+                                }
+                            }
+                        }
                     }
                 });
             }
