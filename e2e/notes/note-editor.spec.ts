@@ -374,3 +374,76 @@ test("a locked note renders the lock gate (no body) with no console errors", asy
 
   expect(consoleErrors).toEqual([]);
 });
+
+/**
+ * The mode toggle: two GLYPHS, and which one starts pressed is decided by
+ * whether there is anything to read.
+ *
+ * Both halves were previously unpinned. The default (`note-editor.component.ts`
+ * `opensInPreview`) was only implied by the suite's `enterEditMode` helper —
+ * which is idempotent, so it passes in EITHER mode and therefore proved nothing.
+ * The labels were plain text, so nothing stopped a future change from dropping
+ * the accessible name along with them.
+ */
+test("the mode toggle is icon-only, and a note with a body starts in Preview", async ({
+  page,
+}) => {
+  await mockNotes(page);
+  await page.goto("/notes/n1");
+
+  const seg = page.getByRole("group", { name: "Edit or preview" });
+  const edit = seg.getByRole("button", { name: "Edit", exact: true });
+  const preview = seg.getByRole("button", { name: "Preview", exact: true });
+
+  // Named for assistive tech and for this suite, but carrying no visible text —
+  // the name now comes from `aria-label`, not from a label the eye can read.
+  await expect(edit).toBeVisible();
+  await expect(preview).toBeVisible();
+  await expect(seg).not.toContainText(/\S/);
+  await expect(edit.locator("svg")).toHaveCount(1);
+  await expect(preview.locator("svg")).toHaveCount(1);
+
+  // `get_note` returns "# Heading\n\nSome body text…", so there IS something to
+  // read: the note opens rendered, not as raw markdown in a textarea.
+  await expect(preview).toHaveAttribute("aria-pressed", "true");
+  await expect(edit).toHaveAttribute("aria-pressed", "false");
+  await expect(page.locator(".note-preview")).toBeVisible();
+  await expect(page.locator(".body-area")).toHaveCount(0);
+
+  // The toggle still toggles, and state is exposed programmatically rather than
+  // by colour alone.
+  await edit.click();
+  await expect(edit).toHaveAttribute("aria-pressed", "true");
+  await expect(preview).toHaveAttribute("aria-pressed", "false");
+  await expect(page.locator(".body-area")).toBeVisible();
+});
+
+test("a brand-new empty note starts in Edit, not in a read-only empty pane", async ({
+  page,
+}) => {
+  await mockNotes(page, {
+    get_note: (args: { id: string }) => ({
+      id: args.id,
+      title: "",
+      folderId: "nf1",
+      markdown: "",
+      tags: [],
+      properties: {},
+      updatedAt: 1_720_000_000_000,
+      createdAt: 1_720_000_000_000,
+      exportedPath: null,
+      locked: false,
+      shared: false,
+    }),
+  });
+  await page.goto("/notes/n1");
+
+  const seg = page.getByRole("group", { name: "Edit or preview" });
+  await expect(seg.getByRole("button", { name: "Edit", exact: true })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  // A read-only empty pane is a dead end where the user meant to start typing.
+  await expect(page.locator(".body-area")).toBeVisible();
+  await expect(page.locator(".note-preview")).toHaveCount(0);
+});
