@@ -624,6 +624,11 @@ impl OrgFeedNotifier for AppHandle {
 /// kind discriminator only — never a title or any other content.
 pub const EVENT_CONTENT_DELETED: &str = "murmur://content-deleted";
 
+/// The trash changed — something was moved in, restored, or purged. CONTENT-FREE: carries only the
+/// entry COUNT, so the sidebar badge updates without any surface learning a label or payload. Every
+/// consumer refetches through the gated `list_trash`, which masks a sealed entry.
+pub const EVENT_TRASH_UPDATED: &str = "murmur://trash-updated";
+
 /// Payload for [`EVENT_CONTENT_DELETED`]. `kind` is `"note"` | `"meeting"`; `id` is the deleted note's
 /// or meeting's id (an opaque identifier, not content).
 #[derive(Debug, Clone, Serialize)]
@@ -924,6 +929,26 @@ mod tests {
         assert_eq!(
             json,
             r#"{"documentId":"d1","stage":"done","done":0,"total":0,"truncated":true}"#
+        );
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashUpdatedPayload {
+    /// How many entries the trash now holds. NOT a list — no label, no payload, no ids.
+    pub count: i64,
+}
+
+/// Emit [`EVENT_TRASH_UPDATED`] to the FE (best-effort). Swallows the emit failure with a
+/// `tracing::warn!` so a failed emit can NEVER turn a successful trash/restore/purge into a
+/// reported failure. NO PII (a count only).
+pub fn emit_trash_updated(app: &AppHandle, count: i64) {
+    if let Err(e) = app.emit(EVENT_TRASH_UPDATED, TrashUpdatedPayload { count }) {
+        tracing::warn!(
+            target: "trash",
+            error = %e,
+            "failed to emit trash-updated notice"
         );
     }
 }

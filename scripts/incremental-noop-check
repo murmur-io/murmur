@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Assert an unchanged tree rebuilds NOTHING.
+
+ORACLE for a bug class that reached the developer (2026-08-31): `src-tauri/build.rs` declared
+`cargo:rerun-if-changed=afm/afm.swift` for a file that deliberately does not exist. Cargo reports a
+missing watched path as `StaleItem::MissingFile`, and that never clears — so the build script re-ran
+on EVERY cargo invocation and dragged a full recompile + relink of the 330k-line app crate with it.
+Measured: a no-op build cost 18.6 s; 0.33 s once fixed. It was paid by every `cargo test`,
+`cargo clippy`, `cargo build`, every dev-watcher rebuild, every harness check and three steps of
+this gate.
+
+The check is general within its scope, not a grep for that one path: for EVERY workspace member it
+repeats `cargo build` until nothing recompiles, and fails if that never happens. That covers a
+phantom `rerun-if-changed`, a build script writing into its own watched inputs, and a generated file
+with a moving mtime — in `src-tauri` AND in `crates/murmur-brain`, which `ci.sh` also builds.
+
+Only path-dependencies (our own crates) fail the gate. A registry crate rebuilding is reported but
+does not fail: it is not ours to fix, and a gate that goes red on someone else's build script is a
+gate the team turns off.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def build(manifest_dir: Path, json_output: bool) -> list:
+    """Run `cargo build`; return the parsed JSON messages when asked for them."""
+    cmd = ["cargo", "build"]
+    if json_output:
+        cmd.append("--message-format=json")
+    proc = subprocess.run(
+        cmd,
+        cwd=str(manifest_dir),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr[-4000:])
+        raise SystemExit(f"cargo build failed in {manifest_dir} (exit {proc.returncode})")
+    if not json_output:
+        return []
+    messages = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            messages.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return messages
+
+
+def stale_units(messages: list) -> tuple:
+    """(ours, theirs) — names of units the build recompiled instead of reusing."""
+    ours, theirs = set(), set()
+    for msg in messages:
+        if msg.get("reason") != "compiler-artifact" or msg.get("fresh") is not False:
+            continue
+        name = msg.get("target", {}).get("name", "?")
+        # A workspace/path member's package id is `path+file:///…`; a crates.io dep's is
+        # `registry+https://…`. Only our own crates are ours to fix.
+        if str(msg.get("package_id", "")).startswith("path+"):
+            ours.add(name)
+        else:
+            theirs.add(name)
+    return sorted(ours), sorted(theirs)
+
+
+# `ci.sh` builds BOTH workspace members, so the oracle must watch both. A phantom in
+# `crates/murmur-brain/build.rs` was demonstrably invisible to a src-tauri-only check.
+MANIFEST_DIRS = ("src-tauri", "crates/murmur-brain")
+
+# A healthy COLD tree self-dirties a bounded number of times before it settles: `build.rs` stages
+# `binaries/<helper>` on the first compile, and `binaries/murmur-brain` flips from the 0-byte
+# placeholder to the real binary — and `tauri_build` declares every `bundle.resources` entry as
+# `rerun-if-changed`. Rather than hard-code "two settling builds" (which was measured to have ZERO
+# margin on a cold runner), retry until a build comes back clean. A genuine phantom is PERMANENT and
+# can never settle, so it still fails — just after a few cheap sub-second builds.
+MAX_ATTEMPTS = 5
+
+
+def check_dir(manifest_dir: Path) -> bool:
+    """True when this directory reaches a state where a repeat build recompiles nothing."""
+    reported_third_party = False
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        ours, theirs = stale_units(build(manifest_dir, json_output=True))
+        if theirs and not reported_third_party:
+            print(f"  note: third-party units rebuilt in {manifest_dir}: {' '.join(theirs)}")
+            print("  (reported, not fatal — not our build scripts)")
+            reported_third_party = True
+        if not ours:
+            settled = "" if attempt == 1 else f" (settled after {attempt} builds)"
+            print(f"  ok — {manifest_dir} rebuilt nothing{settled}")
+            return True
+    print(f"  {manifest_dir}: a repeat `cargo build` still recompiled: {' '.join(ours)}")
+    print(f"  after {MAX_ATTEMPTS} attempts, so this is not a cold-tree settle — some input is")
+    print("  PERMANENTLY stale. Usual cause: a `cargo:rerun-if-changed` naming a path that does")
+    print("  not exist (cargo treats a missing watched path as permanently stale). Diagnose with:")
+    print(f"    cd {manifest_dir} && CARGO_LOG=cargo::core::compiler::fingerprint=info \\")
+    print("      cargo build 2>&1 | grep -i stale")
+    return False
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="fail if an unchanged tree recompiles anything")
+    ap.add_argument(
+        "--manifest-dir",
+        action="append",
+        default=None,
+        help="directory to run `cargo build` in; repeatable (default: every workspace member)",
+    )
+    args = ap.parse_args()
+    dirs = [Path(d) for d in (args.manifest_dir or [REPO_ROOT / d for d in MANIFEST_DIRS])]
+
+    if not all([check_dir(d) for d in dirs]):
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
