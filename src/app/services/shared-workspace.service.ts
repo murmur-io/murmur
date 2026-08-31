@@ -122,6 +122,24 @@ export class SharedWorkspaceService {
       });
   }
 
+  private ensureLoadedInFlight: Promise<void> | null = null;
+
+  /**
+   * Read the received forest unless it has been read already, coalescing
+   * concurrent callers. Both `app-workspace-tree` instances in the sidebar ask
+   * for this on construction, and neither sees the other's result yet — see the
+   * matching note on `WorkspaceService.ensureLoaded`.
+   */
+  ensureLoaded(): Promise<void> {
+    if (this._sharedBrains() !== null) {
+      return Promise.resolve();
+    }
+    this.ensureLoadedInFlight ??= this.load().finally(() => {
+      this.ensureLoadedInFlight = null;
+    });
+    return this.ensureLoadedInFlight;
+  }
+
   /**
    * Re-read the received forest and the outbound roster. Local reads only — no
    * network, because rendering a sidebar must never be an egress event.
