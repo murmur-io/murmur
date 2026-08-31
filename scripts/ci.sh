@@ -252,7 +252,16 @@ playwright_e2e() {
   # workers=2 (not 1): specs are page-side mocked and hermetic (private port, no server reuse, no
   # shared state), so spec-file-level parallelism is safe. macos-14 has 3 cores; 2 keeps contention
   # mild against the 30s per-test timeout with retries:0. Do NOT go to 3 without config retries:1.
-  npm run test:e2e -- --workers=2
+  #
+  # MURMUR_E2E_SHARD ("i/N") rozbija suite na rownolegle joby CI. Bez niego lecimy calosc, wiec
+  # `bash scripts/ci.sh web` odpalone recznie nadal jest PELNA bramka web — shardowanie jest
+  # wylacznie sposobem, w jaki workflow rozklada ta sama prace na wiecej runnerow.
+  if [ -n "${MURMUR_E2E_SHARD:-}" ]; then
+    echo "  shard ${MURMUR_E2E_SHARD}"
+    npm run test:e2e -- --workers=2 --shard="${MURMUR_E2E_SHARD}"
+  else
+    npm run test:e2e -- --workers=2
+  fi
 }
 
 audio_e2e() {
