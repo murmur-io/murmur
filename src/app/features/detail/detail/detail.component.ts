@@ -219,7 +219,7 @@ export class DetailComponent implements OnInit {
   // --- In-app delete confirmation state -----------------------------------
   /** True while the signal-driven delete-confirm panel is shown. */
   readonly confirmingDelete = signal(false);
-  /** True while a deleteMeeting IPC call is in flight (irreversible). */
+  /** True while a deleteMeeting IPC call is in flight (moves it to the Trash). */
   readonly deleting = signal(false);
   /** Inline error surfaced when the delete fails. */
   readonly deleteError = signal("");
