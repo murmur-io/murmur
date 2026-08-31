@@ -1014,7 +1014,8 @@ export class LibraryComponent implements OnInit {
   }
 
   /**
-   * Confirm the pending delete: await the irreversible IPC call, then prune the
+   * Confirm the pending delete: await the IPC call (which moves the recording to
+   * the Trash, recoverable for the retention window), then prune the
    * row from the local `meetings` signal (no full reload needed). On failure we
    * surface an inline error and keep the panel open so the user can retry.
    */

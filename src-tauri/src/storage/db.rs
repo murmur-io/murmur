@@ -1615,6 +1615,13 @@ impl Db {
         // re-gated at read time (`visibility_clause` / `meeting_is_unlocked`), so a board can
         // never become an ungated back door into a sealed folder.
         Self::migrate_dashboards(&conn)?;
+        // Trash — the 30-day recoverable holding area. Additive + guarded. Runs last for the same
+        // reason as dashboards: an entry's `source_folder_id` anchors to `folders`, so that table
+        // must already exist. NOTHING here is a second copy of live content — a row appears only
+        // when the user deletes something, and it is governed by its source folder's lock
+        // (`commands::trash::seal_trash_in_folder`), so it can never become an ungated back door
+        // into a sealed folder.
+        Self::migrate_trash(&conn)?;
         conn.commit().map_err(map_err)?;
         Ok(())
     }
