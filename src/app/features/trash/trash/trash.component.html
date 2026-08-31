@@ -105,15 +105,24 @@
   }
 
   @if (showSpinner()) {
-    <mur-empty-state>
-      <span class="context-spinner" aria-hidden="true"></span>
-      <p>Loading the Trash…</p>
-    </mur-empty-state>
+    <mur-empty-state><mur-spinner /> Loading the Trash…</mur-empty-state>
   } @else if (store.isEmpty()) {
     <mur-empty-state>
-      <mur-icon icon="trash" />
-      <h2>Trash is empty</h2>
-      <p>
+      <!-- An INLINE svg, not <mur-icon>: that component is `display: contents` because it is
+           built to be the flex child of a row (a nav item, a button), so standing alone in a
+           centered column it collapses and drifts to the left edge. Every other empty state in
+           the app draws its 44px mark inline for the same reason. -->
+      <svg class="empty-mark-icon" viewBox="0 0 44 44" fill="none" aria-hidden="true">
+        <path
+          d="M14 17h16m-11-3.5h6M17 17v13.5A1.5 1.5 0 0 0 18.5 32h7a1.5 1.5 0 0 0 1.5-1.5V17M20.5 21v7M23.5 21v7"
+          stroke="currentColor"
+          stroke-width="1.6"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <h2 class="empty-title">Trash is empty</h2>
+      <p class="empty">
         Anything you delete lands here for
         {{ store.retentionDays() }} days before it is removed for good.
       </p>

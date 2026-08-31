@@ -12,6 +12,7 @@ import {
   type ShellIcon,
 } from "../../../design-system/icon/icon.component";
 import { MurEmptyStateComponent } from "../../../design-system/empty-state/empty-state.component";
+import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 import { ToastService } from "../../../services/toast.service";
 import { TrashService } from "../../../services/trash.service";
 import type { TrashEntry, TrashKind } from "../../../core/models";
@@ -57,7 +58,7 @@ const RETENTION_CHOICES = [7, 14, 30, 60, 90] as const;
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./trash.component.html",
   styleUrl: "./trash.component.scss",
-  imports: [MurIconComponent, MurEmptyStateComponent],
+  imports: [MurIconComponent, MurEmptyStateComponent, MurSpinnerComponent],
 })
 export class TrashComponent implements OnInit {
   readonly store = inject(TrashService);
