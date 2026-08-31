@@ -186,12 +186,8 @@ export class WorkspaceTreeComponent {
       unregisterPrivacy();
       this.scrubOrganizeReview();
     });
-    if (this.workspace.workspaceEmpty()) {
-      void this.workspace.reload();
-    }
-    if (this.sharedWorkspace.sharedBrains() === null) {
-      void this.sharedWorkspace.load();
-    }
+    void this.workspace.ensureLoaded();
+    void this.sharedWorkspace.ensureLoaded();
   }
 
   /**
