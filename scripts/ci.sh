@@ -230,6 +230,13 @@ rust_gate() {
   echo "── cargo build ──"
   ( cd src-tauri && cargo build )
   cargo build -p murmur-brain
+
+  # An unchanged tree must rebuild NOTHING. Guards the class that cost 18.6 s on EVERY cargo
+  # command until 2026-08-31 (a `cargo:rerun-if-changed` in build.rs on a path that does not
+  # exist = permanent staleness). Runs right after `cargo build`, so the warm-up is already paid;
+  # the check itself is sub-second on a healthy tree. Rationale + diagnosis live in the script.
+  echo "── incremental no-op (nothing may recompile on an unchanged tree) ──"
+  python3 scripts/incremental-noop-check
 }
 
 web_gate() {
