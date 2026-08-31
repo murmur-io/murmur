@@ -41,6 +41,8 @@ import { FilingRecoveryBannerComponent } from "../features/workspace/filing-reco
 import { WorkspaceService } from "../features/workspace/workspace.service";
 import {
   WorkspaceCreateSheetComponent,
+  type WorkspaceCreateKind,
+  type WorkspaceCreateNewContainer,
   type WorkspaceCreateRequest,
 } from "../features/workspace/workspace-create-sheet/workspace-create-sheet.component";
 import { workspaceDestinations } from "../features/workspace/workspace-destination";
@@ -186,6 +188,7 @@ export class AppShellComponent {
   );
   private workspaceOrganizePlanGeneration = 0;
   readonly workspaceCreateOpen = signal(false);
+  readonly workspaceCreateKind = signal<WorkspaceCreateKind>("space");
   readonly workspaceCreateBusy = signal(false);
   readonly workspaceCreateError = signal<string | null>(null);
   readonly workspaceDestinations = computed(() =>
@@ -246,23 +249,36 @@ export class AppShellComponent {
     this.searchOpen.set(true);
   }
 
+  /**
+   * The Create menu's "New note" — a note you are deliberate about. It opens the
+   * create sheet on the note kind so the WHERE is answered before anything is
+   * written: an existing Workspace or folder, or a brand-new one made on the way.
+   *
+   * This deliberately does NOT go to `/notes/new`. That route creates the draft
+   * immediately in the default note folder, which is the right trade for the
+   * footer's Quick note button and the wrong one for a menu item whose whole
+   * point is choosing a home.
+   */
   newNote(): void {
+    this.searchOpen.set(false);
+    this.closeCreateMenu();
+    this.openWorkspaceCreate("note");
+  }
+
+  /**
+   * The footer's Quick note button — one click from anywhere to a blank note,
+   * with no modal and no menu in the way. It takes the `/notes/new` route, which
+   * creates the draft and replaces the URL with the real id; the note lands in
+   * the default note folder and can be moved later.
+   */
+  quickNote(): void {
     this.searchOpen.set(false);
     this.closeCreateMenu();
     void this.router.navigate(["/notes/new"]);
   }
 
-  /**
-   * The footer's Quick note button — one click from anywhere to a blank note,
-   * with no menu in the way. It lands on the SAME `/notes/new` create flow the
-   * Create menu's "New note" uses (that route creates the draft and replaces
-   * the URL with the real id), so there is one note-creation path, not two.
-   */
-  quickNote(): void {
-    this.newNote();
-  }
-
-  openWorkspaceCreate(): void {
+  openWorkspaceCreate(kind: WorkspaceCreateKind = "space"): void {
+    this.workspaceCreateKind.set(kind);
     this.workspaceCreateError.set(null);
     this.workspaceCreateOpen.set(true);
   }
@@ -281,6 +297,10 @@ export class AppShellComponent {
     }
     this.workspaceCreateBusy.set(true);
     this.workspaceCreateError.set(null);
+    // Hoisted so the catch can tell the two failures apart: "nothing happened"
+    // and "your new Workspace/folder DOES exist, the item in it does not" need
+    // different words, and there is no rolling a real container back.
+    let createdContainer: string | null = null;
     try {
       if (request.kind === "space") {
         const id = await this.workspace.createSpace(request.name);
@@ -289,43 +309,96 @@ export class AppShellComponent {
         this.toast.success(`Created Workspace “${request.name}”`);
         return;
       }
-      const target = request.target;
-      if (!target) {
-        this.workspaceCreateError.set("Choose a destination first.");
-        return;
-      }
-      if (request.kind === "note") {
-        const id = await this.workspace.createNote(
-          target.container.id,
-          request.name,
-        );
-        this.workspaceCreateOpen.set(false);
-        await this.router.navigate(["/notes", id]);
-      } else if (request.kind === "dashboard") {
-        const id = await this.workspace.createDashboard(
-          target.container.id,
-          request.name,
-        );
-        this.workspaceCreateOpen.set(false);
-        await this.router.navigate(["/dashboards", id]);
-      } else {
+      // A folder is the one non-space kind whose destination is a PARENT rather
+      // than a home, and it never brings a new container with it — so it keeps
+      // needing the selected container NODE, not just an id.
+      if (request.kind === "folder") {
+        const parent = request.target;
+        if (!parent) {
+          this.workspaceCreateError.set("Choose a destination first.");
+          return;
+        }
         const id = await this.workspace.createFolder(
-          target.container,
+          parent.container,
           request.name,
         );
         this.workspaceCreateOpen.set(false);
         await this.router.navigate(["/container", id]);
+        this.toast.success(`Created ${request.name} in ${parent.label}`);
+        return;
       }
-      this.toast.success(`Created ${request.name} in ${target.label}`);
+
+      // note | dashboard — an item that lands INSIDE a container, which the user
+      // may have asked us to create on the way.
+      const home = await this.resolveCreateHome(request);
+      if (!home) {
+        return;
+      }
+      if (request.newContainer) {
+        createdContainer = home.label;
+      }
+      const id =
+        request.kind === "note"
+          ? await this.workspace.createNote(home.id, request.name)
+          : await this.workspace.createDashboard(home.id, request.name);
+      this.workspaceCreateOpen.set(false);
+      await this.router.navigate([
+        request.kind === "note" ? "/notes" : "/dashboards",
+        id,
+      ]);
+      this.toast.success(`Created ${request.name} in ${home.label}`);
     } catch (error) {
-      const detail = this.workspaceErrorMessage(error);
+      const detail =
+        this.workspaceErrorMessage(error) ||
+        `Couldn’t create this ${request.kind}. Please check the name and try again.`;
       this.workspaceCreateError.set(
-        detail ||
-          `Couldn’t create this ${request.kind}. Please check the name and try again.`,
+        createdContainer
+          ? `${detail} “${createdContainer}” was created and is still there — the ${request.kind} was not.`
+          : detail,
       );
     } finally {
       this.workspaceCreateBusy.set(false);
     }
+  }
+
+  /**
+   * Where the item goes — creating that container first when the user asked for
+   * one that does not exist yet.
+   *
+   * The new container is addressed by the ID its create returned, deliberately
+   * NOT by looking the node back up in the refreshed forest: the item's create
+   * must not depend on a tree reload having landed, and an id is all
+   * `createNote`/`createDashboard` need.
+   *
+   * `null` means "already reported and nothing was written" — EXCEPT after a
+   * container was created, where the throw propagates instead, so the caller
+   * never silently retries a create that already succeeded.
+   */
+  private async resolveCreateHome(
+    request: WorkspaceCreateRequest,
+  ): Promise<{ id: string; label: string } | null> {
+    const pending: WorkspaceCreateNewContainer | null = request.newContainer;
+    if (!pending) {
+      const target = request.target;
+      if (!target) {
+        this.workspaceCreateError.set("Choose a destination first.");
+        return null;
+      }
+      return { id: target.container.id, label: target.label };
+    }
+    if (pending.kind === "space") {
+      const id = await this.workspace.createSpace(pending.name);
+      return { id, label: pending.name };
+    }
+    const parent = request.target;
+    if (!parent) {
+      this.workspaceCreateError.set(
+        "Choose the Workspace or folder that should hold the new folder.",
+      );
+      return null;
+    }
+    const id = await this.workspace.createFolder(parent.container, pending.name);
+    return { id, label: `${parent.label} / ${pending.name}` };
   }
 
   private workspaceErrorMessage(error: unknown): string | null {

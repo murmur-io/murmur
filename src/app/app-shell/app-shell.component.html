@@ -360,6 +360,7 @@
 @if (workspaceCreateOpen()) {
   <app-workspace-create-sheet
     [targets]="workspaceDestinations()"
+    [initialKind]="workspaceCreateKind()"
     [busy]="workspaceCreateBusy()"
     [error]="workspaceCreateError()"
     (create)="createInWorkspace($event)"
