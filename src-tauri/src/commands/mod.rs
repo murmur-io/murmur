@@ -207,6 +207,16 @@ pub use attachment_commands::*;
 mod lock_commands;
 pub use lock_commands::*;
 
+// TRASH — the 30-day recoverable holding area for deleted content (2026-08-31). A sibling of the
+// delete clusters rather than more of `mod.rs`: it owns its own at-rest snapshot format, its own
+// seal lifecycle (`seal_trash_in_folder` & friends, called from `seal_folder_extras`) and its own
+// purge schedule. The delete paths call INTO it (`trash::capture_*`) before their destructive
+// cascade; it never calls back into them. Reaches the shared gate/seal/AAD helpers through
+// `use super::*`, exactly like the other extracted command modules.
+#[path = "trash.rs"]
+mod trash_commands;
+pub use trash_commands::*;
+
 // ORG (Shared Brain / M6) + 1:1 LINK/USER SHARE (M3-client / M5) command surface — extracted verbatim
 // (God-file split, PURE MOVE — every read-gate / egress-consent / redaction-firewall / crypto-envelope
 // body is byte-identical, only relocated). The gated org/share READERS mask a sealed-not-unlocked
@@ -4504,6 +4514,35 @@ fn index_note_body_chunks(
 // because `list_user_facts_visible` filters by source-meeting `visibility_clause` on the live
 // unlocked snapshot. Forget/clear are bitemporal INVALIDATE (close valid_to), never a silent delete.
 
+/// Where a delete sends the content: into the recoverable trash, or straight to permanent
+/// destruction.
+///
+/// This exists so the destructive cascade stays ONE code path. The pre-trash behavior IS
+/// [`Disposition::Permanent`]; `ToTrash` differs in exactly two ways — a verified snapshot is
+/// captured first, and the meeting's AUDIO FILES are left on disk (the snapshot references them by
+/// path, and they are the only copy). Everything else — the org-share revoke, the gates, the row
+/// cascade, the note `.md` removal — is identical, so trash cannot drift from delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Capture a restorable snapshot, keep the on-disk audio, and let the trash own the purge.
+    ToTrash,
+    /// Destroy everything now — the pre-trash behavior.
+    ///
+    /// `#[cfg(test)]` because production has no caller: every user-facing delete goes to the trash,
+    /// and the trash's own purge does NOT re-run this cascade (the rows are already gone by then —
+    /// `trash::purge_one` only has the on-disk audio left to remove). It exists so the tests that
+    /// assert the destructive cascade itself keep testing that cascade rather than the trash path.
+    /// If a "delete permanently, skip the trash" action is ever added, this is the variant it wants.
+    #[cfg(test)]
+    Permanent,
+}
+
+impl Disposition {
+    fn is_trash(self) -> bool {
+        matches!(self, Disposition::ToTrash)
+    }
+}
+
 /// Permanently delete a meeting: its audio file, its exported vault note, and all DB rows
 /// (segments, notes, timeline cascade via FK). Irreversible.
 ///
@@ -4516,7 +4555,8 @@ pub async fn delete_meeting(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<(), AppError> {
-    delete_meeting_inner_notifying(state.inner(), &meeting_id, Some(&app)).await?;
+    delete_meeting_inner_notifying(state.inner(), &meeting_id, Some(&app), Disposition::ToTrash)
+        .await?;
     emit_ask_history_invalidated_fail_closed(&app);
     crate::events::emit_content_deleted(&app, "meeting", &meeting_id);
     // The delete purged its audit findings (id-matched) — ping the FE inbox (count-only).
@@ -4531,13 +4571,24 @@ pub(crate) async fn delete_meeting_inner(
     state: &AppState,
     meeting_id: &str,
 ) -> Result<(), AppError> {
-    delete_meeting_inner_notifying(state, meeting_id, None).await
+    delete_meeting_inner_notifying(state, meeting_id, None, Disposition::ToTrash).await
+}
+
+/// Bypass the trash and destroy the meeting outright — the pre-trash behavior, kept for the tests
+/// that assert the destructive cascade itself.
+#[cfg(test)]
+pub(crate) async fn delete_meeting_permanently_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<(), AppError> {
+    delete_meeting_inner_notifying(state, meeting_id, None, Disposition::Permanent).await
 }
 
 async fn delete_meeting_inner_notifying(
     state: &AppState,
     meeting_id: &str,
     app: Option<&AppHandle>,
+    disposition: Disposition,
 ) -> Result<(), AppError> {
     // Gate before the network revoke without selecting title/audio/note content. The await below can
     // span a relock, so this is only the early refusal; destructive authority is reacquired below.
@@ -4584,6 +4635,15 @@ async fn delete_meeting_inner_notifying(
         ));
     }
 
+    // TRASH CAPTURE — the LAST thing before anything is destroyed, and the FIRST thing that can
+    // abort the delete. `capture_meeting` writes the snapshot, reads it back out of SQLCipher and
+    // re-parses it; if the content does not round-trip it returns Err and we bail here with NOTHING
+    // mutated (verify-before-destroy). It also seals the snapshot immediately when this folder is
+    // sealed, so a trashed recording is never at rest in plaintext behind a lock.
+    if disposition.is_trash() {
+        trash_commands::capture_meeting(state, meeting_id)?;
+    }
+
     let attachment_rows = state.db.attachments_for_meeting(meeting_id)?;
     remove_attachment_exports(
         &attachment_rows,
@@ -4595,13 +4655,19 @@ async fn delete_meeting_inner_notifying(
     // during a session-unlock, `session_unseal` decrypts the `.enc` to a plaintext WAV for playback
     // but KEEPS the `.enc`. So `audio_path` (plaintext form) alone would orphan the `.enc` on
     // record→lock→unlock→delete. Remove BOTH forms, exactly as the masters block below already does.
-    if let Some(m) = state.db.get_meeting(meeting_id)? {
-        remove_meeting_audio_files(m.audio_path.as_deref());
-    }
-    // Masters too — a master path may be the plaintext WAV or its `.enc`; clear both forms.
-    if let Ok((mic, sys)) = state.db.get_meeting_master_paths(meeting_id) {
-        for p in [mic, sys].into_iter().flatten() {
-            remove_meeting_audio_files(Some(&p));
+    // TRASH: the audio files are the recording's ONLY copy and the snapshot references them by
+    // path, so a to-trash delete deliberately LEAVES them on disk. `trash::purge_one` removes every
+    // on-disk form (plaintext WAV, `.enc` twin, both masters) when the entry is finally purged —
+    // that is the same cleanup, moved to the moment the content actually stops being recoverable.
+    if !disposition.is_trash() {
+        if let Some(m) = state.db.get_meeting(meeting_id)? {
+            remove_meeting_audio_files(m.audio_path.as_deref());
+        }
+        // Masters too — a master path may be the plaintext WAV or its `.enc`; clear both forms.
+        if let Ok((mic, sys)) = state.db.get_meeting_master_paths(meeting_id) {
+            for p in [mic, sys].into_iter().flatten() {
+                remove_meeting_audio_files(Some(&p));
+            }
         }
     }
     if let Some(note) = state.db.get_latest_note_for_meeting(meeting_id)? {
@@ -4651,7 +4717,7 @@ pub(crate) fn remove_rollup_exports_before_seal_purge(db: &Db) -> Result<(), App
 /// record→lock→Touch-ID-unlock→delete leaves the `.enc` orphaned on disk. This is disk-residue
 /// cleanup, NOT a security gate (the plaintext WAV is removed regardless). Mirrors the masters block
 /// in `delete_meeting`. `None` is a no-op.
-fn remove_meeting_audio_files(audio_path: Option<&str>) {
+pub(crate) fn remove_meeting_audio_files(audio_path: Option<&str>) {
     let Some(p) = audio_path else { return };
     let _ = std::fs::remove_file(p); // the path as recorded (plaintext WAV or the `.enc`).
     let _ = std::fs::remove_file(format!("{p}{ENC_SUFFIX}")); // its sealed `.enc` twin.
@@ -11277,6 +11343,18 @@ fn aad_document(folder_id: &str, document_id: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// AAD for a TRASH snapshot's sealed blobs. Bound to `folder_id | entry_id | part | schema_version`,
+/// where `part` is `"label"` or `"payload"` — the two are sealed separately, so binding the part
+/// keeps a payload blob from being swapped into the label column (or vice versa) and decrypted
+/// there. Anchored on the SOURCE FOLDER, the same lock unit that governed the content before it was
+/// deleted, so a snapshot blob cannot be lifted onto another folder's entry and read (B7).
+pub(crate) fn aad_trash(folder_id: &str, entry_id: &str, part: &str) -> Vec<u8> {
+    format!(
+        "murmur:trash:v{AAD_SCHEMA_VERSION}|folder={folder_id}|entry={entry_id}|part={part}"
+    )
+    .into_bytes()
+}
+
 /// The ROLE-LESS audio AAD (the historical B8 form): bound to `meeting_id | folder_id`. Retained as
 /// the lower rung of the decrypt ladder so masters/playback sealed BEFORE stream-role binding (which
 /// carry exactly this NON-empty AAD) still decrypt — see [`aad_audio_role`] and
@@ -11560,6 +11638,11 @@ pub(crate) fn seal_folder_extras(db: &Db, folder_id: &str, ck: &[u8; 32]) -> Res
         }
         db.seal_document(&d.id, &blob)?;
     }
+    // TRASH: a snapshot captured while this folder was OPEN holds plaintext content that this lock is
+    // now supposed to be protecting. Seal it under the same CK (verify-before-destroy inside), or a
+    // locked folder's deleted-but-recoverable content would stay readable at rest — the exact gap the
+    // capture-time seal cannot close, because at capture time the folder was not locked yet.
+    trash_commands::seal_trash_in_folder(db, folder_id, ck)?;
     Ok(())
 }
 
@@ -12225,6 +12308,11 @@ pub(crate) fn unseal_folder_extras(
     // silently skipped) while everything that CAN be restored already has been.
     unseal_dashboards_in_folder(&state.db, folder_id, ck)?;
 
+    // TRASH: decrypt this folder's snapshots back into their plaintext columns FOR THE SESSION
+    // (blobs kept — the folder is still locked on disk), so the Trash view stops masking them and
+    // restore is permitted while the folder is unlocked.
+    trash_commands::unseal_trash_in_folder(&state.db, folder_id, ck)?;
+
     Ok(())
 }
 
@@ -12889,6 +12977,10 @@ fn reblank_folder_extras_after_verification(
             }
         }
     }
+    // TRASH: re-blank the session plaintext of this folder's snapshots, keeping their blobs. Guarded
+    // on the blob being present, so it can never blank the ONLY copy of an entry that was never
+    // sealed — the same guard the note/document reblank uses.
+    trash_commands::reblank_trash_in_folder(&state.db, folder_id)?;
     Ok(())
 }
 
@@ -13015,6 +13107,11 @@ pub(crate) fn unseal_folder_extras_permanent(
     // permanent one running boards first would have been a fix that looked complete and covered
     // the less important half.
     unseal_dashboards_in_folder(&state.db, folder_id, ck)?;
+
+    // TRASH: permanently decrypt this folder's snapshots — plaintext restored FIRST, ciphertext
+    // dropped only after it is durably readable. The lock is going away for good, so an entry left
+    // with only a blob and no key would be unrecoverable content loss.
+    trash_commands::unseal_trash_in_folder_permanent(&state.db, folder_id, ck)?;
 
     Ok(sealed_audio_to_retire)
 }
@@ -14291,6 +14388,10 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "tests/attachment_tests.rs"]
 mod attachment_tests;
+
+#[cfg(test)]
+#[path = "tests/trash_tests.rs"]
+mod trash_tests;
 
 // ─── Task 1.4 — gateway key command argument validation ────────────────────────────────────────
 #[cfg(test)]
