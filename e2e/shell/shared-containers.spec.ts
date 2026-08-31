@@ -3,9 +3,9 @@ import { expect, test, type Page } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
 /**
- * Shared containers in the Spaces sidebar: a received Space as its own
+ * Shared containers in the Workspaces sidebar: a received Workspace as its own
  * top-level row, loose received content inside the virtual "Shared Brains"
- * Space, the shared marker on both sides, and the read-only structure a
+ * Workspace, the shared marker on both sides, and the read-only structure a
  * received container keeps at every access level.
  *
  * Every fixture key below was copied from the RUST DTOs
@@ -141,21 +141,20 @@ async function openSidebar(
     },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
   await expect(
-    page.getByRole("complementary", { name: "Spaces sidebar" }),
+    page.getByRole("navigation", { name: "Primary navigation" }),
   ).toBeVisible();
 }
 
-test("a received Space is its own top-level sidebar row", async ({ page }) => {
+test("a received Workspace is its own top-level sidebar row", async ({ page }) => {
   await openSidebar(page);
   const partners = page.getByRole("treeitem", { name: /Partners/ });
   await expect(partners).toBeVisible();
-  // Top level, beside the user's own Spaces — not buried inside Shared Brains.
+  // Top level, beside the user's own Workspaces — not buried inside Shared Brains.
   await expect(partners).toHaveAttribute("aria-level", "1");
 });
 
-test("loose received content lives inside the virtual Shared Brains Space", async ({
+test("loose received content lives inside the virtual Shared Brains Workspace", async ({
   page,
 }) => {
   await openSidebar(page);
@@ -196,7 +195,7 @@ test("a received container offers arrangement but never structure", async ({
   await partners.getByRole("button", { name: /Actions for shared/ }).click();
 
   // The user may file it in their OWN tree — that is device-local.
-  await expect(page.getByRole("menuitem", { name: /Keep in my Space/ })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: /Keep in my Workspace/ })).toBeVisible();
 
   // But its structure belongs to whoever shared it, at ANY access level.
   await expect(page.getByRole("menuitem", { name: /^Rename/ })).toHaveCount(0);
@@ -206,7 +205,7 @@ test("a received container offers arrangement but never structure", async ({
   ).toHaveCount(0);
 });
 
-test("a local Space offers Share to Org, and a sealed one does not", async ({
+test("a local Workspace offers Share to Org, and a sealed one does not", async ({
   page,
 }) => {
   await openSidebar(page);
@@ -253,7 +252,7 @@ test("the share sheet names what is left behind before anything leaves", async (
   await acme.getByRole("button", { name: /Actions for Acme/ }).click();
   await page.getByTestId("share-container").click();
 
-  const sheet = page.getByRole("dialog", { name: /Share this Space/ });
+  const sheet = page.getByRole("dialog", { name: /Share this Workspace/ });
   await expect(sheet).toBeVisible();
   // The counts, and — the honesty invariant — what is deliberately NOT going.
   await expect(sheet.getByText(/3 notes/)).toBeVisible();
@@ -268,7 +267,7 @@ test("the share sheet names what is left behind before anything leaves", async (
   ).toHaveAttribute("aria-pressed", "true");
 });
 
-test("a received Space can be filed under a local Space, privately", async ({
+test("a received Workspace can be filed under a local Workspace, privately", async ({
   page,
 }) => {
   await mockTauri(
@@ -291,7 +290,6 @@ test("a received Space can be filed under a local Space, privately", async ({
     },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
 
   const partners = page.getByRole("treeitem", { name: /Partners/ });
   await partners.getByRole("button", { name: /Actions for shared/ }).click();
@@ -324,7 +322,7 @@ test("a received Space can be filed under a local Space, privately", async ({
 test("a nested received folder can be filed too, and renders in exactly one place", async ({
   page,
 }) => {
-  // The "Keep in my Space…" action is offered on EVERY received container, so
+  // The "Keep in my Workspace…" action is offered on EVERY received container, so
   // the merge must find a nested one's placement as well — and must not then
   // render it under BOTH its shared parent and its new local host.
   const placed = {
@@ -351,7 +349,6 @@ test("a nested received folder can be filed too, and renders in exactly one plac
     },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
 
   // Expand both possible hosts, then assert the row exists exactly once.
   await page
@@ -402,7 +399,6 @@ test("a received loose item and an own standalone share each carry the marker", 
     },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
   await page
     .getByRole("treeitem", { name: /Acme/ })
     .getByRole("button", { name: /Expand/ })

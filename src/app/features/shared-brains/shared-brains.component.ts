@@ -213,6 +213,6 @@ export class SharedBrainsComponent {
     const normalized = raw.replace(/^invalid argument:\s*/i, "").trim();
     return normalized
       ? normalized.slice(0, 240)
-      : "Couldn’t add this shared item to the selected Space. Please try again.";
+      : "Couldn’t add this shared item to the selected Workspace. Please try again.";
   }
 }

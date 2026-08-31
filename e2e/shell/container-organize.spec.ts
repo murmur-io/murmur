@@ -198,8 +198,7 @@ async function open(page: Page): Promise<void> {
     (globalThis as unknown as { __plan: unknown }).__plan = plan;
   }, PLAN);
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
-  await expect(page.getByRole("tree", { name: "Spaces" })).toBeVisible();
+  await expect(page.getByRole("tree", { name: "Workspaces" })).toBeVisible();
 }
 
 /**

@@ -99,8 +99,7 @@ async function open(page: Page): Promise<void> {
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
-  await expect(page.getByRole("tree", { name: "Spaces" })).toBeVisible();
+  await expect(page.getByRole("tree", { name: "Workspaces" })).toBeVisible();
   await page.getByRole("button", { name: "Expand Acme" }).click();
 }
 
@@ -197,7 +196,7 @@ test("a sealed container is not a drop target", async ({ page }) => {
  * # What shipped broken
  *
  * Every test above passed — in Chromium AND WebKit — while dragging a row in the shipped app did
- * nothing at all. The row picked up and followed the cursor, no Space ever armed, no drop ever
+ * nothing at all. The row picked up and followed the cursor, no Workspace ever armed, no drop ever
  * landed. The tests were not lying: the DOM half is correct, and Playwright dispatches the drag
  * straight into the engine. The app has a native layer in front of the engine, and Playwright has
  * no way to put one there.

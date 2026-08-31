@@ -15,8 +15,8 @@
     "windows": [
       {
         "title": "Murmur",
-        "width": 900,
-        "height": 680,
+        "width": 1170,
+        "height": 884,
         "visible": false,
         "dragDropEnabled": false,
         "titleBarStyle": "Overlay",

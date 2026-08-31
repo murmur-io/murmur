@@ -77,8 +77,8 @@ export interface TreeLine {
   seeAll?: boolean;
   /** Full visible item count across every kind in this container. */
   total?: number;
-  /** Present only on a RECEIVED container row (a shared Space, folder, or the
-   * virtual Shared Brains Space). */
+  /** Present only on a RECEIVED container row (a shared Workspace, folder, or the
+   * virtual Shared Brains Workspace). */
   shared?: SharedContainerNode;
   /** Present only on a RECEIVED item row. */
   sharedItem?: SharedItemRow;
@@ -154,6 +154,18 @@ export class WorkspaceTreeComponent {
   readonly currentPath = input("");
 
   /**
+   * Which half of the forest this instance renders. The sidebar mounts the tree
+   * TWICE — once for the user's own Workspaces, once for what an org shared with
+   * them — so the two never interleave and a colleague's structure cannot be
+   * mistaken for the user's own.
+   *
+   * Shared content the user has PRIVATELY FILED under a local container is not
+   * affected: `pushContainer` still emits it in place, because they put it
+   * there. Only unplaced shared roots move to the shared section.
+   */
+  readonly scope = input<"own" | "shared">("own");
+
+  /**
    * Load the forest when this tree first appears.
    *
    * The section header's toggle also reloads, but it cannot be the only trigger:
@@ -174,12 +186,8 @@ export class WorkspaceTreeComponent {
       unregisterPrivacy();
       this.scrubOrganizeReview();
     });
-    if (this.workspace.workspaceEmpty()) {
-      void this.workspace.reload();
-    }
-    if (this.sharedWorkspace.sharedBrains() === null) {
-      void this.sharedWorkspace.load();
-    }
+    void this.workspace.ensureLoaded();
+    void this.sharedWorkspace.ensureLoaded();
   }
 
   /**
@@ -258,13 +266,18 @@ export class WorkspaceTreeComponent {
    */
   protected readonly lines = computed<TreeLine[]>(() => {
     const out: TreeLine[] = [];
-    for (const project of this.workspace.forest()) {
-      this.pushContainer(out, project, 0);
+    if (this.scope() === "own") {
+      for (const project of this.workspace.forest()) {
+        this.pushContainer(out, project, 0);
+      }
+      return out;
     }
-    // Received content comes LAST at the top level: a shared Space is the
-    // user's colleague's, not theirs, and it should not push their own Spaces
-    // down the sidebar. Anything they have privately filed under a local
-    // container was already emitted inside `pushContainer`.
+    // Received content now has its own section rather than trailing the user's
+    // own Workspaces. Anything privately filed under a local container was
+    // already emitted by `pushContainer` in the "own" pass, so it is skipped
+    // here — otherwise "Keep in my Workspace…" would render it twice, or (when
+    // this pass is the only one that emits it) leave it in Shared and make the
+    // action look like it did nothing.
     for (const space of this.unplacedSharedRoots()) {
       this.pushShared(out, space, 0);
     }
@@ -276,8 +289,9 @@ export class WorkspaceTreeComponent {
   });
 
   /**
-   * Received Spaces the user has NOT filed anywhere of their own — those render
-   * at the top level. A placed one is emitted under its host container instead.
+   * Received Workspaces the user has NOT filed anywhere of their own — those
+   * render at the top of the Shared section. A placed one is emitted under its
+   * host container in the "own" pass instead.
    */
   private readonly unplacedSharedRoots = computed(() =>
     this.sharedWorkspace.spaces().filter((node) => !node.localParentId),
@@ -287,10 +301,10 @@ export class WorkspaceTreeComponent {
    * Received nodes this user privately filed under a local container, indexed by
    * that container.
    *
-   * Walks the WHOLE received forest, not just its roots: the "Keep in my Space…"
-   * action is offered on every received container, including a nested one, and a
-   * placement the merge could not find would be an affordance that silently does
-   * nothing.
+   * Walks the WHOLE received forest, not just its roots: the "Keep in my
+   * Workspace…" action is offered on every received container, including a
+   * nested one, and a placement the merge could not find would be an affordance
+   * that silently does nothing.
    */
   private readonly sharedByLocalParent = computed(() => {
     const map = new Map<string, SharedContainerNode[]>();
@@ -323,6 +337,15 @@ export class WorkspaceTreeComponent {
     }
     return ids;
   });
+
+  /** True while this section has nothing of its own to render. */
+  protected readonly sectionEmpty = computed(() =>
+    this.scope() === "own"
+      ? this.workspace.workspaceEmpty()
+      : this.lines().length === 0,
+  );
+
+  protected readonly isOwnScope = computed(() => this.scope() === "own");
 
   private readonly _expandedShared = signal<ReadonlySet<string>>(
     readStoredSharedSet(),
@@ -572,10 +595,10 @@ export class WorkspaceTreeComponent {
       (container.groups.length > 0 ||
         container.folders.length > 0 ||
         // Received content the user has privately filed here counts as content
-        // for the purpose of the caret. Without this, filing a shared Space into
-        // an EMPTY local Space would hide it: the host has nothing of its own,
-        // so it would render with no way to expand and reveal what was just put
-        // inside it.
+        // for the purpose of the caret. Without this, filing a shared Workspace
+        // into an EMPTY local one would hide it: the host has nothing of its
+        // own, so it would render with no way to expand and reveal what was
+        // just put inside it.
         (this.sharedByLocalParent().get(container.id)?.length ?? 0) > 0)
     );
   }
@@ -653,7 +676,7 @@ export class WorkspaceTreeComponent {
   }
 
   /**
-   * Open a received container. The virtual Shared Brains Space has no container
+   * Open a received container. The virtual Shared Brains Workspace has no container
    * of its own — it is a view over everything loose — so it opens the list route
    * with its per-org filter.
    */
@@ -708,7 +731,7 @@ export class WorkspaceTreeComponent {
    * The received node the user is filing somewhere of their own, if any.
    *
    * Reuses the ordinary move sheet, deliberately: to the user this IS a move —
-   * "put that shared Space in my Clients Space". What differs is invisible to
+   * "put that shared Workspace in my Clients Workspace". What differs is invisible to
    * them and load-bearing underneath: nothing is published, the owner sees
    * nothing, and the content keeps updating from the org feed.
    */
@@ -1171,7 +1194,7 @@ export class WorkspaceTreeComponent {
    */
   protected lockLabel(container: ContainerNode): string {
     const nested = container.folders.length;
-    const noun = container.level === "project" ? "Space" : "folder";
+    const noun = container.level === "project" ? "Workspace" : "folder";
     if (nested === 0) {
       return `Lock ${noun}`;
     }
@@ -1189,7 +1212,7 @@ export class WorkspaceTreeComponent {
     const nested = container.folders.length;
     return nested === 0
       ? "Unlock for this session"
-      : `Unlock this ${container.level === "project" ? "Space" : "folder"} and its folders for this session`;
+      : `Unlock this ${container.level === "project" ? "Workspace" : "folder"} and its folders for this session`;
   }
 
   // ── AI organize, per container ────────────────────────────────────────────

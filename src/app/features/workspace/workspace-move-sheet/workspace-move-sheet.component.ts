@@ -16,7 +16,7 @@ import type { ItemRow } from "../../../core/models";
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import type { WorkspaceDestination } from "../workspace-destination";
 
-/** Viewport-safe destination picker used by every keyboard/pointer Move affordance in Spaces. */
+/** Viewport-safe destination picker used by every keyboard/pointer Move affordance in Workspaces. */
 @Component({
   selector: "app-workspace-move-sheet",
   changeDetection: ChangeDetectionStrategy.OnPush,
