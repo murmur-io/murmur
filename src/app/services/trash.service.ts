@@ -51,6 +51,18 @@ export class TrashService {
   );
 
   private unlisten?: () => void;
+  /**
+   * How many mounted views are showing the list. Only they need the ROWS; the
+   * sidebar badge needs the count alone.
+   *
+   * This matters because `listTrash` makes the backend parse every snapshot payload
+   * to derive each row's `detail`, and a meeting payload carries its whole
+   * transcript plus hex-encoded inline images. Reloading the list on every delete
+   * event — which is what this did first — meant a full payload sweep every time
+   * anyone deleted anything, with the Trash view closed and nothing to render it
+   * into. The count is what the badge reads, and the count is free.
+   */
+  private watchers = 0;
 
   constructor() {
     // ONE subscription for the whole app: the backend emits a content-free count
@@ -59,9 +71,7 @@ export class TrashService {
     void this.ipc
       .onTrashUpdated((p) => {
         this._count.set(p.count);
-        // Only refetch the rows when someone is actually looking at them — the
-        // badge needs the count, the list does not need to exist.
-        if (this._entries().length > 0 || p.count > 0) {
+        if (this.watchers > 0) {
           void this.reload();
         }
       })
@@ -69,6 +79,24 @@ export class TrashService {
         this.unlisten = un;
       });
     this.destroyRef.onDestroy(() => this.unlisten?.());
+  }
+
+  /**
+   * Register a mounted list view. Returns the release callback — the caller wires it
+   * to its own `DestroyRef` so a destroyed view stops pulling payloads.
+   */
+  watch(): () => void {
+    this.watchers += 1;
+    let released = false;
+    return () => {
+      // Guard against a double release: two decrements from one view would leave the
+      // counter negative and silently disable refresh for every OTHER open view.
+      if (released) {
+        return;
+      }
+      released = true;
+      this.watchers = Math.max(0, this.watchers - 1);
+    };
   }
 
   /** Refresh the badge count only. Safe to call on app start; reads no payloads. */
