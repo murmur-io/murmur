@@ -212,3 +212,12 @@
     order: -1;
   }
 }
+
+/* The empty-state mark. 44px matches every other empty state in the app
+   (`.empty-mark` in primitives.css, `.gate-mark` in the Tasks gate). */
+.empty-mark-icon {
+  width: 44px;
+  height: 44px;
+  margin-bottom: var(--space-2);
+  color: var(--text-tertiary);
+}
