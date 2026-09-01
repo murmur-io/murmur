@@ -104,6 +104,9 @@
               @case ("imports") {
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v7" /><path d="M5.2 6.4 8 9.2l2.8-2.8" /><path d="M2.8 10.6v1.6a1.4 1.4 0 0 0 1.4 1.4h7.6a1.4 1.4 0 0 0 1.4-1.4v-1.6" /></svg>
               }
+              @case ("developer") {
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.8" width="12.4" height="10.4" rx="1.8" /><path d="m5 6.6 1.7 1.7L5 10" /><path d="M8.6 10.3h2.6" /></svg>
+              }
               @case ("about") {
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2" /><path d="M8 7.4v3.6M8 5.1h.01" /></svg>
               }
@@ -184,6 +187,9 @@
         }
         @case ("imports") {
           <app-settings-imports-section />
+        }
+        @case ("developer") {
+          <app-settings-developer-section />
         }
         @case ("about") {
           <app-settings-about-section />

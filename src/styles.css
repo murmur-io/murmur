@@ -720,6 +720,37 @@ app-shell.sidebar-collapsed {
   padding: 0;
 }
 
+/* Developer mode — only rendered while the Settings toggle is on. It is marked
+   in the danger ramp on purpose: this group is diagnostics, not a place the
+   user's content lives, and the color is the reminder that a mode is switched
+   on. The chrome CSS lives here (global) with the rest of the shell — see
+   AppShellComponent's FOUC note. */
+.primary-sidebar .sb-developer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-2) 0;
+}
+
+.primary-sidebar .sb-dev-label {
+  color: var(--danger);
+}
+
+.primary-sidebar .sb-dev-row {
+  color: var(--danger);
+}
+
+.primary-sidebar .sb-dev-row:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.primary-sidebar .sb-dev-row.active {
+  background: var(--danger-soft);
+  color: var(--danger);
+  box-shadow: none;
+}
+
 /* Browse sits LAST, after Workspaces and Shared, so the user's own content is
    what the sidebar leads with. */
 .primary-sidebar .sb-browse {
