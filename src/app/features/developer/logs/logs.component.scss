@@ -1,0 +1,386 @@
+:host {
+  display: block;
+  width: 100%;
+}
+
+.logs-page {
+  width: min(var(--content-max), 100%);
+  margin: 0 auto;
+  /* Tight top: this page is a reading surface, and the header above the list
+     was costing more vertical room than the first screen of entries. */
+  padding: var(--space-4) var(--space-5) var(--space-6);
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+/* The copy takes the width the six-button toolbar used to eat, so the subtitle
+   is one or two lines instead of five. */
+.head-copy {
+  min-width: 0;
+
+  h1 {
+    margin: 0;
+    line-height: 1.15;
+  }
+
+  .page-subtitle {
+    margin: var(--space-1) 0 0;
+    max-width: 68ch;
+    font-size: 0.8125rem;
+    line-height: 1.45;
+  }
+}
+
+/* The ⋯ menu is `<mur-row-menu>` from the catalog: it teleports its own opaque
+   panel to the body and positions it against the trigger, so nothing here
+   positions or re-styles a popover (T3 is the component's problem, not this
+   file's). */
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+/* Auto-refresh is now inside the menu, so the header says so at rest. The
+   colour comes from the `.pill.is-accent` primitive; only the scale is local. */
+.live-pill {
+  height: 26px;
+  font-size: 0.75rem;
+}
+
+/* The one filter section — source, severity and text in a single bar. Three
+   separate rows read as three unrelated controls, and cost three lines of a page
+   whose job is to show the list.
+   (These rules, and the chip language below, were deleted by accident when the
+   header's popover CSS was removed; the controls then rendered as bare stacked
+   elements, which is what a screenshot caught.) */
+.filterbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  /* Wrapping is still allowed at a narrow window — the bar's own surface keeps
+     it ONE section either way, which loose rows could not do. */
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+}
+
+.filterbar-divider {
+  width: 1px;
+  height: 18px;
+  flex: none;
+  background: var(--border);
+}
+
+.level-filters {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 26px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    border-color var(--transition),
+    background var(--transition);
+
+  &:hover {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+  }
+
+  &.is-active {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+    background: var(--surface-raised);
+  }
+}
+
+.chip-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+}
+
+/* An ACTIVE level chip wears its level's colour, so the filter row and the rows
+   below it speak the same palette. */
+.chip.is-error.is-active {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.chip.is-warn.is-active {
+  color: var(--warning);
+  border-color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.chip.is-info.is-active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Sizing only — the field's look comes from the global input primitive. It takes
+   whatever the bar has left, pinned to its right edge. */
+.log-search {
+  flex: 1 1 150px;
+  min-width: 120px;
+  width: auto;
+  height: 28px;
+  margin-left: auto;
+  font-size: 0.8125rem;
+}
+
+.log-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin: 0 0 var(--space-2);
+  font-size: 0.75rem;
+}
+
+.log-path {
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+/* The list is the reading surface: an in-flow panel, so the frosted `.card`
+   is right here (an OPAQUE overlay is for things that float — T3). */
+.log-list {
+  max-height: min(70vh, 780px);
+  overflow: auto;
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* One entry = the clickable summary row plus, when expanded, its detail panel. */
+.log-entry {
+  border-bottom: 1px solid var(--border);
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.log-row {
+  display: grid;
+  grid-template-columns: 14px 78px 52px minmax(0, 150px) minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.55;
+  text-align: left;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--surface-raised);
+  }
+
+  &:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--accent-ring);
+  }
+}
+
+.row-caret {
+  display: inline-flex;
+  align-self: center;
+  color: var(--text-muted);
+  transition: transform var(--transition-fast);
+
+  &.open {
+    transform: rotate(90deg);
+  }
+}
+
+.log-time {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.log-level {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+}
+
+.log-target {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Collapsed, the message is ONE line — the row stays scannable however long the
+   event is, and the whole text is one click away in the panel below. */
+.log-message {
+  margin: 0;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── The expanded detail ─────────────────────────────────────────────────────
+   In-flow, so it takes `--surface-input` and never the overlay surface (T3
+   governs floating content only). */
+.row-detail {
+  margin: 0 var(--space-3) var(--space-2) calc(var(--space-3) + 14px);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  font-size: 0.75rem;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: minmax(90px, max-content) minmax(0, 1fr);
+  gap: var(--space-1) var(--space-4);
+  margin: 0;
+
+  dt {
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+
+  dd {
+    margin: 0;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    /* Selectable and wrapped: this panel is the one place the full text lives. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+  }
+}
+
+.detail-utc {
+  margin-left: var(--space-2);
+  color: var(--text-muted);
+}
+
+/* A structured field reads as data, not prose — its key keeps the mono column. */
+.detail-field-key {
+  color: var(--accent) !important;
+  text-transform: none !important;
+  font-family: var(--font-mono);
+}
+
+.detail-raw-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.detail-raw-label {
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.detail-copy {
+  height: 26px;
+  padding: 0 var(--space-3);
+  font-size: 0.75rem;
+}
+
+.detail-raw {
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* Severity reads from the left edge — the scan pattern for a long log. */
+.log-entry.is-error .log-row {
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+
+  .log-level {
+    color: var(--danger);
+  }
+}
+
+.log-entry.is-warn .log-row {
+  border-left-color: var(--warning);
+
+  .log-level {
+    color: var(--warning);
+  }
+}
+
+.log-entry.is-info .log-level {
+  color: var(--accent);
+}
+
+.log-entry.is-debug,
+.log-entry.is-other {
+  .log-time,
+  .log-level,
+  .log-target,
+  .log-message {
+    color: var(--text-muted);
+  }
+}
+
+@media (max-width: 900px) {
+  .log-row {
+    grid-template-columns: 14px 70px 48px minmax(0, 1fr);
+  }
+
+  .log-target {
+    display: none;
+  }
+}

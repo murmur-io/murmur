@@ -3910,3 +3910,48 @@ export type TrashKind = "meeting" | "note" | "folder" | "noteFolder";
 export interface TrashUpdatedPayload {
   count: number;
 }
+
+/**
+ * Which generation of the on-device log to read. `current` is this session;
+ * `previous` is the run before it — the one a crash happened in, kept because
+ * the relaunch that goes looking for it used to destroy it.
+ */
+export type AppLogSession = "current" | "previous";
+
+/**
+ * One parsed line of the `tracing` log file. Mirrors the Rust `LogEntry`
+ * (camelCase asserted by `applog::tests::dtos_serialize_camel_case_keys`).
+ */
+export interface AppLogEntry {
+  /** Position in the returned window — the stable `@for` identity. */
+  seq: number;
+  /** RFC3339 UTC as written, or `null` for a fragment with no header. */
+  timestamp: string | null;
+  /** `ERROR` | `WARN` | `INFO` | `DEBUG` | `TRACE` | `OTHER`. */
+  level: string;
+  /** Event target (`murmur::pipeline`, `panic`, …); empty when unparseable. */
+  target: string;
+  /** Message plus any structured fields; continuation lines are folded in. */
+  message: string;
+  /** The entry exactly as written in the file — what the expanded row shows. */
+  raw: string;
+}
+
+/**
+ * A window over one log generation. Mirrors the Rust `AppLog`.
+ *
+ * `exists: false` is the honest first-launch answer for `previous` — it is not
+ * an error and must not be rendered as one.
+ */
+export interface AppLog {
+  session: AppLogSession;
+  /** Absolute path on disk, so a bug report can name the file. */
+  path: string;
+  exists: boolean;
+  /** Size of the WHOLE file, not of the returned window. */
+  sizeBytes: number;
+  /** Older entries exist above the window that was returned. */
+  truncated: boolean;
+  /** Newest last, matching file order. */
+  entries: AppLogEntry[];
+}

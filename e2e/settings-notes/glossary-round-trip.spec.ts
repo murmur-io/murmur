@@ -55,7 +55,7 @@ test("workspace glossary loads and saves only after blur, then survives a Settin
     )
     .toEqual([UPDATED_GLOSSARY]);
 
-  await page.getByRole("button", { name: "Back to Murmur" }).click();
+  await page.getByRole("button", { name: "Close settings" }).click();
   await page.getByRole("link", { name: "Settings", exact: true }).click();
   await openNotesSettings(page);
   await expect(page.getByLabel("Workspace glossary")).toHaveValue(

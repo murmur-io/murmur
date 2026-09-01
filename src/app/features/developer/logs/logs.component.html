@@ -1,0 +1,267 @@
+<section class="logs-page">
+  <header class="page-head">
+    <div class="head-copy">
+      <h1>Logs</h1>
+      <p class="page-subtitle">
+        What Murmur recorded while it ran — stages, counts and failures. Kept on
+        this Mac for 24 hours, then deleted; never note or transcript text.
+      </p>
+    </div>
+
+    <div class="head-actions">
+      <!-- Auto-refresh is the one action with a lasting state, and it now lives
+           inside the menu — so the header keeps a quiet tell for it. -->
+      @if (autoRefresh()) {
+        <span class="pill is-accent live-pill" title="Auto-refresh is on">
+          <span class="pill-dot" aria-hidden="true"></span>
+          Auto
+        </span>
+      }
+
+      <!-- The catalog's ⋯ menu (mur-row-menu): opaque panel, outside-click and
+           Esc dismissal, keyboard navigation, auto-close after an item. -->
+      <mur-row-menu label="Log actions" [prominent]="true">
+        <button
+          type="button"
+          class="menu-item"
+          role="menuitem"
+          (click)="chooseAutoRefresh()"
+        >
+          <span>{{ autoRefresh() ? "Stop auto-refresh" : "Auto-refresh" }}</span>
+        </button>
+        <button
+          type="button"
+          class="menu-item"
+          role="menuitem"
+          (click)="chooseRefresh()"
+        >
+          <span>Refresh</span>
+        </button>
+        <button
+          type="button"
+          class="menu-item"
+          role="menuitem"
+          (click)="chooseCopy()"
+        >
+          <span>Copy</span>
+        </button>
+        <button
+          type="button"
+          class="menu-item"
+          role="menuitem"
+          (click)="chooseReveal()"
+        >
+          <span>Reveal in Finder</span>
+        </button>
+        @if (session() === "current") {
+          <button
+            type="button"
+            class="menu-item menu-item-danger"
+            role="menuitem"
+            (click)="chooseClear()"
+          >
+            <span>Clear</span>
+          </button>
+        }
+      </mur-row-menu>
+    </div>
+  </header>
+
+  @if (error(); as message) {
+    <div class="banner is-danger" role="alert">
+      <span class="banner-icon" aria-hidden="true">!</span>
+      <span>{{ message }}</span>
+    </div>
+  }
+
+  <!-- ONE filter section: source, severity and text sit in a single bar instead
+       of three loose rows stacked down the page. -->
+  <div class="filterbar" role="group" aria-label="Filter the log">
+    <mur-segmented
+      [options]="sessionOptions"
+      [value]="session()"
+      (valueChange)="selectSession($event)"
+      ariaLabel="Log session"
+    />
+
+    <span class="filterbar-divider" aria-hidden="true"></span>
+
+    <div class="level-filters" role="group" aria-label="Filter by level">
+      <button
+        type="button"
+        class="chip"
+        [class.is-active]="levelFilter() === 'all'"
+        (click)="setLevel('all')"
+      >
+        All <span class="chip-count">{{ counts().all }}</span>
+      </button>
+      <button
+        type="button"
+        class="chip is-error"
+        [class.is-active]="levelFilter() === 'error'"
+        (click)="setLevel('error')"
+      >
+        Errors <span class="chip-count">{{ counts().error }}</span>
+      </button>
+      <button
+        type="button"
+        class="chip is-warn"
+        [class.is-active]="levelFilter() === 'warn'"
+        (click)="setLevel('warn')"
+      >
+        Warnings <span class="chip-count">{{ counts().warn }}</span>
+      </button>
+      <button
+        type="button"
+        class="chip is-info"
+        [class.is-active]="levelFilter() === 'info'"
+        (click)="setLevel('info')"
+      >
+        Info <span class="chip-count">{{ counts().info }}</span>
+      </button>
+      <button
+        type="button"
+        class="chip is-debug"
+        [class.is-active]="levelFilter() === 'debug'"
+        (click)="setLevel('debug')"
+      >
+        Debug <span class="chip-count">{{ counts().debug }}</span>
+      </button>
+    </div>
+
+    <input
+      type="search"
+      class="log-search"
+      [formControl]="searchControl"
+      placeholder="Filter messages"
+      aria-label="Filter log messages"
+      autocomplete="off"
+      spellcheck="false"
+    />
+  </div>
+
+  @if (log(); as loaded) {
+    <p class="log-meta text-muted">
+      <span class="log-path" [title]="loaded.path">{{ loaded.path }}</span>
+      <span aria-hidden="true">·</span>
+      <span>{{ sizeLabel() }}</span>
+      <span aria-hidden="true">·</span>
+      <span>{{ visibleEntries().length }} of {{ counts().all }} shown</span>
+      <span aria-hidden="true">·</span>
+      <span>kept 24 h</span>
+      @if (loaded.truncated) {
+        <span aria-hidden="true">·</span>
+        <span>older entries are in the file only</span>
+      }
+      @if (loading()) {
+        <mur-spinner [size]="12" />
+      }
+    </p>
+  }
+
+  <!-- Cached rows are NEVER hidden behind `loading()` alone (§8): the spinner is
+       for a first visit with nothing to show; a refresh replaces rows underneath. -->
+  @if (listEmpty() && loading()) {
+    <mur-empty-state>
+      <mur-spinner [size]="20" />
+      <p>Reading the log…</p>
+    </mur-empty-state>
+  } @else if (missingFile()) {
+    <mur-empty-state>
+      <h3>No previous session</h3>
+      <p>
+        Murmur keeps the last session's log so a crash can be read after the
+        restart. There isn't one yet — it appears the next time the app starts.
+      </p>
+    </mur-empty-state>
+  } @else if (emptyFile()) {
+    <mur-empty-state>
+      <h3>Nothing logged yet</h3>
+      <p>This session hasn't written anything to the log.</p>
+    </mur-empty-state>
+  } @else if (filteredToNothing()) {
+    <mur-empty-state>
+      <h3>No matching entries</h3>
+      <p>{{ counts().all }} entries are loaded — none match this filter.</p>
+    </mur-empty-state>
+  } @else {
+    <div #list class="log-list card" role="log" aria-label="Application log">
+      @for (entry of visibleEntries(); track entry.seq) {
+        @let open = expandedSeqs().has(entry.seq);
+        <article class="log-entry" [class]="'log-entry ' + entry.levelClass">
+          <!-- The WAI-ARIA disclosure pattern (a real button + aria-expanded +
+               aria-controls), hand-built at TABLE density rather than through
+               <mur-disclosure>: that control's surface is a bordered settings
+               card, and a thousand of them is a different view, not this one.
+               `aria-controls` is bound only while the panel exists, so it can
+               never dangle. -->
+          <button
+            type="button"
+            class="log-row"
+            [attr.aria-expanded]="open"
+            [attr.aria-controls]="open ? entry.detailId : null"
+            (click)="toggleExpanded(entry.seq)"
+          >
+            <span class="row-caret" [class.open]="open" aria-hidden="true">
+              <svg viewBox="0 0 12 12" width="10" height="10" fill="none">
+                <path
+                  d="M4 2l4 4-4 4"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </span>
+            <time class="log-time">{{ entry.time }}</time>
+            <span class="log-level">{{ entry.level }}</span>
+            <span class="log-target" [title]="entry.target">{{ entry.target }}</span>
+            <span class="log-message">{{ entry.message }}</span>
+          </button>
+
+          @if (open) {
+            <div class="row-detail" [id]="entry.detailId" role="group">
+              <dl class="detail-grid">
+                <dt>Time</dt>
+                <dd>
+                  {{ entry.fullTime }}
+                  @if (entry.timestamp) {
+                    <span class="detail-utc">({{ entry.timestamp }} UTC)</span>
+                  }
+                </dd>
+
+                <dt>Level</dt>
+                <dd>{{ entry.level }}</dd>
+
+                @if (entry.target) {
+                  <dt>Target</dt>
+                  <dd>{{ entry.target }}</dd>
+                }
+
+                <dt>Message</dt>
+                <dd class="detail-message">{{ entry.text || entry.message }}</dd>
+
+                @for (field of entry.fields; track field.key) {
+                  <dt class="detail-field-key">{{ field.key }}</dt>
+                  <dd class="detail-field-value">{{ field.value }}</dd>
+                }
+              </dl>
+
+              <div class="detail-raw-head">
+                <span class="detail-raw-label">Raw</span>
+                <button
+                  type="button"
+                  class="btn btn-ghost detail-copy"
+                  (click)="copyEntry(entry)"
+                >
+                  Copy entry
+                </button>
+              </div>
+              <pre class="detail-raw">{{ entry.raw }}</pre>
+            </div>
+          }
+        </article>
+      }
+    </div>
+  }
+</section>
