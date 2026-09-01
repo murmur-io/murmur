@@ -8,84 +8,62 @@
       </p>
     </div>
 
-    <!-- Every action behind ONE menu. Six always-visible buttons pushed the
-         title into a five-line wrap and still read as a toolbar for something
-         you touch once a session. -->
-    <div class="head-menu">
-      <button
-        type="button"
-        class="btn btn-ghost actions-trigger"
-        (click)="toggleActions()"
-        aria-haspopup="menu"
-        [attr.aria-expanded]="actionsOpen()"
-        aria-label="Log actions"
-      >
-        <span>Actions</span>
-        @if (autoRefresh()) {
-          <span class="live-dot" aria-hidden="true"></span>
-        }
-        <span class="trigger-caret" [class.open]="actionsOpen()" aria-hidden="true">
-          <mur-icon icon="chevron-right" />
+    <div class="head-actions">
+      <!-- Auto-refresh is the one action with a lasting state, and it now lives
+           inside the menu — so the header keeps a quiet tell for it. -->
+      @if (autoRefresh()) {
+        <span class="pill is-accent live-pill" title="Auto-refresh is on">
+          <span class="pill-dot" aria-hidden="true"></span>
+          Auto
         </span>
-      </button>
+      }
 
-      @if (actionsOpen()) {
+      <!-- The catalog's ⋯ menu (mur-row-menu): opaque panel, outside-click and
+           Esc dismissal, keyboard navigation, auto-close after an item. -->
+      <mur-row-menu label="Log actions" [prominent]="true">
         <button
           type="button"
-          class="menu-scrim"
-          (click)="closeActions()"
-          aria-label="Close actions menu"
-          tabindex="-1"
-        ></button>
-        <div class="menu actions-menu" role="menu">
+          class="menu-item"
+          role="menuitem"
+          (click)="chooseAutoRefresh()"
+        >
+          <span>{{ autoRefresh() ? "Stop auto-refresh" : "Auto-refresh" }}</span>
+        </button>
+        <button
+          type="button"
+          class="menu-item"
+          role="menuitem"
+          (click)="chooseRefresh()"
+        >
+          <span>Refresh</span>
+        </button>
+        <button
+          type="button"
+          class="menu-item"
+          role="menuitem"
+          (click)="chooseCopy()"
+        >
+          <span>Copy</span>
+        </button>
+        <button
+          type="button"
+          class="menu-item"
+          role="menuitem"
+          (click)="chooseReveal()"
+        >
+          <span>Reveal in Finder</span>
+        </button>
+        @if (session() === "current") {
           <button
             type="button"
-            class="menu-item"
-            role="menuitemcheckbox"
-            [attr.aria-checked]="autoRefresh()"
-            (click)="chooseAutoRefresh()"
-          >
-            <span>Auto-refresh</span>
-            @if (autoRefresh()) {
-              <span class="menu-check"><mur-icon icon="check" /></span>
-            }
-          </button>
-          <button
-            type="button"
-            class="menu-item"
+            class="menu-item menu-item-danger"
             role="menuitem"
-            (click)="chooseRefresh()"
+            (click)="chooseClear()"
           >
-            <span>Refresh</span>
+            <span>Clear</span>
           </button>
-          <button
-            type="button"
-            class="menu-item"
-            role="menuitem"
-            (click)="chooseCopy()"
-          >
-            <span>Copy</span>
-          </button>
-          <button
-            type="button"
-            class="menu-item"
-            role="menuitem"
-            (click)="chooseReveal()"
-          >
-            <span>Reveal in Finder</span>
-          </button>
-          @if (session() === "current") {
-            <button
-              type="button"
-              class="menu-item menu-item-danger"
-              role="menuitem"
-              (click)="chooseClear()"
-            >
-              <span>Clear</span>
-            </button>
-          }
-        </div>
-      }
+        }
+      </mur-row-menu>
     </div>
   </header>
 

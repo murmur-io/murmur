@@ -16,7 +16,7 @@ import { EMPTY, interval, startWith, switchMap } from "rxjs";
 import { IpcService } from "../../../core/ipc.service";
 import type { AppLogEntry, AppLogSession } from "../../../core/models";
 import { MurEmptyStateComponent } from "../../../design-system/empty-state/empty-state.component";
-import { MurIconComponent } from "../../../design-system/icon/icon.component";
+import { MurRowMenuComponent } from "../../../design-system/row-menu/row-menu.component";
 import {
   MurSegmentedComponent,
   type SegmentOption,
@@ -63,12 +63,9 @@ const REFRESH_MS = 3000;
 @Component({
   selector: "app-logs",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  // Esc closes the actions menu — declarative, so Angular owns the listener's
-  // lifecycle (no hand-rolled document listener to leak).
-  host: { "(document:keydown.escape)": "closeActions()" },
   imports: [
     ReactiveFormsModule,
-    MurIconComponent,
+    MurRowMenuComponent,
     MurSegmentedComponent,
     MurSpinnerComponent,
     MurEmptyStateComponent,
@@ -97,9 +94,6 @@ export class LogsComponent implements OnInit {
 
   /** Auto-refresh while watching a live reproduction. Off by default. */
   readonly autoRefresh = signal(false);
-
-  /** The one actions menu (Auto-refresh / Refresh / Copy / Reveal / Clear). */
-  readonly actionsOpen = signal(false);
 
   /** Free-text filter over the message + target. */
   readonly searchControl = new FormControl("", { nonNullable: true });
@@ -224,41 +218,29 @@ export class LogsComponent implements OnInit {
     this.levelFilter.set(level);
   }
 
-  toggleActions(): void {
-    this.actionsOpen.update((open) => !open);
-  }
-
-  closeActions(): void {
-    this.actionsOpen.set(false);
-  }
-
   /**
-   * Menu items close the menu first, the way a macOS menu does — including the
-   * checkable one, so the trigger's live dot is what reports the state
-   * afterwards rather than a menu the user now has to dismiss.
+   * The menu items. `<mur-row-menu>` closes itself after any enabled
+   * `[role=menuitem]`, so these only own the action — including the
+   * auto-refresh toggle, whose state is reported afterwards by the header's
+   * "Auto" pill rather than by a menu the user would have to dismiss.
    */
   chooseAutoRefresh(): void {
     this.autoRefresh.update((on) => !on);
-    this.closeActions();
   }
 
   chooseRefresh(): void {
-    this.closeActions();
     void this.reload();
   }
 
   chooseCopy(): void {
-    this.closeActions();
     void this.copyVisible();
   }
 
   chooseReveal(): void {
-    this.closeActions();
     void this.reveal();
   }
 
   chooseClear(): void {
-    this.closeActions();
     void this.clear();
   }
 

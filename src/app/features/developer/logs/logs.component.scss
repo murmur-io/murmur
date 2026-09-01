@@ -37,127 +37,22 @@
   }
 }
 
-/* The menu floats OVER the list, so it is the OPAQUE `.menu` surface — the
-   frosted `.card` would let the rows behind it bleed through (T3). */
-.head-menu {
-  position: relative;
+/* The ⋯ menu is `<mur-row-menu>` from the catalog: it teleports its own opaque
+   panel to the body and positions it against the trigger, so nothing here
+   positions or re-styles a popover (T3 is the component's problem, not this
+   file's). */
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   flex-shrink: 0;
 }
 
-.actions-trigger {
-  gap: var(--space-2);
-}
-
-/* Auto-refresh is the one action with a lasting state, and it is now hidden
-   inside the menu — so the trigger carries the tell. */
-.live-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: var(--radius-pill);
-  background: var(--accent);
-}
-
-.trigger-caret {
-  display: inline-flex;
-  transform: rotate(90deg);
-  transition: transform var(--transition-fast);
-
-  &.open {
-    transform: rotate(-90deg);
-  }
-}
-
-.actions-menu {
-  position: absolute;
-  top: calc(100% + var(--space-2));
-  right: 0;
-  z-index: 30;
-  min-width: 220px;
-}
-
-.menu-scrim {
-  position: fixed;
-  inset: 0;
-  z-index: 20;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  cursor: default;
-}
-
-.menu-check {
-  display: inline-flex;
-  margin-left: auto;
-  color: var(--accent);
-}
-
-.toolbar {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  flex-wrap: wrap;
-  margin-bottom: var(--space-2);
-}
-
-.level-filters {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-}
-
-.chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  height: 28px;
-  padding: 0 var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-pill);
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 0.8125rem;
-  cursor: pointer;
-  transition:
-    color var(--transition),
-    border-color var(--transition),
-    background var(--transition);
-
-  &:hover {
-    color: var(--text-primary);
-    border-color: var(--border-strong);
-  }
-
-  &.is-active {
-    color: var(--text-primary);
-    border-color: var(--border-strong);
-    background: var(--surface-raised);
-  }
-}
-
-.chip-count {
-  color: var(--text-muted);
-  font-variant-numeric: tabular-nums;
+/* Auto-refresh is now inside the menu, so the header says so at rest. The
+   colour comes from the `.pill.is-accent` primitive; only the scale is local. */
+.live-pill {
+  height: 26px;
   font-size: 0.75rem;
-}
-
-/* A level chip carries its level's color on the dot-free label itself, so the
-   palette in the filter row matches the one in the rows below it. */
-.chip.is-error.is-active {
-  color: var(--danger);
-  border-color: var(--danger);
-  background: var(--danger-soft);
-}
-
-.chip.is-warn.is-active {
-  color: var(--warning);
-  border-color: var(--warning);
-  background: var(--warning-soft);
-}
-
-.chip.is-info.is-active {
-  color: var(--accent);
-  border-color: var(--accent);
 }
 
 /* Sizing only — the field's look comes from the global input primitive. */

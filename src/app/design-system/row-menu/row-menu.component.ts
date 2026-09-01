@@ -58,6 +58,7 @@ const VIEWPORT_MARGIN_PX = 8;
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: {
     "[class.is-open]": "isOpen()",
+    "[class.is-prominent]": "prominent()",
     "(document:click)": "onDocumentClick($event)",
     "(document:keydown.escape)": "onEscape()",
   },
@@ -76,6 +77,15 @@ export class MurRowMenuComponent {
   readonly label = input.required<string>();
   /** Disables the trigger (mirrors a row's `busy` guard). */
   readonly disabled = input(false);
+  /**
+   * Opt OUT of the quiet, hover-revealed trigger. The default suits a tree row,
+   * where the ellipsis should stay faint until the row is hovered; a menu that
+   * stands ALONE (a page header's actions) has no row to hover, so at 0.45
+   * opacity and 21px it reads as disabled. Prominent gives it full contrast and
+   * a touch target sized for a header. Everything else is identical — one
+   * control, two placements, rather than a second ellipsis menu.
+   */
+  readonly prominent = input(false);
 
   private readonly _open = signal(false);
   /** Whether the dropdown panel is showing. */
