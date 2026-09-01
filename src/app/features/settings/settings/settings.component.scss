@@ -22,16 +22,24 @@
   inset: 0;
   display: grid;
   place-items: center;
-  padding: var(--space-5);
+  /* The TOP inset clears the window-button band, and is not cosmetic: macOS
+     draws the traffic lights natively ABOVE the webview (`titleBarStyle:
+     Overlay`), so no z-index of ours can put a panel over them — a dialog that
+     starts at the top edge has three system buttons punched through its corner.
+     `--shell-topbar-h` is the same band the shell's own rail reserves for them. */
+  padding: calc(var(--shell-topbar-h) + var(--space-2)) var(--space-5)
+    var(--space-5);
   background: var(--scrim);
 }
 
+/* Fills the band above the panel, so the whole strip the traffic lights live in
+   drags the window — the shell's own drag region is behind the scrim now. */
 .scrim-drag {
   position: absolute;
   top: 0;
   right: 0;
   left: 0;
-  height: var(--space-5);
+  height: calc(var(--shell-topbar-h) + var(--space-2));
 }
 
 /* ── The panel: nearly the whole window, capped so it stays a dialog on a
@@ -312,7 +320,8 @@
    scrolling within the fixed full-height shell. */
 @media (max-width: 640px) {
   .settings-scrim {
-    padding: var(--space-2);
+    padding: calc(var(--shell-topbar-h) + var(--space-2)) var(--space-2)
+      var(--space-2);
   }
   .settings-shell {
     grid-template-columns: 1fr;
