@@ -117,6 +117,7 @@ export const ERROR_CODES = [
   "touch-id-failed",
   "keychain-denied",
   "sharing-unreachable",
+  "share-busy",
   "sharing-rate-limited",
   "sharing-rejected",
   "sharing-signin-required",
@@ -206,6 +207,8 @@ const BASE_COPY: Readonly<Record<ErrorCode, string>> = {
     "macOS wouldn’t release the key. Unlock your Mac’s login keychain and try again.",
   "sharing-unreachable":
     "Can’t reach the sharing server. Check your connection, then try again.",
+  "share-busy":
+    "Another sharing operation is still running. Give it a moment, then try again.",
   "sharing-rate-limited": "Too many attempts — wait a minute, then try again.",
   "sharing-rejected":
     "That didn’t work. Check the code (it may have expired) and try again.",
