@@ -3933,6 +3933,8 @@ export interface AppLogEntry {
   target: string;
   /** Message plus any structured fields; continuation lines are folded in. */
   message: string;
+  /** The entry exactly as written in the file — what the expanded row shows. */
+  raw: string;
 }
 
 /**
