@@ -2,11 +2,17 @@ import { test, expect } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
 
 /**
- * Settings keeps the persistent global rail. The tab strip therefore retains
- * its normal 24px inset instead of switching to a flush-left drill-down
- * clearance, and the fixed settings surface must begin after the rail.
+ * Settings opens as a MODAL over the whole window, and the shell underneath is
+ * unchanged by it: the tab strip keeps its normal 24px inset rather than
+ * switching to a flush-left drill-down clearance, and it still has that inset
+ * after the dialog closes.
+ *
+ * The geometry assertion used to be the opposite one — the settings surface had
+ * to BEGIN after the global rail, because it was a pane beside it. It now
+ * covers the rail deliberately, so what is checked is that the dialog spans the
+ * window while the strip's own padding is left alone.
  */
-test("settings keeps normal tab-strip padding and clears the global rail", async ({
+test("settings opens as a modal over the shell and leaves the tab strip alone", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -39,16 +45,21 @@ test("settings keeps normal tab-strip padding and clears the global rail", async
   await expect(globalNavigation).toBeVisible();
   await expect(strip).toHaveCSS("padding-left", "24px");
 
-  const [railBox, settingsBox] = await Promise.all([
+  const [railBox, scrimBox] = await Promise.all([
     globalNavigation.boundingBox(),
-    page.locator("app-settings .settings-shell").boundingBox(),
+    page.locator("app-settings .settings-scrim").boundingBox(),
   ]);
   expect(railBox).not.toBeNull();
-  expect(settingsBox).not.toBeNull();
-  expect(settingsBox!.x).toBeGreaterThanOrEqual(railBox!.x + railBox!.width);
+  expect(scrimBox).not.toBeNull();
+  // The dialog spans the window — it starts at or before the rail and ends
+  // after it, rather than beginning where the rail stops.
+  expect(scrimBox!.x).toBeLessThanOrEqual(railBox!.x);
+  expect(scrimBox!.x + scrimBox!.width).toBeGreaterThanOrEqual(
+    railBox!.x + railBox!.width,
+  );
 
   // Leaving Settings preserves the same shell-level inset.
-  await page.getByRole("button", { name: "Back to Murmur" }).click();
+  await page.getByRole("button", { name: "Close settings" }).click();
   await expect(strip).toHaveCSS("padding-left", "24px");
 
   expect(consoleErrors).toEqual([]);

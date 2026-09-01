@@ -77,7 +77,11 @@ function developerNav(page: Page) {
   return page.getByRole("navigation", { name: "Developer mode" });
 }
 
-/** Turn developer mode on in Settings, then open the Logs view. */
+/**
+ * Turn developer mode on in Settings, close the dialog, then open Logs from the
+ * sidebar. Settings is a MODAL — the sidebar behind it is covered by the scrim,
+ * so it has to be dismissed before the app underneath takes clicks again.
+ */
 async function openLogs(page: Page): Promise<void> {
   await page.goto("/settings");
   await page.getByText("Developer").first().click();
@@ -85,6 +89,7 @@ async function openLogs(page: Page): Promise<void> {
     .locator("app-settings-developer-section")
     .getByRole("checkbox", { name: "Developer mode" })
     .check();
+  await page.getByRole("button", { name: "Close settings" }).click();
   await developerNav(page).getByRole("link", { name: "Logs" }).click();
 }
 
@@ -111,8 +116,9 @@ test("turning developer mode on reveals the sidebar group and its Logs entry", a
   await toggle.check();
   await expect(toggle).toBeChecked();
 
-  // The shell sidebar reads the same root signal, so it lights up immediately —
-  // no reload, no navigation.
+  // The shell sidebar reads the same root signal, so it is already there behind
+  // the dialog — closing Settings reveals it with no reload and no navigation.
+  await page.getByRole("button", { name: "Close settings" }).click();
   const nav = developerNav(page);
   await expect(nav).toBeVisible();
   await expect(nav.getByRole("link", { name: "Logs" })).toBeVisible();
