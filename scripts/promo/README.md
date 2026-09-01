@@ -93,27 +93,75 @@ Two consequences worth knowing:
   under the lower third — and the sidebar's Capture button sits in exactly that strip, in every
   scene, so the kicker lands on a button.
 
-## The motion floor
+## Rhythm: action → description → transition → action
 
-Nothing in the film should ever be perfectly still: a static frame of a screenshot IS a screenshot,
-and a cut that alternates dead stills with bursts of motion reads as juddering even when every move
-is smooth. `driftAt` (a slow float) and `breathAt` (a 3%-per-scene push) exist for that.
+**The camera is LOCKED unless it is following a click.** Motion comes from the interface, from the
+cut, or from one motivated push that travels and then stops. Never from the lens wandering.
 
-**Measure it — a drift you cannot measure is not there.** The first version used a 9 px amplitude on
-a ~38 s period, i.e. 0.025 px/frame, and half the film rendered frozen with holds up to 1.9 s:
+This paragraph used to say the opposite — that "nothing should ever be perfectly still" — and
+`driftAt`/`breathAt` existed to guarantee it. Both are gone. The full evidence is
+`docs/research/2026-09-01-promo-cut-rhythm.md`; the short version:
+
+- Phase-correlation global-motion measurement of **13 product films from 10 companies** (Linear,
+  Notion, Raycast, Arc, Superhuman, Descript, Tella, Screen Studio) found the grammar is strictly
+  **bimodal** — dead-locked (&lt;1 px/s) or decisive (&gt;15 px/s). Every reference film spends
+  **0–28%** of its runtime in the 1–15 px/s "visible but purposeless" band; the drifting cut spent
+  **64%** there. Linear holds one locked frame for **17.5 s**. Superhuman's hero is exactly 0.00 px/s.
+- The drift's four terms ran at 0.110, 0.257, 0.093 and 0.224 Hz. Apple's HIG says by name: *"avoid
+  showing an oscillation that has a frequency of around 0.2 Hz because people can be very sensitive
+  to this frequency."*
+- Ken Burns is defined as pan/zoom on **still photographs**, *"principally used when film or video
+  material is not available"*. We have moving material — a live app. The rationale inverts.
+
+### Measure the FOOTAGE, not the render
+
+The old gate differenced the rendered frames, which a global translation raises everywhere at once —
+so a 16 px sinusoid was the cheapest way to move "half the film frozen" to "11%" without adding one
+bit of information. It measured the camera and called it life. Measure two things instead:
 
 ```bash
-ffmpeg -v error -i .promo/render/%06d.png \
-  -vf "scale=320:180,tblend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-" \
-  -f null - 2>/dev/null | grep -oE 'YAVG=[0-9.]+' | sed 's/YAVG=//'
+# 1. Does the APP do anything? Gaps between source frames = the product standing still.
+python3 - <<'PY'
+import json; m=json.load(open('.promo/manifest.json'))
+for s in m['scenes']:
+    ts=sorted(f['t'] for f in s['frames'])+[s['dur']]
+    dead=sum(g for g in (ts[i+1]-ts[i] for i in range(len(ts)-1)) if g>400)
+    print(f"{s['id']:<16}{s['dur']/1000:6.1f}s  app still {100*dead/s['dur']:3.0f}%")
+PY
 ```
 
-Frames under ~0.03 are motionless. Target ≤15% of the film and no hold over ~0.4 s except the end
-card. This cut measures 11%.
+**2. Dead time with NO caption to read** — the number that actually matters. A locked shot while a
+caption is being read is correct and wanted (see the brackets below); a locked shot with nothing to
+read and nothing happening is the dead air. Subtract the caption windows from the still gaps.
+Target **≤15%**. This cut measures 15%, against ~52% before the re-cut.
 
-Scene boundaries have a vocabulary rather than one cross-dissolve — `dissolve`, `push`, `pushUp`,
-`whip`, `through`. Dissolving every boundary is the video equivalent of ending every sentence the
-same way: by the third one the viewer stops registering that anything happened.
+### Caption budget
+
+Netflix (**20 cps**, ≤84 chars on screen, ≤2 lines, ≤7 s per event) and BBC (**160–180 wpm**)
+converge on **≈0.33 s per word**, counting kicker + headline + sub together:
+
+> **`dur` ≈ 0.33 × words + 0.6 s**
+
+The pre-re-cut film had **15 of 15 captions under their own read time**, a 56-second collective
+deficit — which is *why* it had to sit and stare. Delete the text nobody can finish and the hold has
+no reason to exist.
+
+### Shot brackets
+
+| Beat | Hold | Camera |
+| --- | --- | --- |
+| Action beat (UI performing, no text) | 1.5–3 s | locked; cut on completion |
+| Caption beat | `max(3 s, 0.33 × words + 0.6)`, copy ≤84 chars | **locked for the whole hold** |
+| Demo hold (multi-step action worth watching) | 6–10 s | locked; motion from the UI only |
+| Motivated push (follow a click / reveal) | 0.6–1.2 s travel, then a full stop | eased |
+
+Target **ASL 4–6 s** and **≥6 hard cuts**. Beat length 8–10 s is right (Mayer's segmenting
+principle, 10/10 tests, d = 0.79) — do NOT "fix" pacing by cutting faster: past ~12 shots per 30 s
+persuasion declines. The beat and the shot are different units.
+
+Boundaries have a vocabulary — `cut`, `dissolve`, `push`, `pushUp`, `whip`, `through`. Cut inside an
+act, transition between acts. Dissolving every boundary is the video equivalent of ending every
+sentence the same way.
 
 ## Directing a scene
 

@@ -534,6 +534,24 @@
        * object displacing another rather than two things fading.
        */
       const TRANSITIONS = {
+        /*
+         * A hard cut. `ms: 1` rather than 0 because the overlap is what the
+         * timeline arithmetic subtracts — one millisecond is a sixteenth of a
+         * frame at 60 fps, so the two shots do not coexist on any rendered
+         * frame, and nothing divides by zero.
+         *
+         * This is the transition the first cut of the film did not have AT ALL:
+         * nine scenes, zero hard cuts, everything dissolved or pushed. Measured
+         * against the reference films that is backwards — Raycast cuts 7 times
+         * in 38 s, Arc 20 times in 34 s. A cut is the cheapest way to say
+         * "something happened" and it costs no motion whatsoever, which is
+         * exactly what a film full of static UI needs.
+         */
+        cut: {
+          ms: 1,
+          enter: () => ({ o: 1 }),
+          exit: () => ({ o: 1 }),
+        },
         dissolve: {
           ms: 620,
           enter: (p) => ({ o: EASE(p) }),
@@ -707,51 +725,38 @@
         return g;
       }
 
-      /**
-       * A slow, continuous drift applied to every shot.
+      /*
+       * ── THE CAMERA IS LOCKED UNLESS IT HAS A REASON ───────────────────────
        *
-       * Nothing in this film is ever perfectly static, because a perfectly
-       * static frame of a screenshot IS a screenshot — the eye reads it as a
-       * still and stops watching. This is deliberately tiny (a few pixels and
-       * ~1% of scale over ten seconds); it is felt rather than seen, and being a
-       * pure function of t it costs the renderer's determinism nothing.
+       * There used to be a `driftAt` here — a continuous sinusoidal float — and
+       * a `breathAt` slow push, both added to stop the film reading as a series
+       * of screenshots. Both are gone, and the reasoning is worth keeping so
+       * nobody adds them back.
        *
-       * It is applied AFTER the camera clamp, as a translation of the whole
-       * layer, so it works at rest — where the clamp pins the camera dead centre
-       * and a drift expressed in camera coordinates would do nothing at all.
+       * They were a symptom-fix. The film read as screenshots because the
+       * FOOTAGE was static: the hook scene was 99% unchanged frames, its note
+       * body fully written at frame 0, under a caption that said "Type while it
+       * listens". Moving the lens does not fix a product that is not doing
+       * anything; it just moves the screenshot around.
+       *
+       * And it was measurably the wrong move. Phase-correlation global-motion
+       * measurement of thirteen product films from ten companies (Linear,
+       * Notion, Raycast, Arc, Superhuman, Descript, Tella, Screen Studio) found
+       * the grammar is strictly BIMODAL — dead-locked (<1 px/s) or decisive
+       * (>15 px/s) — with every reference film spending 0–28% of its runtime in
+       * the 1–15 px/s "visible but purposeless" band. `driftAt` put this film in
+       * that band 86.4% of the time and locked 0.3%. Linear holds one locked
+       * frame for 17.5 s; Superhuman's hero is exactly 0.00 px/s.
+       *
+       * Worse, its four terms ran at 0.110, 0.257, 0.093 and 0.224 Hz. Apple's
+       * HIG says, by name: "avoid showing an oscillation that has a frequency of
+       * around 0.2 Hz because people can be very sensitive to this frequency."
+       * Two of the four sat on it, and all four fall inside the ISO 2631-1
+       * motion-sickness band.
+       *
+       * So: motion comes from the interface, from the cut, or from a camera move
+       * with a destination. Never from the lens wandering.
        */
-      function driftAt(t, seed) {
-        const a = (t + seed * 2200) / 1000;
-        /*
-         * MEASURED, and the first version of this function was far too timid to
-         * do its job. It used a 9 px amplitude on a ~38 s period, which is
-         * 0.025 px per frame — below the point where anything changes at all.
-         *
-         * Differencing consecutive rendered frames proved it: HALF the film
-         * (46.8 s of 92.8) came out under 0.03 mean luma change, i.e. frozen,
-         * with holds as long as 1.9 s. A film that alternates between a dead
-         * still and a burst of motion does not read as "calm", it reads as
-         * juddering — and the frozen stretches read as screenshots, which feeds
-         * straight into "the resolution looks weak".
-         *
-         * 16 px on a ~9 s period is ~11 px/s; the second term adds a shorter
-         * wobble. That is inside the 10–30 px/s a slow film push occupies at
-         * 1080p: felt, not watched.
-         */
-        return {
-          dx: Math.sin(a / 1.45) * 16 + Math.sin(a / 0.62) * 4,
-          dy: Math.cos(a / 1.72) * 12 + Math.cos(a / 0.71) * 3,
-          ds: 1 + Math.sin(a / 2.4) * 0.004,
-        };
-      }
-
-      /**
-       * A slow push across each scene's own length — the Ken Burns half of the
-       * same problem. Drift moves the frame; this makes it breathe, so even a
-       * shot the camera is not touching is continuously growing by ~3%. It
-       * resets at each cut, which the transition covers.
-       */
-      const breathAt = (local, dur) => 1 + 0.03 * clamp01(local / Math.max(1, dur));
 
       /**
        * App-viewport point → composition point, then scale about it.
@@ -818,8 +823,8 @@
 
         return { ax, ay, px, py, s };
       }
-      const matrixFor = (f, drift) =>
-        `translate(${f.ax + drift.dx}px, ${f.ay + drift.dy}px) scale(${f.s * drift.ds}) translate(${-f.px}px, ${-f.py}px)`;
+      const matrixFor = (f) =>
+        `translate(${f.ax}px, ${f.ay}px) scale(${f.s}) translate(${-f.px}px, ${-f.py}px)`;
 
       /**
        * Velocity-proportional blur.
@@ -1026,7 +1031,6 @@
       // ── End card ───────────────────────────────────────────────────────────
       const endcard = document.getElementById("endcard");
       const veil = document.getElementById("veil");
-      const bgEl = document.getElementById("bg");
       const ecMark = endcard.querySelector(".mark");
       const ecH1 = endcard.querySelector("h1");
       const ecTag = endcard.querySelector(".tag");
@@ -1092,12 +1096,10 @@
 
           const g = layoutAt(s, Math.max(0, local));
           const cam = cameraAt(s, Math.max(0, local));
-          const drift = driftAt(t, i);
-          drift.ds *= breathAt(Math.max(0, local), s.dur);
           const f = transformFor(cam, g);
 
           L.el.style.opacity = String(Math.min(eIn.o ?? 1, eOut.o ?? 1));
-          L.el.style.transform = matrixFor(f, drift);
+          L.el.style.transform = matrixFor(f);
 
           const blur = motionBlur(s, Math.max(0, local), g) + (eIn.blur || 0) + (eOut.blur || 0);
           const filter = blur > 0.35 ? `blur(${blur.toFixed(2)}px)` : "";
@@ -1123,11 +1125,6 @@
             pending.push(L.img.decode().catch(() => {}));
           }
         }
-
-        // The aurora parallaxes a fraction of the drift, so the ground and the
-        // product are not welded together.
-        const bd = driftAt(t, 7);
-        bgEl.style.transform = `translate(${bd.dx * -0.5}px, ${bd.dy * -0.5}px) scale(1.02)`;
 
         paintCaptions(t);
         paintEndcard(t);
