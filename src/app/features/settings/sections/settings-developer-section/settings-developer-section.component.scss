@@ -1,0 +1,28 @@
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.dev-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+}
+
+.dev-copy {
+  min-width: 0;
+
+  h3 {
+    margin: 0 0 var(--space-1);
+    font-size: 0.9375rem;
+  }
+
+  p {
+    margin: 0;
+    max-width: 52ch;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+  }
+}

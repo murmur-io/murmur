@@ -150,6 +150,30 @@
     </section>
   }
 
+  <!-- Developer mode — hidden unless the Settings toggle is on. Marked red so
+       it never reads as an ordinary destination: it is a diagnostics surface
+       the user deliberately switched on and can switch back off. -->
+  @if (developerMode()) {
+    <nav class="sb-developer" aria-label="Developer mode">
+      @if (sidebarExpanded()) {
+        <span class="sb-group-label sb-dev-label">Developer mode</span>
+      }
+      <a
+        class="sb-row sb-dev-row"
+        routerLink="/developer/logs"
+        [class.active]="isDeveloperItemActive('/developer/logs')"
+        [attr.aria-current]="
+          isDeveloperItemActive('/developer/logs') ? 'page' : null
+        "
+        aria-label="Logs"
+        title="Logs"
+      >
+        <mur-icon icon="logs" />
+        <span class="sb-label">Logs</span>
+      </a>
+    </nav>
+  }
+
   <nav class="sb-browse" aria-label="Browse destinations">
     <button
       type="button"
