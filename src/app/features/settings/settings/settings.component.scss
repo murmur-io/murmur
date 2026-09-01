@@ -183,6 +183,11 @@
      ~28px instead of a hard cut, the standard "there's more, scroll" tell. */
   mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
   -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
+  /* …but the fade must not eat the LAST row once you have scrolled to the end.
+     Scroll padding deeper than the fade means the final item comes to rest
+     above it, fully painted, instead of arriving half-transparent at the exact
+     moment it becomes the thing you are looking at. */
+  padding-bottom: 36px;
 }
 /* Cluster heading. The component doc says this rail "mirrors the main rail's
    labeled clusters" — but the class carried NO styles anywhere in the repo, so
@@ -351,6 +356,7 @@
     flex-direction: row;
     flex-wrap: wrap;
     overflow-y: visible;
+    padding-bottom: 0;
   }
   .nav-item {
     width: auto;
