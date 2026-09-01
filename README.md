@@ -25,7 +25,7 @@
 </p>
 
 <p align="center">
-  <a href="https://murmurnotes.io/#product"><img src="docs/screenshots/promo-poster.jpg" alt="Play the Murmur tour: recording a meeting, the on-device transcript, asking across your vault with citations, the brain graph, and locking a Space" width="760"></a>
+  <a href="https://murmurnotes.io/#product"><img src="docs/screenshots/promo-poster.jpg" alt="Play the Murmur tour: a meeting recorded while a note is typed alongside it, the note Murmur writes afterwards, the dual-stream speaker timeline, a question answered with its sources, the brain graph, the Workspaces rail, a live board, and a workspace refusing to open because it is sealed" width="760"></a>
 </p>
 
 <p align="center">
@@ -33,7 +33,7 @@
   <a href="#-quick-start">Quick start</a> ·
   <a href="#-the-brain--your-meeting-memory-you-can-talk-to">The brain</a> ·
   <a href="#-features">Features</a> ·
-  <a href="#-spaces-boards--imports">Spaces &amp; boards</a> ·
+  <a href="#-workspaces-boards--imports">Workspaces &amp; boards</a> ·
   <a href="#-notes">Notes</a> ·
   <a href="#-shared-brain-org">Shared Brain</a> ·
   <a href="#-architecture">Architecture</a> ·
@@ -71,15 +71,16 @@ zero-knowledge, no plaintext ever touching a server.
   something useful it offers a quiet **"✓ Add to notes"** — nothing enters your notes unless you say so.
 - 🔒 **Truly local-first.** The brain, transcription, and search all run on your Mac. Pick a fully-local
   stack (Ollama or the bundled GGUF model) and **nothing ever leaves the device.**
-- 🗂️ **One hierarchy: Spaces.** Recordings and notes live in the same tree — **Spaces › folders ›
-  items** — not in two parallel folder systems. Lock a Space and everything inside it is sealed with it.
+- 🗂️ **One hierarchy: Workspaces.** Recordings and notes live in the same tree — **Workspaces ›
+  folders › items** — not in two parallel folder systems. Lock a workspace and everything inside it
+  is sealed with it, and anything you delete waits 30 days in the Trash before it is really gone.
 - 📊 **Dashboards you compose.** Put notes, recordings, documents, people, promise ledgers and reminders
   on a board, pin a **living answer** the app keeps current, and read it through Brief / Overview /
   Commitments / Sources / People lenses. A board's sources going locked withholds the answer.
 - 📥 **Bring the notes you already have.** Import a Notion export, an Obsidian vault, or Apple Notes —
   entirely offline, dry-run first, no token and no account.
 - 📝 **A real notes product, not an afterthought.** A standalone Markdown editor filed in the same
-  Spaces as your recordings, with the same lock lifecycle, a 19-action AI command menu, and per-note end-to-end-encrypted sharing — for
+  workspaces as your recordings, with the same lock lifecycle, a 19-action AI command menu, and per-note end-to-end-encrypted sharing — for
   writing that never came from a recording.
 - 🌐 **A Shared Brain for your org — free, E2EE.** Opt in and publish notes or meetings into a
   zero-knowledge shared pool your teammates' apps replicate and search locally. The server only ever
@@ -193,7 +194,7 @@ across your whole history, and browse what it knows — all over the same store.
   <img src="docs/screenshots/full-brain-graph.png" alt="The full brain graph — meetings, notes, documents and people as one map with typed links" width="860">
   <br/><em>The full brain graph — meetings, notes, documents and people as one map, with typed links
   (co-occurrence, mentions, wikilinks, companion, manual, semantic) and suggested links drawn dashed.
-  Sealed Spaces produce no nodes, and the map says so rather than pretending it is complete.</em>
+  Sealed workspaces produce no nodes, and the map says so rather than pretending it is complete.</em>
 </p>
 
 <p align="center">
@@ -300,32 +301,32 @@ Markdown you own, openable in any editor. (The encrypted SQLite DB — not the v
 
 ---
 
-## 🗂️ Spaces, boards & imports
+## 🗂️ Workspaces, boards & imports
 
 The three structural changes 2.0 made. Everything above lives inside them.
 
-### 🗂️ Spaces — one hierarchy
+### 🗂️ Workspaces — one hierarchy
 
 <p align="center">
-  <img src="docs/screenshots/hero-spaces.png" alt="The Spaces sidebar — one tree of Spaces and folders holding recordings, notes and boards" width="860">
-  <br/><em>One tree: <b>Spaces › folders › your recordings, notes, tasks and boards</b>. The separate
+  <img src="docs/screenshots/hero-spaces.png" alt="The Workspaces sidebar — one tree of workspaces and folders holding recordings, notes and boards" width="860">
+  <br/><em>One tree: <b>Workspaces › folders › your recordings, notes, tasks and boards</b>. The separate
   Meetings and Notes folder trees are gone.</em>
 </p>
 
-- **One tree, four kinds of thing.** A Space holds folders; a folder holds recordings, notes, tasks and
+- **One tree, four kinds of thing.** A workspace holds folders; a folder holds recordings, notes, tasks and
   boards. There is no second hierarchy to keep in sync, and no item that belongs to "notes" rather than
   to a project.
-- **A persistent icon rail plus a contextual panel.** The rail is always there (Capture, Search, Spaces,
-  Shared Brains, Ask, Browse, New note, Settings); the panel beside it switches between the Spaces tree
-  and a flat Browse view of every kind.
-- **Lock a Space and everything inside it is sealed with it.** A project lock cascades to each child
+- **One sidebar that collapses to a rail.** Workspaces, Shared brains and Browse live in a single
+  sidebar; Search, Ask and Settings sit in a band level with the window buttons, and Capture and Quick
+  note share the footer. One click collapses the whole thing to an icon rail.
+- **Lock a workspace and everything inside it is sealed with it.** A project lock cascades to each child
   folder in its own right, so every existing visibility gate applies unchanged.
 - **Brain-assisted filing.** "File recordings with Brain" proposes where stray recordings belong; you
   review the plan and nothing moves until you approve it.
 
 <p align="center">
-  <img src="docs/screenshots/spaces-locked.png" alt="A sealed Space discloses its name and nothing else" width="820">
-  <br/><em>A sealed Space discloses its <b>name</b> — which is what you need in order to unlock it — and
+  <img src="docs/screenshots/spaces-locked.png" alt="A sealed workspace discloses its name and nothing else" width="820">
+  <br/><em>A sealed workspace discloses its <b>name</b> — which is what you need in order to unlock it — and
   nothing else. No counts, no children, no items, not even totals.</em>
 </p>
 
@@ -368,7 +369,7 @@ The three structural changes 2.0 made. Everything above lives inside them.
 - **Dry run first.** Every import reports what it *would* write — new versus already imported — before
   anything is written, and an unfiled import lands in its own named, badged container.
 - **Imported notes join the same brain**: chunked, indexed, `[[link]]`-able, and gated by the same
-  per-Space lock as everything else.
+  per-workspace lock as everything else.
 
 ### ✅ Tasks & reminders
 
@@ -405,7 +406,7 @@ recording. Same store, same lock model, same brain.
 - **A real editor** at its own route, with collapsible YAML front-matter, a formatting toolbar, markdown
   keyboard shortcuts, an 11-type slash-`/` block-insert menu, Edit/Preview toggle, and debounced
   autosave.
-- **Filed in Spaces alongside your recordings** — one hierarchy, not a separate note-folder tree.
+- **Filed in workspaces alongside your recordings** — one hierarchy, not a separate note-folder tree.
   It reuses the exact same **Touch-ID-gated per-container lock**: a locked container masks its notes'
   titles to `🔒 Locked` and blanks body, tags, and properties, just like a locked meeting.
 - **AI auto-organize** — the brain proposes a folder/tag reorganization plan, you review it, nothing
@@ -708,9 +709,9 @@ transcribe → summarize MVP.
 - **A self-building link graph** — notes, meetings, *and* imported documents are first-class
   `[[link]]` targets you pick/link/open from any surface; backlinks resolve by id, and the full-brain
   graph renders as a living neural map.
-- **Spaces** — one hierarchy for everything. The separate Meetings and Notes folder trees are gone;
-  there is a single tree of **Spaces › folders › your recordings and notes**, behind a rebuilt shell
-  (a persistent icon rail plus a contextual panel). Locking a Space seals everything inside it.
+- **Workspaces** — one hierarchy for everything. The separate Meetings and Notes folder trees are
+  gone; there is a single tree of **Workspaces › folders › your recordings and notes**, in one sidebar
+  that collapses to a rail. Locking a workspace seals everything inside it.
 - **Dashboards** — compose a board from your notes, recordings, documents, people, promise ledgers
   and reminders, plus pinned **living answers** (a question whose answer the app keeps up to date, and
   withholds the moment its sources stop being readable). Read a board through **Brief / Overview /
@@ -723,7 +724,7 @@ transcribe → summarize MVP.
   browser. A conversation disappears the instant any folder it drew on stops being readable.
 - **One model picker** across every AI surface, always accepting a free-text model id — so a model
   released after this build is still selectable.
-- **Notes** as a full standalone product — editor, the shared Space/folder lock lifecycle, AI
+- **Notes** as a full standalone product — editor, the shared workspace/folder lock lifecycle, AI
   auto-organize, and the 19-action AI command menu.
 - **Shared Brain** — free, opt-in, end-to-end-encrypted org sharing of notes and meetings, multi-org
   aware, auto-refreshing, with its own MCP tool, and **per-document permissions** (**View only** /
@@ -731,7 +732,7 @@ transcribe → summarize MVP.
 - **Tasks** — shared work inside a Shared Brain org: assignees, due dates, subtasks, and the same
   per-document permissions. Tasks belong to an org, so — like Shared Brain and link sharing — they
   require a signed-in account. Everything else in this list works with no account at all.
-- The per-Space / per-folder Touch ID lock model (two encryption layers, gated reads,
+- The per-workspace / per-folder Touch ID lock model (two encryption layers, gated reads,
   verify-before-destroy seals), the content-free egress ledger, and the read-only MCP server.
 - Per-note and per-meeting expiring E2EE link sharing.
 
