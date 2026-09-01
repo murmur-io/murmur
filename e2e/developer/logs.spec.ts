@@ -151,7 +151,7 @@ test("a never-written previous session reads as 'no previous session', not an er
   await boot(page);
   await openLogs(page);
 
-  await page.getByRole("button", { name: "Previous session" }).click();
+  await page.getByRole("button", { name: "Previous", exact: true }).click();
 
   await expect(page.getByText("No previous session")).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
@@ -195,7 +195,7 @@ test("Clear is offered for this session only — the previous one is evidence", 
   await boot(page);
   await openLogs(page);
 
-  await page.getByRole("button", { name: "Previous session" }).click();
+  await page.getByRole("button", { name: "Previous", exact: true }).click();
   await page.getByRole("button", { name: "Log actions" }).click();
 
   await expect(page.getByRole("menuitem", { name: "Refresh" })).toBeVisible();
