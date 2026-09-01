@@ -33,6 +33,14 @@
 :host(.is-open) .row-menu-trigger {
   opacity: 1;
 }
+/* Standing alone (a page header) there is no row to hover, so the trigger is
+   always at full contrast and sized as a real header control. */
+:host(.is-prominent) .row-menu-trigger {
+  width: 32px;
+  height: 32px;
+  opacity: 1;
+  color: var(--text-secondary);
+}
 .row-menu-trigger:hover:not(:disabled),
 .row-menu-trigger.is-open {
   background: var(--surface-raised);
