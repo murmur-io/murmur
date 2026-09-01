@@ -163,6 +163,12 @@ test("a never-written previous session reads as 'no previous session', not an er
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
+/**
+ * `exact: true` on every menu-item name here is load-bearing, not decoration:
+ * `getByRole`'s `name` is a case-insensitive SUBSTRING match by default, so
+ * `"Refresh"` also matches `"Auto-refresh"` and `"Stop auto-refresh"` — two
+ * elements, which is a strict-mode violation rather than an assertion failure.
+ */
 test("every action sits behind the ⋯ menu, and choosing one closes it", async ({
   page,
 }) => {
@@ -172,26 +178,26 @@ test("every action sits behind the ⋯ menu, and choosing one closes it", async 
   // The header carries ONE control, not a six-button toolbar.
   const trigger = page.getByRole("button", { name: "Log actions" });
   await expect(trigger).toBeVisible();
-  await expect(page.getByRole("menuitem", { name: "Refresh" })).toHaveCount(0);
+  await expect(page.getByRole("menuitem", { name: "Refresh", exact: true })).toHaveCount(0);
 
   await trigger.click();
-  await expect(page.getByRole("menuitem", { name: "Refresh" })).toBeVisible();
-  await expect(page.getByRole("menuitem", { name: "Copy" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Refresh", exact: true })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Copy", exact: true })).toBeVisible();
   await expect(
-    page.getByRole("menuitem", { name: "Reveal in Finder" }),
+    page.getByRole("menuitem", { name: "Reveal in Finder", exact: true }),
   ).toBeVisible();
-  await expect(page.getByRole("menuitem", { name: "Clear" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Clear", exact: true })).toBeVisible();
 
-  await page.getByRole("menuitem", { name: "Auto-refresh" }).click();
+  await page.getByRole("menuitem", { name: "Auto-refresh", exact: true }).click();
 
   // Choosing closes the menu; the header keeps reporting the lasting state.
-  await expect(page.getByRole("menuitem", { name: "Refresh" })).toHaveCount(0);
+  await expect(page.getByRole("menuitem", { name: "Refresh", exact: true })).toHaveCount(0);
   await expect(page.locator(".live-pill")).toBeVisible();
 
   // ...and the item now offers the reverse action.
   await trigger.click();
   await expect(
-    page.getByRole("menuitem", { name: "Stop auto-refresh" }),
+    page.getByRole("menuitem", { name: "Stop auto-refresh", exact: true }),
   ).toBeVisible();
 });
 
@@ -204,8 +210,8 @@ test("Clear is offered for this session only — the previous one is evidence", 
   await page.getByRole("button", { name: "Previous", exact: true }).click();
   await page.getByRole("button", { name: "Log actions" }).click();
 
-  await expect(page.getByRole("menuitem", { name: "Refresh" })).toBeVisible();
-  await expect(page.getByRole("menuitem", { name: "Clear" })).toHaveCount(0);
+  await expect(page.getByRole("menuitem", { name: "Refresh", exact: true })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Clear", exact: true })).toHaveCount(0);
 });
 
 test("clicking a row expands it into the whole entry, and again collapses it", async ({
