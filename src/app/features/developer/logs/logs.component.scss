@@ -92,25 +92,50 @@
   gap: 1px;
 }
 
-.log-row {
-  display: grid;
-  grid-template-columns: 78px 52px minmax(0, 150px) minmax(0, 1fr);
-  align-items: baseline;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  border-left: 2px solid transparent;
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-  line-height: 1.55;
+/* One entry = the clickable summary row plus, when expanded, its detail panel. */
+.log-entry {
   border-bottom: 1px solid var(--border);
 
   &:last-child {
     border-bottom: none;
   }
+}
+
+.log-row {
+  display: grid;
+  grid-template-columns: 14px 78px 52px minmax(0, 150px) minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.55;
+  text-align: left;
+  cursor: pointer;
 
   &:hover {
     background: var(--surface-raised);
+  }
+
+  &:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--accent-ring);
+  }
+}
+
+.row-caret {
+  display: inline-flex;
+  align-self: center;
+  color: var(--text-muted);
+  transition: transform var(--transition-fast);
+
+  &.open {
+    transform: rotate(90deg);
   }
 }
 
@@ -133,17 +158,103 @@
   white-space: nowrap;
 }
 
+/* Collapsed, the message is ONE line — the row stays scannable however long the
+   event is, and the whole text is one click away in the panel below. */
 .log-message {
   margin: 0;
   color: var(--text-primary);
-  /* Multi-line events (a folded panic payload) keep their shape instead of
-     collapsing into one unreadable line. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── The expanded detail ─────────────────────────────────────────────────────
+   In-flow, so it takes `--surface-input` and never the overlay surface (T3
+   governs floating content only). */
+.row-detail {
+  margin: 0 var(--space-3) var(--space-2) calc(var(--space-3) + 14px);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  font-size: 0.75rem;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: minmax(90px, max-content) minmax(0, 1fr);
+  gap: var(--space-1) var(--space-4);
+  margin: 0;
+
+  dt {
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+
+  dd {
+    margin: 0;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    /* Selectable and wrapped: this panel is the one place the full text lives. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+  }
+}
+
+.detail-utc {
+  margin-left: var(--space-2);
+  color: var(--text-muted);
+}
+
+/* A structured field reads as data, not prose — its key keeps the mono column. */
+.detail-field-key {
+  color: var(--accent) !important;
+  text-transform: none !important;
+  font-family: var(--font-mono);
+}
+
+.detail-raw-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.detail-raw-label {
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.detail-copy {
+  height: 26px;
+  padding: 0 var(--space-3);
+  font-size: 0.75rem;
+}
+
+.detail-raw {
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  user-select: text;
 }
 
 /* Severity reads from the left edge — the scan pattern for a long log. */
-.log-row.is-error {
+.log-entry.is-error .log-row {
   border-left-color: var(--danger);
   background: var(--danger-soft);
 
@@ -152,7 +263,7 @@
   }
 }
 
-.log-row.is-warn {
+.log-entry.is-warn .log-row {
   border-left-color: var(--warning);
 
   .log-level {
@@ -160,12 +271,12 @@
   }
 }
 
-.log-row.is-info .log-level {
+.log-entry.is-info .log-level {
   color: var(--accent);
 }
 
-.log-row.is-debug,
-.log-row.is-other {
+.log-entry.is-debug,
+.log-entry.is-other {
   .log-time,
   .log-level,
   .log-target,
@@ -176,7 +287,7 @@
 
 @media (max-width: 900px) {
   .log-row {
-    grid-template-columns: 70px 48px minmax(0, 1fr);
+    grid-template-columns: 14px 70px 48px minmax(0, 1fr);
   }
 
   .log-target {
