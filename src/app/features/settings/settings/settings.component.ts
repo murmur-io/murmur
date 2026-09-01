@@ -1,10 +1,14 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  type ElementRef,
+  Injector,
   OnInit,
+  afterNextRender,
   computed,
   inject,
   signal,
+  viewChild,
 } from "@angular/core";
 import { toSignal } from "@angular/core/rxjs-interop";
 import { FormControl, ReactiveFormsModule } from "@angular/forms";
@@ -27,6 +31,7 @@ import { SettingsPrivacySectionComponent } from "../sections/settings-privacy-se
 import { SettingsObsidianSectionComponent } from "../sections/settings-obsidian-section/settings-obsidian-section.component";
 import { SettingsImportsSectionComponent } from "../sections/settings-imports-section/settings-imports-section.component";
 import { SettingsAboutSectionComponent } from "../sections/settings-about-section/settings-about-section.component";
+import { SettingsDeveloperSectionComponent } from "../sections/settings-developer-section/settings-developer-section.component";
 
 /** One entry in the macOS-style Settings sidebar. `keywords` feeds the search box. */
 interface SettingsSection {
@@ -54,6 +59,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop memory remember facts user memory cross-meeting forget" },
   { id: "obsidian", label: "Obsidian", keywords: "vault markdown notes companion export wikilinks" },
   { id: "imports", label: "Imports", keywords: "notion obsidian apple notes import migrate export zip markdown vault bring in move from another app switch migration" },
+  { id: "developer", label: "Developer", keywords: "developer mode logs log file diagnostics debug crash troubleshooting console tools advanced" },
   { id: "about", label: "About", keywords: "about version update check for updates release changelog product info" },
 ];
 
@@ -72,7 +78,7 @@ const SETTINGS_GROUPS: readonly {
   { label: "Intelligence", ids: ["notes", "ai", "connectors"] },
   { label: "Sharing", ids: ["account", "organization"] },
   { label: "Privacy & Vault", ids: ["privacy", "obsidian", "imports"] },
-  { label: null, ids: ["about"] },
+  { label: null, ids: ["developer", "about"] },
 ];
 
 /**
@@ -86,10 +92,6 @@ const SETTINGS_GROUPS: readonly {
 @Component({
   selector: "app-settings",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  // Esc in settings backs out ("← Murmur") — but NOT while you're typing: in the
-  // search box Esc clears/blurs it first, and it never hijacks another form field.
-  // Declarative host listener — Angular owns its lifecycle (no manual DOM listener).
-  host: { "(document:keydown.escape)": "onEscape()" },
   providers: [SettingsStore],
   imports: [
     MurSidebarComponent,
@@ -108,6 +110,7 @@ const SETTINGS_GROUPS: readonly {
     SettingsObsidianSectionComponent,
     SettingsImportsSectionComponent,
     SettingsAboutSectionComponent,
+    SettingsDeveloperSectionComponent,
   ],
   templateUrl: "./settings.component.html",
   styleUrl: "./settings.component.scss",
@@ -123,10 +126,30 @@ export class SettingsComponent implements OnInit {
    * settings shortcut) opens directly on that section instead of the Appearance default. */
   private readonly route = inject(ActivatedRoute);
 
+  private readonly injector = inject(Injector);
+
+  /** The modal panel — focused on open so Esc and Tab start inside the dialog. */
+  private readonly panel = viewChild<ElementRef<HTMLElement>>("panel");
+
+  /**
+   * Click the backdrop to leave, the standard modal dismissal. Only a click that
+   * LANDS on the scrim itself counts — one that bubbles up from a control inside
+   * the panel must never close the screen the user is working in.
+   */
+  onScrimClick(event: MouseEvent): void {
+    if (event.target === event.currentTarget) {
+      this.nav.back();
+    }
+  }
+
   /**
    * Esc while in settings. Backs out to where you came from — EXCEPT while you're
    * typing: in the search box the first Esc clears it (or blurs when empty), and
    * Esc is ignored inside any other form field, so it never ejects you mid-edit.
+   *
+   * Bound on the SCRIM rather than on `document` now that Settings is a modal:
+   * the dialog focuses itself on open, so every Escape reaches it by bubbling,
+   * and the handler can no longer fire for a keystroke aimed at something else.
    */
   onEscape(): void {
     const el = document.activeElement as HTMLElement | null;
@@ -209,6 +232,14 @@ export class SettingsComponent implements OnInit {
   /** Save/load state surfaced from the store — the sidebar template reads these. */
   readonly saved = this.store.saved;
   readonly loadError = this.store.loadError;
+
+  constructor() {
+    // A dialog should own the keyboard the moment it opens: without this the
+    // focus stays on whatever opened Settings, behind the scrim.
+    afterNextRender(() => this.panel()?.nativeElement.focus(), {
+      injector: this.injector,
+    });
+  }
 
   ngOnInit(): void {
     // Pre-split this was an async ngOnInit whose promise Angular ignored;

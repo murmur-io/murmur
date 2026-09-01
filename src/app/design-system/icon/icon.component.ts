@@ -50,7 +50,11 @@ export type ShellIcon =
   | "numbers"
   | "pulse"
   | "promises"
-  | "lock";
+  | "lock"
+  // Developer mode — the diagnostics surface behind the Settings toggle.
+  // `developer` is the terminal chevron+caret; `logs` is a stack of log lines.
+  | "developer"
+  | "logs";
 
 /**
  * Design System — one inline-SVG glyph, shared by the floating sidebar, the

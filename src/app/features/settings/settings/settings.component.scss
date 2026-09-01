@@ -1,104 +1,135 @@
-/* Settings is a drill-down (L2) beside the persistent global rail. This fixed
-   host starts after that rail and fills the remaining window as a
-   [section rail | content] layout. Fixed so it ignores .app-main's centered
-   max-width + padding; below the toast viewport (z-index 60).
-   `top: var(--tabs-strip-height, 0px)` (not `inset: 0`) — real reserved
-   space for `mur-tab-strip`'s in-flow header row; see library.component.scss
-   for the full rationale. */
+/* Settings is a MODAL over the whole window.
+   It used to be a fixed pane that started AFTER the shell sidebar
+   (`left: var(--shell-content-inset)`), which left the app's navigation live
+   and clickable beside a screen the user is meant to finish and leave — and it
+   inherited the shell's height arithmetic (`--tabs-strip-height`) to avoid
+   spilling past the viewport. As a dialog neither problem exists: the scrim
+   owns the window and the panel is sized from it.
+
+   z-index 50 is deliberate: above the sidebar (9) and the drag strip (8), below
+   the toast viewport (60) so a toast raised FROM settings is still readable, and
+   below the menu/dialog layers (110, --z-overlay) so a menu opened inside
+   settings paints over it. */
 :host {
   position: fixed;
-  top: var(--tabs-strip-height, 0px);
-  right: 0;
-  bottom: 0;
-  left: var(--shell-content-inset);
-  z-index: 5;
+  inset: 0;
+  z-index: 50;
   display: block;
-  background: var(--surface-base);
 }
 
-/* ── Two-pane shell: floating section rail + scrolling content ──
-   `:host` already starts BELOW the tab strip (`top: var(--tabs-strip-height,
-   0px)` above), but this inner shell was still sized to the FULL viewport
-   height (`100vh`/`100dvh`) — so it overflowed the fixed `:host` box by
-   exactly the strip's height, spilling its bottom rows (the Light/Dark/
-   System toggle row, the sidebar's last nav item) past the bottom of the
-   viewport. Subtract the same offset here so the shell's height matches the
-   space `:host` actually reserves. */
+.settings-scrim {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  /* The TOP inset clears the window-button band, and is not cosmetic: macOS
+     draws the traffic lights natively ABOVE the webview (`titleBarStyle:
+     Overlay`), so no z-index of ours can put a panel over them — a dialog that
+     starts at the top edge has three system buttons punched through its corner.
+     `--shell-topbar-h` is the same band the shell's own rail reserves for them. */
+  padding: calc(var(--shell-topbar-h) + var(--space-2)) var(--space-5)
+    var(--space-5);
+  background: var(--scrim);
+}
+
+/* Fills the band above the panel, so the whole strip the traffic lights live in
+   drags the window — the shell's own drag region is behind the scrim now. */
+.scrim-drag {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: calc(var(--shell-topbar-h) + var(--space-2));
+}
+
+/* ── The panel: nearly the whole window, capped so it stays a dialog on a
+   large display rather than a second full-screen app. Opaque (T3: it floats
+   over content), and the two-pane [section rail | content] layout lives on it. */
 .settings-shell {
+  position: relative;
   display: grid;
   grid-template-columns: calc(var(--space-8) * 4) minmax(0, 1fr);
-  height: calc(100vh - var(--tabs-strip-height, 0px));
-  height: calc(100dvh - var(--tabs-strip-height, 0px));
-}
-
-/* Left rail — the shared floating liquid-glass panel (global .drill-rail
-   in styles.css carries the panel look; only layout + the enter glide
-   live here). */
-.settings-sidebar {
-  gap: var(--space-3);
-  height: calc(100% - var(--space-4));
-  margin: var(--space-2) 0;
-  animation: settings-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-
-/* Enter transition — the rail and the content pane share ONE cohesive,
-   smoothly-eased glide (content lags 40ms for a touch of depth). It is
-   TRANSFORM ONLY, never opacity: the position:fixed :host is opaque and
-   near-black (--surface-base), so any opacity fade shows through as a
-   "black background, then the UI jumps in" flash (the reported bug). Staying
-   opaque means the settings surface is painted from the very first frame and
-   simply settles into place. Disabled under reduced-motion below. */
-@keyframes settings-enter {
-  from {
-    transform: translateY(8px);
-  }
-  to {
-    transform: none;
-  }
-}
-
-/* Top drag strip — mirrors the primary rail so the overlay traffic lights
-   have somewhere to float and the window stays draggable up here. */
-.rail-drag {
-  flex: none;
-  height: 30px;
-}
-
-/* "← Murmur" drill-down up-affordance. */
-.rail-back {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
   width: 100%;
-  height: 34px;
-  padding: 0 var(--space-2);
+  height: 100%;
+  max-width: 1180px;
+  max-height: 900px;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xl);
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-lg);
+  animation: settings-enter 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.settings-shell:focus-visible {
+  outline: none;
+}
+
+/* Close is the modal's own affordance, pinned to the panel — not a "← Murmur"
+   row inside the rail, which read as navigation in a window you dismiss. */
+.settings-close {
+  position: absolute;
+  top: var(--space-3);
+  right: var(--space-3);
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
   border: 0;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-pill);
   background: transparent;
   color: var(--text-secondary);
-  font: inherit;
-  font-size: 0.9rem;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  text-align: left;
   cursor: pointer;
   transition:
     background var(--transition-fast),
     color var(--transition-fast);
 }
-.rail-back:hover {
+.settings-close svg {
+  width: 15px;
+  height: 15px;
+}
+.settings-close:hover {
   background: var(--surface-hover);
   color: var(--text-primary);
 }
-.rail-back:focus-visible {
+.settings-close:focus-visible {
   outline: none;
   color: var(--text-primary);
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
-.rail-back-icon {
-  flex: none;
-  width: 16px;
-  height: 16px;
+
+/* Left rail — FLAT inside the modal. `<mur-sidebar>` carries the global
+   `.drill-rail` glass, and glass over an opaque dialog is glass on glass (rule
+   §6b): the blur has nothing real to sample and the panel reads as two floating
+   surfaces. Overridden here on the host element, so every other rail in the app
+   keeps its glass. */
+.settings-sidebar {
+  gap: var(--space-3);
+  height: 100%;
+  margin: 0;
+  padding: var(--space-4) var(--space-3);
+  border: none;
+  border-right: 1px solid var(--border-subtle);
+  border-radius: 0;
+  background: var(--surface-raised);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+}
+
+/* Enter transition — the panel rises a touch as it fades in. Unlike the old
+   full-bleed pane (opaque over near-black, where any opacity fade flashed), a
+   dialog over a scrim can fade honestly. Disabled under reduced-motion below. */
+@keyframes settings-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .sidebar-search {
@@ -152,6 +183,11 @@
      ~28px instead of a hard cut, the standard "there's more, scroll" tell. */
   mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
   -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
+  /* …but the fade must not eat the LAST row once you have scrolled to the end.
+     Scroll padding deeper than the fade means the final item comes to rest
+     above it, fully painted, instead of arriving half-transparent at the exact
+     moment it becomes the thing you are looking at. */
+  padding-bottom: 36px;
 }
 /* Cluster heading. The component doc says this rail "mirrors the main rail's
    labeled clusters" — but the class carried NO styles anywhere in the repo, so
@@ -201,12 +237,26 @@
   background: var(--surface-hover);
   color: var(--text-primary);
 }
-/* Active: the shell's neutral glass-on-glass pill — accent only on the
-   glyph/label, never as the fill (matches the primary rail). */
+/* Active: the flat accent fill of a NATIVE selection (§6b) — the same thing
+   macOS System Settings does to the section you are on.
+   It used to be the shell's neutral glass-on-glass pill, which was right while
+   this rail was glass: a near-white pill READS on a blurred, darkened surface.
+   Flattening the rail for the modal took that contrast away and left a white
+   pill on a near-white column — the selected section was effectively invisible.
+   A selection list is not chrome, so it takes the selection treatment. */
 .nav-item.active {
-  background: var(--shell-active-bg);
-  color: var(--shell-active-text);
-  box-shadow: var(--shell-active-shadow);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-weight: 600;
+  box-shadow: none;
+}
+.nav-item.active:hover {
+  background: var(--accent-hover);
+  color: var(--text-on-accent);
+}
+.nav-item.active:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 .nav-icon {
   display: inline-flex;
@@ -247,8 +297,7 @@
   flex: none;
 }
 
-/* Right pane — scrolls independently of the fixed rail. It provides its own
-   padding (the shell no longer sits inside .app-main's padded column). */
+/* Right pane — scrolls independently of the rail, inside the panel. */
 .settings-content {
   display: flex;
   flex-direction: column;
@@ -256,7 +305,8 @@
   min-width: 0;
   height: 100%;
   overflow-y: auto;
-  padding: var(--space-7) var(--space-6) var(--space-8);
+  /* Right padding clears the close button. */
+  padding: var(--space-6) var(--space-6) var(--space-7);
 }
 /* Cap the reading width AND center the column — the same centered
    max-width reading column as the main pages (.app-main). The error
@@ -288,18 +338,25 @@
 /* Narrow widths: stack the rail on top of the content (rows), each
    scrolling within the fixed full-height shell. */
 @media (max-width: 640px) {
+  .settings-scrim {
+    padding: calc(var(--shell-topbar-h) + var(--space-2)) var(--space-2)
+      var(--space-2);
+  }
   .settings-shell {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
   }
   .settings-sidebar {
     height: auto;
-    margin: 10px 10px 0;
+    padding: var(--space-3);
+    border-right: none;
+    border-bottom: 1px solid var(--border-subtle);
   }
   .sidebar-nav {
     flex-direction: row;
     flex-wrap: wrap;
     overflow-y: visible;
+    padding-bottom: 0;
   }
   .nav-item {
     width: auto;
@@ -311,7 +368,7 @@
 
 /* Honor reduced-motion: no rail slide, no section rise. */
 @media (prefers-reduced-motion: reduce) {
-  .settings-sidebar,
+  .settings-shell,
   .section-body {
     animation: none;
   }

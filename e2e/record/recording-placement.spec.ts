@@ -121,10 +121,17 @@ async function finishRecording(page: Page): Promise<void> {
   await expect(page.getByTestId("recording-result")).toBeVisible();
 }
 
+/**
+ * Leave the recorder and come back.
+ *
+ * Settings is a MODAL: while it is open the shell behind it is under a scrim,
+ * so the way back is closing the dialog — which returns to the route we came
+ * from — not clicking a sidebar link the scrim intercepts.
+ */
 async function navigateAwayAndBack(page: Page): Promise<void> {
   await page.getByRole("link", { name: "Settings" }).click();
   await expect(page).toHaveURL(/\/settings$/);
-  await page.getByRole("link", { name: "Capture" }).click();
+  await page.getByRole("button", { name: "Close settings" }).click();
   await expect(page).toHaveURL(/\/record$/);
 }
 
@@ -1346,7 +1353,7 @@ test.describe("Record — one final result and route-scoped presentation", () =>
         ),
       )
       .toBeGreaterThanOrEqual(1);
-    await page.getByRole("link", { name: "Capture" }).click();
+    await page.getByRole("button", { name: "Close settings" }).click();
     await expect(page).toHaveURL(/\/record$/);
     await expect(page.getByTestId("recording-result")).toHaveCount(0);
     await expect(page.locator(".proc-inline")).toHaveCount(0);
@@ -1441,7 +1448,7 @@ test.describe("Record — one final result and route-scoped presentation", () =>
       ).__resolveAwayDetail?.();
     });
     await page.waitForTimeout(100);
-    await page.getByRole("link", { name: "Capture" }).click();
+    await page.getByRole("button", { name: "Close settings" }).click();
 
     await expect(page.locator("button.start-btn")).toHaveText(
       /Start recording/,
@@ -1515,7 +1522,7 @@ test.describe("Record — one final result and route-scoped presentation", () =>
       )
       .toBeGreaterThanOrEqual(1);
     await page.waitForTimeout(100);
-    await page.getByRole("link", { name: "Capture" }).click();
+    await page.getByRole("button", { name: "Close settings" }).click();
     await expect(page.locator("button.start-btn")).toBeVisible();
 
     await page.evaluate(() => {

@@ -35,6 +35,7 @@ import { TilePaletteComponent } from "../features/dashboards/tile-palette/tile-p
 import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialog/lock-shares-dialog.component";
 import { ReminderComposerComponent } from "../features/reminders/reminder-composer/reminder-composer.component";
 import { ReminderComposerService } from "../features/reminders/reminder-composer/reminder-composer.service";
+import { DeveloperModeService } from "../services/developer-mode.service";
 import { TrashService } from "../services/trash.service";
 import { RemindersStore } from "../features/reminders/reminders.store";
 import { AccountSessionBannerComponent } from "../features/sharing/account-session-banner/account-session-banner.component";
@@ -163,6 +164,14 @@ export class AppShellComponent {
    * without anyone opening the view.
    */
   readonly trashCount = this.trash.count;
+  /**
+   * Developer mode (Settings → Developer). OFF by default; when on, the sidebar
+   * grows a red "Developer mode" group with the diagnostics tools in it. A root
+   * signal, so flipping the toggle in Settings lights this up immediately.
+   */
+  private readonly developer = inject(DeveloperModeService);
+  readonly developerMode = this.developer.enabled;
+
   readonly lockFlow = inject(FolderLockFlowService);
   readonly docPreview = inject(DocumentPreviewService);
   readonly tilePalette = inject(TilePaletteService);
@@ -264,6 +273,10 @@ export class AppShellComponent {
   }
 
   isBrowseItemActive(path: string): boolean {
+    return this.currentPath() === path;
+  }
+
+  isDeveloperItemActive(path: string): boolean {
     return this.currentPath() === path;
   }
 

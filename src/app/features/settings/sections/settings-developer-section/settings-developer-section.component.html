@@ -1,0 +1,34 @@
+<div class="section-stack">
+  <div class="card dev-card">
+    <div class="dev-copy">
+      <h3>Developer mode</h3>
+      <p class="text-secondary">
+        Reveals Murmur's diagnostic tools — a <b>Developer mode</b> group in the
+        sidebar with the app log inside it. Off by default; nothing about
+        recording, transcription or your notes changes either way.
+      </p>
+    </div>
+    <input
+      type="checkbox"
+      class="switch"
+      [checked]="enabled()"
+      (change)="setEnabled($event)"
+      aria-label="Developer mode"
+    />
+  </div>
+
+  @if (enabled()) {
+    <div class="card dev-card">
+      <div class="dev-copy">
+        <h3>Logs</h3>
+        <p class="text-secondary">
+          What the app recorded this session and the one before it — including
+          the last words of a run that crashed. Kept on this Mac for
+          <b>24 hours</b> and then deleted automatically; they carry no note or
+          transcript text.
+        </p>
+      </div>
+      <a class="btn" routerLink="/developer/logs">Open logs</a>
+    </div>
+  }
+</div>
