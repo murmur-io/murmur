@@ -61,7 +61,13 @@ ffmpeg -y -loglevel error -stats \
 # ── Poster ──────────────────────────────────────────────────────────────────
 # A frame from a couple of seconds in: frame 0 is mid-fade on most cuts, and a
 # poster that shows a half-faded caption looks like a broken video.
-POSTER_FRAME=$(printf "%06d" $((FPS * 2)))
+#
+# Two seconds is only a safe default, not a good choice — it is whatever the film
+# happens to be doing then. The poster is the single frame most people will ever
+# see (a <video preload="none"> shows nothing else until it is clicked), so it is
+# worth picking deliberately: set PROMO_POSTER_SEC to the second you want.
+POSTER_SEC="${PROMO_POSTER_SEC:-2}"
+POSTER_FRAME=$(printf "%06d" $(python3 -c "print(int($FPS * $POSTER_SEC))" 2>/dev/null || echo $((FPS * 2))))
 if [ -f "$IN/$POSTER_FRAME.png" ]; then
   ffmpeg -y -loglevel error -i "$IN/$POSTER_FRAME.png" -q:v 3 "$OUT/promo-poster.jpg"
 fi
