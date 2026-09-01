@@ -612,10 +612,26 @@
 
       // Captions carry absolute times and live above every layer: they are
       // titles, so they sit in screen space and the camera never touches them.
+      /*
+       * A caption belongs to its shot, and a cut takes everything with it.
+       *
+       * `until` is the shot's own end. Without it a caption whose fade-out runs
+       * past the cut keeps painting over the NEXT shot — which with soft
+       * transitions merely looked generous and with hard cuts puts two captions
+       * on screen at once, stacked. Seen in the 2026-09-01 re-cut: "Owners.
+       * Dates. Done." was still fading while "Your mic and the room" rose
+       * underneath it.
+       *
+       * Clipping is the correct grammar rather than a workaround — titles cut
+       * with the picture — but author the `dur` to finish inside the shot
+       * anyway, so the clip is a safety net and not the plan.
+       */
       const captions = [];
       if (OPT.captions) {
         for (const s of scenes) {
-          for (const c of s.captions || []) captions.push(Object.assign({}, c, { t: c.t + s.start }));
+          for (const c of s.captions || []) {
+            captions.push(Object.assign({}, c, { t: c.t + s.start, until: s.start + s.dur }));
+          }
         }
       }
 
@@ -953,7 +969,8 @@
           const start = c.t;
           const end = c.t + c.dur;
           const local = t - start;
-          if (local < -50 || t > end + OUT_MS + 50) {
+          const gone = c.until != null && t >= c.until;
+          if (local < -50 || t > end + OUT_MS + 50 || gone) {
             if (n.el.style.display !== "none") n.el.style.display = "none";
             continue;
           }

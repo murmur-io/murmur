@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <a href="https://murmurnotes.io/#product"><b>▶︎ Watch the 85-second tour</b></a>
+  <a href="https://murmurnotes.io/#product"><b>▶︎ Watch the 90-second tour</b></a>
 </p>
 
 <p align="center">

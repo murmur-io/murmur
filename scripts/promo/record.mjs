@@ -477,7 +477,7 @@ const SCENES = {
 
   /* 3. The note itself. One motivated push into the header, then a full stop. */
   note: {
-    transition: "push",
+    transition: "cut",
     async run(page, film) {
       await film.goto("/meeting/m-atlas-roadmap");
       await film.settle(700);
@@ -490,7 +490,6 @@ const SCENES = {
         dur: 3200,
       });
       await film.wait(700);
-      await film.focus({ x: 300, y: 100, width: 1264, height: 260 }, { scale: 1.3, ms: 1000 });
       await film.wait(2400);
     },
   },
@@ -534,9 +533,8 @@ const SCENES = {
       });
       await film.wait(500);
       await film.reveal("app-meeting-actions");
-      await film.focus("app-meeting-actions", { scale: 1.4, ms: 1100 });
       await film.assertClean("noteActions");
-      await film.wait(2600);
+      await film.wait(3100);
     },
   },
 
@@ -544,7 +542,7 @@ const SCENES = {
 
   /* 6. Dual-stream. The tab click is the action; the timeline paints in. */
   speakers: {
-    transition: "push",
+    transition: "cut",
     async run(page, film) {
       await film.goto("/meeting/m-atlas-roadmap");
       await film.settle(600);
@@ -560,8 +558,7 @@ const SCENES = {
       await film.showCursor(false);
       await film.assertClean("speakers");
       await film.reveal("app-meeting-timeline");
-      await film.focus("app-meeting-timeline", { scale: 1.35, ms: 1100 });
-      await film.wait(1000);
+      await film.wait(1200);
     },
   },
 
@@ -580,7 +577,6 @@ const SCENES = {
       film.frame("lower", { ms: 10 });
       film.title("Jump to *any moment*.", { kicker: "Topics", dur: 2300 });
       await film.showCursor(true);
-      await film.focus("app-meeting-timeline", { scale: 1.4, ms: 900 });
       await film.click(':text("Mobile redesign scope")', { after: 900 });
       await film.showCursor(false);
       await film.wait(400);
@@ -632,7 +628,7 @@ const SCENES = {
    *     help at all. NOT `/graph`: that route is the entity BROWSER and
    *     photographs as a list of chips, which would make the caption a lie. */
   brain: {
-    transition: "whip",
+    transition: "cut",
     async run(page, film) {
       await film.goto("/brain");
       await film.settle(600);
@@ -665,7 +661,7 @@ const SCENES = {
   /* 11. The Workspaces tree. Expanding a node is the action — and it navigates,
    *     so the whole right-hand pane changes with it. */
   workspace: {
-    transition: "pushUp",
+    transition: "cut",
     async run(page, film) {
       await film.goto("/notes");
       await film.settle(700);
@@ -697,7 +693,6 @@ const SCENES = {
       film.frame("lower", { ms: 10 });
       film.title("Collapse it to *a rail*.", { kicker: "One click", dur: 2900 });
       await film.showCursor(true);
-      await film.focus({ x: 200, y: 440, width: 620, height: 600 }, { scale: 1.28, ms: 800 });
       await film.click('button[aria-label="Collapse sidebar"]', { after: 1300 });
       await film.click('button[aria-label="Expand sidebar"]', { after: 900 });
       await film.showCursor(false);
@@ -727,7 +722,7 @@ const SCENES = {
 
   /* 14. Opening a board. */
   boards: {
-    transition: "push",
+    transition: "cut",
     async run(page, film) {
       await film.goto("/dashboards");
       await film.settle(700);
@@ -762,7 +757,6 @@ const SCENES = {
 
       film.frame("lower", { ms: 10 });
       film.title("It answers, and|*shows its working*.", { kicker: "Brief", dur: 2900 });
-      await film.focus({ x: 300, y: 200, width: 1260, height: 300 }, { scale: 1.28, ms: 1000 });
       await film.wait(1500);
       await film.showCursor(true);
       await film.click('button:has-text("Commitments")', { after: 1000 });
@@ -784,7 +778,6 @@ const SCENES = {
       film.frame("lower", { ms: 10 });
       film.title("It remembers *who owes what*.", { kicker: "People", dur: 2600 });
       await film.showCursor(true);
-      await film.focus({ x: 300, y: 150, width: 1264, height: 200 }, { scale: 1.32, ms: 900 });
       await film.cursorTo("text=Sarah Chen", { ms: 620 });
       await film.wait(320);
       await film.cursorTo("text=Marcus Reid", { ms: 560 });
@@ -802,7 +795,7 @@ const SCENES = {
    *     refuse. The refusal only means something once you have just seen what
    *     an open workspace looks like. */
   lockRefuse: {
-    transition: "whip",
+    transition: "cut",
     async run(page, film) {
       await film.goto("/container/f-eng");
       await film.settle(700);
@@ -810,12 +803,31 @@ const SCENES = {
       await film.assertClean("lockRefuse-open");
 
       film.frame("lower", { ms: 10 });
+      film.title("Locked means *locked*.", {
+        kicker: "Sealed",
+        sub: "Even to Murmur.",
+        dur: 2900,
+      });
       await film.showCursor(true);
-      await film.wait(1100);
+      await film.wait(900);
       await film.click('mur-sidebar :text-is("Personal")', { after: 1200 });
       await film.showCursor(false);
       await film.assertClean("lockRefuse-sealed");
-      film.frame("title", { ms: 900 });
+      await film.wait(1300);
+    },
+  },
+
+  /* 18. The claim, on its own shot. A frame mode NEVER animates inside a shot —
+   *     that is a slide, and a slide is the thing this cut exists to remove. If
+   *     the composition needs to change, that is what a cut is for. */
+  lockClaim: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/container/f-personal");
+      await film.settle(600);
+      await film.roll();
+
+      film.frame("title", { ms: 10 });
       film.title("A door *only you*|hold the key to.", {
         kicker: "Lock a workspace",
         dur: 4200,
@@ -840,10 +852,9 @@ const SCENES = {
         dur: 4900,
       });
       await film.showCursor(true);
-      await film.focus({ x: 30, y: 240, width: 560, height: 380 }, { scale: 1.42, ms: 1000 });
       await film.cursorTo('mur-sidebar :text-is("Personal")', { ms: 800 });
       await film.showCursor(false);
-      await film.wait(2900);
+      await film.wait(3500);
     },
   },
 };
