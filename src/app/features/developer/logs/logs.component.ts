@@ -406,7 +406,12 @@ export class LogsComponent implements OnInit {
  * query, a serialized struct). A message with no trailing pairs comes back unchanged.
  */
 function splitFields(message: string): { text: string; fields: LogField[] } {
-  const suffix = /(?:\s+[A-Za-z_][\w.]*=(?:"(?:[^"\\]|\\.)*"|[^\s"]+))+$/.exec(message);
+  // `(?:^|\s+)` — the run may START the string. `tracing` writes an event with no
+  // message text as fields alone (`location="…" message="boom"`), and a pattern
+  // that required leading whitespace matched only from the SECOND pair on: the
+  // first field was left behind as prose.
+  const suffix =
+    /(?:(?:^|\s+)[A-Za-z_][\w.]*=(?:"(?:[^"\\]|\\.)*"|[^\s"]+))+$/.exec(message);
   if (!suffix) {
     return { text: message, fields: [] };
   }

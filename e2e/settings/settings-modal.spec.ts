@@ -50,15 +50,21 @@ test("the settings dialog covers the window and owns the clicks", async ({
   const pane = page.locator("app-settings");
   await expect(pane).toBeVisible();
 
-  // It is the window, not a column beside the sidebar.
-  const [paneBox, viewport] = [
-    await pane.boundingBox(),
-    page.viewportSize(),
-  ];
+  // It is the window, not a column beside the sidebar: the dialog starts at or
+  // before the sidebar's left edge and ends after its right one. Stated against
+  // the SIDEBAR rather than against exact viewport pixels — a scrollbar or a
+  // fractional device ratio must not decide whether this passes.
+  const sidebar = page.getByRole("navigation", { name: "Primary navigation" });
+  const [paneBox, sidebarBox] = await Promise.all([
+    pane.boundingBox(),
+    sidebar.boundingBox(),
+  ]);
   expect(paneBox).not.toBeNull();
-  expect(viewport).not.toBeNull();
-  expect(Math.round(paneBox!.x)).toBe(0);
-  expect(Math.round(paneBox!.width)).toBe(viewport!.width);
+  expect(sidebarBox).not.toBeNull();
+  expect(paneBox!.x).toBeLessThanOrEqual(sidebarBox!.x);
+  expect(paneBox!.x + paneBox!.width).toBeGreaterThanOrEqual(
+    sidebarBox!.x + sidebarBox!.width,
+  );
 
   // A nav row's centre reaches the dialog — the assertion the original
   // regression needed and visibility could not give.
@@ -67,13 +73,8 @@ test("the settings dialog covers the window and owns the clicks", async ({
   );
 
   // And the app BEHIND is inert: a point over the shell sidebar lands on the
-  // dialog's scrim, not on the sidebar.
-  expect(
-    await hitsSettings(
-      page,
-      page.getByRole("navigation", { name: "Primary navigation" }),
-    ),
-  ).toBe(true);
+  // dialog, not on the sidebar.
+  expect(await hitsSettings(page, sidebar)).toBe(true);
 
   // The click that used to time out.
   await page.getByText("AI & Models").first().click();
@@ -95,9 +96,10 @@ test("Escape, the close button and the scrim all dismiss it", async ({
   await expect(page.locator("app-settings")).toHaveCount(0);
 
   await page.goto("/settings");
-  // The scrim is the dialog element itself; click its top-left corner, which is
-  // outside the centred panel.
-  await page.locator(".settings-scrim").click({ position: { x: 4, y: 4 } });
+  // Click the scrim's left margin, BELOW the top band: that band is the window
+  // drag strip (the shell's own is behind the dialog), and a click there must
+  // drag rather than dismiss.
+  await page.locator(".settings-scrim").click({ position: { x: 4, y: 300 } });
   await expect(page.locator("app-settings")).toHaveCount(0);
 });
 
