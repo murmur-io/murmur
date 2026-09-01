@@ -232,12 +232,26 @@
   background: var(--surface-hover);
   color: var(--text-primary);
 }
-/* Active: the shell's neutral glass-on-glass pill — accent only on the
-   glyph/label, never as the fill (matches the primary rail). */
+/* Active: the flat accent fill of a NATIVE selection (§6b) — the same thing
+   macOS System Settings does to the section you are on.
+   It used to be the shell's neutral glass-on-glass pill, which was right while
+   this rail was glass: a near-white pill READS on a blurred, darkened surface.
+   Flattening the rail for the modal took that contrast away and left a white
+   pill on a near-white column — the selected section was effectively invisible.
+   A selection list is not chrome, so it takes the selection treatment. */
 .nav-item.active {
-  background: var(--shell-active-bg);
-  color: var(--shell-active-text);
-  box-shadow: var(--shell-active-shadow);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-weight: 600;
+  box-shadow: none;
+}
+.nav-item.active:hover {
+  background: var(--accent-hover);
+  color: var(--text-on-accent);
+}
+.nav-item.active:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 .nav-icon {
   display: inline-flex;
