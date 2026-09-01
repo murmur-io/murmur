@@ -154,7 +154,7 @@ test("a never-written previous session reads as 'no previous session', not an er
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
-test("every action sits behind one menu, and choosing one closes it", async ({
+test("every action sits behind the ⋯ menu, and choosing one closes it", async ({
   page,
 }) => {
   await boot(page);
@@ -173,13 +173,17 @@ test("every action sits behind one menu, and choosing one closes it", async ({
   ).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Clear" })).toBeVisible();
 
-  const auto = page.getByRole("menuitemcheckbox", { name: "Auto-refresh" });
-  await expect(auto).toHaveAttribute("aria-checked", "false");
-  await auto.click();
+  await page.getByRole("menuitem", { name: "Auto-refresh" }).click();
 
-  // Choosing closes the menu; the trigger keeps reporting the lasting state.
+  // Choosing closes the menu; the header keeps reporting the lasting state.
   await expect(page.getByRole("menuitem", { name: "Refresh" })).toHaveCount(0);
-  await expect(trigger.locator(".live-dot")).toBeVisible();
+  await expect(page.locator(".live-pill")).toBeVisible();
+
+  // ...and the item now offers the reverse action.
+  await trigger.click();
+  await expect(
+    page.getByRole("menuitem", { name: "Stop auto-refresh" }),
+  ).toBeVisible();
 });
 
 test("Clear is offered for this session only — the previous one is evidence", async ({
