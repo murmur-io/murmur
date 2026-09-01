@@ -14341,12 +14341,14 @@ mod lock_read_gate_tests;
 #[path = "tests/workspace_tree_tests.rs"]
 mod workspace_tree_tests;
 
-// ── Shared containers: the share plan's leak oracles + the received-forest read model ────────────
-#[cfg(test)]
+// ── The org panel's diagnosability oracles: the bounded lock, the nameable log line, the honest
+// sync report ───────────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 #[path = "tests/org_diagnosability_tests.rs"]
 mod org_diagnosability_tests;
 
+// ── Shared containers: the share plan's leak oracles + the received-forest read model ────────────
+#[cfg(test)]
 #[path = "tests/container_share_tests.rs"]
 mod container_share_tests;
 
