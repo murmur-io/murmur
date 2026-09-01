@@ -55,12 +55,102 @@
   font-size: 0.75rem;
 }
 
-/* Sizing only — the field's look comes from the global input primitive. */
+/* The one filter section — source, severity and text in a single bar. Three
+   separate rows read as three unrelated controls, and cost three lines of a page
+   whose job is to show the list.
+   (These rules, and the chip language below, were deleted by accident when the
+   header's popover CSS was removed; the controls then rendered as bare stacked
+   elements, which is what a screenshot caught.) */
+.filterbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  /* Wrapping is still allowed at a narrow window — the bar's own surface keeps
+     it ONE section either way, which loose rows could not do. */
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+}
+
+.filterbar-divider {
+  width: 1px;
+  height: 18px;
+  flex: none;
+  background: var(--border);
+}
+
+.level-filters {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 26px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    border-color var(--transition),
+    background var(--transition);
+
+  &:hover {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+  }
+
+  &.is-active {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+    background: var(--surface-raised);
+  }
+}
+
+.chip-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+}
+
+/* An ACTIVE level chip wears its level's colour, so the filter row and the rows
+   below it speak the same palette. */
+.chip.is-error.is-active {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.chip.is-warn.is-active {
+  color: var(--warning);
+  border-color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.chip.is-info.is-active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Sizing only — the field's look comes from the global input primitive. It takes
+   whatever the bar has left, pinned to its right edge. */
 .log-search {
-  flex: 1 1 200px;
-  min-width: 160px;
+  flex: 1 1 150px;
+  min-width: 120px;
   width: auto;
-  height: 32px;
+  height: 28px;
+  margin-left: auto;
   font-size: 0.8125rem;
 }
 
