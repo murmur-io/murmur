@@ -3,8 +3,8 @@
  *
  * Drives the REAL shipping Angular UI over the screenshot harness's mocked Tauri
  * IPC + privacy-safe demo world (../screenshots/mock-tauri.js), and captures raw
- * footage as a numbered JPEG sequence plus a timeline of *authored* camera and
- * caption marks.
+ * footage as a numbered JPEG sequence plus a timeline of *authored* camera,
+ * layout, caption and spotlight marks.
  *
  * Why frames-and-timestamps instead of Playwright's built-in recordVideo: that
  * API gives a viewport-sized VP8 webm at a best-effort frame rate, with no
@@ -43,10 +43,10 @@ const EVENT_STATUS = "meetnotes://status";
 const EVENT_LIVE_CAPTION = "murmur://live-caption";
 
 /*
- * 16:9 at 1600×900 CSS px. The delivered film is 1920×1080 with the app inside a
- * 1664×936 window, so at rest one CSS pixel of UI is ~1.04 delivered pixels —
- * the app reads at its natural size — while the captured pixels behind it are 2×,
- * which is the headroom the push-ins spend.
+ * 16:9 at 1600×900 CSS px. The delivered film is 1920×1080 and the window inside
+ * it is a KEYFRAMED object (see compose.html `LAYOUTS`), so one CSS pixel of UI
+ * is between ~0.76 and ~1.04 delivered pixels depending on the shot — while the
+ * captured pixels behind it are 2×, which is the headroom every push-in spends.
  */
 const V = { width: 1600, height: 900 };
 
@@ -127,8 +127,8 @@ async function privacyViolations(page) {
 /**
  * The authoring surface a scene's `run` gets. Every call that matters to the cut
  * records a MARK stamped with the millisecond it happened, so stage 2 never has
- * to guess when to push the camera in or when a caption should land: the edit is
- * a by-product of performing the scene.
+ * to guess when to push the camera in, when to move the window or when a caption
+ * should land: the edit is a by-product of performing the scene.
  */
 function makeFilm(page, scene) {
   const t0 = Date.now();
@@ -164,6 +164,48 @@ function makeFilm(page, scene) {
         ([x, y]) => window.__promoCursor.init(x, y),
         [cursorAt.x, cursorAt.y],
       );
+      // Everything the screencast emitted up to here is the BLANK PAGE and the
+      // navigation painting in. Mark the roll point so those frames are dropped.
+      //
+      // This is not theoretical. The screencast only emits on a paint, so a
+      // static route emits very few frames — /dashboards produced six for a
+      // seven-second take — and frame 00000 of that scene was solid black. With
+      // so few samples the compositor holds that black across a real fraction of
+      // the shot, and it lands exactly on the cross-fade in, where it reads as
+      // the film stuttering. Filming starts when the app is on screen.
+      scene.roll = at();
+    },
+
+    /**
+     * Start the take HERE — everything captured before this point is dropped.
+     *
+     * `goto` sets a roll point of its own, which covers the blank page painting
+     * in. This one is for a shot that needs to ARRIVE somewhere first: open a
+     * board, switch to a tab, unlock a panel, and only then start filming. Put
+     * the setup between `goto` and `roll`, and the film never sees it.
+     */
+    async roll(settle = 260) {
+      await sleep(settle);
+      scene.roll = at();
+    },
+
+    /**
+     * Clear a field and type into it at a human-but-brisk rate.
+     *
+     * The hook's whole claim is "type while it listens", and the first cut of
+     * this film never typed a character — the note body was fully written in
+     * frame 0 and the scene was 99% unchanged frames. This is what makes the
+     * shot honest AND what gives it its motion: a field filling in is the
+     * product performing, which is worth more than any camera move.
+     */
+    async clearAndType(target, text, { cps = 22 } = {}) {
+      await film.click(target, { after: 160 });
+      await page.keyboard.press("Meta+a");
+      await page.keyboard.press("Backspace");
+      await sleep(200);
+      const loc = typeof target === "string" ? page.locator(target).first() : target;
+      await loc.type(text, { delay: 1000 / cps });
+      await sleep(160);
     },
 
     async showCursor(on = true) {
@@ -249,12 +291,88 @@ function makeFilm(page, scene) {
     },
 
     /**
-     * A caption. `dur` is how long it stays up; stage 2 gives it a rise-and-fade
-     * in and out, so the authored time is when it should be READ, not when the
-     * animation starts.
+     * Scroll a target to the vertical middle of the app viewport before the
+     * camera goes near it.
+     *
+     * This is not a nicety. Several of the panels worth filming — the action
+     * items, the speaker timeline, the graph canvas — begin ABOVE 900 px and run
+     * below it, and the compositor's camera clamp cannot leave the app screen.
+     * So `focus` on a target whose centre is off the bottom silently settles
+     * somewhere else and photographs the wrong thing, which is exactly how the
+     * first cut ended up with a caption about a map over a picture of a list.
+     * Scroll first, then frame what is now actually on screen.
      */
-    title(text, { sub = "", dur = 2800, kind = "lower" } = {}) {
-      scene.captions.push({ t: at(), text, sub, dur, kind });
+    async reveal(target, { settle = 500 } = {}) {
+      const sel = typeof target === "string" ? target : null;
+      if (!sel) return;
+      await page.evaluate((s) => {
+        const el = document.querySelector(s);
+        if (!el) return;
+        el.scrollIntoView({ block: "center", behavior: "instant" });
+        const r = el.getBoundingClientRect();
+        const delta = r.top + r.height / 2 - window.innerHeight / 2;
+        if (Math.abs(delta) < 8) return;
+        let n = el.parentElement;
+        while (n && n !== document.body) {
+          if (n.scrollHeight > n.clientHeight + 4) { n.scrollTop += delta; return; }
+          n = n.parentElement;
+        }
+        window.scrollBy(0, delta);
+      }, sel);
+      await sleep(settle);
+    },
+
+    /**
+     * Move the WINDOW ITSELF: one of compose.html's `LAYOUTS`.
+     *
+     *   full    the product, large and centred — the default, and the shot to
+     *           use whenever the UI is the whole point
+     *   lower   parked high, leaving a band underneath for a lower-third
+     *   title   pushed right and tilted, bleeding off frame, with a type column
+     *           on the LEFT — the layout for a claim, not for a feature
+     *   titleR  mirrored: window bleeds left, type column on the RIGHT
+     *   card    pushed back and down, for a full-frame chapter caption
+     *
+     * This is the film's cheapest source of motion and its main defence against
+     * looking like a slideshow: the frame RE-COMPOSES between beats, so a cut
+     * never lands on a picture that is the same shape as the one before it.
+     */
+    frame(mode, { ms = 900 } = {}) {
+      scene.layout.push({ t: at(), mode, ms });
+    },
+
+    /**
+     * A caption.
+     *
+     * `text` may mark accent words with asterisks: "Nothing leaves *your Mac*."
+     * `kicker` is the small uppercase accent line above the headline — it is what
+     * turns a line of type into a title rather than a subtitle, so most beats
+     * should have one. `dur` is how long the caption stays up; stage 2 gives it a
+     * rise-and-fade in and out, so the authored time is when it should be READ.
+     */
+    title(text, { kicker = "", sub = "", dur = 2800, kind = "lower", align, rule } = {}) {
+      scene.captions.push({ t: at(), text, kicker, sub, dur, kind, align, rule });
+    },
+
+    /**
+     * Ring a REGION of the UI and shade everything else down.
+     *
+     * This is how the re-cut shows a feature without spending a push-in on it:
+     * the wide shot keeps its context, and the eye still goes exactly where the
+     * film is pointing. Cheaper than a camera move, and it can point at
+     * something small near an edge, which the clamped camera cannot.
+     */
+    async spotlight(target, { dur = 1700, label = "", pad = 10 } = {}) {
+      const b = await boxOf(target);
+      scene.spots.push({
+        t: at(),
+        dur,
+        label,
+        x: b.x - pad,
+        y: b.y - pad,
+        width: b.width + pad * 2,
+        height: b.height + pad * 2,
+      });
     },
 
     /** Scan what is currently rendered before it is committed to footage. */
@@ -267,161 +385,476 @@ function makeFilm(page, scene) {
 }
 
 // ── The cut ─────────────────────────────────────────────────────────────────
-// Beat order follows the brief: hook → problem → solution → proof → ownership →
-// CTA. Each scene is one continuous take; stage 2 cross-dissolves between them.
+//
+// EIGHTEEN SHOTS, and the rules they follow are measured rather than felt.
+//
+// The previous cut was nine scenes with ZERO hard cuts, 34 camera moves against
+// 16 things the app actually did, and 52% of its running time with the product
+// doing nothing at all. It papered over that with a continuous camera drift —
+// which put the film in the 1–15 px/s "visible but purposeless" band 64% of the
+// time, where no reference product film spends more than 28%. See
+// `docs/research/2026-09-01-promo-cut-rhythm.md`.
+//
+// So, three binding rules, and the shots below are just their consequence:
+//
+//   1. MOTION COMES FROM THE APP. Every shot performs something — a field being
+//      typed, a tab switching, a tree expanding, a panel refusing to open. The
+//      camera is LOCKED unless it is following a click, and then it travels
+//      once and stops.
+//   2. THE CAPTION RUNS WITH THE ACTION, NOT AFTER IT. Words and pictures at
+//      the same time (Mayer's temporal contiguity, 8/8 tests, d = 1.31) — which
+//      also means the caption's reading time is paid for by the action's
+//      duration instead of by a hold. That is what removes the dead air.
+//   3. CUT WHEN THE SHOT STOPS EARNING ITS PLACE. Eleven hard cuts inside the
+//      acts, softer transitions between them. ASL ~5 s.
+//
+// Caption budget, from Netflix (20 cps, ≤84 chars on screen, ≤7 s) and BBC
+// (160–180 wpm), which converge on ~0.33 s per word:
+//
+//      dur ≈ 0.33 × words + 0.6      (the 0.6 covers the per-word stagger)
+//
+// counting kicker + headline + sub together. Every `dur:` below was computed
+// that way; the previous cut had 15 of 15 captions under their own read time,
+// a 56-second collective deficit, which is the actual reason it had to sit and
+// stare.
+//
+// Every selector is against the CURRENT shell. Re-run `record` after any shell
+// change rather than trusting that the takes still land.
 const SCENES = {
-  /* 1. HOOK — open on the product mid-action. No logo, no title card. */
-  record: {
+  /* ═══ ACT 1 — CAPTURE ═══════════════════════════════════════════════════ */
+
+  /* 1. The hook. The note is CLEARED and typed on camera, because the caption
+   *    promises exactly that — and the previous cut's version of this shot was
+   *    99% unchanged frames with the note fully written in frame 0, under the
+   *    words "Type while it listens". The typing is both the honesty fix and
+   *    the entire motion budget of the shot. */
+  hook: {
+    transition: "cut",
     async run(page, film) {
       await film.goto("/record");
-      await film.settle(900);
       await film.startRecording();
-      await film.wait(700);
-      await film.assertClean("record");
+      await film.settle(500);
+      await film.roll();
+      await film.assertClean("hook");
 
-      // Beat 1 — the claim, over the WIDE shot. At rest the window sits above
-      // the caption band, so the hero title has the frame to itself.
-      film.title("Nothing leaves your Mac.", {
-        sub: "Recording and transcription run on device.",
-        dur: 2900,
-        kind: "hero",
+      film.frame("title", { ms: 10 });
+      film.title("Nothing leaves|*your Mac*.", {
+        kicker: "On-device",
+        sub: "Recorded and transcribed right here.",
+        dur: 3900,
+        kind: "title",
       });
-      await film.wait(3600);
-
-      // Beat 2 — push in on the app's own live-transcript bar and let two lines
-      // arrive. No title here: the app is doing the talking.
       await film.liveCaption("…so the sync-layer dependency is gone — Atlas is unblocked for GA.");
-      await film.focus({ x: 120, y: 800, width: 1360, height: 120 }, { scale: 1.4, ms: 1500 });
-      await film.wait(2100);
-      await film.liveCaption("Then let's commit to the 14th. Priya, you own the migration note.");
-      await film.wait(2300);
-
-      // Beat 3 — pull back out, and land the problem the product exists for.
-      await film.wide({ ms: 1200 });
+      await film.wait(600);
+      await film.clearAndType("app-meeting-conversation textarea", "Kickoff ran long — good energy on the GA date.", { cps: 21 });
       await film.wait(500);
-      film.title("Meetings end. The decisions scatter.", { dur: 2500 });
-      await film.wait(3000);
+      await film.liveCaption("Then let's commit to the 14th. Priya, you own the migration note.");
+      await film.wait(1100);
     },
   },
 
-  /* 2. SOLUTION — the dual-stream transcript, the thing that is actually hard. */
-  transcript: {
+  /* 2. The live ticker — your side, transcribed as you speak. */
+  hookLive: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/record");
+      await film.startRecording();
+      await film.liveCaption("Marcus — Windows loopback is the last blocker on the list.");
+      await film.settle(500);
+      await film.roll();
+      await film.assertClean("hookLive");
+
+      film.frame("lower", { ms: 10 });
+      film.title("Your side, *as you speak*.", { kicker: "Live", dur: 2600 });
+      await film.spotlight(".rec-foot", { dur: 2300, label: "Full transcript after Stop", pad: 6 });
+      await film.wait(1300);
+      await film.liveCaption("And the design-partner track is committed for the 15th.");
+      await film.wait(1900);
+    },
+  },
+
+  /* ═══ ACT 2 — WHAT IS WAITING AFTERWARDS ════════════════════════════════ */
+
+  /* 3. The note itself. One motivated push into the header, then a full stop. */
+  note: {
+    transition: "cut",
     async run(page, film) {
       await film.goto("/meeting/m-atlas-roadmap");
-      await film.settle(800);
-      await film.showCursor(true);
-      film.title("Transcribed on-device — and split by speaker.", {
-        sub: "whisper.cpp on Metal. Your voice and theirs, on separate tracks.",
-        dur: 3400,
-      });
-      await film.click("button:has-text('Audio')", { after: 900 });
-      await film.assertClean("transcript");
-      // The Me/Others columns live in the upper-middle of the content column;
-      // bias up so the caption band stays clear of the rows being read.
-      await film.focus({ x: 380, y: 300, width: 900, height: 380 }, { scale: 1.62, ms: 1400 });
-      await film.wait(2800);
-      await film.wide({ ms: 1000 });
-      await film.wait(900);
-    },
-  },
-
-  /* 3. PROOF — ask across everything, with citations. */
-  ask: {
-    async run(page, film) {
-      await film.goto("/ask");
       await film.settle(700);
-      await film.showCursor(true);
-      film.title("Ask across everything you've recorded.", {
-        sub: "Grounded in your own vault — never a guess.",
+      await film.roll();
+      await film.assertClean("note");
+
+      film.frame("lower", { ms: 10 });
+      film.title("A note you'd have|*written yourself*.", {
+        kicker: "Minutes later",
         dur: 3200,
       });
-      const input = "textarea, input[type=text]";
-      await film.type(input, "What did we decide about Atlas, and who owns what's left?", { cps: 17 });
-      await film.wait(320);
-      await page.keyboard.press("Enter");
-      await film.wait(1800);
-      await film.assertClean("ask");
-      await film.focus({ x: 300, y: 220, width: 1000, height: 420 }, { scale: 1.5, ms: 1300 });
-      await film.wait(2800);
-      await film.wide({ ms: 900 });
-      await film.wait(400);
-      film.title("Every claim cites the second of audio it came from.", { dur: 2600 });
-      await film.wait(3000);
+      await film.wait(700);
+      await film.wait(2400);
     },
   },
 
-  /* 4. PROOF — the brain as a map. Motion for free: the force layout settles.
-   *
-   * NOT `/graph`. That route is the entity BROWSER — a list of People and
-   * Projects as chips — which photographs as a list and flatly fails to deliver
-   * the caption's promise. The actual map lives behind the "Full brain graph"
-   * disclosure on `/brain`, which is where the screenshot harness gets it too
-   * (scripts/screenshots/capture.mjs, the `full-brain-graph` shot). */
-  graph: {
+  /* 4. Related — and then CLICK one, so the link is a thing that happens rather
+   *    than a thing that is described. The shot lands on the linked note. */
+  noteRelated: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/meeting/m-atlas-roadmap");
+      await film.settle(700);
+      await film.roll();
+      await film.assertClean("noteRelated");
+
+      film.frame("lower", { ms: 10 });
+      film.title("Linked to *what it touches*.", { kicker: "Related", dur: 2600 });
+      await film.spotlight(".related-primary", { dur: 1900 });
+      await film.showCursor(true);
+      await film.wait(1600);
+      await film.click('.related-primary :text("Atlas — PRD v3")', { after: 900 });
+      await film.showCursor(false);
+      await film.assertClean("noteRelated-landed");
+      await film.wait(250);
+    },
+  },
+
+  /* 5. Action items. The scroll IS the action — they start at y≈637 and run past
+   *    the fold, so revealing them is both the reframe and the motion. */
+  noteActions: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/meeting/m-atlas-roadmap");
+      await film.settle(700);
+      await film.roll();
+
+      film.frame("lower", { ms: 10 });
+      film.title("Owners. Dates. *Done.*", {
+        kicker: "Action items",
+        sub: "Into Apple Reminders or Obsidian Tasks.",
+        dur: 4200,
+      });
+      await film.wait(500);
+      await film.reveal("app-meeting-actions");
+      await film.assertClean("noteActions");
+      await film.wait(3100);
+    },
+  },
+
+  /* ═══ ACT 3 — PROOF ═════════════════════════════════════════════════════ */
+
+  /* 6. Dual-stream. The tab click is the action; the timeline paints in. */
+  speakers: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/meeting/m-atlas-roadmap");
+      await film.settle(600);
+      await film.roll();
+
+      film.frame("lower", { ms: 10 });
+      film.title("Your mic and the room,|*on separate tracks*.", {
+        kicker: "Dual-stream",
+        dur: 3600,
+      });
+      await film.showCursor(true);
+      await film.click("button:has-text('Audio')", { after: 900 });
+      await film.showCursor(false);
+      await film.assertClean("speakers");
+      await film.reveal("app-meeting-timeline");
+      await film.wait(1200);
+    },
+  },
+
+  /* 7. Topics — a chip click jumps the timeline. Setup happens BEFORE the roll,
+   *    so the film never sees the tab being opened a second time. */
+  speakersTopics: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/meeting/m-atlas-roadmap");
+      await page.locator("button:has-text('Audio')").first().click();
+      await film.settle(900);
+      await film.reveal("app-meeting-timeline");
+      await film.roll();
+      await film.assertClean("speakersTopics");
+
+      film.frame("lower", { ms: 10 });
+      film.title("Jump to *any moment*.", { kicker: "Topics", dur: 2300 });
+      await film.showCursor(true);
+      await film.click(':text("Mobile redesign scope")', { after: 900 });
+      await film.showCursor(false);
+      await film.wait(400);
+    },
+  },
+
+  /* 8. Ask — typed live at 17 cps, because this scene captures at ~19 fps and at
+   *    30 cps three characters land between frames and it reads as a stutter. */
+  askType: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/ask");
+      await film.settle(600);
+      await film.roll();
+      await film.assertClean("askType");
+
+      film.frame("lower", { ms: 10 });
+      film.title("Ask across|*everything you've recorded*.", { kicker: "Ask", dur: 2600 });
+      await film.showCursor(true);
+      await film.type("textarea, input[type=text]", "What did we decide about Atlas, and who owns what's left?", { cps: 17 });
+      await film.showCursor(false);
+      await film.wait(700);
+    },
+  },
+
+  /* 9. The answer streaming in, with its sources ringed. The question is already
+   *    typed before the roll — this shot is only the answer arriving. */
+  askAnswer: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/ask");
+      await film.settle(500);
+      await page.locator("textarea, input[type=text]").first().fill("What did we decide about Atlas, and who owns what's left?");
+      await film.roll();
+
+      await page.keyboard.press("Enter");
+      film.frame("lower", { ms: 10 });
+      film.title("It shows *its receipts*.", { kicker: "Grounded", dur: 2300 });
+      await film.wait(1900);
+      await film.assertClean("askAnswer");
+      await film.spotlight("app-sources.ask-sources", { dur: 2100, label: "Where it came from" });
+      await film.wait(2500);
+    },
+  },
+
+  /* ═══ ACT 4 — THE MAP ═══════════════════════════════════════════════════ */
+
+  /* 10. The force layout settles on camera — the one shot whose motion needs no
+   *     help at all. NOT `/graph`: that route is the entity BROWSER and
+   *     photographs as a list of chips, which would make the caption a lie. */
+  brain: {
+    transition: "cut",
     async run(page, film) {
       await film.goto("/brain");
-      await film.settle(900);
-      await film.showCursor(true);
-      await film.click("button:has-text('Full brain graph')", { after: 700 });
+      await film.settle(600);
+      await page.locator("button:has-text('Full brain graph')").first().click();
       await page.waitForSelector("app-full-brain-graph", { timeout: 15_000 });
-      await film.showCursor(false);
-      // "Clusters" packs the map by community; "Layers" leaves most of the
-      // canvas empty at this size. "Fit" then centres it.
       const clusters = page.locator("button", { hasText: /^\s*Clusters\s*$/ }).first();
       if (await clusters.count()) await clusters.click();
-      await film.wait(1800);
+      await film.reveal("app-full-brain-graph canvas", { settle: 300 });
+      await film.roll();
+      await film.assertClean("brain");
+
+      film.frame("titleR", { ms: 10 });
+      // `kind` MUST match the frame mode: the layout puts the window off to one
+      // side, and a caption left on the default `lower` lands a bottom-left
+      // third straight across it. Same bug class as the centred-window one —
+      // two halves of one composition authored in two places.
+      film.title("Meetings, notes, documents,|people — *one brain*.", {
+        kicker: "It connects itself",
+        dur: 3900,
+        kind: "titleR",
+      });
       const fit = page.locator("button", { hasText: /^\s*Fit\s*$/ }).first();
       if (await fit.count()) await fit.click();
-      // Park the CANVAS in frame, not the component host. The host starts at the
-      // legend and control rows, so centring it leaves the map itself below the
-      // fold — which is what the first take photographed. Scroll whichever
-      // ancestor actually scrolls until the canvas is centred.
-      await page.evaluate(() => {
-        const c = document.querySelector("app-full-brain-graph canvas");
-        if (!c) return;
-        c.scrollIntoView({ block: "center", behavior: "instant" });
-        const r = c.getBoundingClientRect();
-        const delta = r.top + r.height / 2 - window.innerHeight / 2;
-        if (Math.abs(delta) < 8) return;
-        let n = c.parentElement;
-        while (n && n !== document.body) {
-          if (n.scrollHeight > n.clientHeight + 4) { n.scrollTop += delta; return; }
-          n = n.parentElement;
-        }
-        window.scrollBy(0, delta);
-      });
-      await film.wait(900);
-      await film.assertClean("graph");
-
-      film.title("Meetings, notes, documents, people — one brain.", { dur: 3000 });
-      // A slow, continuous push on the map. The force layout is still settling,
-      // so this beat has motion of its own — the camera only frames it.
-      await film.focus("app-full-brain-graph", { scale: 1.3, ms: 3400 });
-      await film.wait(3600);
-      await film.wide({ ms: 1200 });
-      await film.wait(800);
+      await film.wait(5400);
     },
   },
 
-  /* 5. OWNERSHIP — a sealed Space discloses its NAME and nothing else. */
-  lock: {
+  /* ═══ ACT 5 — ORGANISE ══════════════════════════════════════════════════ */
+
+  /* 11. The Workspaces tree. Expanding a node is the action — and it navigates,
+   *     so the whole right-hand pane changes with it. */
+  workspace: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/notes");
+      await film.settle(700);
+      await film.roll();
+      await film.assertClean("workspace");
+
+      film.frame("lower", { ms: 10 });
+      film.title("Your vault, *the way you think*.", { kicker: "Workspaces", dur: 2900 });
+      await film.spotlight('[aria-label="Workspaces"] .sb-tree, mur-sidebar .sb-workspaces', {
+        dur: 1800,
+        label: "3 unfiled recordings",
+      });
+      await film.showCursor(true);
+      await film.wait(1500);
+      await film.click('mur-sidebar :text-is("Product")', { after: 1000 });
+      await film.showCursor(false);
+      await film.wait(250);
+    },
+  },
+
+  /* 12. Collapse to the rail and back — the app animating its own chrome. */
+  workspaceRail: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/notes");
+      await film.settle(600);
+      await film.roll();
+
+      film.frame("lower", { ms: 10 });
+      film.title("Collapse it to *a rail*.", { kicker: "One click", dur: 2900 });
+      await film.showCursor(true);
+      await film.click('button[aria-label="Collapse sidebar"]', { after: 1300 });
+      await film.click('button[aria-label="Expand sidebar"]', { after: 900 });
+      await film.showCursor(false);
+      await film.wait(250);
+    },
+  },
+
+  /* 13. ⌘K — the palette opens and takes a query. */
+  search: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/notes");
+      await film.settle(600);
+      await film.roll();
+
+      film.frame("lower", { ms: 10 });
+      film.title("Search everything.|*On device.*", { kicker: "⌘K", dur: 2300 });
+      await page.keyboard.press("Meta+k");
+      await film.wait(700);
+      await film.assertClean("search");
+      await film.type("mur-quick-search input", "atlas", { cps: 9, focusFirst: false });
+      await film.wait(1800);
+    },
+  },
+
+  /* ═══ ACT 6 — SURFACES ══════════════════════════════════════════════════ */
+
+  /* 14. Opening a board. */
+  boards: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/dashboards");
+      await film.settle(700);
+      await film.roll();
+      await film.assertClean("boards");
+
+      film.frame("lower", { ms: 10 });
+      film.title("Compose a board. The brain|*reasons inside it*.", {
+        kicker: "Dashboards",
+        dur: 3600,
+      });
+      await film.showCursor(true);
+      await film.wait(900);
+      // Scoped to the main column: the sidebar carries the same board title and
+      // CSS truncation leaves the full string in the DOM, so an unscoped match
+      // resolves to the tree row instead of the card.
+      await film.click('.main-col :text-is("Atlas — GA readiness")', { after: 1100 });
+      await film.showCursor(false);
+      await film.assertClean("boards-detail");
+      await film.wait(700);
+    },
+  },
+
+  /* 15. Its standing answer, and the tab that shows what is owed. */
+  boardsTabs: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/dashboards/d-atlas");
+      await film.settle(800);
+      await film.roll();
+      await film.assertClean("boardsTabs");
+
+      film.frame("lower", { ms: 10 });
+      film.title("It answers, and|*shows its working*.", { kicker: "Brief", dur: 2900 });
+      await film.wait(1500);
+      await film.showCursor(true);
+      await film.click('button:has-text("Commitments")', { after: 1000 });
+      await film.showCursor(false);
+      await film.wait(300);
+    },
+  },
+
+  /* 16. People — the cursor glide is the action, and it lights the hover states
+   *     on the way. */
+  people: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/people");
+      await film.settle(600);
+      await film.roll();
+      await film.assertClean("people");
+
+      film.frame("lower", { ms: 10 });
+      film.title("It remembers *who owes what*.", { kicker: "People", dur: 2600 });
+      await film.showCursor(true);
+      await film.cursorTo("text=Sarah Chen", { ms: 620 });
+      await film.wait(320);
+      await film.cursorTo("text=Marcus Reid", { ms: 560 });
+      await film.wait(300);
+      await film.cursorTo("text=Priya Nair", { ms: 640 });
+      await film.showCursor(false);
+      await film.wait(250);
+    },
+  },
+
+  /* ═══ ACT 7 — OWNERSHIP ═════════════════════════════════════════════════ */
+
+  /* 17. The contrast shot, and the reason this act works at all: open a
+   *     workspace that HAS contents, then click the sealed one and watch it
+   *     refuse. The refusal only means something once you have just seen what
+   *     an open workspace looks like. */
+  lockRefuse: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/container/f-eng");
+      await film.settle(700);
+      await film.roll();
+      await film.assertClean("lockRefuse-open");
+
+      film.frame("lower", { ms: 10 });
+      film.title("Locked means *locked*.", {
+        kicker: "Sealed",
+        sub: "Even to Murmur.",
+        dur: 2900,
+      });
+      await film.showCursor(true);
+      await film.wait(900);
+      await film.click('mur-sidebar :text-is("Personal")', { after: 1200 });
+      await film.showCursor(false);
+      await film.assertClean("lockRefuse-sealed");
+      await film.wait(1300);
+    },
+  },
+
+  /* 18. The claim, on its own shot. A frame mode NEVER animates inside a shot —
+   *     that is a slide, and a slide is the thing this cut exists to remove. If
+   *     the composition needs to change, that is what a cut is for. */
+  lockClaim: {
+    transition: "cut",
     async run(page, film) {
       await film.goto("/container/f-personal");
-      await film.settle(500);
-      await film.showCursor(true);
-      await film.click('nav.global-rail button[aria-label="Spaces"]', { after: 900 });
-      await film.assertClean("lock");
-      film.title("A door you hold the key to.", {
-        sub: "Lock a Space and its notes, transcripts and audio seal behind Touch ID.",
-        dur: 3400,
-        kind: "hero",
+      await film.settle(600);
+      await film.roll();
+
+      film.frame("title", { ms: 10 });
+      film.title("A door *only you*|hold the key to.", {
+        kicker: "Lock a workspace",
+        dur: 4200,
+        kind: "title",
       });
-      // The Spaces panel is the left third; a sealed Space discloses its NAME and
-      // nothing else, which is the whole point of the beat — frame the tree.
-      await film.focus({ x: 60, y: 220, width: 620, height: 460 }, { scale: 1.7, ms: 1500 });
-      await film.wait(3200);
-      await film.wide({ ms: 1000 });
-      await film.wait(900);
+      await film.wait(4550);
+    },
+  },
+
+  /* 18. And the files are yours regardless. */
+  lockFiles: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/container/f-personal");
+      await film.settle(600);
+      await film.roll();
+
+      film.frame("lower", { ms: 10 });
+      film.title("And it is all *plain Markdown*.", {
+        kicker: "Your files",
+        sub: "In your own Obsidian vault.",
+        dur: 4900,
+      });
+      await film.showCursor(true);
+      await film.cursorTo('mur-sidebar :text-is("Personal")', { ms: 800 });
+      await film.showCursor(false);
+      await film.wait(3500);
     },
   },
 };
@@ -460,7 +893,15 @@ async function assertSupersampled(dir, scene) {
 }
 
 async function recordScene(browser, name, dir) {
-  const scene = { id: name, camera: [], captions: [], frames: [] };
+  const scene = {
+    id: name,
+    transition: SCENES[name].transition || "dissolve",
+    camera: [],
+    layout: [],
+    captions: [],
+    spots: [],
+    frames: [],
+  };
   const ctx = await browser.newContext({
     viewport: V,
     deviceScaleFactor: 2,
@@ -522,12 +963,42 @@ async function recordScene(browser, name, dir) {
 
   await assertSupersampled(dir, scene);
 
-  // The film clock starts at the scene's first frame, not at t0 — a page that
-  // paints late would otherwise open on a hold of nothing.
-  const skew = scene.frames.length ? scene.frames[0].t : 0;
-  for (const f of scene.frames) f.t -= skew;
+  /*
+   * The film clock starts when the app is actually on screen.
+   *
+   * Two things have to be trimmed off the front of a take. `scene.roll` is the
+   * moment `goto` finished, so everything before it is the blank page and the
+   * navigation painting in — drop those frames outright. After that, a page that
+   * paints late would still open on a hold of nothing, so the clock starts at
+   * whichever came later, the roll or the first surviving frame.
+   *
+   * The guard matters for a static route: /dashboards, /people and
+   * /container/:id repaint so rarely that the settled page can be the LAST
+   * pre-roll frame with nothing after it, and filtering strictly would leave the
+   * scene with no footage at all.
+   */
+  const roll = Math.max(0, scene.roll || 0);
+  if (roll > 0 && scene.frames.length) {
+    const before = scene.frames.filter((f) => f.t < roll);
+    const after = scene.frames.filter((f) => f.t >= roll);
+    // SEED the take with the last pre-roll frame, re-stamped to the roll instant.
+    //
+    // That frame is the settled app — `goto` waits for networkidle, so the page
+    // has painted by the time the roll is stamped — and it must be kept even
+    // when there are plenty of later frames. A static route does not repaint
+    // until something drives it, which on /container/:id is a cursor glide five
+    // seconds in; dropping everything before that made the first surviving frame
+    // the clock origin and silently deleted the whole opening beat, taking a
+    // ten-second scene down to five.
+    const seed = before.length ? [Object.assign({}, before[before.length - 1], { t: roll })] : [];
+    scene.frames = seed.concat(after);
+  }
+  const skew = roll;
+  for (const f of scene.frames) f.t = Math.max(0, f.t - skew);
   for (const c of scene.camera) c.t = Math.max(0, c.t - skew);
+  for (const c of scene.layout) c.t = Math.max(0, c.t - skew);
   for (const c of scene.captions) c.t = Math.max(0, c.t - skew);
+  for (const c of scene.spots) c.t = Math.max(0, c.t - skew);
   scene.dur -= skew;
   scene.consoleErrors = consoleErrors;
   return scene;
@@ -540,17 +1011,31 @@ async function main() {
     if (!SCENES[n]) throw new Error(`unknown scene: ${n}`);
   }
 
-  rmSync(join(OUT, "frames"), { recursive: true, force: true });
+  // A partial re-record keeps the scenes it is not re-shooting: re-taking one
+  // beat should not cost the other eight, and the manifest is merged below.
+  const partial = wanted.length > 0;
+  let previous = [];
+  if (partial) {
+    try {
+      previous = JSON.parse(readFileSync(join(OUT, "manifest.json"), "utf8")).scenes || [];
+    } catch {
+      previous = [];
+    }
+  }
+  if (!partial) {
+    rmSync(join(OUT, "frames"), { recursive: true, force: true });
+  }
   mkdirSync(join(OUT, "frames"), { recursive: true });
 
   const browser = await chromium.launch({ args: launchArgs, headless: HEADLESS });
-  const scenes = [];
+  const fresh = new Map();
   try {
     for (const name of names) {
       const dir = join(OUT, "frames", name);
+      rmSync(dir, { recursive: true, force: true });
       process.stdout.write(`▸ ${name} … `);
       const scene = await recordScene(browser, name, dir);
-      scenes.push(scene);
+      fresh.set(name, scene);
       const secs = (scene.dur / 1000).toFixed(1);
       const fps = (scene.frames.length / (scene.dur / 1000)).toFixed(0);
       console.log(`${scene.frames.length} frames / ${secs}s (~${fps}fps)`);
@@ -562,6 +1047,12 @@ async function main() {
   } finally {
     await browser.close();
   }
+
+  // Order is always the SCENES order, never the argv order — a partial re-record
+  // must not silently re-cut the film.
+  const scenes = Object.keys(SCENES)
+    .map((n) => fresh.get(n) || previous.find((p) => p.id === n))
+    .filter(Boolean);
 
   const manifest = { version: VERSION, viewport: V, scenes };
   writeFileSync(join(OUT, "manifest.json"), JSON.stringify(manifest, null, 2));
