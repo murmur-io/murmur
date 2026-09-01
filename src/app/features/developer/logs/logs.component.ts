@@ -28,17 +28,34 @@ import { LogsStore } from "../logs.store";
 /** The level buckets the filter offers. `all` is not a level — it clears the filter. */
 type LevelFilter = "all" | "error" | "warn" | "info" | "debug";
 
+/** One `key=value` pair `tracing` appended after an event's message. */
+interface LogField {
+  readonly key: string;
+  readonly value: string;
+}
+
 /** One rendered row — an entry with its presentation already derived. */
 interface LogRow {
   readonly seq: number;
   /** Local wall-clock, e.g. `14:02:11.483`. */
   readonly time: string;
-  /** The timestamp as written (UTC), for Copy. */
-  readonly raw: string | null;
+  /** Local date + time, shown in the expanded detail. */
+  readonly fullTime: string;
+  /** The timestamp as written (UTC). */
+  readonly timestamp: string | null;
   readonly level: string;
   readonly levelClass: string;
   readonly target: string;
+  /** The whole message, fields included — the collapsed row's last column. */
   readonly message: string;
+  /** The message WITHOUT its trailing `key=value` fields. */
+  readonly text: string;
+  /** Those fields, split out for the detail panel. */
+  readonly fields: readonly LogField[];
+  /** The entry exactly as it appears in the file. */
+  readonly raw: string;
+  /** `aria-controls` target for the disclosure. */
+  readonly detailId: string;
 }
 
 /** How many entries one read asks for. The backend clamps its own ceiling. */
@@ -165,16 +182,32 @@ export class LogsComponent implements OnInit {
           entry.target.toLowerCase().includes(query)
         );
       })
-      .map((entry) => ({
-        seq: entry.seq,
-        time: formatTime(entry.timestamp),
-        raw: entry.timestamp,
-        level: entry.level.toUpperCase(),
-        levelClass: `is-${levelBucket(entry.level) ?? "other"}`,
-        target: entry.target,
-        message: entry.message,
-      }));
+      .map((entry) => {
+        const split = splitFields(entry.message);
+        return {
+          seq: entry.seq,
+          time: formatTime(entry.timestamp),
+          fullTime: formatFullTime(entry.timestamp),
+          timestamp: entry.timestamp,
+          level: entry.level.toUpperCase(),
+          levelClass: `is-${levelBucket(entry.level) ?? "other"}`,
+          target: entry.target,
+          message: entry.message,
+          text: split.text,
+          fields: split.fields,
+          raw: entry.raw,
+          detailId: `log-entry-${entry.seq}`,
+        };
+      });
   });
+
+  /**
+   * Which rows are expanded, by `seq`. A Set rather than a single id: comparing
+   * two entries means having both open at once, and there is no reason to make
+   * that a mode.
+   */
+  private readonly _expanded = signal<ReadonlySet<number>>(new Set());
+  readonly expandedSeqs = this._expanded.asReadonly();
 
   /** True when there is nothing cached to show — gates the spinner (§8). */
   readonly listEmpty = computed(() => this.entries().length === 0);
@@ -216,6 +249,27 @@ export class LogsComponent implements OnInit {
 
   setLevel(level: LevelFilter): void {
     this.levelFilter.set(level);
+  }
+
+  /** Open/close one entry's detail. */
+  toggleExpanded(seq: number): void {
+    this._expanded.update((open) => {
+      const next = new Set(open);
+      if (!next.delete(seq)) {
+        next.add(seq);
+      }
+      return next;
+    });
+  }
+
+  /** Copy ONE entry exactly as the file has it. */
+  async copyEntry(row: LogRow): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(row.raw);
+      this.toast.success("Entry copied");
+    } catch {
+      this.toast.danger("Couldn’t copy the entry.");
+    }
   }
 
   /**
@@ -262,6 +316,10 @@ export class LogsComponent implements OnInit {
       }
       this.store.log.set(log);
       this.error.set(null);
+      // `seq` is a POSITION in the window, so it means something different after
+      // every read — carrying the open set across would expand whichever entries
+      // happen to land on those indices next.
+      this._expanded.set(new Set());
       this.scrollToNewest();
     } catch (error) {
       if (requested !== this.session()) {
@@ -280,7 +338,7 @@ export class LogsComponent implements OnInit {
   /** Copy the visible rows as plain text — what you paste into a bug report. */
   async copyVisible(): Promise<void> {
     const text = this.visibleEntries()
-      .map((row) => `${row.raw ?? ""} ${row.level} ${row.target} ${row.message}`.trim())
+      .map((row) => row.raw)
       .join("\n");
     if (!text) {
       return;
@@ -332,6 +390,49 @@ export class LogsComponent implements OnInit {
       { injector: this.injector },
     );
   }
+}
+
+/**
+ * The trailing `key=value` fields `tracing` writes after an event's message.
+ *
+ * Matched only as a SUFFIX, deliberately: fields always come last in the writer's format, and
+ * scanning the whole string would tear apart a message that merely contains an `=` (a path, a
+ * query, a serialized struct). A message with no trailing pairs comes back unchanged.
+ */
+function splitFields(message: string): { text: string; fields: LogField[] } {
+  const suffix = /(?:\s+[A-Za-z_][\w.]*=(?:"(?:[^"\\]|\\.)*"|[^\s"]+))+$/.exec(message);
+  if (!suffix) {
+    return { text: message, fields: [] };
+  }
+  const fields: LogField[] = [];
+  const pair = /([A-Za-z_][\w.]*)=("(?:[^"\\]|\\.)*"|[^\s"]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pair.exec(suffix[0])) !== null) {
+    const raw = match[2];
+    // Unwrap the writer's quoting so the detail panel shows the VALUE, not its escaping.
+    const value =
+      raw.startsWith('"') && raw.endsWith('"')
+        ? raw.slice(1, -1).replace(/\\(.)/g, "$1")
+        : raw;
+    fields.push({ key: match[1], value });
+  }
+  return { text: message.slice(0, suffix.index).trimEnd(), fields };
+}
+
+/** Local date + wall-clock for the expanded detail (`2026-09-01 14:02:11.483`). */
+function formatFullTime(timestamp: string | null): string {
+  if (!timestamp) {
+    return "—";
+  }
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return timestamp;
+  }
+  const pad = (n: number, width = 2) => String(n).padStart(width, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    formatTime(timestamp)
+  );
 }
 
 /** Local wall-clock (`14:02:11.483`) — the log writes its timestamps in UTC. */

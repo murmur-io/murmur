@@ -124,6 +124,10 @@ pub struct LogEntry {
     pub target: String,
     /// Everything after the target — the message plus any structured fields.
     pub message: String,
+    /// The entry EXACTLY as it appears in the file, continuation lines included. What the expanded
+    /// row shows and what "Copy entry" puts on the clipboard: a bug report wants the line that was
+    /// written, not one reassembled from parsed parts whose spacing no longer matches the file.
+    pub raw: String,
 }
 
 /// A window over one log generation.
@@ -421,6 +425,7 @@ fn parse_lines(lines: &[String]) -> Vec<LogEntry> {
                 level,
                 target,
                 message: cap(message),
+                raw: cap(line.trim_end().to_string()),
             }),
             None => match out.last_mut() {
                 Some(previous) => {
@@ -428,6 +433,9 @@ fn parse_lines(lines: &[String]) -> Vec<LogEntry> {
                         previous.message.push('\n');
                         previous.message.push_str(line.trim_end());
                         previous.message = cap(std::mem::take(&mut previous.message));
+                        previous.raw.push('\n');
+                        previous.raw.push_str(line.trim_end());
+                        previous.raw = cap(std::mem::take(&mut previous.raw));
                     }
                 }
                 // A fragment before any header (the first line after a tail seek, or a stray
@@ -439,6 +447,7 @@ fn parse_lines(lines: &[String]) -> Vec<LogEntry> {
                     level: "OTHER".to_string(),
                     target: String::new(),
                     message: cap(line.trim_end().to_string()),
+                    raw: cap(line.trim_end().to_string()),
                 }),
             },
         }
@@ -491,6 +500,21 @@ mod tests {
         ));
         assert_eq!(parsed.len(), 1, "a wrapped payload is ONE event");
         assert_eq!(parsed[0].message, "thread panicked\nstack frame one\nstack frame two");
+        assert_eq!(
+            parsed[0].raw,
+            "2026-09-01T10:11:12.123456Z ERROR panic: thread panicked\nstack frame one\nstack frame two",
+            "`raw` carries the whole entry as written — header line included"
+        );
+    }
+
+    /// The expanded row shows `raw`, so it has to be the FILE's text, not a reassembly: the
+    /// shipped writer pads the level to five columns, and a rebuilt line would quietly differ
+    /// from what a bug report's attached file says.
+    #[test]
+    fn raw_preserves_the_line_verbatim_including_its_padding() {
+        let line = "2026-09-01T10:11:12.123456Z  INFO murmur::pipeline: stage complete count=3";
+        let parsed = parse_lines(&lines(line));
+        assert_eq!(parsed[0].raw, line);
     }
 
     #[test]
@@ -702,6 +726,7 @@ mod tests {
                 level: "INFO".into(),
                 target: "murmur".into(),
                 message: "hello".into(),
+                raw: "2026-09-01T10:11:12.123456Z  INFO murmur: hello".into(),
             }],
         };
         let value = serde_json::to_value(&log).unwrap();

@@ -48,6 +48,7 @@ async function boot(page: Page): Promise<void> {
                   level: "INFO",
                   target: "murmur::pipeline",
                   message: "stage complete count=3",
+                  raw: "2026-09-01T10:11:12.123456Z  INFO murmur::pipeline: stage complete count=3",
                 },
                 {
                   seq: 1,
@@ -55,6 +56,7 @@ async function boot(page: Page): Promise<void> {
                   level: "WARN",
                   target: "murmur::audio",
                   message: "system audio helper unavailable",
+                  raw: "2026-09-01T10:11:13.500000Z  WARN murmur::audio: system audio helper unavailable",
                 },
                 {
                   seq: 2,
@@ -62,6 +64,7 @@ async function boot(page: Page): Promise<void> {
                   level: "ERROR",
                   target: "panic",
                   message: 'location="src/lib.rs:12" message="boom"',
+                  raw: '2026-09-01T10:11:14.750000Z ERROR panic: location="src/lib.rs:12" message="boom"',
                 },
               ],
             },
@@ -126,7 +129,7 @@ test("the log renders as formatted rows, filterable by level and by text", async
 
   // Formatting: the level, the target and the message are separate columns, and
   // an error row carries the error class the palette hangs off.
-  const error = list.locator(".log-row.is-error");
+  const error = list.locator(".log-entry.is-error");
   await expect(error).toHaveCount(1);
   await expect(error.locator(".log-level")).toHaveText("ERROR");
   await expect(error.locator(".log-target")).toHaveText("panic");
@@ -197,4 +200,70 @@ test("Clear is offered for this session only — the previous one is evidence", 
 
   await expect(page.getByRole("menuitem", { name: "Refresh" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Clear" })).toHaveCount(0);
+});
+
+test("clicking a row expands it into the whole entry, and again collapses it", async ({
+  page,
+}) => {
+  await boot(page);
+  await openLogs(page);
+
+  const list = page.getByRole("log", { name: "Application log" });
+  const row = list
+    .locator(".log-entry", { hasText: "system audio helper unavailable" })
+    .locator(".log-row");
+  await expect(row).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator(".row-detail")).toHaveCount(0);
+
+  await row.click();
+
+  await expect(row).toHaveAttribute("aria-expanded", "true");
+  const detail = page.locator(".row-detail");
+  await expect(detail).toBeVisible();
+  // The detail carries what the row could only truncate: the exact UTC stamp,
+  // the full target, and the line as the file has it.
+  await expect(detail).toContainText("2026-09-01T10:11:13.500000Z");
+  await expect(detail).toContainText("murmur::audio");
+  await expect(detail.locator(".detail-raw")).toContainText(
+    "WARN murmur::audio: system audio helper unavailable",
+  );
+
+  await row.click();
+  await expect(row).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator(".row-detail")).toHaveCount(0);
+});
+
+test("an entry's structured fields are split out as key/value rows", async ({
+  page,
+}) => {
+  await boot(page);
+  await openLogs(page);
+
+  await page
+    .getByRole("log", { name: "Application log" })
+    .locator(".log-entry.is-error .log-row")
+    .click();
+
+  const detail = page.locator(".row-detail");
+  // `location="src/lib.rs:12" message="boom"` is two FIELDS, not prose — and the
+  // panel shows their values unquoted.
+  await expect(detail.locator(".detail-field-key")).toHaveText([
+    "location",
+    "message",
+  ]);
+  await expect(detail.locator(".detail-field-value").first()).toHaveText(
+    "src/lib.rs:12",
+  );
+  await expect(detail.locator(".detail-field-value").last()).toHaveText("boom");
+});
+
+test("two entries can be open at once", async ({ page }) => {
+  await boot(page);
+  await openLogs(page);
+
+  const list = page.getByRole("log", { name: "Application log" });
+  await list.locator(".log-entry.is-warn .log-row").click();
+  await list.locator(".log-entry.is-error .log-row").click();
+
+  await expect(page.locator(".row-detail")).toHaveCount(2);
 });
