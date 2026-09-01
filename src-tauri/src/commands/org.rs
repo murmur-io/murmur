@@ -3156,8 +3156,61 @@ fn org_status_from_local(
 /// FE triggers this on settings-open so an org you were just invited to appears without a re-login.
 #[tauri::command]
 pub async fn org_refresh(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    // BOUNDED. This used to be a bare `.lock().await` — the only wait on the whole org-panel path
+    // with no timeout, taken BEFORE any timeout-protected code. A wedged holder therefore produced
+    // an unbounded "Loading organizations…" that no error path could reach: the frontend clears its
+    // loading flag in a `finally`, and a `finally` does not run for a future that never settles.
+    // Logging out did not help either, because a mutex is process state — only a restart cleared it.
+    //
+    // Refusing is strictly better than waiting: the caller already treats a failed refresh as
+    // non-fatal and falls through to the local replica, so the panel renders either way.
+    let _mutation = acquire_share_mutation_within(state.inner(), SHARE_MUTATION_WAIT).await?;
     org_reconcile_memberships_notifying(state.inner(), Some(&app)).await
+}
+
+/// What a reconcile should do with the result of [`valid_access_token`].
+///
+/// Pure, so the policy can be asserted directly rather than inferred from a live session.
+pub(crate) enum TokenOutcome {
+    /// A live bearer — go on and talk to the server.
+    Proceed(String),
+    /// The session is unrecoverable and the user must sign in again. This MUST reach them: the
+    /// reconcile used to answer `Ok(())` here, which rendered a permanently dead session as an
+    /// empty panel indistinguishable from being offline.
+    Fatal(AppError),
+    /// Offline, logged out, a 5xx, a keychain hiccup — expected and transient. Keep the cached
+    /// rows and try again next tick; never turn this into an error banner.
+    SkipQuietly,
+}
+
+/// Classify a token result for a reconcile. Only a definitive `Auth` refusal is fatal — that is the
+/// same line [`valid_access_token`] already draws internally, where `refresh_failure_fallback`
+/// propagates `Auth` and falls back to the cached bearer for everything else.
+pub(crate) fn reconcile_token_outcome(result: Result<String, AppError>) -> TokenOutcome {
+    match result {
+        Ok(token) => TokenOutcome::Proceed(token),
+        Err(e @ AppError::Auth(_)) => TokenOutcome::Fatal(e),
+        Err(_) => TokenOutcome::SkipQuietly,
+    }
+}
+
+/// How long a read-side refresh waits for an in-flight sharing mutation before giving up. Long
+/// enough for a normal mutation (its own network calls are capped at 30 s) to finish and hand over;
+/// short enough that the panel never looks dead.
+pub(crate) const SHARE_MUTATION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Acquire `org_share_mutation_lock`, or refuse once `wait` elapses.
+pub(crate) async fn acquire_share_mutation_within(
+    state: &AppState,
+    wait: std::time::Duration,
+) -> Result<tokio::sync::MutexGuard<'_, ()>, AppError> {
+    match tokio::time::timeout(wait, state.org_share_mutation_lock.lock()).await {
+        Ok(guard) => Ok(guard),
+        Err(_) => Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::SHARE_BUSY,
+            "another sharing operation is still running",
+        ))),
+    }
 }
 
 /// Reconcile the LOCAL `org_state` set against the server's authoritative membership list
@@ -3195,9 +3248,10 @@ async fn org_reconcile_memberships_with_policy(
         Ok(b) if !b.trim().is_empty() => b,
         _ => return Ok(()),
     };
-    let access = match valid_access_token(state).await {
-        Ok(a) => a,
-        Err(_) => return Ok(()),
+    let access = match reconcile_token_outcome(valid_access_token(state).await) {
+        TokenOutcome::Proceed(a) => a,
+        TokenOutcome::Fatal(e) => return Err(e),
+        TokenOutcome::SkipQuietly => return Ok(()),
     };
     if !policy.is_current() {
         return Ok(());
@@ -9865,7 +9919,7 @@ pub async fn org_sync_now(
     // pass `None` (→ sync the next round-robin org). This is the command-boundary
     // dispatch of the multi-org fix: a user-triggered "Sync now" from a picked org must not sync (or
     // report against) the wrong org.
-    let report = match org_id {
+    let mut report = match org_id {
         Some(id) => org_sync_one_now_with_app(state.inner(), &id, Some(app.clone())).await,
         None => {
             org_sync_now_inner_with_policy(
@@ -9883,6 +9937,7 @@ pub async fn org_sync_now(
         crate::commands::org_containers::reconcile_container_shares(state.inner(), Some(&app)).await
     {
         tracing::warn!(target: "org", error = %brief_err(&e), "container share reconcile after manual sync failed");
+        note_container_failure(&mut report, &e);
     }
     Ok(report)
 }
@@ -10041,9 +10096,12 @@ async fn org_sync_one_now_with_app_and_policy(
     if base.trim().is_empty() {
         return Ok(report);
     }
-    let access = match valid_access_token(state).await {
-        Ok(a) => a,
-        Err(_) => return Ok(report),
+    let access = match reconcile_token_outcome(valid_access_token(state).await) {
+        TokenOutcome::Proceed(a) => a,
+        // A dead session must not masquerade as a clean sync: an empty report renders as
+        // "Synced — up to date.", which is the most misleading thing the panel can say.
+        TokenOutcome::Fatal(e) => return Err(e),
+        TokenOutcome::SkipQuietly => return Ok(report),
     };
     let client = crate::share::client::ShareClient::new(&base)?;
     org_sync_one(
@@ -10097,9 +10155,12 @@ async fn org_sync_now_inner_with_policy(
         return Ok(report);
     }
     // Logged out ⇒ best-effort no-op (the FE surfaces "sign in to sync").
-    let access = match valid_access_token(state).await {
-        Ok(a) => a,
-        Err(_) => return Ok(report),
+    let access = match reconcile_token_outcome(valid_access_token(state).await) {
+        TokenOutcome::Proceed(a) => a,
+        // A dead session must not masquerade as a clean sync: an empty report renders as
+        // "Synced — up to date.", which is the most misleading thing the panel can say.
+        TokenOutcome::Fatal(e) => return Err(e),
+        TokenOutcome::SkipQuietly => return Ok(report),
     };
     if !policy.is_current() {
         return Ok(report);
@@ -11380,9 +11441,46 @@ pub(crate) fn brief_err(e: &AppError) -> String {
     match e {
         AppError::Locked(_) => "locked".to_string(),
         AppError::Auth(_) => "auth".to_string(),
-        AppError::Unavailable(_) => "unavailable".to_string(),
+        // Keep the `errcode::tag` code when there is one. A failure that repeats every 60 s
+        // ("container share reconcile tick failed error=unavailable") is unactionable without it —
+        // that exact line cost a full field investigation before anyone could say WHICH failure it
+        // was. The tagged prefix is safe to log by construction: `share/client.rs` maps HTTP
+        // failures to a fixed label plus the numeric status and never surfaces the reqwest
+        // `Display` (which can echo the URL). An UNTAGGED message has no such guarantee, so it
+        // stays collapsed — no rule promises an arbitrary `Unavailable` string is PII-free.
+        AppError::Unavailable(msg) => match tagged_code(msg) {
+            Some(code) => format!("unavailable[{code}]"),
+            None => "unavailable".to_string(),
+        },
         _ => "error".to_string(),
     }
+}
+
+/// Record a best-effort container-reconcile failure ON the sync report, so a manual "Sync now"
+/// cannot answer a clean report while shared-folder publishing is failing.
+///
+/// This was the second half of the 2026-09-01 field report: the tick failed every 60 s, the manual
+/// sync swallowed the same failure into a `tracing::warn!`, and the panel — which renders an empty
+/// report as **"Synced — up to date."** — told the user everything was fine. Content-free by
+/// construction: [`brief_err`] emits a stage label and, at most, a client-chosen `[code]`.
+pub(crate) fn note_container_failure(
+    report: &mut crate::storage::models::OrgSyncReport,
+    e: &AppError,
+) {
+    report.errors.push(format!("shared folders: {}", brief_err(e)));
+}
+
+/// The `[code]` an [`crate::errcode::tag`] message starts with, if any.
+fn tagged_code(msg: &str) -> Option<&str> {
+    let rest = msg.strip_prefix('[')?;
+    let (code, _) = rest.split_once(']')?;
+    // A tag is a short kebab-case label the client itself chose; anything else is not a tag.
+    let plausible = !code.is_empty()
+        && code.len() <= 40
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    plausible.then_some(code)
 }
 
 /// `org_get_item(item_id)` — the full decrypted org item for the read-only FE viewer. Org items are
