@@ -53,14 +53,16 @@ fixing one beat costs ~20 s rather than the whole three-minute take.
 
 ## 2. Direct a scene
 
-Scenes are `SCENES` in `record.mjs`. Each declares the transition it ENTERS on — `dissolve`,
-`push`, `pushUp`, `whip`, `through` — and a `run` that performs the take. The `film` object records
+Scenes are `SCENES` in `record.mjs` — one entry per SHOT, not per topic. Each declares the
+transition it ENTERS on — `cut`, `dissolve`, `push`, `pushUp`, `whip`, `through` — and a `run` that performs the take. The `film` object records
 a *mark* every time you move the camera, move the window or place a caption, so the edit is a
 by-product of performing the scene:
 
 | call | does |
 | --- | --- |
 | `film.goto(path)` | navigate (re-installs the cursor, marks the roll point) |
+| `film.roll()` | start the take HERE — arrive/set up first, film only what follows |
+| `film.clearAndType(sel, text)` | empty a field and type into it on camera |
 | `film.click(sel)` / `film.type(sel, text, {cps})` | act, cursor glides there first |
 | `film.cursorTo(sel)` | glide the cursor without clicking |
 | `film.reveal(sel)` | scroll a target to the middle of the app viewport |
@@ -124,12 +126,25 @@ Follow the research, not instinct (`docs/research/2026-08-31-app-promo-video.md`
 - **Lengths:** 60–90 s narrative demo; 4–20 s for an ambient hero loop; 2–3 min only for an
   evaluator who opted in.
 
-Shipped shape (2026-09-01, ~93 s, nine scenes): **capture** (the hook — already recording, with a
-companion note) → **note** (what is waiting afterwards: title, tags, Related, action items) →
-**speakers** (the dual-stream timeline) → **ask** (a grounded answer, with its sources ringed) →
-**brain** (the map settling) → **workspace** (the Workspaces rail, collapsed and restored) →
-**boards** (a board opened, its standing answer and evidence) → **people** → **lock** (the sealed
-workspace, and the files being yours) → end card.
+Shipped shape (2026-09-01 re-cut, ~85 s, **eighteen shots**, ASL 4.7 s, 12 hard cuts). One entry
+per SHOT, grouped into seven acts — cut inside an act, transition between acts:
+
+| act | shots |
+| --- | --- |
+| capture | `hook` (the note typed on camera) · `hookLive` |
+| the output | `note` · `noteRelated` (clicks through to the linked note) · `noteActions` |
+| proof | `speakers` · `speakersTopics` · `askType` · `askAnswer` |
+| the map | `brain` |
+| organise | `workspace` · `workspaceRail` · `search` |
+| surfaces | `boards` · `boardsTabs` · `people` |
+| ownership | `lockRefuse` (open a workspace, then click the sealed one) · `lockFiles` |
+
+**Every shot performs something, and the caption runs WITH the action, not after it** — words and
+pictures at the same time (Mayer's temporal contiguity, 8/8 tests, d = 1.31), which also means the
+caption's reading time is paid for by the action's duration instead of by a hold. That is what
+removes the dead air. `lockRefuse` is the pattern in miniature: open a workspace that HAS contents,
+then click the sealed one and watch it refuse — the refusal only means something once you have just
+seen what an open workspace looks like.
 
 **Say only what the frame shows.** This is not a style note, it is the failure mode with the
 shortest fuse: a draft of the hook claimed "recording, transcription *and reasoning* run locally"
@@ -179,28 +194,45 @@ gate at every authored beat, and `assertSupersampled` on the capture scale — b
 | **Window size IS resolution** | The app is captured 1600 CSS px wide, so a window `w` px wide renders its 14 px UI type at `14·w/1600` output px. Shrinking the window to make room for type is paid for in legibility: 1210 px gives 10.6 px type and reads as "low resolution", because it is. A title shot should BLEED further off frame, not shrink — 1520 px (0.95×) with 600 px off-frame measured **+65% edge energy** over 1210 px at the same tilt. |
 | **The 3-D tilt is NOT the softness** | Worth knowing because it is the obvious suspect and it is wrong: at identical geometry, `rotateY(-13deg)` costs ~17% of edge energy (111 vs 134 Laplacian variance), not the 3.8× a naive before/after suggests. That 3.8× was the window size, measured across two different layouts. Isolate the variable before you act on it. |
 
-### The motion floor — measure it, do not assume it
+### THE CAMERA IS LOCKED UNLESS IT IS FOLLOWING A CLICK
 
-A drift you cannot measure is a drift that is not there. The first version of `driftAt` used a 9 px
-amplitude on a ~38 s period — 0.025 px/frame — and **half the film (46.8 s of 92.8) rendered
-frozen**, with holds up to 1.9 s. A film that alternates dead stills with bursts of motion reads as
-juddering, and the frozen stretches read as screenshots, which the viewer reports as "the resolution
-looks weak". Both complaints, one cause.
+Motion comes from the interface, from the cut, or from one motivated push that travels and stops.
+**Never from the lens wandering.** There was briefly a `driftAt` here that floated the whole picture
+continuously so no frame would ever be still; it is deleted, and the reasoning is worth keeping so
+nobody rebuilds it. Full evidence: `docs/research/2026-09-01-promo-cut-rhythm.md`.
 
-The check is cheap, so run it on every cut:
+- Phase-correlation measurement of **13 product films from 10 companies** (Linear, Notion, Raycast,
+  Arc, Superhuman, Descript, Tella, Screen Studio): the grammar is strictly **bimodal** —
+  dead-locked (&lt;1 px/s) or decisive (&gt;15 px/s). Reference films spend **0–28%** of runtime in the
+  1–15 px/s "visible but purposeless" band; the drifting cut spent **64%**. Linear holds one locked
+  frame for **17.5 s**; Superhuman's hero is exactly 0.00 px/s.
+- The drift's terms ran at 0.110/0.257/0.093/0.224 Hz. Apple's HIG, by name: *"avoid showing an
+  oscillation that has a frequency of around 0.2 Hz because people can be very sensitive to this
+  frequency."* Two of four landed on it.
+- Ken Burns is pan/zoom on **still photographs**, *"principally used when film or video material is
+  not available"*. We have a live app. The rationale inverts into an argument against it.
 
-```bash
-ffmpeg -v error -i .promo/render/%06d.png \
-  -vf "scale=320:180,tblend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-" \
-  -f null - 2>/dev/null | grep -oE 'YAVG=[0-9.]+' | sed 's/YAVG=//'
-```
+**Measure the FOOTAGE, not the render.** The old gate differenced rendered frames, which a global
+translation raises everywhere at once — so a sinusoid was the cheapest way to move "half the film
+frozen" to "11%" without adding one bit of information. It measured the camera and called it life.
+Measure instead (a) gaps between SOURCE frames, i.e. the app standing still, and (b) the part of
+that with **no caption on screen**, which is the real dead air. A locked shot while a caption reads
+is correct; a locked shot with nothing to read and nothing happening is not. Target **≤15%**.
 
-Frames under ~0.03 mean luma change are motionless. Target: **≤15%** of the film, and no hold over
-~0.4 s except the end card, which is a title card and is supposed to sit still. The 2026-09-01 cut
-went 50% → 11% by raising the drift to ~11 px/s (inside the 10–30 px/s a slow film push occupies at
-1080p) and adding a 3%-per-scene breathe. The same trace is also how you check a transition: it
-should be a clean ramp, and on this harness it always has been — when a cut feels jerky, the fault
-is the stillness on either side of it, not the move.
+**And the dead air is usually a caption problem.** The pre-re-cut film had **15 of 15 captions under
+their own read time** (56 s collective deficit) — it had to sit and stare because it was asking for
+137 characters in 3.6 s. Netflix (20 cps, ≤84 chars, ≤7 s) and BBC (160–180 wpm) converge on
+**`dur` ≈ 0.33 × words + 0.6 s**, counting kicker + headline + sub. Delete what nobody can finish
+and the hold has no reason to exist.
+
+**Do NOT fix pacing by cutting faster.** Beat length 8–10 s is right (Mayer's segmenting principle,
+10/10 tests, d = 0.79); past ~12 shots per 30 s persuasion declines. The beat and the shot are
+different units — target **ASL 4–6 s** with **≥6 hard cuts**, and put the missing events *inside*
+the beat.
+
+**A `title`/`titleR` frame needs a caption with the matching `kind`.** They are two halves of one
+composition authored in two places, and a caption left on the default `lower` lands a bottom-left
+third straight across a window that has been pushed to one side.
 
 ---
 

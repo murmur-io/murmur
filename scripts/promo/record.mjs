@@ -176,6 +176,38 @@ function makeFilm(page, scene) {
       scene.roll = at();
     },
 
+    /**
+     * Start the take HERE — everything captured before this point is dropped.
+     *
+     * `goto` sets a roll point of its own, which covers the blank page painting
+     * in. This one is for a shot that needs to ARRIVE somewhere first: open a
+     * board, switch to a tab, unlock a panel, and only then start filming. Put
+     * the setup between `goto` and `roll`, and the film never sees it.
+     */
+    async roll(settle = 260) {
+      await sleep(settle);
+      scene.roll = at();
+    },
+
+    /**
+     * Clear a field and type into it at a human-but-brisk rate.
+     *
+     * The hook's whole claim is "type while it listens", and the first cut of
+     * this film never typed a character — the note body was fully written in
+     * frame 0 and the scene was 99% unchanged frames. This is what makes the
+     * shot honest AND what gives it its motion: a field filling in is the
+     * product performing, which is worth more than any camera move.
+     */
+    async clearAndType(target, text, { cps = 22 } = {}) {
+      await film.click(target, { after: 160 });
+      await page.keyboard.press("Meta+a");
+      await page.keyboard.press("Backspace");
+      await sleep(200);
+      const loc = typeof target === "string" ? page.locator(target).first() : target;
+      await loc.type(text, { delay: 1000 / cps });
+      await sleep(160);
+    },
+
     async showCursor(on = true) {
       await page.evaluate((v) => window.__promoCursor.show(v), on);
       await sleep(240);
@@ -354,388 +386,464 @@ function makeFilm(page, scene) {
 
 // ── The cut ─────────────────────────────────────────────────────────────────
 //
-// Beat order follows the brief: hook → output → proof → intelligence →
-// organisation → surfaces → ownership → CTA. Each scene is one continuous take;
-// stage 2 joins them with the transition each scene declares.
+// EIGHTEEN SHOTS, and the rules they follow are measured rather than felt.
 //
-// Every selector here is against the CURRENT shell (`mur-sidebar.primary-sidebar`
-// and the Workspaces/Shared tree). The previous cut still aimed at
-// `nav.global-rail`, which the 2026-08-31 sidebar rewrite deleted — a scene file
-// silently describing a UI that no longer exists is the failure mode this whole
-// harness is supposed to make impossible, so re-run `record` after any shell
+// The previous cut was nine scenes with ZERO hard cuts, 34 camera moves against
+// 16 things the app actually did, and 52% of its running time with the product
+// doing nothing at all. It papered over that with a continuous camera drift —
+// which put the film in the 1–15 px/s "visible but purposeless" band 64% of the
+// time, where no reference product film spends more than 28%. See
+// `docs/research/2026-09-01-promo-cut-rhythm.md`.
+//
+// So, three binding rules, and the shots below are just their consequence:
+//
+//   1. MOTION COMES FROM THE APP. Every shot performs something — a field being
+//      typed, a tab switching, a tree expanding, a panel refusing to open. The
+//      camera is LOCKED unless it is following a click, and then it travels
+//      once and stops.
+//   2. THE CAPTION RUNS WITH THE ACTION, NOT AFTER IT. Words and pictures at
+//      the same time (Mayer's temporal contiguity, 8/8 tests, d = 1.31) — which
+//      also means the caption's reading time is paid for by the action's
+//      duration instead of by a hold. That is what removes the dead air.
+//   3. CUT WHEN THE SHOT STOPS EARNING ITS PLACE. Eleven hard cuts inside the
+//      acts, softer transitions between them. ASL ~5 s.
+//
+// Caption budget, from Netflix (20 cps, ≤84 chars on screen, ≤7 s) and BBC
+// (160–180 wpm), which converge on ~0.33 s per word:
+//
+//      dur ≈ 0.33 × words + 0.6      (the 0.6 covers the per-word stagger)
+//
+// counting kicker + headline + sub together. Every `dur:` below was computed
+// that way; the previous cut had 15 of 15 captions under their own read time,
+// a 56-second collective deficit, which is the actual reason it had to sit and
+// stare.
+//
+// Every selector is against the CURRENT shell. Re-run `record` after any shell
 // change rather than trusting that the takes still land.
 const SCENES = {
-  /* 1. HOOK — open on the product mid-action. No logo, no title card.
-   *
-   * The cold open is the whole ballgame for a technical audience: the first
-   * three seconds decide whether the rest gets watched, and the strongest hook
-   * is the software visibly doing the thing. So: already recording, timer
-   * running, a note being kept, and captions arriving. */
-  capture: {
-    transition: "dissolve",
+  /* ═══ ACT 1 — CAPTURE ═══════════════════════════════════════════════════ */
+
+  /* 1. The hook. The note is CLEARED and typed on camera, because the caption
+   *    promises exactly that — and the previous cut's version of this shot was
+   *    99% unchanged frames with the note fully written in frame 0, under the
+   *    words "Type while it listens". The typing is both the honesty fix and
+   *    the entire motion budget of the shot. */
+  hook: {
+    transition: "cut",
     async run(page, film) {
       await film.goto("/record");
-      await film.settle(900);
       await film.startRecording();
-      await film.wait(500);
-      await film.liveCaption("…so the sync-layer dependency is gone — Atlas is unblocked for GA.");
-      await film.wait(900);
-      await film.assertClean("capture");
+      await film.settle(500);
+      await film.roll();
+      await film.assertClean("hook");
 
-      // Beat 1 — let the product play alone for a beat before saying anything.
-      await film.wait(400);
-
-      // Beat 2 — the claim, in the title layout: window tilted away to the
-      // right, type holding the left third. This is the shot the old cut could
-      // not make, because its window never moved.
-      film.frame("title", { ms: 1150 });
-      // ACCURACY, not modesty: an earlier draft of this line said "recording,
-      // transcription AND REASONING run locally". `DEFAULT_PROVIDER_ID` is
-      // `claude_code` (settings/config.rs calls it "the default brain", and it
-      // is cloud-classified), and this very scene photographs a `claude-opus-4-8`
-      // model chip — so that caption would have been a lie by framing, over
-      // footage that disproved it. What IS unconditionally true is the promise in
-      // CLAUDE.md's first non-negotiable constraint: audio and transcript stay on
-      // the device. Claim exactly that.
+      film.frame("title", { ms: 10 });
       film.title("Nothing leaves|*your Mac*.", {
         kicker: "On-device",
-        sub: "Recorded and transcribed on this Mac. Your audio and transcript never leave it. No account, no upload.",
-        dur: 3600,
+        sub: "Recorded and transcribed right here.",
+        dur: 3900,
         kind: "title",
       });
-      await film.wait(4150);
-
-      // Beat 3 — re-compose to the lower band and go to work: the note being
-      // kept while the meeting runs, then the live caption ticker.
-      film.frame("lower", { ms: 950 });
+      await film.liveCaption("…so the sync-layer dependency is gone — Atlas is unblocked for GA.");
+      await film.wait(600);
+      await film.clearAndType("app-meeting-conversation textarea", "Kickoff ran long — good energy on the GA date.", { cps: 21 });
+      await film.wait(500);
       await film.liveCaption("Then let's commit to the 14th. Priya, you own the migration note.");
-      await film.focus("app-meeting-conversation", { scale: 1.5, ms: 1400, bias: -40 });
-      film.title("Type while it *listens*.", {
-        kicker: "Companion note",
-        sub: "What you jot down steers the summary it writes afterwards.",
-        dur: 2900,
-      });
-      await film.wait(3300);
-
-      await film.wide({ ms: 900 });
-      await film.spotlight(".rec-foot", { dur: 2200, label: "Live · your side", pad: 6 });
-      await film.liveCaption("Marcus — Windows loopback is the last blocker on the list.");
-      await film.wait(2300);
+      await film.wait(1100);
     },
   },
 
-  /* 2. THE OUTPUT — what is waiting when the meeting ends. */
+  /* 2. The live ticker — your side, transcribed as you speak. */
+  hookLive: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/record");
+      await film.startRecording();
+      await film.liveCaption("Marcus — Windows loopback is the last blocker on the list.");
+      await film.settle(500);
+      await film.roll();
+      await film.assertClean("hookLive");
+
+      film.frame("lower", { ms: 10 });
+      film.title("Your side, *as you speak*.", { kicker: "Live", dur: 2600 });
+      await film.spotlight(".rec-foot", { dur: 2300, label: "Full transcript after Stop", pad: 6 });
+      await film.wait(1300);
+      await film.liveCaption("And the design-partner track is committed for the 15th.");
+      await film.wait(1900);
+    },
+  },
+
+  /* ═══ ACT 2 — WHAT IS WAITING AFTERWARDS ════════════════════════════════ */
+
+  /* 3. The note itself. One motivated push into the header, then a full stop. */
   note: {
     transition: "push",
     async run(page, film) {
       await film.goto("/meeting/m-atlas-roadmap");
-      await film.settle(900);
+      await film.settle(700);
+      await film.roll();
       await film.assertClean("note");
 
       film.frame("lower", { ms: 10 });
-      film.title("A note you'd have *written yourself*.", {
+      film.title("A note you'd have|*written yourself*.", {
         kicker: "Minutes later",
-        sub: "Titled, tagged, filed into the right workspace — and exported to your vault as plain Markdown.",
-        dur: 3400,
-      });
-      await film.wait(1500);
-      await film.spotlight(".related-primary", { dur: 2200, label: "Linked to what it touches" });
-      await film.wait(2300);
-
-      // Say it wide, THEN push in — a caption authored after the push lands on
-      // top of whatever the push-in filled the frame with, and the action-items
-      // panel is exactly the kind of dense content that turns into mush under
-      // 46 px type. The action items are the beat that closes a sale: they are
-      // the part a human would otherwise re-type by hand. They start at y≈637
-      // and run past the fold, so scroll them into the middle before framing.
-      film.title("Owners. Dates. *Done.*", {
-        kicker: "Action items",
-        sub: "Straight into Apple Reminders or Obsidian Tasks.",
-        dur: 2800,
-      });
-      await film.wait(1200);
-      await film.reveal("app-meeting-actions");
-      await film.focus("app-meeting-actions", { scale: 1.45, ms: 1300 });
-      await film.wait(2400);
-      await film.wide({ ms: 900 });
-      await film.wait(400);
-    },
-  },
-
-  /* 3. PROOF — the dual-stream transcript, the thing that is actually hard.
-   *
-   * Starts on the Note tab and CLICKS across, so the beat has the app's own
-   * motion in it rather than a camera move over a still panel. */
-  speakers: {
-    transition: "dissolve",
-    async run(page, film) {
-      await film.goto("/meeting/m-atlas-roadmap");
-      await film.settle(800);
-      await film.showCursor(true);
-      film.frame("lower", { ms: 10 });
-      await film.click("button:has-text('Audio')", { after: 1100 });
-      await film.showCursor(false);
-      await film.assertClean("speakers");
-
-      film.title("Your mic and the room, *on separate tracks*.", {
-        kicker: "Dual-stream",
-        sub: "whisper.cpp on Metal transcribes each side on its own, then merges them by wall clock.",
-        dur: 3400,
-      });
-      await film.wait(1200);
-      await film.reveal("app-meeting-timeline");
-      await film.focus("app-meeting-timeline", { scale: 1.4, ms: 1500 });
-      await film.wait(2900);
-      await film.wide({ ms: 950 });
-      await film.wait(400);
-    },
-  },
-
-  /* 4. PROOF — ask across everything, with citations. */
-  ask: {
-    transition: "push",
-    async run(page, film) {
-      await film.goto("/ask");
-      await film.settle(700);
-      await film.showCursor(true);
-      film.frame("lower", { ms: 10 });
-      film.title("Ask across *everything you've recorded*.", {
-        kicker: "Ask",
-        sub: "Forty-seven meetings, every note, every document you added.",
         dur: 3200,
       });
-      // 17 cps, not 26: this scene captures at ~19 fps, and at 30 cps three
-      // characters land between frames and it reads as a stutter, not as typing.
-      await film.type("textarea, input[type=text]", "What did we decide about Atlas, and who owns what's left?", { cps: 17 });
-      await film.wait(320);
-      await page.keyboard.press("Enter");
-      await film.wait(1700);
-      await film.showCursor(false);
-      await film.assertClean("ask");
-
-      await film.focus({ x: 300, y: 200, width: 1000, height: 380 }, { scale: 1.42, ms: 1300 });
-      await film.wait(2000);
-      await film.wide({ ms: 900 });
-      // Not "every claim, cited": this row cites the ANSWER, with a meeting and
-      // a date per chip. Murmur does have per-claim receipts elsewhere, but a
-      // label has to be true of the pixels it is drawn on.
-      await film.spotlight("app-sources.ask-sources", { dur: 2400, label: "Where it came from" });
-      // "…and the second of audio it came from" overclaims what this shot shows:
-      // the SOURCES chips carry a meeting and a date, not a timestamp. Claim the
-      // thing that is on screen — which is also what the route's own copy says.
-      film.title("It shows *its receipts*.", {
-        kicker: "Grounded",
-        sub: "Every answer links back to the meetings it came from.",
-        dur: 2900,
-      });
-      await film.wait(3300);
+      await film.wait(700);
+      await film.focus({ x: 300, y: 100, width: 1264, height: 260 }, { scale: 1.3, ms: 1000 });
+      await film.wait(2400);
     },
   },
 
-  /* 5. THE MAP — motion for free: the force layout settles on camera.
-   *
-   * NOT `/graph`. That route is the entity BROWSER — People and Projects as
-   * chips — which photographs as a list and flatly fails to deliver the
-   * caption's promise. The actual map lives behind the "Full brain graph"
-   * disclosure on `/brain`, which is where the screenshot harness gets it too. */
-  brain: {
-    transition: "whip",
+  /* 4. Related — and then CLICK one, so the link is a thing that happens rather
+   *    than a thing that is described. The shot lands on the linked note. */
+  noteRelated: {
+    transition: "cut",
     async run(page, film) {
-      await film.goto("/brain");
-      await film.settle(900);
-      await film.showCursor(true);
-      film.frame("full", { ms: 10 });
-      await film.click("button:has-text('Full brain graph')", { after: 700 });
-      await page.waitForSelector("app-full-brain-graph", { timeout: 15_000 });
-      await film.showCursor(false);
-      // "Clusters" packs the map by community; "Layers" leaves most of the
-      // canvas empty at this size. "Fit" then centres it.
-      const clusters = page.locator("button", { hasText: /^\s*Clusters\s*$/ }).first();
-      if (await clusters.count()) await clusters.click();
-      await film.wait(1200);
-      const fit = page.locator("button", { hasText: /^\s*Fit\s*$/ }).first();
-      if (await fit.count()) await fit.click();
-      // Park the CANVAS in frame, not the component host. The host starts at the
-      // legend and control rows, so centring it leaves the map itself below the
-      // fold — which is what the first take photographed.
-      await film.reveal("app-full-brain-graph canvas", { settle: 800 });
-      await film.assertClean("brain");
+      await film.goto("/meeting/m-atlas-roadmap");
+      await film.settle(700);
+      await film.roll();
+      await film.assertClean("noteRelated");
 
-      film.frame("titleR", { ms: 1150 });
-      film.title("Meetings, notes, documents,|people — *one brain*.", {
-        kicker: "It connects itself",
-        sub: "Co-occurrence, mentions, wikilinks and semantic neighbours, drawn as one map.",
-        dur: 3600,
-        kind: "titleR",
+      film.frame("lower", { ms: 10 });
+      film.title("Linked to *what it touches*.", { kicker: "Related", dur: 2600 });
+      await film.spotlight(".related-primary", { dur: 1900 });
+      await film.showCursor(true);
+      await film.wait(1600);
+      await film.click('.related-primary :text("Atlas — PRD v3")', { after: 900 });
+      await film.showCursor(false);
+      await film.assertClean("noteRelated-landed");
+      await film.wait(250);
+    },
+  },
+
+  /* 5. Action items. The scroll IS the action — they start at y≈637 and run past
+   *    the fold, so revealing them is both the reframe and the motion. */
+  noteActions: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/meeting/m-atlas-roadmap");
+      await film.settle(700);
+      await film.roll();
+
+      film.frame("lower", { ms: 10 });
+      film.title("Owners. Dates. *Done.*", {
+        kicker: "Action items",
+        sub: "Into Apple Reminders or Obsidian Tasks.",
+        dur: 4200,
       });
-      await film.wait(3980);
-      film.frame("full", { ms: 1000 });
-      // A slow, continuous push on the map. The force layout is still settling,
-      // so this beat has motion of its own — the camera only frames it.
-      await film.focus("app-full-brain-graph canvas", { scale: 1.28, ms: 2800 });
+      await film.wait(500);
+      await film.reveal("app-meeting-actions");
+      await film.focus("app-meeting-actions", { scale: 1.4, ms: 1100 });
+      await film.assertClean("noteActions");
+      await film.wait(2600);
+    },
+  },
+
+  /* ═══ ACT 3 — PROOF ═════════════════════════════════════════════════════ */
+
+  /* 6. Dual-stream. The tab click is the action; the timeline paints in. */
+  speakers: {
+    transition: "push",
+    async run(page, film) {
+      await film.goto("/meeting/m-atlas-roadmap");
+      await film.settle(600);
+      await film.roll();
+
+      film.frame("lower", { ms: 10 });
+      film.title("Your mic and the room,|*on separate tracks*.", {
+        kicker: "Dual-stream",
+        dur: 3600,
+      });
+      await film.showCursor(true);
+      await film.click("button:has-text('Audio')", { after: 900 });
+      await film.showCursor(false);
+      await film.assertClean("speakers");
+      await film.reveal("app-meeting-timeline");
+      await film.focus("app-meeting-timeline", { scale: 1.35, ms: 1100 });
+      await film.wait(1000);
+    },
+  },
+
+  /* 7. Topics — a chip click jumps the timeline. Setup happens BEFORE the roll,
+   *    so the film never sees the tab being opened a second time. */
+  speakersTopics: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/meeting/m-atlas-roadmap");
+      await page.locator("button:has-text('Audio')").first().click();
+      await film.settle(900);
+      await film.reveal("app-meeting-timeline");
+      await film.roll();
+      await film.assertClean("speakersTopics");
+
+      film.frame("lower", { ms: 10 });
+      film.title("Jump to *any moment*.", { kicker: "Topics", dur: 2300 });
+      await film.showCursor(true);
+      await film.focus("app-meeting-timeline", { scale: 1.4, ms: 900 });
+      await film.click(':text("Mobile redesign scope")', { after: 900 });
+      await film.showCursor(false);
+      await film.wait(400);
+    },
+  },
+
+  /* 8. Ask — typed live at 17 cps, because this scene captures at ~19 fps and at
+   *    30 cps three characters land between frames and it reads as a stutter. */
+  askType: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/ask");
+      await film.settle(600);
+      await film.roll();
+      await film.assertClean("askType");
+
+      film.frame("lower", { ms: 10 });
+      film.title("Ask across|*everything you've recorded*.", { kicker: "Ask", dur: 2600 });
+      await film.showCursor(true);
+      await film.type("textarea, input[type=text]", "What did we decide about Atlas, and who owns what's left?", { cps: 17 });
+      await film.showCursor(false);
+      await film.wait(700);
+    },
+  },
+
+  /* 9. The answer streaming in, with its sources ringed. The question is already
+   *    typed before the roll — this shot is only the answer arriving. */
+  askAnswer: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/ask");
+      await film.settle(500);
+      await page.locator("textarea, input[type=text]").first().fill("What did we decide about Atlas, and who owns what's left?");
+      await film.roll();
+
+      await page.keyboard.press("Enter");
+      film.frame("lower", { ms: 10 });
+      film.title("It shows *its receipts*.", { kicker: "Grounded", dur: 2300 });
+      await film.wait(1900);
+      await film.assertClean("askAnswer");
+      await film.spotlight("app-sources.ask-sources", { dur: 2100, label: "Where it came from" });
       await film.wait(2500);
     },
   },
 
-  /* 6. ORGANISATION — the sidebar, which is the shell rewrite's whole point.
-   *
-   * The collapse/expand is REAL UI animation, not a camera move: the rail
-   * animates its own width and swaps to icons. Filming the app's own motion is
-   * always worth more than manufacturing some. */
+  /* ═══ ACT 4 — THE MAP ═══════════════════════════════════════════════════ */
+
+  /* 10. The force layout settles on camera — the one shot whose motion needs no
+   *     help at all. NOT `/graph`: that route is the entity BROWSER and
+   *     photographs as a list of chips, which would make the caption a lie. */
+  brain: {
+    transition: "whip",
+    async run(page, film) {
+      await film.goto("/brain");
+      await film.settle(600);
+      await page.locator("button:has-text('Full brain graph')").first().click();
+      await page.waitForSelector("app-full-brain-graph", { timeout: 15_000 });
+      const clusters = page.locator("button", { hasText: /^\s*Clusters\s*$/ }).first();
+      if (await clusters.count()) await clusters.click();
+      await film.reveal("app-full-brain-graph canvas", { settle: 300 });
+      await film.roll();
+      await film.assertClean("brain");
+
+      film.frame("titleR", { ms: 10 });
+      // `kind` MUST match the frame mode: the layout puts the window off to one
+      // side, and a caption left on the default `lower` lands a bottom-left
+      // third straight across it. Same bug class as the centred-window one —
+      // two halves of one composition authored in two places.
+      film.title("Meetings, notes, documents,|people — *one brain*.", {
+        kicker: "It connects itself",
+        dur: 3900,
+        kind: "titleR",
+      });
+      const fit = page.locator("button", { hasText: /^\s*Fit\s*$/ }).first();
+      if (await fit.count()) await fit.click();
+      await film.wait(5400);
+    },
+  },
+
+  /* ═══ ACT 5 — ORGANISE ══════════════════════════════════════════════════ */
+
+  /* 11. The Workspaces tree. Expanding a node is the action — and it navigates,
+   *     so the whole right-hand pane changes with it. */
   workspace: {
     transition: "pushUp",
     async run(page, film) {
       await film.goto("/notes");
-      await film.settle(900);
+      await film.settle(700);
+      await film.roll();
       await film.assertClean("workspace");
 
       film.frame("lower", { ms: 10 });
-      film.title("Your vault, *the way you think*.", {
-        kicker: "Workspaces",
-        sub: "Projects, clients, shared brains — and an inbox for anything you haven't filed yet.",
-        dur: 3300,
-      });
-      await film.wait(1200);
+      film.title("Your vault, *the way you think*.", { kicker: "Workspaces", dur: 2900 });
       await film.spotlight('[aria-label="Workspaces"] .sb-tree, mur-sidebar .sb-workspaces', {
-        dur: 2400,
+        dur: 1800,
         label: "3 unfiled recordings",
       });
-      await film.wait(2760);
-
-      // Collapse to the icon rail and back — the app animating itself.
       await film.showCursor(true);
-      await film.focus({ x: 220, y: 450, width: 620, height: 620 }, { scale: 1.34, ms: 900 });
-      await film.click('button[aria-label="Collapse sidebar"]', { after: 1150 });
-      // Not "one keystroke": `toggleSidebar()` is click-only, there is no
-      // accelerator bound to it.
-      film.title("Collapse it to a rail. *Get out of the way.*", {
-        kicker: "One click",
-        dur: 2400,
-      });
       await film.wait(1500);
-      await film.click('button[aria-label="Expand sidebar"]', { after: 1300 });
+      await film.click('mur-sidebar :text-is("Product")', { after: 1000 });
       await film.showCursor(false);
-      await film.wide({ ms: 900 });
-      await film.wait(500);
+      await film.wait(250);
     },
   },
 
-  /* 7. SURFACES — a board is where the brain's reasoning is standing output
-   *    rather than a chat answer, which is the least like every other notes app
-   *    this product gets.
-   *
-   *    The click into the board is doing two jobs: it is the beat, and it is the
-   *    FOOTAGE. `/dashboards` is a static route — the screencast only emits on a
-   *    paint, so an un-driven take of it captured a single frame for seven
-   *    seconds. Driving the UI is what gives these scenes anything to sample. */
+  /* 12. Collapse to the rail and back — the app animating its own chrome. */
+  workspaceRail: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/notes");
+      await film.settle(600);
+      await film.roll();
+
+      film.frame("lower", { ms: 10 });
+      film.title("Collapse it to *a rail*.", { kicker: "One click", dur: 2900 });
+      await film.showCursor(true);
+      await film.focus({ x: 200, y: 440, width: 620, height: 600 }, { scale: 1.28, ms: 800 });
+      await film.click('button[aria-label="Collapse sidebar"]', { after: 1300 });
+      await film.click('button[aria-label="Expand sidebar"]', { after: 900 });
+      await film.showCursor(false);
+      await film.wait(250);
+    },
+  },
+
+  /* 13. ⌘K — the palette opens and takes a query. */
+  search: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/notes");
+      await film.settle(600);
+      await film.roll();
+
+      film.frame("lower", { ms: 10 });
+      film.title("Search everything.|*On device.*", { kicker: "⌘K", dur: 2300 });
+      await page.keyboard.press("Meta+k");
+      await film.wait(700);
+      await film.assertClean("search");
+      await film.type("mur-quick-search input", "atlas", { cps: 9, focusFirst: false });
+      await film.wait(1800);
+    },
+  },
+
+  /* ═══ ACT 6 — SURFACES ══════════════════════════════════════════════════ */
+
+  /* 14. Opening a board. */
   boards: {
     transition: "push",
     async run(page, film) {
       await film.goto("/dashboards");
-      await film.settle(800);
+      await film.settle(700);
+      await film.roll();
       await film.assertClean("boards");
 
       film.frame("lower", { ms: 10 });
-      film.title("Compose a board. The brain *reasons inside it*.", {
+      film.title("Compose a board. The brain|*reasons inside it*.", {
         kicker: "Dashboards",
-        sub: "Tiles that stay live against your vault.",
-        dur: 2800,
+        dur: 3600,
       });
       await film.showCursor(true);
-      await film.wait(1300);
-      // Scoped to the main column: the sidebar carries the same board title, and
-      // CSS truncation leaves the full string in the DOM, so an unscoped text
-      // match resolves to the tree row instead of the card.
-      await film.click('.main-col :text-is("Atlas — GA readiness")', { after: 1400 });
+      await film.wait(900);
+      // Scoped to the main column: the sidebar carries the same board title and
+      // CSS truncation leaves the full string in the DOM, so an unscoped match
+      // resolves to the tree row instead of the card.
+      await film.click('.main-col :text-is("Atlas — GA readiness")', { after: 1100 });
       await film.showCursor(false);
-      await film.assertClean("board-detail");
-
-      film.title("It answers, and *shows its working*.", {
-        kicker: "Brief",
-        sub: "A standing answer, what needs attention, and the evidence underneath it.",
-        dur: 2600,
-      });
-      await film.wait(1400);
-      await film.focus({ x: 300, y: 205, width: 1260, height: 290 }, { scale: 1.3, ms: 1400 });
-      await film.wait(2200);
-      await film.wide({ ms: 850 });
-      await film.wait(350);
+      await film.assertClean("boards-detail");
+      await film.wait(700);
     },
   },
 
-  /* 8. MEMORY — the human half. Short, because the claim is small and obvious
-   *    once photographed. The cursor glide is deliberate: it lights the hover
-   *    states AND it is the only thing repainting this route. */
-  people: {
-    transition: "dissolve",
+  /* 15. Its standing answer, and the tab that shows what is owed. */
+  boardsTabs: {
+    transition: "cut",
     async run(page, film) {
-      await film.goto("/people");
+      await film.goto("/dashboards/d-atlas");
       await film.settle(800);
-      await film.assertClean("people");
+      await film.roll();
+      await film.assertClean("boardsTabs");
 
       film.frame("lower", { ms: 10 });
-      film.title("It remembers *who owes what*.", {
-        kicker: "People",
-        sub: "Everyone across your meetings — when you last spoke, and what is still open.",
-        dur: 2900,
-      });
+      film.title("It answers, and|*shows its working*.", { kicker: "Brief", dur: 2900 });
+      await film.focus({ x: 300, y: 200, width: 1260, height: 300 }, { scale: 1.28, ms: 1000 });
+      await film.wait(1500);
       await film.showCursor(true);
-      await film.wait(1200);
-      await film.focus({ x: 300, y: 150, width: 1264, height: 200 }, { scale: 1.38, ms: 1200 });
-      await film.cursorTo('text=Sarah Chen', { ms: 700 });
-      await film.wait(450);
-      await film.cursorTo('text=Marcus Reid', { ms: 620 });
-      await film.wait(400);
-      await film.cursorTo('text=Priya Nair', { ms: 700 });
-      await film.wait(400);
+      await film.click('button:has-text("Commitments")', { after: 1000 });
       await film.showCursor(false);
-      await film.wide({ ms: 850 });
       await film.wait(300);
     },
   },
 
-  /* 9. OWNERSHIP — the closing argument, and the one the hook promised.
-   *
-   * A sealed Workspace discloses its NAME and nothing else: no note, no
-   * transcript, no audio, not even to the app's own read paths. That is the
-   * whole point of the beat, so frame the tree and the refusal together. */
-  lock: {
+  /* 16. People — the cursor glide is the action, and it lights the hover states
+   *     on the way. */
+  people: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/people");
+      await film.settle(600);
+      await film.roll();
+      await film.assertClean("people");
+
+      film.frame("lower", { ms: 10 });
+      film.title("It remembers *who owes what*.", { kicker: "People", dur: 2600 });
+      await film.showCursor(true);
+      await film.focus({ x: 300, y: 150, width: 1264, height: 200 }, { scale: 1.32, ms: 900 });
+      await film.cursorTo("text=Sarah Chen", { ms: 620 });
+      await film.wait(320);
+      await film.cursorTo("text=Marcus Reid", { ms: 560 });
+      await film.wait(300);
+      await film.cursorTo("text=Priya Nair", { ms: 640 });
+      await film.showCursor(false);
+      await film.wait(250);
+    },
+  },
+
+  /* ═══ ACT 7 — OWNERSHIP ═════════════════════════════════════════════════ */
+
+  /* 17. The contrast shot, and the reason this act works at all: open a
+   *     workspace that HAS contents, then click the sealed one and watch it
+   *     refuse. The refusal only means something once you have just seen what
+   *     an open workspace looks like. */
+  lockRefuse: {
     transition: "whip",
     async run(page, film) {
-      await film.goto("/container/f-personal");
-      await film.settle(800);
-      await film.assertClean("lock");
+      await film.goto("/container/f-eng");
+      await film.settle(700);
+      await film.roll();
+      await film.assertClean("lockRefuse-open");
 
-      film.frame("title", { ms: 1100 });
+      film.frame("lower", { ms: 10 });
+      await film.showCursor(true);
+      await film.wait(1100);
+      await film.click('mur-sidebar :text-is("Personal")', { after: 1200 });
+      await film.showCursor(false);
+      await film.assertClean("lockRefuse-sealed");
+      film.frame("title", { ms: 900 });
       film.title("A door *only you*|hold the key to.", {
         kicker: "Lock a workspace",
-        sub: "Notes, transcripts and audio seal behind Touch ID. Locked means locked — even to Murmur.",
-        dur: 3600,
+        dur: 4200,
         kind: "title",
       });
-      await film.wait(3980);
+      await film.wait(4550);
+    },
+  },
 
-      // The sealed workspace discloses its NAME and nothing else, which is the
-      // whole claim — so end on the padlock and the refusal in one frame. The
-      // cursor glide is also what keeps this static route repainting.
-      film.frame("lower", { ms: 1000 });
-      await film.showCursor(true);
+  /* 18. And the files are yours regardless. */
+  lockFiles: {
+    transition: "cut",
+    async run(page, film) {
+      await film.goto("/container/f-personal");
+      await film.settle(600);
+      await film.roll();
+
+      film.frame("lower", { ms: 10 });
       film.title("And it is all *plain Markdown*.", {
         kicker: "Your files",
-        sub: "In your own Obsidian vault. Delete Murmur tomorrow and every note is still yours.",
-        dur: 2800,
+        sub: "In your own Obsidian vault.",
+        dur: 4900,
       });
-      await film.wait(1300);
-      // Aim at the SIDEBAR, not the middle of the pane. A sealed workspace's
-      // whole visible evidence is the red padlock beside its name plus the
-      // refusal text — the rest of the route is deliberately empty, so a shot
-      // centred on the content area photographs nothing at all.
-      await film.focus({ x: 30, y: 240, width: 560, height: 380 }, { scale: 1.5, ms: 1300 });
+      await film.showCursor(true);
+      await film.focus({ x: 30, y: 240, width: 560, height: 380 }, { scale: 1.42, ms: 1000 });
       await film.cursorTo('mur-sidebar :text-is("Personal")', { ms: 800 });
-      await film.wait(2000);
       await film.showCursor(false);
-      await film.wide({ ms: 850 });
-      await film.wait(350);
+      await film.wait(2900);
     },
   },
 };
