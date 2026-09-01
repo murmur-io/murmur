@@ -163,6 +163,13 @@ pub const SHARE_ACTIVE: &str = "share-active";
 pub const FOLDER_CLOSING: &str = "folder-closing";
 /// The meeting's container is not a container Murmur can write a note into.
 pub const CONTAINER_UNAVAILABLE: &str = "container-unavailable";
+/// A read-side org refresh gave up waiting for an in-flight sharing mutation.
+///
+/// DISTINCT from [`FOLDER_CLOSING`], which names one container mid-close. This one is the GLOBAL
+/// `org_share_mutation_lock`: some other sharing operation still holds it. Refusing is what keeps
+/// the org panel from waiting forever — before this code existed the wait was unbounded, and a
+/// wedged holder left "Loading organizations…" on screen until the app was restarted.
+pub const SHARE_BUSY: &str = "share-busy";
 
 /// Every code this crate emits, in declaration order. The frontend's allowlist mirrors it;
 /// `error_codes_are_unique_and_kebab_case` keeps the shape a machine can rely on.
@@ -198,6 +205,7 @@ pub const ALL: &[&str] = &[
     NOTE_PROVIDER_EMPTY,
     SHARE_ACTIVE,
     FOLDER_CLOSING,
+    SHARE_BUSY,
     CONTAINER_UNAVAILABLE,
 ];
 
@@ -294,6 +302,8 @@ mod tests {
             "note-provider-empty",
             "share-active",
             "folder-closing",
+            // Added 2026-09-01 with the bounded org-refresh wait. See `SHARE_BUSY`.
+            "share-busy",
             "container-unavailable",
         ];
         assert_eq!(ALL, expected);

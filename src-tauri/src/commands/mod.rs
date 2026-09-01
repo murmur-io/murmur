@@ -14343,6 +14343,10 @@ mod workspace_tree_tests;
 
 // ── Shared containers: the share plan's leak oracles + the received-forest read model ────────────
 #[cfg(test)]
+#[cfg(test)]
+#[path = "tests/org_diagnosability_tests.rs"]
+mod org_diagnosability_tests;
+
 #[path = "tests/container_share_tests.rs"]
 mod container_share_tests;
 
