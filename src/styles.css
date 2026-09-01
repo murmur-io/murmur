@@ -654,7 +654,13 @@ app-shell.sidebar-collapsed {
 
    The round button carries `plus`; open, it rotates 45 degrees into an X. That
    is the same affordance Notion uses, and it means the close state needs no
-   second glyph in the icon set. */
+   second glyph in the icon set.
+
+   Quick note sits BETWEEN the two: jotting a note is the second thing this app
+   is for, and burying it one menu deep cost a click every time. It stays an
+   icon-only round button so Capture keeps the only label in the row, and it
+   reuses the very same `/notes/new` flow the menu item does — the menu keeps
+   its New note entry rather than leaving a hole where users learned to look. */
 .primary-sidebar .sb-create {
   justify-content: flex-start;
 }
@@ -673,7 +679,10 @@ app-shell.sidebar-collapsed {
   box-shadow: var(--shell-active-shadow);
 }
 
-.primary-sidebar .sb-create-more {
+/* Quick note and the create caret are the SAME round control, so they share
+   one rule instead of drifting apart by a pixel. */
+.primary-sidebar .sb-create-more,
+.primary-sidebar .sb-quick-note {
   flex: none;
   width: var(--shell-footer-btn);
   height: var(--shell-footer-btn);
@@ -701,8 +710,8 @@ app-shell.sidebar-collapsed {
 }
 
 /* Collapsed, Capture has no room for a label, so it becomes the same round
-   button as its neighbour rather than a stretched pill with a glyph adrift in
-   it. Two circles, one accented, reads as the same pair the expanded footer
+   button as its neighbours rather than a stretched pill with a glyph adrift in
+   it. Three circles, one accented, reads as the same set the expanded footer
    shows. */
 .primary-sidebar.collapsed .sb-capture {
   flex: none;
