@@ -19,9 +19,18 @@ use crate::error::{AppError, Result};
 /// `limit` is the number of most-recent entries to return, clamped to
 /// [1, [`applog::MAX_ENTRIES`]]; omit it for [`applog::DEFAULT_ENTRIES`]. A generation that has
 /// never been written returns `exists: false` with no entries rather than an error.
+///
+/// Prunes first, so what the view shows is exactly what is still kept: the 24 h window is enforced
+/// on DISK before anything is read out of it, and a stale entry can never be rendered as if it had
+/// survived. A prune failure is not allowed to withhold the log — the read proceeds and the
+/// hourly tick will try again.
 #[tauri::command]
 pub fn read_app_log(session: String, limit: Option<usize>) -> Result<AppLog> {
-    applog::read(LogSession::parse(&session)?, limit)
+    let target = LogSession::parse(&session)?;
+    if let Err(error) = applog::prune_expired() {
+        tracing::warn!(target: "applog", %error, "log prune before read failed");
+    }
+    applog::read(target, limit)
 }
 
 /// Empty the CURRENT session's log so a reproduction starts from a clean slate. The previous

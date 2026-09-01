@@ -10,13 +10,21 @@
 //! destroyed by the relaunch that went looking for it. A crash is diagnosed from the run BEFORE
 //! the current one; keeping exactly one generation costs one file and loses nothing.
 //!
+//! RETENTION: nothing older than 24 h survives. Expiry DELETES — a whole aged-out previous-session
+//! file is removed, and the current file's expired head is dropped from the file itself — rather
+//! than merely being filtered out of the view, so the promise the UI makes ("kept for 24 hours") is
+//! true on disk too. Pruning runs at launch, on an hourly tick, and before every read, so it never
+//! depends on anyone opening the Logs view.
+//!
 //! PII: the log itself carries IDs / stages / counts only (the no-PII rule), and the panic hook
 //! sanitizes payloads before they land here. This module only READS what is already on disk and
 //! never widens what is written, so surfacing it in-app adds no new disclosure — the file is
 //! local, and its contents were already local.
 
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use crate::error::{AppError, Result};
 
@@ -36,6 +44,14 @@ pub const DEFAULT_ENTRIES: usize = 1_000;
 /// multi-MB log from being parsed in full on every refresh; the older head is still on disk and
 /// reachable through "Reveal in Finder".
 const TAIL_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How long a log is kept. Past this, entries are DELETED — see the module doc.
+pub const RETENTION_HOURS: i64 = 24;
+
+/// How often the background pruner runs. Hourly is far finer than the 24 h window it enforces, so
+/// an aged-out log is gone within an hour of expiring, and the tick costs nothing noticeable (a
+/// stat, plus one rewrite on the rare tick that actually has something to drop).
+pub const PRUNE_TICK_SECS: u64 = 3600;
 
 /// Cap on a single entry's retained text. One absurd line (a serialized blob threaded into an
 /// `expect`) can no longer inflate the whole response.
@@ -128,21 +144,31 @@ pub struct AppLog {
     pub entries: Vec<LogEntry>,
 }
 
-/// Prepare the log file for a NEW session: move the last session's file aside, then hand back a
-/// fresh append handle. Best-effort by construction — every failure degrades to "no file writer"
-/// (stderr only) rather than failing startup, because logging must never be the reason the app
-/// does not launch.
+/// Prepare the log file for a NEW session: drop whatever has aged out, move the last session's
+/// file aside, then hand back a fresh append handle. Best-effort by construction — every failure
+/// degrades to "no file writer" (stderr only) rather than failing startup, because logging must
+/// never be the reason the app does not launch.
 ///
 /// Returns the opened current-session file, or `None` when a file writer could not be set up.
 pub fn rotate_and_open() -> Option<std::fs::File> {
     let dir = log_dir().ok()?;
     std::fs::create_dir_all(&dir).ok()?;
+    // Prune BEFORE rotating, so a session older than the retention window is deleted instead of
+    // being promoted to `murmur.prev.log` — otherwise every relaunch would renew the expiry of
+    // content that is already too old to keep.
+    let _ = prune_dir(&dir, Utc::now());
     let current = dir.join(LOG_FILE);
     let previous = dir.join(PREV_LOG_FILE);
     // Rotate rather than truncate: the crash we are asked to explain is in the PREVIOUS run.
     // A failed rename must not leave the last session's lines glued to this one's, so fall back
     // to truncating — the old behavior — instead of appending into a mixed file.
-    if current.exists() && std::fs::rename(&current, &previous).is_err() {
+    //
+    // An EMPTY current file is not rotated: after a prune emptied it there is nothing to preserve,
+    // and rotating would overwrite a still-in-retention previous session with a blank file.
+    let has_content = std::fs::metadata(&current)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    if has_content && std::fs::rename(&current, &previous).is_err() {
         let _ = std::fs::write(&current, b"");
     }
     std::fs::OpenOptions::new()
@@ -150,6 +176,95 @@ pub fn rotate_and_open() -> Option<std::fs::File> {
         .append(true)
         .open(&current)
         .ok()
+}
+
+/// Delete everything past the retention window. Called at launch, on the hourly tick, and before
+/// every read.
+pub fn prune_expired() -> Result<()> {
+    let dir = log_dir()?;
+    prune_dir(&dir, Utc::now())
+}
+
+/// The retention boundary: entries stamped before this are gone.
+fn cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
+    now - ChronoDuration::hours(RETENTION_HOURS)
+}
+
+/// Prune both generations in `dir`.
+///
+/// The PREVIOUS file is judged WHOLE: it belongs to a finished session, so once its last write is
+/// past the cutoff every line in it is too. The CURRENT file is judged PER ENTRY, because a session
+/// running longer than the window holds expired and live lines in the same file.
+fn prune_dir(dir: &Path, now: DateTime<Utc>) -> Result<()> {
+    let cutoff = cutoff(now);
+    let previous = dir.join(PREV_LOG_FILE);
+    if let Ok(meta) = std::fs::metadata(&previous) {
+        let expired = meta
+            .modified()
+            .map(|m| DateTime::<Utc>::from(m) < cutoff)
+            .unwrap_or(false);
+        if expired {
+            std::fs::remove_file(&previous)
+                .map_err(|e| AppError::Storage(format!("prune previous log: {e}")))?;
+        }
+    }
+    prune_file_head(&dir.join(LOG_FILE), cutoff)
+}
+
+/// Drop the expired HEAD of one file, in place.
+///
+/// Rewritten on the SAME inode (write at offset 0 + `set_len`), never through a temp file and a
+/// rename: the running `tracing` writer holds an fd to this inode, and a rename would leave it
+/// appending into an unlinked file — every later line would vanish with no error anywhere. The
+/// cost is a small race, taken deliberately: a line appended during the rewrite lands past the new
+/// length and is truncated away. That is at most a line or two, only on a prune that actually has
+/// something to expire; the alternative silently kills logging for the rest of the session.
+fn prune_file_head(path: &Path, cutoff: DateTime<Utc>) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // A non-UTF-8 log is not something to silently delete; leave it for "Reveal in Finder".
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(()),
+        Err(e) => return Err(AppError::Storage(format!("read log for prune: {e}"))),
+    };
+    let keep_from = first_retained_offset(&text, cutoff);
+    if keep_from == 0 {
+        return Ok(()); // nothing has expired — the common case, and it writes nothing.
+    }
+    let retained = &text.as_bytes()[keep_from..];
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| AppError::Storage(format!("open log for prune: {e}")))?;
+    file.write_all(retained)
+        .map_err(|e| AppError::Storage(format!("rewrite log: {e}")))?;
+    file.set_len(retained.len() as u64)
+        .map_err(|e| AppError::Storage(format!("truncate log: {e}")))?;
+    file.flush()
+        .map_err(|e| AppError::Storage(format!("flush log: {e}")))?;
+    Ok(())
+}
+
+/// Byte offset of the first entry to KEEP.
+///
+/// `0` means nothing has expired; `text.len()` means everything has. A continuation line belongs to
+/// the entry above it, so it is kept or dropped WITH that entry — never promoted into the retained
+/// region on its own, which would leave a stack frame with no panic attached to it.
+fn first_retained_offset(text: &str, cutoff: DateTime<Utc>) -> usize {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if let Some((timestamp, _, _, _)) = parse_header(line.trim_end_matches(['\n', '\r'])) {
+            match DateTime::parse_from_rfc3339(&timestamp) {
+                // The first in-window entry opens the retained region.
+                Ok(parsed) if parsed.with_timezone(&Utc) >= cutoff => return offset,
+                // An unparseable stamp is not evidence of age — keep it rather than delete it.
+                Err(_) => return offset,
+                _ => {}
+            }
+        }
+        offset += line.len();
+    }
+    offset
 }
 
 /// Read the tail of one generation and parse it into entries.
@@ -430,6 +545,136 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].message.chars().count() <= MAX_ENTRY_CHARS + 16);
         assert!(parsed[0].message.ends_with("…[truncated]"));
+    }
+
+    // ── Retention: 24 h, enforced by DELETING ────────────────────────────────────────────────
+
+    /// A log line stamped `hours_ago`, in exactly the format the writer produces.
+    fn line_at(now: DateTime<Utc>, hours_ago: i64, message: &str) -> String {
+        let ts = (now - ChronoDuration::hours(hours_ago))
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string();
+        format!("{ts}  INFO murmur: {message}\n")
+    }
+
+    fn temp_log_dir(label: &str) -> std::path::PathBuf {
+        let dir = crate::storage::db::unique_temp_path(&format!("murmur-applog-{label}"), "dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn nothing_expired_means_nothing_is_rewritten() {
+        let now = Utc::now();
+        let text = line_at(now, 1, "fresh") + &line_at(now, 23, "still inside the window");
+        assert_eq!(
+            first_retained_offset(&text, cutoff(now)),
+            0,
+            "an untouched file must not be rewritten at all"
+        );
+    }
+
+    #[test]
+    fn the_expired_head_is_dropped_and_the_rest_kept() {
+        let now = Utc::now();
+        let old = line_at(now, 30, "yesterday's noise");
+        let older = line_at(now, 48, "two days ago");
+        let fresh = line_at(now, 2, "keep me");
+        let text = format!("{older}{old}{fresh}");
+        let offset = first_retained_offset(&text, cutoff(now));
+        assert_eq!(&text[offset..], fresh, "the retained region starts at the first live entry");
+    }
+
+    #[test]
+    fn an_entirely_expired_file_retains_nothing() {
+        let now = Utc::now();
+        let text = line_at(now, 25, "just past the window") + &line_at(now, 90, "ancient");
+        assert_eq!(first_retained_offset(&text, cutoff(now)), text.len());
+    }
+
+    #[test]
+    fn a_continuation_line_expires_with_the_entry_it_belongs_to() {
+        let now = Utc::now();
+        let expired_panic = line_at(now, 40, "thread panicked");
+        let text = format!("{expired_panic}stack frame one\nstack frame two\n{}", line_at(now, 1, "fresh"));
+        let offset = first_retained_offset(&text, cutoff(now));
+        let kept = &text[offset..];
+        assert!(
+            !kept.contains("stack frame"),
+            "a frame must never outlive its panic — it would read as an event of its own"
+        );
+        assert!(kept.contains("fresh"));
+    }
+
+    /// An unparseable stamp is not evidence of age. Deleting on a parse failure would let one
+    /// malformed line take every line above it with it.
+    #[test]
+    fn an_unparseable_timestamp_is_kept_not_deleted() {
+        let now = Utc::now();
+        let text = format!(
+            "{}9999-99-99T99:99:99.000000Z  INFO murmur: malformed\n{}",
+            line_at(now, 40, "expired"),
+            line_at(now, 1, "fresh"),
+        );
+        let offset = first_retained_offset(&text, cutoff(now));
+        assert!(text[offset..].contains("malformed"));
+    }
+
+    #[test]
+    fn prune_deletes_an_aged_previous_session_and_trims_the_current_one() {
+        let now = Utc::now();
+        let dir = temp_log_dir("prune");
+        let current = dir.join(LOG_FILE);
+        let previous = dir.join(PREV_LOG_FILE);
+        std::fs::write(
+            &current,
+            line_at(now, 30, "expired") + &line_at(now, 1, "live"),
+        )
+        .unwrap();
+        std::fs::write(&previous, line_at(now, 30, "last session")).unwrap();
+        // The previous file is judged by its mtime, so age it explicitly rather than trusting the
+        // clock of the machine running the test.
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&previous)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+
+        prune_dir(&dir, now).unwrap();
+
+        assert!(!previous.exists(), "an aged-out previous session is DELETED, not hidden");
+        let kept = std::fs::read_to_string(&current).unwrap();
+        assert!(kept.contains("live"));
+        assert!(
+            !kept.contains("expired"),
+            "the expired head must be gone from the FILE, not merely from the view"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_keeps_a_previous_session_that_is_still_inside_the_window() {
+        let now = Utc::now();
+        let dir = temp_log_dir("prune-fresh");
+        let previous = dir.join(PREV_LOG_FILE);
+        std::fs::write(&previous, line_at(now, 2, "recent crash")).unwrap();
+
+        prune_dir(&dir, now).unwrap();
+
+        assert!(
+            previous.exists(),
+            "a session that ended two hours ago is exactly what the previous tab is for"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_is_a_no_op_on_an_empty_log_dir() {
+        let dir = temp_log_dir("prune-empty");
+        assert!(prune_dir(&dir, Utc::now()).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
