@@ -6,31 +6,89 @@
 .logs-page {
   width: min(var(--content-max), 100%);
   margin: 0 auto;
-  padding: var(--space-6) var(--space-5) var(--space-8);
+  /* Tight top: this page is a reading surface, and the header above the list
+     was costing more vertical room than the first screen of entries. */
+  padding: var(--space-4) var(--space-5) var(--space-6);
 }
 
 .page-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: var(--space-5);
-  margin-bottom: var(--space-5);
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
 }
 
-.head-actions {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-  justify-content: flex-end;
+/* The copy takes the width the six-button toolbar used to eat, so the subtitle
+   is one or two lines instead of five. */
+.head-copy {
+  min-width: 0;
+
+  h1 {
+    margin: 0;
+    line-height: 1.15;
+  }
+
+  .page-subtitle {
+    margin: var(--space-1) 0 0;
+    max-width: 68ch;
+    font-size: 0.8125rem;
+    line-height: 1.45;
+  }
+}
+
+/* The menu floats OVER the list, so it is the OPAQUE `.menu` surface — the
+   frosted `.card` would let the rows behind it bleed through (T3). */
+.head-menu {
+  position: relative;
   flex-shrink: 0;
 }
 
-/* Auto-refresh is a state, not a one-shot: the button reads as pressed while
-   the interval is running. */
-.head-actions .btn.is-on {
+.actions-trigger {
+  gap: var(--space-2);
+}
+
+/* Auto-refresh is the one action with a lasting state, and it is now hidden
+   inside the menu — so the trigger carries the tell. */
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+}
+
+.trigger-caret {
+  display: inline-flex;
+  transform: rotate(90deg);
+  transition: transform var(--transition-fast);
+
+  &.open {
+    transform: rotate(-90deg);
+  }
+}
+
+.actions-menu {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  right: 0;
+  z-index: 30;
+  min-width: 220px;
+}
+
+.menu-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: default;
+}
+
+.menu-check {
+  display: inline-flex;
+  margin-left: auto;
   color: var(--accent);
-  border-color: var(--accent);
 }
 
 .toolbar {
@@ -38,7 +96,7 @@
   align-items: center;
   gap: var(--space-3);
   flex-wrap: wrap;
-  margin-bottom: var(--space-3);
+  margin-bottom: var(--space-2);
 }
 
 .level-filters {
@@ -116,7 +174,7 @@
   align-items: center;
   gap: var(--space-2);
   flex-wrap: wrap;
-  margin: 0 0 var(--space-3);
+  margin: 0 0 var(--space-2);
   font-size: 0.75rem;
 }
 
@@ -131,7 +189,7 @@
 /* The list is the reading surface: an in-flow panel, so the frosted `.card`
    is right here (an OPAQUE overlay is for things that float — T3). */
 .log-list {
-  max-height: min(62vh, 720px);
+  max-height: min(70vh, 780px);
   overflow: auto;
   padding: var(--space-2);
   display: flex;

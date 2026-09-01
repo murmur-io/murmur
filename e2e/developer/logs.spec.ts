@@ -74,6 +74,17 @@ function developerNav(page: Page) {
   return page.getByRole("navigation", { name: "Developer mode" });
 }
 
+/** Turn developer mode on in Settings, then open the Logs view. */
+async function openLogs(page: Page): Promise<void> {
+  await page.goto("/settings");
+  await page.getByText("Developer").first().click();
+  await page
+    .locator("app-settings-developer-section")
+    .getByRole("checkbox", { name: "Developer mode" })
+    .check();
+  await developerNav(page).getByRole("link", { name: "Logs" }).click();
+}
+
 test("developer mode is off by default — the sidebar shows no developer group", async ({
   page,
 }) => {
@@ -108,14 +119,7 @@ test("the log renders as formatted rows, filterable by level and by text", async
   page,
 }) => {
   await boot(page);
-  await page.goto("/settings");
-  await page.getByText("Developer").first().click();
-  await page
-    .locator("app-settings-developer-section")
-    .getByRole("checkbox", { name: "Developer mode" })
-    .check();
-
-  await developerNav(page).getByRole("link", { name: "Logs" }).click();
+  await openLogs(page);
 
   const list = page.getByRole("log", { name: "Application log" });
   await expect(list.locator(".log-row")).toHaveCount(3);
@@ -142,16 +146,51 @@ test("a never-written previous session reads as 'no previous session', not an er
   page,
 }) => {
   await boot(page);
-  await page.goto("/settings");
-  await page.getByText("Developer").first().click();
-  await page
-    .locator("app-settings-developer-section")
-    .getByRole("checkbox", { name: "Developer mode" })
-    .check();
-  await developerNav(page).getByRole("link", { name: "Logs" }).click();
+  await openLogs(page);
 
   await page.getByRole("button", { name: "Previous session" }).click();
 
   await expect(page.getByText("No previous session")).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("every action sits behind one menu, and choosing one closes it", async ({
+  page,
+}) => {
+  await boot(page);
+  await openLogs(page);
+
+  // The header carries ONE control, not a six-button toolbar.
+  const trigger = page.getByRole("button", { name: "Log actions" });
+  await expect(trigger).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Refresh" })).toHaveCount(0);
+
+  await trigger.click();
+  await expect(page.getByRole("menuitem", { name: "Refresh" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Copy" })).toBeVisible();
+  await expect(
+    page.getByRole("menuitem", { name: "Reveal in Finder" }),
+  ).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Clear" })).toBeVisible();
+
+  const auto = page.getByRole("menuitemcheckbox", { name: "Auto-refresh" });
+  await expect(auto).toHaveAttribute("aria-checked", "false");
+  await auto.click();
+
+  // Choosing closes the menu; the trigger keeps reporting the lasting state.
+  await expect(page.getByRole("menuitem", { name: "Refresh" })).toHaveCount(0);
+  await expect(trigger.locator(".live-dot")).toBeVisible();
+});
+
+test("Clear is offered for this session only — the previous one is evidence", async ({
+  page,
+}) => {
+  await boot(page);
+  await openLogs(page);
+
+  await page.getByRole("button", { name: "Previous session" }).click();
+  await page.getByRole("button", { name: "Log actions" }).click();
+
+  await expect(page.getByRole("menuitem", { name: "Refresh" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Clear" })).toHaveCount(0);
 });
