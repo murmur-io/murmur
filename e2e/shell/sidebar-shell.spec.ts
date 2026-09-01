@@ -214,8 +214,52 @@ test("the footer offers Capture plus a menu for the other create actions", async
   );
 
   await menu.getByRole("menuitem", { name: "New note" }).click();
-  // `/notes/new` creates the draft and hands off to that note's own route, so
-  // assert the destination is a note rather than the transient path.
+
+  // "New note" asks WHERE before it writes anything: the create sheet opens on
+  // the note kind rather than dropping a draft into the default note folder.
+  const sheet = page.getByRole("dialog", { name: "Create in Workspaces" });
+  await expect(sheet).toBeVisible();
+  await expect(page.getByRole("menu")).toHaveCount(0);
+  await expect(
+    sheet.getByRole("button", { name: "Note", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(page).not.toHaveURL(/\/notes\//);
+
+  await sheet.getByRole("button", { name: /Acme/ }).click();
+  await sheet.getByRole("button", { name: "Create note" }).click();
+  await expect(page).toHaveURL(/\/notes\/n-new$/);
+});
+
+test("Quick note sits beside Capture and opens a blank note in one click", async ({
+  page,
+}) => {
+  await boot(page);
+  const sb = sidebar(page);
+
+  const capture = sb.getByRole("link", { name: "Capture" });
+  const quick = sb.getByRole("button", { name: "Quick note" });
+  const create = sb.getByRole("button", { name: "Create", exact: true });
+  await expect(quick).toBeVisible();
+
+  // The same round control as the create caret, seated BETWEEN Capture and it,
+  // and carrying no label of its own so Capture keeps the only one in the row.
+  const [captureBox, quickBox, createBox] = await Promise.all([
+    capture.boundingBox(),
+    quick.boundingBox(),
+    create.boundingBox(),
+  ]);
+  expect(captureBox).not.toBeNull();
+  expect(quickBox).not.toBeNull();
+  expect(createBox).not.toBeNull();
+  expect(quickBox!.width).toBeCloseTo(quickBox!.height, 0);
+  expect(quickBox!.width).toBeCloseTo(createBox!.width, 0);
+  expect(quickBox!.x).toBeGreaterThan(captureBox!.x);
+  expect(quickBox!.x).toBeLessThan(createBox!.x);
+  await expect(quick).not.toContainText(/\S/);
+
+  // One click, no menu: it reaches the note route the Create menu's New note
+  // reaches, and it does NOT open that menu on the way.
+  await quick.click();
   await expect(page).toHaveURL(/\/notes\//);
   await expect(page.getByRole("menu")).toHaveCount(0);
 });
