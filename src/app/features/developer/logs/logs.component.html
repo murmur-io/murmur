@@ -3,8 +3,8 @@
     <div class="head-copy">
       <h1>Logs</h1>
       <p class="page-subtitle">
-        What Murmur recorded while it ran — stages, counts and failures. This
-        Mac only, and never note or transcript text.
+        What Murmur recorded while it ran — stages, counts and failures. Kept on
+        this Mac for 24 hours, then deleted; never note or transcript text.
       </p>
     </div>
 
@@ -143,6 +143,8 @@
       <span>{{ sizeLabel() }}</span>
       <span aria-hidden="true">·</span>
       <span>{{ visibleEntries().length }} of {{ counts().all }} shown</span>
+      <span aria-hidden="true">·</span>
+      <span>kept 24 h</span>
       @if (loaded.truncated) {
         <span aria-hidden="true">·</span>
         <span>older entries are in the file only</span>

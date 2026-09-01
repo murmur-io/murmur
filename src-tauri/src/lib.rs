@@ -1061,6 +1061,23 @@ pub fn run() {
                     }
                 });
             }
+            // LOGS — the retention pruner. The on-device log is kept for 24 h and no longer
+            // (`applog::RETENTION_HOURS`); this tick is what makes "and no longer" true without
+            // anyone opening the Developer-mode Logs view. Cheap and silent when nothing has
+            // expired: it stats the previous-session file and scans the current one's head.
+            {
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            crate::applog::PRUNE_TICK_SECS,
+                        ))
+                        .await;
+                        if let Err(error) = crate::applog::prune_expired() {
+                            tracing::warn!(target: "applog", %error, "log prune tick failed");
+                        }
+                    }
+                });
+            }
             // TRASH — the expired-entry purge loop. Rides the same shape as the memory/brief loops:
             // re-reads live AppState each tick, warns-and-continues on any failure, never exits, and
             // the FIRST tick is a full interval after launch (so a cold start is never competing with
