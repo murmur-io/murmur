@@ -1,0 +1,164 @@
+<section class="logs-page">
+  <header class="page-head">
+    <div>
+      <p class="page-eyebrow">Developer mode</p>
+      <h1>Logs</h1>
+      <p class="page-subtitle">
+        What Murmur recorded while it ran — stages, counts and failures. Kept on
+        this Mac only, and free of note or transcript text by design.
+      </p>
+    </div>
+
+    <div class="head-actions">
+      <button
+        type="button"
+        class="btn btn-ghost"
+        [class.is-on]="autoRefresh()"
+        (click)="toggleAutoRefresh()"
+        [attr.aria-pressed]="autoRefresh()"
+      >
+        <mur-icon icon="history" />
+        <span>Auto-refresh</span>
+      </button>
+      <button type="button" class="btn btn-ghost" (click)="reload()">
+        <span>Refresh</span>
+      </button>
+      <button type="button" class="btn btn-ghost" (click)="copyVisible()">
+        <span>Copy</span>
+      </button>
+      <button type="button" class="btn btn-ghost" (click)="reveal()">
+        <span>Reveal in Finder</span>
+      </button>
+      @if (session() === "current") {
+        <button type="button" class="btn btn-ghost" (click)="clear()">
+          <mur-icon icon="trash" />
+          <span>Clear</span>
+        </button>
+      }
+    </div>
+  </header>
+
+  @if (error(); as message) {
+    <div class="banner is-danger" role="alert">
+      <span class="banner-icon" aria-hidden="true">!</span>
+      <span>{{ message }}</span>
+    </div>
+  }
+
+  <div class="toolbar">
+    <mur-segmented
+      [options]="sessionOptions"
+      [value]="session()"
+      (valueChange)="selectSession($event)"
+      ariaLabel="Log session"
+    />
+
+    <div class="level-filters" role="group" aria-label="Filter by level">
+      <button
+        type="button"
+        class="chip"
+        [class.is-active]="levelFilter() === 'all'"
+        (click)="setLevel('all')"
+      >
+        All <span class="chip-count">{{ counts().all }}</span>
+      </button>
+      <button
+        type="button"
+        class="chip is-error"
+        [class.is-active]="levelFilter() === 'error'"
+        (click)="setLevel('error')"
+      >
+        Errors <span class="chip-count">{{ counts().error }}</span>
+      </button>
+      <button
+        type="button"
+        class="chip is-warn"
+        [class.is-active]="levelFilter() === 'warn'"
+        (click)="setLevel('warn')"
+      >
+        Warnings <span class="chip-count">{{ counts().warn }}</span>
+      </button>
+      <button
+        type="button"
+        class="chip is-info"
+        [class.is-active]="levelFilter() === 'info'"
+        (click)="setLevel('info')"
+      >
+        Info <span class="chip-count">{{ counts().info }}</span>
+      </button>
+      <button
+        type="button"
+        class="chip is-debug"
+        [class.is-active]="levelFilter() === 'debug'"
+        (click)="setLevel('debug')"
+      >
+        Debug <span class="chip-count">{{ counts().debug }}</span>
+      </button>
+    </div>
+
+    <input
+      type="search"
+      class="log-search"
+      [formControl]="searchControl"
+      placeholder="Filter messages"
+      aria-label="Filter log messages"
+      autocomplete="off"
+      spellcheck="false"
+    />
+  </div>
+
+  @if (log(); as loaded) {
+    <p class="log-meta text-muted">
+      <span class="log-path" [title]="loaded.path">{{ loaded.path }}</span>
+      <span aria-hidden="true">·</span>
+      <span>{{ sizeLabel() }}</span>
+      <span aria-hidden="true">·</span>
+      <span>{{ visibleEntries().length }} of {{ counts().all }} shown</span>
+      @if (loaded.truncated) {
+        <span aria-hidden="true">·</span>
+        <span>older entries are in the file only</span>
+      }
+      @if (loading()) {
+        <mur-spinner [size]="12" />
+      }
+    </p>
+  }
+
+  <!-- Cached rows are NEVER hidden behind `loading()` alone (§8): the spinner is
+       for a first visit with nothing to show; a refresh replaces rows underneath. -->
+  @if (listEmpty() && loading()) {
+    <mur-empty-state>
+      <mur-spinner [size]="20" />
+      <p>Reading the log…</p>
+    </mur-empty-state>
+  } @else if (missingFile()) {
+    <mur-empty-state>
+      <h3>No previous session</h3>
+      <p>
+        Murmur keeps the last session's log so a crash can be read after the
+        restart. There isn't one yet — it appears the next time the app starts.
+      </p>
+    </mur-empty-state>
+  } @else if (emptyFile()) {
+    <mur-empty-state>
+      <h3>Nothing logged yet</h3>
+      <p>This session hasn't written anything to the log.</p>
+    </mur-empty-state>
+  } @else if (filteredToNothing()) {
+    <mur-empty-state>
+      <h3>No matching entries</h3>
+      <p>{{ counts().all }} entries are loaded — none match this filter.</p>
+    </mur-empty-state>
+  } @else {
+    <div #list class="log-list card" role="log" aria-label="Application log">
+      @for (entry of visibleEntries(); track entry.seq) {
+        <article class="log-row" [class]="'log-row ' + entry.levelClass">
+          <time class="log-time">{{ entry.time }}</time>
+          <span class="log-level">{{ entry.level }}</span>
+          <span class="log-target" [title]="entry.target">{{ entry.target }}</span>
+          <p class="log-message">{{ entry.message }}</p>
+        </article>
+      }
+    </div>
+  }
+</section>

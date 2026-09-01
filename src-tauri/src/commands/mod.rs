@@ -59,6 +59,10 @@ pub(crate) fn emit_ask_history_invalidated_fail_closed(app: &AppHandle) {
 mod pipeline_commands;
 pub use pipeline_commands::*;
 
+// Developer-mode diagnostics (the on-device log reader). No content surface — see the module doc.
+mod devtools;
+pub use devtools::*;
+
 // macOS Reminders (osascript) — no name collision with a crate module.
 mod reminders;
 pub use reminders::*;

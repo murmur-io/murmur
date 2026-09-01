@@ -8,6 +8,8 @@ import type {
   ActiveSharesReport,
   AiMapRow,
   Analytics,
+  AppLog,
+  AppLogSession,
   AppConfigDto,
   AppInfo,
   ApplyResult,
@@ -447,6 +449,29 @@ export class IpcService {
   /** Reveal the recordings folder in Finder. */
   revealAudioDir(): Promise<void> {
     return invoke<void>("reveal_audio_dir");
+  }
+
+  // ── Developer mode: the on-device log ────────────────────────────────────
+  // Diagnostics only — no meeting content crosses these, so there is nothing
+  // here for the lock gate to mask (see `commands/devtools.rs`).
+
+  /**
+   * Read a window of the on-device log. `limit` is the number of most-recent
+   * entries (backend-clamped); a generation that was never written comes back
+   * `exists: false` rather than throwing.
+   */
+  readAppLog(session: AppLogSession, limit?: number): Promise<AppLog> {
+    return invoke<AppLog>("read_app_log", { session, limit });
+  }
+
+  /** Empty the CURRENT session's log so a reproduction starts clean. */
+  clearAppLog(): Promise<void> {
+    return invoke<void>("clear_app_log");
+  }
+
+  /** Reveal the log folder in Finder (to attach the raw file to a report). */
+  revealAppLog(): Promise<void> {
+    return invoke<void>("reveal_app_log");
   }
 
   /**

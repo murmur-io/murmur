@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod applog;
 pub mod audio;
 pub mod audit;
 pub mod brain_reactions;
@@ -103,20 +104,11 @@ pub fn run() {
     // double-click / DMG install) its stderr is discarded, so a signed/release build was previously
     // un-diagnosable — every keychain/share failure was invisible. Logs carry NO PII (IDs, stages,
     // counts, durations only — see the no-PII rule), so persisting them on-device is safe. Fresh file
-    // per launch (truncate at start); O_APPEND so concurrent writes stay line-atomic. Best-effort: if the
-    // file can't be opened we fall back to stderr-only rather than fail startup.
-    let log_file = dirs::data_dir()
-        .map(|b| b.join(crate::state::app_dir_name()))
-        .and_then(|dir| {
-            std::fs::create_dir_all(&dir).ok()?;
-            let path = dir.join("murmur.log");
-            let _ = std::fs::write(&path, b""); // truncate for a fresh per-session log
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .ok()
-        });
+    // per launch, with the previous session ROTATED to `murmur.prev.log` rather than truncated away
+    // (a crash is diagnosed from the run BEFORE the relaunch that goes looking for it — see
+    // `applog`); O_APPEND so concurrent writes stay line-atomic. Best-effort: if the file can't be
+    // opened we fall back to stderr-only rather than fail startup.
+    let log_file = crate::applog::rotate_and_open();
     match log_file {
         Some(file) => {
             use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -258,6 +250,10 @@ pub fn run() {
             commands::consent_to_slack,
             commands::consent_to_notion,
             commands::consent_to_clickup,
+            // Developer mode — the on-device log reader (Settings → Developer → Logs).
+            commands::read_app_log,
+            commands::clear_app_log,
+            commands::reveal_app_log,
             // Brain v2 L5 — scheduled briefs (schedule CRUD + propose-accept runs).
             commands::list_brief_schedules,
             commands::create_brief_schedule,
@@ -1477,9 +1473,14 @@ mod tests {
         assert!(scan < ledger_claim && scan < legacy_claim);
     }
 
-    /// A second process must be rejected before it can truncate the shared log, open/migrate the
+    /// A second process must be rejected before it can ROTATE the shared log, open/migrate the
     /// SQLCipher library, or reach either recovery claimant. This source-order pin complements the
     /// kernel-lock unit test without launching a second GUI process in the library test suite.
+    ///
+    /// The log surface used to be an inline `std::fs::write(&path, b"")` truncate here; it now
+    /// lives in `applog::rotate_and_open` (which moves the previous session aside instead of
+    /// destroying it), so the pin follows the CALL — the invariant is unchanged: a losing second
+    /// process must not touch the shared file at all.
     #[test]
     fn instance_lock_precedes_every_shared_startup_surface() {
         let source = include_str!("lib.rs");
@@ -1487,8 +1488,8 @@ mod tests {
             .find("instance_lock::acquire()")
             .expect("process-wide instance lock exists");
         let log_truncate = source
-            .find("std::fs::write(&path, b\"\")")
-            .expect("per-launch log truncate exists");
+            .find("crate::applog::rotate_and_open()")
+            .expect("per-launch log rotation exists");
         let state_init = source.find("AppState::init()").expect("state init exists");
         let ledger_claim = source
             .find("claim_stale_recording_generations")

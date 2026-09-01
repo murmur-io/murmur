@@ -27,6 +27,7 @@ import { SettingsPrivacySectionComponent } from "../sections/settings-privacy-se
 import { SettingsObsidianSectionComponent } from "../sections/settings-obsidian-section/settings-obsidian-section.component";
 import { SettingsImportsSectionComponent } from "../sections/settings-imports-section/settings-imports-section.component";
 import { SettingsAboutSectionComponent } from "../sections/settings-about-section/settings-about-section.component";
+import { SettingsDeveloperSectionComponent } from "../sections/settings-developer-section/settings-developer-section.component";
 
 /** One entry in the macOS-style Settings sidebar. `keywords` feeds the search box. */
 interface SettingsSection {
@@ -54,6 +55,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop memory remember facts user memory cross-meeting forget" },
   { id: "obsidian", label: "Obsidian", keywords: "vault markdown notes companion export wikilinks" },
   { id: "imports", label: "Imports", keywords: "notion obsidian apple notes import migrate export zip markdown vault bring in move from another app switch migration" },
+  { id: "developer", label: "Developer", keywords: "developer mode logs log file diagnostics debug crash troubleshooting console tools advanced" },
   { id: "about", label: "About", keywords: "about version update check for updates release changelog product info" },
 ];
 
@@ -72,7 +74,7 @@ const SETTINGS_GROUPS: readonly {
   { label: "Intelligence", ids: ["notes", "ai", "connectors"] },
   { label: "Sharing", ids: ["account", "organization"] },
   { label: "Privacy & Vault", ids: ["privacy", "obsidian", "imports"] },
-  { label: null, ids: ["about"] },
+  { label: null, ids: ["developer", "about"] },
 ];
 
 /**
@@ -108,6 +110,7 @@ const SETTINGS_GROUPS: readonly {
     SettingsObsidianSectionComponent,
     SettingsImportsSectionComponent,
     SettingsAboutSectionComponent,
+    SettingsDeveloperSectionComponent,
   ],
   templateUrl: "./settings.component.html",
   styleUrl: "./settings.component.scss",

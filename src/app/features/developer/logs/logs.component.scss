@@ -1,0 +1,232 @@
+:host {
+  display: block;
+  width: 100%;
+}
+
+.logs-page {
+  width: min(var(--content-max), 100%);
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5) var(--space-8);
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-5);
+  margin-bottom: var(--space-5);
+}
+
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+/* Auto-refresh is a state, not a one-shot: the button reads as pressed while
+   the interval is running. */
+.head-actions .btn.is-on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-3);
+}
+
+.level-filters {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 28px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    border-color var(--transition),
+    background var(--transition);
+
+  &:hover {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+  }
+
+  &.is-active {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+    background: var(--surface-raised);
+  }
+}
+
+.chip-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+}
+
+/* A level chip carries its level's color on the dot-free label itself, so the
+   palette in the filter row matches the one in the rows below it. */
+.chip.is-error.is-active {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.chip.is-warn.is-active {
+  color: var(--warning);
+  border-color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.chip.is-info.is-active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Sizing only — the field's look comes from the global input primitive. */
+.log-search {
+  flex: 1 1 200px;
+  min-width: 160px;
+  width: auto;
+  height: 32px;
+  font-size: 0.8125rem;
+}
+
+.log-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin: 0 0 var(--space-3);
+  font-size: 0.75rem;
+}
+
+.log-path {
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+/* The list is the reading surface: an in-flow panel, so the frosted `.card`
+   is right here (an OPAQUE overlay is for things that float — T3). */
+.log-list {
+  max-height: min(62vh, 720px);
+  overflow: auto;
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.log-row {
+  display: grid;
+  grid-template-columns: 78px 52px minmax(0, 150px) minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  border-left: 2px solid transparent;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.55;
+  border-bottom: 1px solid var(--border);
+
+  &:last-child {
+    border-bottom: none;
+  }
+
+  &:hover {
+    background: var(--surface-raised);
+  }
+}
+
+.log-time {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.log-level {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+}
+
+.log-target {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-message {
+  margin: 0;
+  color: var(--text-primary);
+  /* Multi-line events (a folded panic payload) keep their shape instead of
+     collapsing into one unreadable line. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Severity reads from the left edge — the scan pattern for a long log. */
+.log-row.is-error {
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+
+  .log-level {
+    color: var(--danger);
+  }
+}
+
+.log-row.is-warn {
+  border-left-color: var(--warning);
+
+  .log-level {
+    color: var(--warning);
+  }
+}
+
+.log-row.is-info .log-level {
+  color: var(--accent);
+}
+
+.log-row.is-debug,
+.log-row.is-other {
+  .log-time,
+  .log-level,
+  .log-target,
+  .log-message {
+    color: var(--text-muted);
+  }
+}
+
+@media (max-width: 900px) {
+  .log-row {
+    grid-template-columns: 70px 48px minmax(0, 1fr);
+  }
+
+  .log-target {
+    display: none;
+  }
+}

@@ -64,6 +64,16 @@ export const routes: Routes = [
           ),
       },
       {
+        // Developer mode → Logs. The route stays reachable when developer mode
+        // is off (a bookmark, a link in a bug report): the toggle decides what
+        // the UI OFFERS, and the view reads nothing that needs guarding.
+        path: "developer/logs",
+        loadComponent: () =>
+          import("./features/developer/logs/logs.component").then(
+            (m) => m.LogsComponent,
+          ),
+      },
+      {
         path: "reminders",
         loadComponent: () =>
           import("./features/reminders/reminders/reminders.component").then(
