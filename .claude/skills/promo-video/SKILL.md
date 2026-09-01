@@ -176,6 +176,31 @@ gate at every authored beat, and `assertSupersampled` on the capture scale — b
 | **Partial re-record** | `record.mjs <scene…>` re-shoots only those scenes and merges them into the existing manifest, in `SCENES` order. Fixing one beat costs ~20 s, not the whole take. But durations shift, so the RENDER still restarts from the first changed scene. |
 | **Roll point** | `film.goto` marks the moment the app is on screen; frames before it are the blank page painting in, and are dropped. The last pre-roll frame is kept and re-stamped, because a static route may never repaint again — filtering strictly deleted a whole opening beat and took a 10 s scene down to 5. |
 | **Poster** | `PROMO_POSTER_SEC` picks the frame. The default of 2 s is only a safe default — it is whatever the film happens to be doing then, and with `preload="none"` the poster is the only frame most visitors ever see. |
+| **Window size IS resolution** | The app is captured 1600 CSS px wide, so a window `w` px wide renders its 14 px UI type at `14·w/1600` output px. Shrinking the window to make room for type is paid for in legibility: 1210 px gives 10.6 px type and reads as "low resolution", because it is. A title shot should BLEED further off frame, not shrink — 1520 px (0.95×) with 600 px off-frame measured **+65% edge energy** over 1210 px at the same tilt. |
+| **The 3-D tilt is NOT the softness** | Worth knowing because it is the obvious suspect and it is wrong: at identical geometry, `rotateY(-13deg)` costs ~17% of edge energy (111 vs 134 Laplacian variance), not the 3.8× a naive before/after suggests. That 3.8× was the window size, measured across two different layouts. Isolate the variable before you act on it. |
+
+### The motion floor — measure it, do not assume it
+
+A drift you cannot measure is a drift that is not there. The first version of `driftAt` used a 9 px
+amplitude on a ~38 s period — 0.025 px/frame — and **half the film (46.8 s of 92.8) rendered
+frozen**, with holds up to 1.9 s. A film that alternates dead stills with bursts of motion reads as
+juddering, and the frozen stretches read as screenshots, which the viewer reports as "the resolution
+looks weak". Both complaints, one cause.
+
+The check is cheap, so run it on every cut:
+
+```bash
+ffmpeg -v error -i .promo/render/%06d.png \
+  -vf "scale=320:180,tblend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-" \
+  -f null - 2>/dev/null | grep -oE 'YAVG=[0-9.]+' | sed 's/YAVG=//'
+```
+
+Frames under ~0.03 mean luma change are motionless. Target: **≤15%** of the film, and no hold over
+~0.4 s except the end card, which is a title card and is supposed to sit still. The 2026-09-01 cut
+went 50% → 11% by raising the drift to ~11 px/s (inside the 10–30 px/s a slow film push occupies at
+1080p) and adding a 3%-per-scene breathe. The same trace is also how you check a transition: it
+should be a clean ramp, and on this harness it always has been — when a cut feels jerky, the fault
+is the stillness on either side of it, not the move.
 
 ---
 
