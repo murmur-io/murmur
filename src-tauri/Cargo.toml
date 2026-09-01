@@ -1,6 +1,6 @@
 [package]
 name = "murmur"
-version = "2.2.0"
+version = "2.3.0"
 description = "Murmur — local meeting capture, transcription, and AI notes for Obsidian"
 edition = "2021"
 rust-version = "1.77"
