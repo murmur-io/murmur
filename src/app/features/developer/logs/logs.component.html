@@ -1,39 +1,90 @@
 <section class="logs-page">
   <header class="page-head">
-    <div>
-      <p class="page-eyebrow">Developer mode</p>
+    <div class="head-copy">
       <h1>Logs</h1>
       <p class="page-subtitle">
-        What Murmur recorded while it ran — stages, counts and failures. Kept on
-        this Mac only, and free of note or transcript text by design.
+        What Murmur recorded while it ran — stages, counts and failures. This
+        Mac only, and never note or transcript text.
       </p>
     </div>
 
-    <div class="head-actions">
+    <!-- Every action behind ONE menu. Six always-visible buttons pushed the
+         title into a five-line wrap and still read as a toolbar for something
+         you touch once a session. -->
+    <div class="head-menu">
       <button
         type="button"
-        class="btn btn-ghost"
-        [class.is-on]="autoRefresh()"
-        (click)="toggleAutoRefresh()"
-        [attr.aria-pressed]="autoRefresh()"
+        class="btn btn-ghost actions-trigger"
+        (click)="toggleActions()"
+        aria-haspopup="menu"
+        [attr.aria-expanded]="actionsOpen()"
+        aria-label="Log actions"
       >
-        <mur-icon icon="history" />
-        <span>Auto-refresh</span>
+        <span>Actions</span>
+        @if (autoRefresh()) {
+          <span class="live-dot" aria-hidden="true"></span>
+        }
+        <span class="trigger-caret" [class.open]="actionsOpen()" aria-hidden="true">
+          <mur-icon icon="chevron-right" />
+        </span>
       </button>
-      <button type="button" class="btn btn-ghost" (click)="reload()">
-        <span>Refresh</span>
-      </button>
-      <button type="button" class="btn btn-ghost" (click)="copyVisible()">
-        <span>Copy</span>
-      </button>
-      <button type="button" class="btn btn-ghost" (click)="reveal()">
-        <span>Reveal in Finder</span>
-      </button>
-      @if (session() === "current") {
-        <button type="button" class="btn btn-ghost" (click)="clear()">
-          <mur-icon icon="trash" />
-          <span>Clear</span>
-        </button>
+
+      @if (actionsOpen()) {
+        <button
+          type="button"
+          class="menu-scrim"
+          (click)="closeActions()"
+          aria-label="Close actions menu"
+          tabindex="-1"
+        ></button>
+        <div class="menu actions-menu" role="menu">
+          <button
+            type="button"
+            class="menu-item"
+            role="menuitemcheckbox"
+            [attr.aria-checked]="autoRefresh()"
+            (click)="chooseAutoRefresh()"
+          >
+            <span>Auto-refresh</span>
+            @if (autoRefresh()) {
+              <span class="menu-check"><mur-icon icon="check" /></span>
+            }
+          </button>
+          <button
+            type="button"
+            class="menu-item"
+            role="menuitem"
+            (click)="chooseRefresh()"
+          >
+            <span>Refresh</span>
+          </button>
+          <button
+            type="button"
+            class="menu-item"
+            role="menuitem"
+            (click)="chooseCopy()"
+          >
+            <span>Copy</span>
+          </button>
+          <button
+            type="button"
+            class="menu-item"
+            role="menuitem"
+            (click)="chooseReveal()"
+          >
+            <span>Reveal in Finder</span>
+          </button>
+          @if (session() === "current") {
+            <button
+              type="button"
+              class="menu-item menu-item-danger"
+              role="menuitem"
+              (click)="chooseClear()"
+            >
+              <span>Clear</span>
+            </button>
+          }
+        </div>
       }
     </div>
   </header>
