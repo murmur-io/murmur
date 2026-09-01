@@ -120,6 +120,35 @@ pub(crate) fn isolate_process_group(command: &mut Command) {
 #[cfg(not(unix))]
 pub(crate) fn isolate_process_group(_command: &mut Command) {}
 
+/// Classify the errno of a `kill(-pgid, …)` that delivered to nobody.
+///
+/// `true` = the attempt found nothing to signal, which is NOT a teardown failure: the caller
+/// proceeds to the liveness proof, the only step allowed to conclude a group is dead. `false` = an
+/// errno we cannot explain, which stays a hard error.
+///
+/// Both benign codes name the same kernel outcome — "no member of this group received the signal":
+///
+/// * ESRCH: the group is already absent.
+/// * EPERM: macOS reports "the group iterate found no eligible member" as EPERM, which is not the
+///   claim "you may not kill this group". Measured under CPU starvation (6 failures in 40 runs of
+///   `a_timed_out_child_leaves_no_unproven_process_group`), the direct child was simultaneously
+///   invisible to `kill(pid, 0)` and to `getpgid(pid)` — both ESRCH, with `ps` listing nothing in
+///   the group — while `waitpid(WNOHANG)` still reported it running. Every process we spawn runs
+///   as our own uid, so a genuine permission denial is not reachable on this path.
+///
+/// Treating EPERM as fatal is what put this class in CI: teardown returned early, `mark_proven_dead`
+/// never ran, and `Drop` left the group `Unproven`. That marker is sticky and `perf::…` refuses
+/// recording admission while any group carries it, so a teardown that merely raced a child's
+/// creation or exit could cost a user the ability to record until the app restarted.
+///
+/// This does not weaken the invariant. Proving a group dead still requires `process_group_is_alive`
+/// to report ESRCH; EPERM there still counts as ALIVE, so no group is ever marked proven-dead on
+/// the strength of this errno.
+#[cfg(unix)]
+fn group_signal_errno_is_benign(raw: Option<i32>) -> bool {
+    matches!(raw, Some(3) | Some(1))
+}
+
 #[cfg(unix)]
 fn signal_process_group(pgid: i32, signal: i32) -> crate::error::Result<()> {
     extern "C" {
@@ -131,8 +160,8 @@ fn signal_process_group(pgid: i32, signal: i32) -> crate::error::Result<()> {
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(3) {
-        Ok(()) // ESRCH: the group is already absent.
+    if group_signal_errno_is_benign(error.raw_os_error()) {
+        Ok(())
     } else {
         Err(AppError::Summarize(format!(
             "failed signaling external cloud CLI process group: {error}"
@@ -219,9 +248,14 @@ async fn kill_and_prove_group_dead(
     let Some(pgid) = pgid else {
         return Ok(());
     };
-    #[cfg(unix)]
-    signal_process_group(pgid, 9)?;
     loop {
+        // Re-deliver on every pass rather than once before the loop. A member can become visible
+        // to `kill(2)` AFTER the first delivery — a process still being created is invisible to
+        // both the group signal and `getpgid`, and the kernel reports that as "nothing was
+        // signaled", not as an error. A single up-front SIGKILL would miss it and then wait out
+        // the deadline; re-sending costs one syscall per 10 ms and cannot miss the window.
+        #[cfg(unix)]
+        signal_process_group(pgid, 9)?;
         if !process_group_is_alive(pgid)? {
             return Ok(());
         }
@@ -298,23 +332,33 @@ async fn kill_and_reap_external_cli(
     if let Some(pgid) = group.pgid() {
         signal_process_group(pgid, 9)?;
     }
-    if let Err(kill_error) = child.start_kill() {
-        return match child.try_wait() {
-            Ok(Some(_)) => {
-                kill_and_prove_group_dead(group.pgid(), deadline).await?;
-                group.mark_proven_dead();
-                Ok(())
-            }
-            Ok(None) => Err(AppError::Summarize(match pre_kill_error {
-                Some(precheck) => format!(
-                    "failed checking {provider_label} status before teardown: {precheck}; failed to kill {provider_label}: {kill_error}"
-                ),
-                None => format!("failed to kill {provider_label} after deadline: {kill_error}"),
-            })),
-            Err(wait_error) => Err(AppError::Summarize(format!(
-                "failed to kill {provider_label} after deadline: {kill_error}; status check failed: {wait_error}"
-            ))),
-        };
+    match child.start_kill() {
+        Ok(()) => {}
+        // Nothing was left to signal: the child already exited (std records that as InvalidInput)
+        // or its pid is already gone (ESRCH). Both are the ordinary end of a wedged child that
+        // lost the race with our own deadline, not a failure to tear it down — fall through to the
+        // reap and the group proof, which are the steps that actually decide.
+        Err(kill_error)
+            if kill_error.kind() == std::io::ErrorKind::InvalidInput
+                || kill_error.raw_os_error() == Some(3) => {}
+        Err(kill_error) => {
+            return match child.try_wait() {
+                Ok(Some(_)) => {
+                    kill_and_prove_group_dead(group.pgid(), deadline).await?;
+                    group.mark_proven_dead();
+                    Ok(())
+                }
+                Ok(None) => Err(AppError::Summarize(match pre_kill_error {
+                    Some(precheck) => format!(
+                        "failed checking {provider_label} status before teardown: {precheck}; failed to kill {provider_label}: {kill_error}"
+                    ),
+                    None => format!("failed to kill {provider_label} after deadline: {kill_error}"),
+                })),
+                Err(wait_error) => Err(AppError::Summarize(format!(
+                    "failed to kill {provider_label} after deadline: {kill_error}; status check failed: {wait_error}"
+                ))),
+            };
+        }
     }
 
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1328,6 +1372,39 @@ mod tests {
     /// stays false. That marker is sticky and recording admission refuses while any group carries
     /// it, so a teardown that stopped proving groups dead would silently cost the user the ability
     /// to record until they restarted the app.
+    /// Teardown must conclude nothing from the errno of a group signal that reached nobody.
+    ///
+    /// RED before the fix this pins: EPERM made `signal_process_group` return an error, so
+    /// `kill_and_reap_external_cli` returned early, `mark_proven_dead` never ran, and `Drop` left
+    /// the group `Unproven` — a sticky marker that makes `perf::…` refuse recording admission
+    /// until the app restarts. It reached CI as an intermittent failure of three external-CLI
+    /// teardown tests, and reproduces at ~15% under CPU starvation, where a child is briefly
+    /// invisible to `kill(pid, 0)` and `getpgid` while `waitpid(WNOHANG)` still calls it running.
+    ///
+    /// The control arm is the point: an unexplained errno must still fail closed, or this guard
+    /// would wave through every teardown and measure nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_signal_that_reached_nobody_is_not_a_teardown_failure() {
+        assert!(
+            group_signal_errno_is_benign(Some(3)),
+            "ESRCH: the group is already absent"
+        );
+        assert!(
+            group_signal_errno_is_benign(Some(1)),
+            "EPERM: macOS names 'no eligible member in this group' this way; the liveness proof, \
+             not this errno, decides whether the group is dead"
+        );
+        assert!(
+            !group_signal_errno_is_benign(Some(22)),
+            "EINVAL is a real failure to deliver and must stay fatal"
+        );
+        assert!(
+            !group_signal_errno_is_benign(None),
+            "a failure with no errno is unexplained and must stay fatal"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_child_leaves_no_unproven_process_group() {

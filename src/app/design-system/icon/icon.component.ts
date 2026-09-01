@@ -29,6 +29,11 @@ export type ShellIcon =
   | "folder-add"
   | "move"
   | "rename"
+  // Edit / read the same document — the note editor's mode toggle. `rename` is a
+  // pencil ON a baseline (retitle a thing); `edit` is the bare pencil (change the
+  // thing's contents), and `eye` is its read-only counterpart.
+  | "edit"
+  | "eye"
   | "trash"
   | "unlock"
   | "check"

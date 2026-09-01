@@ -188,6 +188,20 @@
 .head-seg {
   flex: none;
 }
+/* Icon-only segment: the global `.seg-btn` pads for a text label, so a lone
+   glyph would sit in a wide, off-centre pill. Square it and centre the glyph.
+   28px is what the labelled button measured (13px line + 2x8px padding) and
+   leaves 4px around the design system's 20px glyph — the glyph is NOT resized
+   here on purpose: `.nav-icon` lives inside `mur-icon`'s own template, so only
+   a GLOBAL rule could reach it, and a global rule for one button is not worth
+   the reach. */
+.head-seg .seg-btn-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
 .head-btn {
   height: 32px;
   padding: 0 var(--space-3);
