@@ -242,11 +242,12 @@
          and it is the single thing that made the first cut read as one. */
       /* The lower third's left edge aligns with the window's (LAYOUTS.lower.x),
          so the type and the product share a margin instead of floating apart. */
-      .cap.lower { left: 240px; right: 240px; bottom: 52px; text-align: left; }
+      .cap.lower { left: 200px; right: 200px; bottom: 34px; text-align: left; }
       .cap.lower.center { text-align: center; }
-      /* Title layouts — type in a column BESIDE the tilted window. */
-      .cap.title  { left: 112px; width: 690px; top: 50%; transform: translateY(-50%); text-align: left; }
-      .cap.titleR { right: 112px; width: 690px; top: 50%; transform: translateY(-50%); text-align: left; }
+      /* Title layouts — type in a column BESIDE the tilted window, which bleeds
+         off the opposite edge (see LAYOUTS). */
+      .cap.title  { left: 112px; width: 776px; top: 50%; transform: translateY(-50%); text-align: left; }
+      .cap.titleR { right: 112px; width: 776px; top: 50%; transform: translateY(-50%); text-align: left; }
       /* Chapter card — the full frame, product pushed back behind it. */
       .cap.card { left: 0; right: 0; top: 50%; transform: translateY(-50%); text-align: center; }
 
@@ -453,15 +454,38 @@
        * px, and the FOOTAGE is 2×. So a push-in stays pixel-native to ~1.9× —
        * the headroom is the whole reason to capture at 2× and deliver at 1×.
        */
+      /*
+       * MEASURED — the window sizes are a legibility budget, not taste.
+       *
+       * The app is captured at 1600 CSS px wide, so a window `w` px wide renders
+       * its 14 px UI type at `14 * w / 1600` output pixels. The first draft of
+       * this re-cut shrank the window to make room for type and paid for it in
+       * exactly the currency that matters:
+       *
+       *     layout    w      scale    14px UI type
+       *     full     1664    1.04x      14.6 px
+       *     lower    1440    0.90x      12.6 px   ← was 1536 / 13.4 px before
+       *     title    1210    0.756x     10.6 px   ← 21% smaller than the old cut
+       *
+       * and the result reads as "low resolution", because it IS lower resolution.
+       *
+       * The fix for a title shot is to BLEED MORE, not to shrink. A title layout
+       * does not need the whole window in frame — it needs the part that IS in
+       * frame to be sharp. So `title` now runs 1520 px wide (0.95x) and lets 600
+       * px of it leave the frame; the type column is unchanged, and the app is
+       * 26% bigger than it was.
+       */
       const LAYOUTS = {
         full:   { w: 1664, x: 128,  y: 72,  tilt: 0,   rise: 0 },
-        // 1440 is not arbitrary: the tallest lower third (kicker + headline +
-        // rule + a two-line sub) begins at y≈862, so the window's bottom edge
-        // has to sit above that or the kicker lands on the app's own footer.
-        lower:  { w: 1440, x: 240,  y: 40,  tilt: 0,   rise: 0 },
-        title:  { w: 1210, x: 872,  y: 206, tilt: -13, rise: 0 },
-        titleR: { w: 1210, x: -162, y: 206, tilt: 13,  rise: 0 },
-        card:   { w: 1180, x: 370,  y: 300, tilt: 0,   rise: -70 },
+        // 1520 is the balance point. Bigger reads sharper, but the window's
+        // bottom edge then runs under the lower third — and the sidebar's
+        // Capture button lives in exactly that strip, in every scene, so the
+        // kicker lands on a button. At 1520 with `bottom: 34px` the tallest
+        // one-line caption clears the window by ~12 px.
+        lower:  { w: 1520, x: 200,  y: 20,  tilt: 0,   rise: 0 },
+        title:  { w: 1520, x: 1000, y: 112, tilt: -13, rise: 0 },
+        titleR: { w: 1520, x: -600, y: 112, tilt: 13,  rise: 0 },
+        card:   { w: 1320, x: 300,  y: 250, tilt: 0,   rise: -70 },
       };
       const LAYOUT_REST = "full";
       const geomOf = (L) => ({ w: L.w, h: (L.w * 9) / 16, x: L.x, y: L.y, tilt: L.tilt, rise: L.rise });
@@ -698,12 +722,36 @@
        */
       function driftAt(t, seed) {
         const a = (t + seed * 2200) / 1000;
+        /*
+         * MEASURED, and the first version of this function was far too timid to
+         * do its job. It used a 9 px amplitude on a ~38 s period, which is
+         * 0.025 px per frame — below the point where anything changes at all.
+         *
+         * Differencing consecutive rendered frames proved it: HALF the film
+         * (46.8 s of 92.8) came out under 0.03 mean luma change, i.e. frozen,
+         * with holds as long as 1.9 s. A film that alternates between a dead
+         * still and a burst of motion does not read as "calm", it reads as
+         * juddering — and the frozen stretches read as screenshots, which feeds
+         * straight into "the resolution looks weak".
+         *
+         * 16 px on a ~9 s period is ~11 px/s; the second term adds a shorter
+         * wobble. That is inside the 10–30 px/s a slow film push occupies at
+         * 1080p: felt, not watched.
+         */
         return {
-          dx: Math.sin(a / 6.1) * 9 + Math.sin(a / 2.7) * 2.5,
-          dy: Math.cos(a / 7.3) * 7 + Math.cos(a / 3.1) * 2,
-          ds: 1 + Math.sin(a / 9.7) * 0.006,
+          dx: Math.sin(a / 1.45) * 16 + Math.sin(a / 0.62) * 4,
+          dy: Math.cos(a / 1.72) * 12 + Math.cos(a / 0.71) * 3,
+          ds: 1 + Math.sin(a / 2.4) * 0.004,
         };
       }
+
+      /**
+       * A slow push across each scene's own length — the Ken Burns half of the
+       * same problem. Drift moves the frame; this makes it breathe, so even a
+       * shot the camera is not touching is continuously growing by ~3%. It
+       * resets at each cut, which the transition covers.
+       */
+      const breathAt = (local, dur) => 1 + 0.03 * clamp01(local / Math.max(1, dur));
 
       /**
        * App-viewport point → composition point, then scale about it.
@@ -794,7 +842,10 @@
         const dx = (b.ax - b.px * b.s) - (a.ax - a.px * a.s);
         const dy = (b.ay - b.py * b.s) - (a.ay - a.py * a.s);
         const v = Math.hypot(dx, dy) + Math.abs(b.s - a.s) * 900;
-        return Math.min(5, Math.max(0, (v - 1.4) * 0.20));
+        // Capped at 2.5 px, not 5. This is a demo of a user interface: the whole
+        // reason the capture is supersampled is that someone has to READ it, and
+        // a 5 px blur at 1080p spends that budget in the middle of a move.
+        return Math.min(2.5, Math.max(0, (v - 1.6) * 0.16));
       }
 
       // ── Captions ───────────────────────────────────────────────────────────
@@ -1042,6 +1093,7 @@
           const g = layoutAt(s, Math.max(0, local));
           const cam = cameraAt(s, Math.max(0, local));
           const drift = driftAt(t, i);
+          drift.ds *= breathAt(Math.max(0, local), s.dur);
           const f = transformFor(cam, g);
 
           L.el.style.opacity = String(Math.min(eIn.o ?? 1, eOut.o ?? 1));
