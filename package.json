@@ -1,6 +1,6 @@
 {
   "name": "murmur",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "scripts": {
     "start": "cargo build -p murmur-brain && ng serve --port 1420",
     "build": "ng build",
