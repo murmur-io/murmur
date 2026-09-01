@@ -102,9 +102,15 @@ export class LogsComponent implements OnInit {
   readonly error = this.store.error;
   readonly session = this.store.session;
 
+  /**
+   * Short labels on purpose: the switcher shares one bar with five level chips
+   * and the text filter, and "This session"/"Previous session" alone cost the
+   * ~120px that pushed the row into a second and third line. The group's
+   * `ariaLabel` supplies the noun the labels drop.
+   */
   readonly sessionOptions: readonly SegmentOption[] = [
-    { value: "current", label: "This session" },
-    { value: "previous", label: "Previous session" },
+    { value: "current", label: "Current" },
+    { value: "previous", label: "Previous" },
   ];
 
   readonly levelFilter = signal<LevelFilter>("all");

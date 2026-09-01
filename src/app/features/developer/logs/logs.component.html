@@ -74,13 +74,17 @@
     </div>
   }
 
-  <div class="toolbar">
+  <!-- ONE filter section: source, severity and text sit in a single bar instead
+       of three loose rows stacked down the page. -->
+  <div class="filterbar" role="group" aria-label="Filter the log">
     <mur-segmented
       [options]="sessionOptions"
       [value]="session()"
       (valueChange)="selectSession($event)"
       ariaLabel="Log session"
     />
+
+    <span class="filterbar-divider" aria-hidden="true"></span>
 
     <div class="level-filters" role="group" aria-label="Filter by level">
       <button
