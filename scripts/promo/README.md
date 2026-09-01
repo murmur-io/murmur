@@ -83,8 +83,33 @@ Two consequences worth knowing:
   camera pushes in, the anchor eases to the centre of frame and the containment clamp takes over.
   An earlier draft anchored to the centre *always*, which silently re-centred the window and made
   `title` produce a centred product with the headline lying across the app's own sidebar.
-- **`lower` is 1440 px wide for a reason.** The tallest lower third (kicker + headline + rule + a
-  two-line sub) begins at y≈862, so the window's bottom edge has to clear it.
+- **Window width IS resolution.** The app is captured 1600 CSS px wide, so a window `w` px wide
+  renders its 14 px UI type at `14·w/1600` output px. The first draft of the re-cut shrank the
+  window to make room for type and got 10.6 px type in the title shots — which reads as "low
+  resolution", because it is. Bleed further off frame instead: 1520 px with 600 px outside the
+  frame measured **+65% edge energy** over 1210 px at the same tilt. (The 3-D tilt is the obvious
+  suspect for softness and is not the cause — at identical geometry it costs ~17%.)
+- **`lower` is 1520 px, not more.** Bigger reads sharper, but the window's bottom edge then runs
+  under the lower third — and the sidebar's Capture button sits in exactly that strip, in every
+  scene, so the kicker lands on a button.
+
+## The motion floor
+
+Nothing in the film should ever be perfectly still: a static frame of a screenshot IS a screenshot,
+and a cut that alternates dead stills with bursts of motion reads as juddering even when every move
+is smooth. `driftAt` (a slow float) and `breathAt` (a 3%-per-scene push) exist for that.
+
+**Measure it — a drift you cannot measure is not there.** The first version used a 9 px amplitude on
+a ~38 s period, i.e. 0.025 px/frame, and half the film rendered frozen with holds up to 1.9 s:
+
+```bash
+ffmpeg -v error -i .promo/render/%06d.png \
+  -vf "scale=320:180,tblend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-" \
+  -f null - 2>/dev/null | grep -oE 'YAVG=[0-9.]+' | sed 's/YAVG=//'
+```
+
+Frames under ~0.03 are motionless. Target ≤15% of the film and no hold over ~0.4 s except the end
+card. This cut measures 11%.
 
 Scene boundaries have a vocabulary rather than one cross-dissolve — `dissolve`, `push`, `pushUp`,
 `whip`, `through`. Dissolving every boundary is the video equivalent of ending every sentence the
