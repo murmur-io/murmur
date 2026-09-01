@@ -449,10 +449,14 @@ export class SettingsOrganizationSectionComponent {
       const report = await this.ipc.orgSyncNow(org.orgId);
       const stalled = report.pulled > 0 && report.ingested === 0;
       if (report.errors.length > 0 || stalled) {
+        // Name the FIRST real error rather than always guessing "a key may not be granted yet".
+        // The report now also carries shared-folder publish failures, which that guess describes
+        // wrongly — and a wrong explanation is what kept the org-sharing outage invisible.
+        const detail = report.errors[0] ?? "a key may not be granted yet";
         this.toast.danger(
           `${report.pulled} pulled, ${report.ingested} ingested, ` +
             `${report.errors.length} error${report.errors.length === 1 ? "" : "s"} — ` +
-            `a key may not be granted yet.`,
+            `${detail}.`,
         );
       } else {
         this.toast.success(
