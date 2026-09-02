@@ -23,6 +23,8 @@ For the current product, read [`README.md`](../README.md) in the repo root, and
 | [`USE-WITH-YOUR-AGENT.md`](USE-WITH-YOUR-AGENT.md) | Pointing your own AI agent at your vault, and the `vault-skills/` pack. |
 | [`screenshots/`](screenshots) | The product screenshots the README uses. Generated — never hand-edited. See [`scripts/screenshots/README.md`](../scripts/screenshots/README.md) for the capture runbook. |
 | [`research/`](research) | Dated, cited research briefs. Each one is a snapshot of its own date and says so; that is the format working as intended, not staleness. |
+| [`research/2026-09-02-full-app-analysis.md`](research/2026-09-02-full-app-analysis.md) | The whole-app audit of 2.3.1 — brain and entity connections, MCP, memory, recording, stability, org sharing. Every `file:line` in it was opened during the audit; anchors drift with the tree, so grep the symbol, not the line number. |
+| [`research/2026-09-02-prod-ready-tasks.md`](research/2026-09-02-prod-ready-tasks.md) | The task list that audit produced, with acceptance criteria per task. Unlike its neighbours this is a **live plan, not a snapshot**: execution state lives outside the repo, in `../.murmur-agent-tasks/prod-ready/STATUS.md`, and lands here only when the work closes. |
 | [`superpowers/specs/`](superpowers) | Design specs, dated. The most recent ones are the live plans. |
 | [`agent-harness-guide/`](agent-harness-guide) | How the `scripts/h` harness works. |
 | [`dreams/`](dreams) | Dated ideation notes from `/dreaming` sweeps, each stamped with its own date. Not roadmap and not spec — but several did ship (receipts, dashboards, off-the-record), so read them as "where an idea came from", never as "what exists". |
