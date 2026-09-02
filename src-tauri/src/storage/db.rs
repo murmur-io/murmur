@@ -4699,7 +4699,7 @@ impl Db {
     /// (and on `delete_meeting` / the startup reconcile). Facts are plaintext-derived (entity ·
     /// predicate · object) content that mirrors a meeting; a sealed meeting must surface NOTHING, so
     /// — exactly like `correction_log` / `note_chunks` / `assistant_interactions` — we DELETE rather
-    /// than key-seal. Dropped by design + not recoverable (never keyed); the underlying transcript is
+    /// than key-seal. Dropped by design; the rows are RECOVERABLE from `sealed_fact_ledgers`, which the seal writes before this purge runs; the underlying transcript is
     /// still sealed + restorable, and a later re-summarize re-derives facts.
     pub(crate) fn purge_facts_tx(
         tx: &rusqlite::Transaction<'_>,
@@ -8197,7 +8197,7 @@ impl Db {
     /// on a seal (and on `delete_meeting` / the startup reconcile). Live bullets are
     /// plaintext-DERIVED running notes mirroring the meeting's transcript; a sealed meeting must
     /// surface NOTHING, so — exactly like `assistant_interactions` / `facts` / `note_chunks` — we
-    /// DELETE rather than key-seal. Dropped by design + not recoverable (never keyed); the
+    /// DELETE rather than key-seal. Dropped by design; the rows are RECOVERABLE from `sealed_fact_ledgers`, which the seal writes before this purge runs; the
     /// underlying transcript is still sealed + restorable.
     pub(crate) fn purge_live_bullets_tx(
         tx: &rusqlite::Transaction<'_>,

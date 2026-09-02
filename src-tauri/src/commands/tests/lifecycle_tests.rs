@@ -5851,6 +5851,136 @@
         }
     }
 
+    // ── The fact ledger's PRODUCTION wiring ──────────────────────────────────────────────────────
+    //
+    // An adversarial review deleted the relock re-seal loops (`commands/lock.rs`) and the restore
+    // inside `unseal_meeting_extras`, ran the WHOLE suite, and everything stayed green. The two
+    // headline claims of that change — "an unlock puts the ledger back" and "a relock re-seals
+    // before the purge" — were pinned by nothing. These two drive the real lock/unlock/relock
+    // commands, so removing either wire fails here.
+
+    /// Seed one entity fact on `mid` and hand back the entity id.
+    fn seed_one_fact(db: &Db, mid: &str, predicate: &str, object: &str) -> String {
+        let atlas = db
+            .upsert_entity("Atlas", crate::storage::models::EntityKind::Project)
+            .unwrap();
+        db.add_mention(&atlas, mid).unwrap();
+        db.apply_fact_ops(&[crate::facts::FactOp::Add(crate::facts::NewFact {
+            entity_id: atlas.clone(),
+            subject: "Atlas".into(),
+            predicate: predicate.into(),
+            object: object.into(),
+            valid_from: "2026-06-01T00:00:00Z".into(),
+            recorded_at: "2026-06-01T00:00:00Z".into(),
+            confidence: 1.0,
+            meeting_id: Some(mid.to_string()),
+        })])
+        .unwrap();
+        atlas
+    }
+
+    /// Unwrap a locked folder's content key the way the unlock command does.
+    fn folder_ck(state: &AppState, folder_id: &str) -> [u8; 32] {
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(folder_id).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(folder_id)).unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        ck_vec.try_into().expect("CK is 32 bytes")
+    }
+
+    /// LOCK → the facts are gone → UNLOCK → they are back. Through the real commands.
+    #[test]
+    fn locking_and_unlocking_a_folder_returns_its_facts() {
+        let state = std::sync::Arc::new(build_state("ledger-wiring-unlock"));
+        make_open_folder(&state.db, "f-facts", "Secret");
+        seed_meeting(&state.db, "m-facts", "# Note", Some("f-facts"));
+        let atlas = seed_one_fact(&state.db, "m-facts", "status", "shipped");
+
+        lock_folder_inner(state.as_ref(), "f-facts".into()).unwrap();
+        assert!(
+            state
+                .db
+                .facts_for_entities(std::slice::from_ref(&atlas))
+                .unwrap()
+                .is_empty(),
+            "the seal still removes the rows — that half is unchanged"
+        );
+
+        let ck = folder_ck(state.as_ref(), "f-facts");
+        unseal_folder_extras(state.as_ref(), "f-facts", &ck, None).unwrap();
+        assert_eq!(
+            state
+                .db
+                .facts_for_entities(std::slice::from_ref(&atlas))
+                .unwrap()
+                .len(),
+            1,
+            "an unlock must put the ledger back — this is the wire the review could delete silently"
+        );
+    }
+
+    /// UNLOCK → learn something → RELOCK → UNLOCK: both facts are there.
+    ///
+    /// The relock purges before it re-seals, so the re-seal has to happen first. Without it the
+    /// relock leaves the ciphertext written at the ORIGINAL lock, and the fact the open session
+    /// learned is destroyed with no trace.
+    #[test]
+    fn a_relock_keeps_the_fact_the_open_session_learned() {
+        let state = std::sync::Arc::new(build_state("ledger-wiring-relock"));
+        make_open_folder(&state.db, "f-facts", "Secret");
+        seed_meeting(&state.db, "m-facts", "# Note", Some("f-facts"));
+        let atlas = seed_one_fact(&state.db, "m-facts", "status", "shipped");
+
+        lock_folder_inner(state.as_ref(), "f-facts".into()).unwrap();
+        let ck = folder_ck(state.as_ref(), "f-facts");
+        unseal_folder_extras(state.as_ref(), "f-facts", &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-facts".into());
+
+        // The open session learns a second thing about the same project.
+        state
+            .db
+            .apply_fact_ops(&[crate::facts::FactOp::Add(crate::facts::NewFact {
+                entity_id: atlas.clone(),
+                subject: "Atlas".into(),
+                predicate: "owner".into(),
+                object: "Ada".into(),
+                valid_from: "2026-08-01T00:00:00Z".into(),
+                recorded_at: "2026-08-01T00:00:00Z".into(),
+                confidence: 1.0,
+                meeting_id: Some("m-facts".to_string()),
+            })])
+            .unwrap();
+
+        relock_folder_inner_with_visibility_notice(&state, "f-facts", || {}).unwrap();
+        assert!(
+            state
+                .db
+                .facts_for_entities(std::slice::from_ref(&atlas))
+                .unwrap()
+                .is_empty(),
+            "the relock purges, as it always did"
+        );
+
+        let ck = folder_ck(state.as_ref(), "f-facts");
+        unseal_folder_extras(state.as_ref(), "f-facts", &ck, None).unwrap();
+        let after = state
+            .db
+            .facts_for_entities(std::slice::from_ref(&atlas))
+            .unwrap();
+        assert!(
+            after.iter().any(|f| f.predicate == "owner"),
+            "the fact the open session learned must survive the relock — got {after:?}"
+        );
+        assert!(
+            after.iter().any(|f| f.predicate == "status"),
+            "and so must the one sealed at the original lock — got {after:?}"
+        );
+    }
+
     #[test]
     fn conversion_command_relock_during_provider_await_writes_nothing() {
         let state = std::sync::Arc::new(build_state("conversion-command-await-relock"));

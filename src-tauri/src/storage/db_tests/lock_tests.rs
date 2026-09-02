@@ -2577,7 +2577,7 @@ fn a_sealed_fact_ledger_round_trips_through_lock_and_unlock() {
     );
 
     // Unlock: the ledger comes back exactly as it was, closure and all.
-    crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck, false).unwrap();
+    crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck).unwrap();
     let after = db.facts_for_entities(std::slice::from_ref(&atlas)).unwrap();
 
     let key = |f: &crate::facts::Fact| {
@@ -2631,13 +2631,13 @@ fn a_sealed_fact_ledger_is_bound_to_its_folder_and_meeting() {
     // The same ciphertext, filed under a different meeting, must not open.
     db.seal_fact_ledger("m2", &blob).unwrap();
     assert!(
-        crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m2", &ck, false)
+        crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m2", &ck)
             .is_err(),
         "a ledger must not open under another meeting's identity"
     );
     // Nor under a different key.
     assert!(
-        crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &[9u8; 32], false)
+        crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &[9u8; 32])
             .is_err(),
         "a ledger must not open under a different content key"
     );
@@ -2666,7 +2666,7 @@ fn removing_a_lock_restores_the_ledger_and_then_drops_its_ciphertext() {
     crate::commands::seal_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck).unwrap();
     db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
 
-    crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck, true).unwrap();
+    crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck).unwrap();
     assert_eq!(
         db.facts_for_entities(std::slice::from_ref(&atlas))
             .unwrap()
@@ -2675,8 +2675,18 @@ fn removing_a_lock_restores_the_ledger_and_then_drops_its_ciphertext() {
         "the rows are back"
     );
     assert!(
+        db.fact_ledger_blob("m1").unwrap().is_some(),
+        "the restore itself must NOT drop the ciphertext — an interruption here has to leave \
+         something recoverable"
+    );
+
+    // The ciphertext retires in the ATOMIC folder-open commit, with every other blob. Driving that
+    // real function is the point: an earlier version of this test passed a `clear_blob` flag no
+    // production caller ever set, so the actual retire was pinned by nothing.
+    db.commit_folder_permanent_unlock("f-secret").unwrap();
+    assert!(
         db.fact_ledger_blob("m1").unwrap().is_none(),
-        "and the ciphertext is gone — the rows are the only copy again"
+        "and after the commit the rows are the only copy again"
     );
 }
 
@@ -2703,7 +2713,7 @@ fn a_relock_seals_the_facts_the_unlocked_session_added() {
     let ck = [7u8; 32];
     crate::commands::seal_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck).unwrap();
     db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
-    crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck, false).unwrap();
+    crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck).unwrap();
 
     // The unlocked session learns one more thing.
     db.apply_fact_ops(&[add_op(
@@ -2718,7 +2728,7 @@ fn a_relock_seals_the_facts_the_unlocked_session_added() {
     // Relock: re-seal, then purge.
     crate::commands::seal_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck).unwrap();
     db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
-    crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck, false).unwrap();
+    crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck).unwrap();
 
     let after = db.facts_for_entities(std::slice::from_ref(&atlas)).unwrap();
     assert!(
@@ -2775,7 +2785,7 @@ fn the_real_folder_seal_captures_user_facts_and_supersessions_too() {
     assert!(db.unapplied_supersessions_for("m2").unwrap().is_empty());
 
     for mid in ["m1", "m2"] {
-        crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", mid, &ck, false).unwrap();
+        crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", mid, &ck).unwrap();
     }
     assert_eq!(
         db.facts_for_entities(std::slice::from_ref(&atlas))
@@ -2865,9 +2875,147 @@ fn a_cross_folder_supersession_waits_for_its_other_anchor() {
     assert!(db.unapplied_supersessions_for("m-open").unwrap().is_empty());
 
     // Unlocking the OPEN side must not resurrect a row carrying the sealed side's content.
-    crate::commands::restore_fact_ledger_for_meeting(&db, "f-open", "m-open", &ck, false).unwrap();
+    crate::commands::restore_fact_ledger_for_meeting(&db, "f-open", "m-open", &ck).unwrap();
     assert!(
         db.unapplied_supersessions_for("m-open").unwrap().is_empty(),
         "a supersession must wait until BOTH of its meetings are readable"
+    );
+}
+
+/// A RE-SEAL MUST NEVER SHRINK A CIPHERTEXT.
+///
+/// This is the loss an adversarial review reproduced, and it was caused by the cross-folder skip
+/// directly above. A supersession spans meetings in two folders. Lock both; the rows are purged and
+/// only A's ciphertext still holds the row. Unlock A alone: the restore correctly SKIPS the row,
+/// because B is still sealed and the row carries B's plaintext. Relock A: the re-seal reads the live
+/// rows, which no longer contain it, and overwrites the one copy that did.
+///
+/// Nothing surfaced it. The row is not leaked, not logged, not counted anywhere — it is simply gone
+/// from both ciphertexts, and the next time both folders are open it does not come back.
+#[test]
+fn a_re_seal_carries_forward_what_the_restore_had_to_skip() {
+    let db = file_db("fact-ledger-no-shrink");
+    seed_folder(&db, "f-a", "A");
+    seed_folder(&db, "f-b", "B");
+    seed_note(&db, "m-a", "Side A", None);
+    seed_note(&db, "m-b", "Side B", None);
+    db.set_note_folder("m-a", Some("f-a")).unwrap();
+    db.set_note_folder("m-b", Some("f-b")).unwrap();
+    // A fact of its own, so the re-seal does not take the empty-ledger early return (which keeps
+    // the old blob by accident and would hide the hazard).
+    let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+    db.add_mention(&atlas, "m-a").unwrap();
+    db.apply_fact_ops(&[add_op(
+        &atlas,
+        "status",
+        "shipped",
+        "2026-06-01T00:00:00Z",
+        "m-a",
+    )])
+    .unwrap();
+    db.record_supersessions(&[supersession_row("s1", "m-a", "m-b")])
+        .unwrap();
+
+    let ck_a = [7u8; 32];
+    crate::commands::seal_fact_ledger_for_meeting(&db, "f-a", "m-a", &ck_a).unwrap();
+    db.purge_chunks_for_meetings(&["m-a".to_string()]).unwrap();
+
+    // B seals for real too, so it reads as sealed-at-rest.
+    db.seal_note("m-b", "claude_code", &[1u8, 2, 3]).unwrap();
+    db.set_folder_locked("f-b", true, None).unwrap();
+
+    // Unlock A alone: the row is skipped, correctly — B's content must not come back yet.
+    crate::commands::restore_fact_ledger_for_meeting(&db, "f-a", "m-a", &ck_a).unwrap();
+    assert!(
+        db.unapplied_supersessions_for("m-a").unwrap().is_empty(),
+        "the skip itself is right — B is still sealed"
+    );
+
+    // Relock A. The re-seal reads live rows that no longer hold the supersession.
+    crate::commands::seal_fact_ledger_for_meeting(&db, "f-a", "m-a", &ck_a).unwrap();
+    db.purge_chunks_for_meetings(&["m-a".to_string()]).unwrap();
+
+    // Now B opens. The row must still be recoverable — it was never anyone's to delete.
+    db.restore_note_markdown("m-b", "claude_code", "Side B")
+        .unwrap();
+    db.set_folder_locked("f-b", false, None).unwrap();
+    crate::commands::restore_fact_ledger_for_meeting(&db, "f-a", "m-a", &ck_a).unwrap();
+    assert_eq!(
+        db.unapplied_supersessions_for("m-a").unwrap().len(),
+        1,
+        "a re-seal must carry forward what the restore skipped — otherwise unlocking one folder and \
+         locking it again silently destroys a row spanning two"
+    );
+    assert_eq!(
+        db.facts_for_entities(std::slice::from_ref(&atlas))
+            .unwrap()
+            .len(),
+        1,
+        "and the meeting's own fact is still there"
+    );
+}
+
+/// The ciphertext is bound to its FOLDER as well as its meeting. Per-folder keys already make a
+/// cross-folder swap fail, so this is defence in depth — but the earlier binding test could not
+/// tell the two apart, and a mutation that dropped `folder_id` from the AAD survived it.
+#[test]
+fn a_sealed_fact_ledger_does_not_open_under_another_folders_identity() {
+    let db = file_db("fact-ledger-folder-aad");
+    seed_folder(&db, "f-a", "A");
+    seed_note(&db, "m1", "Atlas", None);
+    db.set_note_folder("m1", Some("f-a")).unwrap();
+    let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+    db.add_mention(&atlas, "m1").unwrap();
+    db.apply_fact_ops(&[add_op(
+        &atlas,
+        "status",
+        "shipped",
+        "2026-06-01T00:00:00Z",
+        "m1",
+    )])
+    .unwrap();
+
+    let ck = [7u8; 32];
+    crate::commands::seal_fact_ledger_for_meeting(&db, "f-a", "m1", &ck).unwrap();
+    assert!(
+        crate::commands::restore_fact_ledger_for_meeting(&db, "f-b", "m1", &ck).is_err(),
+        "the same key and meeting under a different folder must not open the ledger"
+    );
+}
+
+/// `facts.importance` rides along. It is not on `crate::facts::Fact`, so it had to be carried
+/// separately — and a mutation dropping it passed every other test.
+#[test]
+fn the_sealed_ledger_carries_fact_importance() {
+    let db = file_db("fact-ledger-importance");
+    seed_folder(&db, "f-secret", "Secret");
+    seed_note(&db, "m1", "Atlas", None);
+    db.set_note_folder("m1", Some("f-secret")).unwrap();
+    let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+    db.add_mention(&atlas, "m1").unwrap();
+    db.apply_fact_ops(&[add_op(
+        &atlas,
+        "status",
+        "shipped",
+        "2026-06-01T00:00:00Z",
+        "m1",
+    )])
+    .unwrap();
+    let fact_id = db
+        .facts_for_entities(std::slice::from_ref(&atlas))
+        .unwrap()
+        .remove(0)
+        .id;
+    db.set_fact_importance(&fact_id, 9.0).unwrap();
+
+    let ck = [7u8; 32];
+    crate::commands::seal_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck).unwrap();
+    db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+    crate::commands::restore_fact_ledger_for_meeting(&db, "f-secret", "m1", &ck).unwrap();
+
+    assert_eq!(
+        db.fact_importance_map().unwrap().get(&fact_id).copied(),
+        Some(9.0),
+        "importance must survive — otherwise every restored fact is silently re-assessed"
     );
 }

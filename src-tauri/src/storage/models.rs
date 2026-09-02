@@ -2017,6 +2017,58 @@ impl SealedFactLedger {
     pub fn is_empty(&self) -> bool {
         self.facts.is_empty() && self.user_facts.is_empty() && self.supersessions.is_empty()
     }
+
+    /// Carry forward everything `prev` holds that `self` does not, keyed by row id.
+    ///
+    /// A re-seal reads the LIVE rows, and some rows are deliberately absent from them: a restore
+    /// skips a supersession whose other anchor is still sealed. Sealing the live rows alone would
+    /// therefore replace the ciphertext with a strict subset of itself and lose those rows for
+    /// good. `self` always wins on a shared id — the live row is the current truth — and `prev`
+    /// only fills the gaps.
+    pub fn merge_missing_from(&mut self, prev: Self) {
+        let have_facts: std::collections::HashSet<&str> =
+            self.facts.iter().map(|f| f.id.as_str()).collect();
+        let carried: Vec<_> = prev
+            .facts
+            .iter()
+            .filter(|f| !have_facts.contains(f.id.as_str()))
+            .cloned()
+            .collect();
+        self.facts.extend(carried);
+
+        let have_user: std::collections::HashSet<&str> =
+            self.user_facts.iter().map(|f| f.id.as_str()).collect();
+        let carried: Vec<_> = prev
+            .user_facts
+            .iter()
+            .filter(|f| !have_user.contains(f.id.as_str()))
+            .cloned()
+            .collect();
+        self.user_facts.extend(carried);
+
+        let have_sup: std::collections::HashSet<&str> =
+            self.supersessions.iter().map(|s| s.id.as_str()).collect();
+        let carried: Vec<_> = prev
+            .supersessions
+            .iter()
+            .filter(|s| !have_sup.contains(s.id.as_str()))
+            .cloned()
+            .collect();
+        self.supersessions.extend(carried);
+
+        let have_importance: std::collections::HashSet<&str> = self
+            .fact_importance
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let carried: Vec<_> = prev
+            .fact_importance
+            .iter()
+            .filter(|(id, _)| !have_importance.contains(id.as_str()))
+            .cloned()
+            .collect();
+        self.fact_importance.extend(carried);
+    }
 }
 
 /// M6 Shared Brain — one row of the outbound org-share state machine (`org_shares`). Anchors on a
