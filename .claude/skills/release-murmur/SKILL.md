@@ -1,6 +1,6 @@
 ---
 name: release-murmur
-description: Cut a signed, notarized macOS release of Murmur (Tauri 2 + Angular 22). The exact, proven step-by-step runbook — preflight gates → version bump (+ Cargo.lock sync) → QueaT commit → PR-merge to the `murmur` trunk (never direct-push) → rustup targets → stop dev → universal build → Developer-ID sign BY IDENTITY HASH (the Polish-ń cert gotcha) → DMG → notarize → staple/spctl → gh release create + upload. Use whenever the user wants to ship, release, cut a version, build a distributable .app/.dmg, sign/notarize, or publish a GitHub release of Murmur. Supersedes the stale docs/RELEASE-CHECKLIST.md.
+description: Cut a signed, notarized macOS release of Murmur (Tauri 2 + Angular 22). The exact, proven step-by-step runbook — preflight gates → version bump (+ Cargo.lock sync) → JakubGawr commit → PR-merge to the `murmur` trunk (never direct-push) → rustup targets → stop dev → universal build → Developer-ID sign BY IDENTITY HASH (the Polish-ń cert gotcha) → DMG → notarize → staple/spctl → gh release create + upload. Use whenever the user wants to ship, release, cut a version, build a distributable .app/.dmg, sign/notarize, or publish a GitHub release of Murmur. Supersedes the stale docs/RELEASE-CHECKLIST.md.
 ---
 
 # /release-murmur — the Murmur macOS release runbook
@@ -25,9 +25,9 @@ stop at that boundary and hand back the exact command the user must run.
 
 1. **`gh` active account MUST be `JakubGawr`.** `gh auth status` → "Active account: true"
    on `JakubGawr` (a second account `jakub-united` is also logged in — do not use it).
-2. **Commit author MUST be `QueaT <kgm004a@gmail.com>`.** NO `Co-Authored-By: Claude`,
+2. **Commit author MUST be `JakubGawr <63911380+JakubGawr@users.noreply.github.com>`.** NO `Co-Authored-By: Claude`,
    NO Claude trailers anywhere in release commits/PR bodies. (Repo git config is already
-   `QueaT` / `kgm004a@gmail.com`; the v0.3.0 bump commit `2038177` proves the shape.)
+   `JakubGawr` / `63911380+JakubGawr@users.noreply.github.com`; the v0.3.0 bump commit `be4ef0f3` proves the shape.)
 3. **NEVER `git push origin murmur` / `…main` directly.** The trunk branch is `murmur`;
    integrate via a PR (`gh pr create … --base murmur` → `gh pr merge`). An environment-level
    `block-bash.sh` guard rejects direct pushes to main/master — a PR is the only path.
@@ -51,7 +51,7 @@ source "$HOME/.cargo/env"
 cd /Users/jakubgawronski/Projects/meetnotes
 git rev-parse --abbrev-ref HEAD            # confirm a feature branch, NOT murmur/main
 gh auth status                            # confirm Active account: JakubGawr
-git log -1 --format='%an <%ae>'           # confirm QueaT <kgm004a@gmail.com>
+git log -1 --format='%an <%ae>'           # confirm JakubGawr <63911380+JakubGawr@users.noreply.github.com>
 scripts/agent-resource-run -- bash scripts/ci.sh  # must end "✅ CI: all gates green"
 ```
 
@@ -138,17 +138,17 @@ scripts/agent-resource-run --chdir src-tauri -- cargo update -p murmur --precise
 grep -A1 '^name = "murmur"' Cargo.lock   # workspace-root lock; confirm version = "<NEW>"
 ```
 
-## Stage 3 — Commit as QueaT (no Claude trailers)
+## Stage 3 — Commit as JakubGawr (no Claude trailers)
 
 ```bash
 git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml Cargo.lock
 git commit -m "chore(release): bump version to $NEW"
-git log -1 --format='%an <%ae>%n%b'   # author QueaT, body has NO Co-Authored-By / Claude
+git log -1 --format='%an <%ae>%n%b'   # author JakubGawr, body has NO Co-Authored-By / Claude
 ```
 
 > **CALLOUT — no Claude trailers.** If your environment auto-appends a
 > `Co-Authored-By: Claude` trailer, strip it (`git commit --amend`) before pushing.
-> Release history is QueaT-only.
+> Release history is JakubGawr-only.
 
 ## Stage 4 — Merge to the `murmur` trunk via PR (NEVER direct push)
 
@@ -331,7 +331,7 @@ build→sign→notarize leg is long-running and Mac-bound. Two shapes:
   commit-author identity — collect verdicts, and only enter the bump stage when all PASS.
 
 Keep the **identity interlocks as preconditions** on every writing node: `gh`=JakubGawr,
-author=QueaT, base=`murmur`, identifier unchanged, sign-by-hash. The Mac-only stages stay a
+author=JakubGawr, base=`murmur`, identifier unchanged, sign-by-hash. The Mac-only stages stay a
 hard boundary — a headless orchestrator hands them to the user rather than faking them.
 
 ## Rules
@@ -340,7 +340,7 @@ hard boundary — a headless orchestrator hands them to the user rather than fak
 - **Never invent a green.** `lipo` must show both arches; `codesign --verify` must show
   `flags=0x10000(runtime)` + `Developer ID Application`; `spctl` must say accepted. If a
   check doesn't pass, STOP and report — do not "assume it worked."
-- **Identity is non-negotiable:** gh=JakubGawr, commit-author=QueaT (no Claude trailers),
+- **Identity is non-negotiable:** gh=JakubGawr, commit-author=JakubGawr (no Claude trailers),
   base=`murmur` via PR, identifier=`com.meetnotes.app` unchanged, sign **by hash**.
 - **Headless honesty.** If there is no Mac / no cert / no notary creds, say so and hand the
   user the exact remaining commands — never claim a notarized DMG you didn't produce.

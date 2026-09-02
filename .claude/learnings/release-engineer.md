@@ -22,7 +22,7 @@
   `git`/`gh` push ("could not read Username") — the user unlocks, you retry.
 - **PR-merge, never direct-push the trunk.** `git push origin murmur` is refused by
   `block-bash.sh`; land via `gh pr create --base murmur` → `gh pr merge`. `gh` active account =
-  `JakubGawr`; commits authored ONLY by `QueaT <kgm004a@gmail.com>`, NO AI co-author trailers.
+  `JakubGawr`; commits authored ONLY by `JakubGawr <63911380+JakubGawr@users.noreply.github.com>`, NO AI co-author trailers.
 - **Version bump touches four files in sync** — `package.json`, `src-tauri/tauri.conf.json`,
   `src-tauri/Cargo.toml`, then `cargo update -p murmur --precise <ver>` (Cargo.lock).
 - **`MURMUR_DEV_DEK` vs release-keychain DEK collide on a shared DB** → the release build can't open

@@ -90,7 +90,7 @@ A change is DONE only when verified — not when "code is written". Self-eval is
 
 ## Release / deployment
 
-Full runbook: **[`.claude/skills/release-murmur`](.claude/skills/release-murmur/SKILL.md)** (supersedes `docs/RELEASE-CHECKLIST.md`). Pipeline: gates green → version bump (package.json + src-tauri/tauri.conf.json + src-tauri/Cargo.toml, then `(cd src-tauri && cargo update -p murmur --precise <ver>)`) → QueaT commit → PR-merge to `murmur` → `rustup target add aarch64-apple-darwin x86_64-apple-darwin` → stop dev → `npx tauri build --target universal-apple-darwin --bundles app` → Developer-ID sign → DMG → **notarize** → staple → `gh release create`/upload.
+Full runbook: **[`.claude/skills/release-murmur`](.claude/skills/release-murmur/SKILL.md)** (supersedes `docs/RELEASE-CHECKLIST.md`). Pipeline: gates green → version bump (package.json + src-tauri/tauri.conf.json + src-tauri/Cargo.toml, then `(cd src-tauri && cargo update -p murmur --precise <ver>)`) → JakubGawr commit → PR-merge to `murmur` → `rustup target add aarch64-apple-darwin x86_64-apple-darwin` → stop dev → `npx tauri build --target universal-apple-darwin --bundles app` → Developer-ID sign → DMG → **notarize** → staple → `gh release create`/upload.
 
 ### Hard-won release rules — DO NOT repeat the 2026-06-27 mess
 
@@ -99,7 +99,7 @@ Full runbook: **[`.claude/skills/release-murmur`](.claude/skills/release-murmur/
 3. **NEVER run `security` / keychain CLI ops from the agent shell.** It can't surface the macOS auth dialog → the command HANGS → retries queue → many hung processes spamming the user (the 2026-06-27 loop was 11 `security` procs). Any keychain op needing auth (add / unlock / `notarytool store-credentials`) MUST be run by the **user** interactively (`!` in their terminal) or avoided. Even ACL/locked reads hang — never loop them. (Process kills like `pkill security` are fine; they don't touch the keychain.)
 4. **Dev and release data are intentionally isolated.** Debug/dev resolves through `state::app_dir_name()` to `MeetNotes-dev`; release uses `MeetNotes`. Never copy, restore, delete, or re-key the release database as part of a dev test.
 5. **A locked login keychain also breaks `git`/`gh` push** (the credential helper reads the GitHub token from it). `git push` → "could not read Username for https://github.com" means the keychain is locked, not that auth broke — the user unlocks it (`security unlock-keychain`, run BY THE USER) and you retry.
-6. Merge to `murmur` **via a PR, never a direct push** (enforced by `.claude/hooks/block-bash.sh`); commits/PRs authored **only** by `QueaT <kgm004a@gmail.com>`, **no Claude trailers**; `gh` account = `JakubGawr`; `com.meetnotes.app` immutable.
+6. Merge to `murmur` **via a PR, never a direct push** (enforced by `.claude/hooks/block-bash.sh`); commits/PRs authored **only** by `JakubGawr <63911380+JakubGawr@users.noreply.github.com>`, **no Claude trailers**; `gh` account = `JakubGawr`; `com.meetnotes.app` immutable.
 7. **Startup must never hard-crash on a keychain/DB failure** (v0.3.1 made it a graceful dialog + clean exit, DB untouched) — keep it; never reintroduce an `init().expect()` / `.unwrap()` on the keychain-or-DB-open path.
 
 ## Agents, skills, rules & hooks (this repo's `.claude/`)
