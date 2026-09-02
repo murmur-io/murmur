@@ -1,6 +1,6 @@
 # Murmur Contributor License Agreement (CLA)
 
-> ⚠️ **DRAFT — for review, not yet binding.** Adapted from the **Apache Software Foundation Individual CLA v2.0** (a public template). Resolved: the rights holder is **Jakub Gawroński** (an individual for now — transferable to a company later); the approach is a **relicensing license *grant*** (§2), **not** a copyright assignment, so contributors keep full ownership. Still to do before it binds: (a) a qualified-counsel review, and (b) a **retroactive sign-off from existing contributor Lukasz Swierlikowski** for his pre-CLA commits (or a clean-room replacement) before any commercial license is offered over the affected code. **Nothing here is legal advice.**
+> ⚠️ **DRAFT — for review, not yet binding.** Adapted from the **Apache Software Foundation Individual CLA v2.0** (a public template). Resolved: the rights holder is **Jakub Gawroński** (an individual for now — transferable to a company later); the approach is a **relicensing license *grant*** (§2), **not** a copyright assignment, so contributors keep full ownership. Still to do before it binds: (a) a qualified-counsel review, and (b) a **retroactive sign-off from existing contributor Lucas** for his pre-CLA commits (or a clean-room replacement) before any commercial license is offered over the affected code. **Nothing here is legal advice.**
 
 This agreement documents the rights granted by contributors to **Jakub Gawroński** ("the Maintainer") for the **Murmur** project. It lets Murmur remain free and open under **AGPL-3.0** while allowing the Maintainer to offer commercial licenses (dual licensing). You retain full ownership of your Contributions.
 
@@ -36,7 +36,7 @@ Adding a row here means: *"I agree to this CLA, and it covers all of my past and
 | Name | GitHub | Date | Scope |
 |---|---|---|---|
 | Jakub Gawroński | @JakubGawr | 2026-07-03 | rights holder / maintainer |
-| _Łukasz Świerlikowski_ | _@LukeSwierlik_ | _pending_ | _all past + future contributions_ |
+| _Lucas_ | _@Lukas9315_ | _pending_ | _all past + future contributions_ |
 
 ---
 *Adapted from the Apache Software Foundation ICLA v2.0 (https://www.apache.org/licenses/icla.pdf) and the CCLA v1.0. Grafana and GitLab use the same pattern to combine AGPL/open-source with a commercial license.*
