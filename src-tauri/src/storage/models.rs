@@ -1952,6 +1952,28 @@ pub struct OrgState {
     pub context_enabled: bool,
 }
 
+/// One org member's PUBLIC identity key, as this device learned it (`org_member_keys`).
+///
+/// Public material only — the same bytes `POST /v1/keys/lookup` publishes to any authenticated
+/// caller, plus the fingerprint the safety-word check already shows. Cached because a key rotation
+/// has to wrap the new OCK for every remaining member in one pass, while the only key directory is
+/// the email-keyed lookup capped at 20 calls per day for orgs of up to 50 members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgMemberKey {
+    pub org_id: String,
+    /// The member's STABLE server user id — the same identity `org_members.user_id` and a key grant
+    /// are keyed on. Never the email.
+    pub user_id: String,
+    /// The address the key was learned from, when one was known. Diagnostic only; the lookup path
+    /// prefers this over asking the server again.
+    pub email: Option<String>,
+    pub pk_enc: Vec<u8>,
+    pub pk_sig: Vec<u8>,
+    /// `key_fingerprint(pk_enc, pk_sig)` — the value a grant binds as `recipient_acct_id`.
+    pub fingerprint: String,
+    pub updated_at: String,
+}
+
 /// M6 Shared Brain — one row of the outbound org-share state machine (`org_shares`). Anchors on a
 /// local `meeting_id` XOR `document_id`; carries the item kind, the content-hash dedup key, the
 /// server `item_id` once published, and the current `state`. NO note title/body/OCK.

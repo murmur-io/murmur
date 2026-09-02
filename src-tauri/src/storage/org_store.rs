@@ -358,6 +358,161 @@ impl Db {
         Ok(())
     }
 
+    // ── Member identity keys + the rotation journal ─────────────────────────────────────────────
+    //
+    // Rotation needs every REMAINING member's public key in one pass. The only directory the relay
+    // offers is `POST /v1/keys/lookup`, keyed by email and capped at `KEY_LOOKUPS_PER_DAY = 20`,
+    // against orgs of up to `MAX_ORG_MEMBERS = 50`. So keys are learned once — at the invite that
+    // already looks the member up — and read locally afterwards. Nothing secret is stored: these
+    // are the bytes the relay publishes to any authenticated caller.
+
+    /// Remember a member's published identity key for this org. Replaces the row on a key change,
+    /// so the caller (never this method) is the place that decides whether a CHANGED key is
+    /// acceptable — storage must not be the thing that silently accepts a substituted key.
+    pub fn upsert_org_member_key(
+        &self,
+        org_id: &str,
+        user_id: &str,
+        email: Option<&str>,
+        pk_enc: &[u8],
+        pk_sig: &[u8],
+        fingerprint: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO org_member_keys
+               (org_id, user_id, email, pk_enc, pk_sig, fingerprint, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(org_id, user_id) DO UPDATE SET
+               email       = excluded.email,
+               pk_enc      = excluded.pk_enc,
+               pk_sig      = excluded.pk_sig,
+               fingerprint = excluded.fingerprint,
+               updated_at  = excluded.updated_at",
+            rusqlite::params![
+                org_id,
+                user_id,
+                email,
+                pk_enc,
+                pk_sig,
+                fingerprint,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// This device's remembered key for one member, if it has ever learned one.
+    pub fn get_org_member_key(
+        &self,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<Option<crate::storage::OrgMemberKey>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT org_id, user_id, email, pk_enc, pk_sig, fingerprint, updated_at
+               FROM org_member_keys WHERE org_id = ?1 AND user_id = ?2",
+            rusqlite::params![org_id, user_id],
+            |r| {
+                Ok(crate::storage::OrgMemberKey {
+                    org_id: r.get(0)?,
+                    user_id: r.get(1)?,
+                    email: r.get(2)?,
+                    pk_enc: r.get(3)?,
+                    pk_sig: r.get(4)?,
+                    fingerprint: r.get(5)?,
+                    updated_at: r.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Drop a member's remembered key — used when they leave the org, so a later re-invite has to
+    /// learn the key afresh instead of trusting one this device kept while they were gone.
+    pub fn forget_org_member_key(&self, org_id: &str, user_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM org_member_keys WHERE org_id = ?1 AND user_id = ?2",
+            rusqlite::params![org_id, user_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Record that this org OWES a key rotation. Written BEFORE the server-side removal, so an
+    /// interruption at any later point leaves a re-drivable debt rather than an org sitting on a
+    /// generation the removed member still holds a key for. Idempotent: a second removal before the
+    /// first rotation lands keeps one row and the ORIGINAL timestamp (the debt is the org's, not the
+    /// individual removal's), while resetting `attempts` so a fresh removal is not throttled by an
+    /// older failure streak.
+    pub fn mark_org_rotation_pending(&self, org_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO org_rotation_pending (org_id, requested_at, attempts, last_error)
+             VALUES (?1, ?2, 0, NULL)
+             ON CONFLICT(org_id) DO UPDATE SET attempts = 0, last_error = NULL",
+            rusqlite::params![org_id, chrono::Utc::now().to_rfc3339()],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The rotation debt is settled — the relay committed the new generation.
+    pub fn clear_org_rotation_pending(&self, org_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM org_rotation_pending WHERE org_id = ?1",
+            rusqlite::params![org_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Note a failed rotation attempt. `error` is a short non-PII label (an `errcode` tag or an
+    /// HTTP stage/status), never a message body that could carry content.
+    pub fn record_org_rotation_failure(&self, org_id: &str, error: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_rotation_pending
+                SET attempts = attempts + 1, last_error = ?2
+              WHERE org_id = ?1",
+            rusqlite::params![org_id, error],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Every org that still owes a rotation, oldest debt first — the drive order for the retry.
+    pub fn list_org_rotations_pending(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT org_id FROM org_rotation_pending ORDER BY requested_at ASC")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Whether one org owes a rotation (with its attempt count), for tests and diagnostics.
+    pub fn org_rotation_pending_attempts(&self, org_id: &str) -> Result<Option<i64>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT attempts FROM org_rotation_pending WHERE org_id = ?1",
+            rusqlite::params![org_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
     /// Atomically withdraw local membership AND purge its decrypted replica. Idempotent; leaves
     /// `org_shares` alone (a leave doesn't retroactively un-share — the items stay published unless
     /// explicitly revoked).

@@ -1095,25 +1095,41 @@ impl ShareClient {
         Err(Self::status_err("org-tombstone-item", resp.status()))
     }
 
-    /// `POST /v1/orgs/{id}/generation` (owner) — bump the OCK generation (monotonic +1). The owner
-    /// must have already PUT grants for gen N+1 for every active member (the server checks counts).
-    pub async fn org_bump_generation(&self, access_token: &str, org_id: &str) -> Result<()> {
+    /// `POST /v1/orgs/{id}/generation {generation}` (owner) — bump the OCK generation (monotonic
+    /// +1). The owner must have already PUT grants for gen `generation` for EVERY active member;
+    /// the server checks that coverage in the same transaction and answers 409 otherwise.
+    ///
+    /// The JSON body is REQUIRED. This call used to send none, and the server extracts it with
+    /// axum's `Json<BumpGenerationRequest>` — an extractor that rejects a body-less POST with 415
+    /// *before* the handler runs. So the rotation that follows every member removal always failed,
+    /// the org never left the generation the removed member held a key for, and the user saw only
+    /// an untagged refusal. Returns the server's new live generation so the caller records what the
+    /// relay actually committed rather than what it hoped for.
+    pub async fn org_bump_generation(
+        &self,
+        access_token: &str,
+        org_id: &str,
+        generation: u32,
+    ) -> Result<u32> {
         Self::guard_id(org_id)?;
         let url = self.url(&format!("/v1/orgs/{org_id}/generation"))?;
         let resp = self
             .http
             .post(url)
             .bearer_auth(access_token)
+            .json(&super::org_dto::BumpGenerationRequest { generation })
             .send()
             .await
             .map_err(|_| {
                 AppError::Unavailable("org-bump-generation: could not reach the server".into())
             })?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(Self::status_err("org-bump-generation", resp.status()))
+        if !resp.status().is_success() {
+            return Err(Self::status_err("org-bump-generation", resp.status()));
         }
+        let body: super::org_dto::BumpGenerationResponse = resp.json().await.map_err(|_| {
+            AppError::Unavailable("org-bump-generation: malformed server response".into())
+        })?;
+        Ok(body.current_generation)
     }
 
     /// Guard a path segment that we mint (a UUID) against traversal / query injection. A stray `/`

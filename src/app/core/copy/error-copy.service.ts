@@ -134,6 +134,7 @@ export const ERROR_CODES = [
   "share-active",
   "folder-closing",
   "container-unavailable",
+  "org-rotation-pending",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -237,6 +238,12 @@ const BASE_COPY: Readonly<Record<ErrorCode, string>> = {
     "This note is shared. Revoke its share first, then try again.",
   "folder-closing":
     "That folder is being prepared for sharing. Try again in a moment.",
+  // Deliberately NOT phrased as a failure. The removal SUCCEEDED; what is outstanding is the key
+  // rotation that locks the removed person out of anything published from now on. Telling the user
+  // to "try again" would invite them to re-remove somebody who is already gone, and hide the one
+  // fact that matters: until the rotation lands, new posts are still readable with their old key.
+  "org-rotation-pending":
+    "Removed. Their access key is still being rotated — until that finishes, anything new you share here could still be readable by them. Murmur keeps retrying.",
   "container-unavailable":
     "This recording isn’t in a folder Murmur can add a note to. Move it, then try again.",
 };
