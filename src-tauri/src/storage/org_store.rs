@@ -451,9 +451,11 @@ impl Db {
     pub fn mark_org_rotation_pending(&self, org_id: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO org_rotation_pending (org_id, requested_at, attempts, last_error)
-             VALUES (?1, ?2, 0, NULL)
-             ON CONFLICT(org_id) DO UPDATE SET attempts = 0, last_error = NULL",
+            "INSERT INTO org_rotation_pending
+               (org_id, requested_at, attempts, last_error, next_attempt_at)
+             VALUES (?1, ?2, 0, NULL, NULL)
+             ON CONFLICT(org_id) DO UPDATE SET
+               attempts = 0, last_error = NULL, next_attempt_at = NULL",
             rusqlite::params![org_id, chrono::Utc::now().to_rfc3339()],
         )
         .map_err(map_err)?;
@@ -471,21 +473,56 @@ impl Db {
         Ok(())
     }
 
-    /// Note a failed rotation attempt. `error` is a short non-PII label (an `errcode` tag or an
-    /// HTTP stage/status), never a message body that could carry content.
-    pub fn record_org_rotation_failure(&self, org_id: &str, error: &str) -> Result<()> {
+    /// Note a failed rotation attempt and decide when the retry may run again. `error` is a short
+    /// non-PII label (an `errcode` tag or an HTTP stage/status), never a message body that could
+    /// carry content.
+    ///
+    /// `learned_something` is the difference between "this attempt is going nowhere" and "this
+    /// attempt is converging slowly". A first rotation of an org invited before member keys were
+    /// remembered has to resolve them a few at a time against a 20-a-day lookup quota, and
+    /// throttling THAT would turn a two-hour convergence into a two-week one. A doomed attempt --
+    /// a member whose account is gone but whose membership is not -- learns nothing, and gets an
+    /// exponential back-off capped at six hours so it cannot spend the quota every minute forever.
+    pub fn record_org_rotation_failure(
+        &self,
+        org_id: &str,
+        error: &str,
+        learned_something: bool,
+    ) -> Result<()> {
         let conn = self.lock();
+        // `attempts` counts attempts, always. Only the BACK-OFF is conditional: an attempt that
+        // learned a key it did not have keeps its place at the front of the queue.
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT attempts FROM org_rotation_pending WHERE org_id = ?1",
+                rusqlite::params![org_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .unwrap_or(0)
+            + 1;
+        let next_attempt_at = if learned_something {
+            None
+        } else {
+            let minutes = 2i64
+                .checked_pow(u32::try_from(attempts.clamp(1, 16)).unwrap_or(16))
+                .unwrap_or(360)
+                .min(360);
+            Some((chrono::Utc::now() + chrono::Duration::minutes(minutes)).to_rfc3339())
+        };
         conn.execute(
             "UPDATE org_rotation_pending
-                SET attempts = attempts + 1, last_error = ?2
+                SET attempts = ?2, last_error = ?3, next_attempt_at = ?4
               WHERE org_id = ?1",
-            rusqlite::params![org_id, error],
+            rusqlite::params![org_id, attempts, error, next_attempt_at],
         )
         .map_err(map_err)?;
         Ok(())
     }
 
-    /// Every org that still owes a rotation, oldest debt first — the drive order for the retry.
+    /// Every org that still owes a rotation, oldest debt first — regardless of back-off. The
+    /// diagnostic view; the retry drives [`Self::list_org_rotations_due`] instead.
     pub fn list_org_rotations_pending(&self) -> Result<Vec<String>> {
         let conn = self.lock();
         let mut stmt = conn
@@ -493,6 +530,29 @@ impl Db {
             .map_err(map_err)?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// The owed rotations whose back-off has elapsed, oldest debt first. A row with no
+    /// `next_attempt_at` has never failed (or last made progress) and is always due.
+    pub fn list_org_rotations_due(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT org_id FROM org_rotation_pending
+                  WHERE next_attempt_at IS NULL OR next_attempt_at <= ?1
+                  ORDER BY requested_at ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![chrono::Utc::now().to_rfc3339()], |r| {
+                r.get::<_, String>(0)
+            })
             .map_err(map_err)?;
         let mut out = Vec::new();
         for row in rows {
@@ -532,6 +592,20 @@ impl Db {
                 rusqlite::params![org_id],
             )
             .map_err(map_err)?;
+        // The org's remembered member keys and any owed rotation go with it, in the SAME
+        // transaction. A debt outliving its org is retried by every sweep forever against an org
+        // `resolve_org` can no longer find, and remembered addresses have no reason to survive a
+        // membership this device no longer holds.
+        tx.execute(
+            "DELETE FROM org_member_keys WHERE org_id = ?1",
+            rusqlite::params![org_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM org_rotation_pending WHERE org_id = ?1",
+            rusqlite::params![org_id],
+        )
+        .map_err(map_err)?;
         if removed > 0 {
             // Membership withdrawal invalidates global-derived Ask even when the decrypted org
             // replica was already empty and the durable conversation is the only derived copy.

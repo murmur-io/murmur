@@ -3718,7 +3718,24 @@ async fn task_org_members_read_with_permit(
 /// already met, and it keeps a 50-member org inside the 20-lookups-a-day quota.
 ///
 /// Returns the generation the relay committed.
-pub(crate) async fn rotate_org_generation(state: &AppState, org_id: &str) -> Result<u32, AppError> {
+/// How many identity lookups one rotation attempt may spend. The relay allows 20 a day per
+/// account against orgs of up to 50 members, so an org invited before member keys were remembered
+/// cannot resolve everyone in one pass. Bounding it per attempt means a first rotation converges
+/// over a few attempts instead of spending the whole day's quota — and leaving none for the
+/// invites and shares the same quota pays for.
+const ROTATION_LOOKUP_BUDGET: usize = 8;
+
+/// What one rotation attempt achieved when it did not finish: whether it LEARNED a key it did not
+/// have. A slow-but-progressing rotation must not be backed off; a doomed one must.
+pub(crate) struct RotationProgress {
+    pub learned_keys: usize,
+}
+
+pub(crate) async fn rotate_org_generation(
+    state: &AppState,
+    org_id: &str,
+    progress: &mut RotationProgress,
+) -> Result<u32, AppError> {
     let org = resolve_org(state, org_id)?;
     let base = share_base_url(state)?;
     let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
@@ -3764,6 +3781,13 @@ pub(crate) async fn rotate_org_generation(state: &AppState, org_id: &str) -> Res
                     "a remaining member's identity key is unknown and cannot be resolved",
                 )));
             };
+            if progress.learned_keys >= ROTATION_LOOKUP_BUDGET {
+                return Err(AppError::Unavailable(crate::errcode::tag(
+                    crate::errcode::ORG_ROTATION_PENDING,
+                    "resolved this attempt's share of the remaining members' keys; \
+                     the rotation continues on the next pass",
+                )));
+            }
             let lookup = client.lookup_key(&access_token, email).await?;
             let Some(key) = lookup.key.filter(|_| lookup.registered) else {
                 return Err(AppError::Unavailable(crate::errcode::tag(
@@ -3780,6 +3804,7 @@ pub(crate) async fn rotate_org_generation(state: &AppState, org_id: &str) -> Res
                 &key.pk_sig,
                 &fp,
             )?;
+            progress.learned_keys += 1;
             (key.pk_enc, fp)
         };
 
@@ -3819,16 +3844,12 @@ pub(crate) async fn rotate_org_generation(state: &AppState, org_id: &str) -> Res
     }
 
     state.db.set_org_generation(&org.org_id, committed)?;
-    {
-        let mut cache = state
-            .org_ock_cache
-            .lock()
-            .map_err(|_| AppError::Storage("org-ock cache mutex poisoned".into()))?;
-        cache.insert(
-            (org.org_id.clone(), committed),
-            zeroize::Zeroizing::new(*new_ock),
-        );
-    }
+    // The freshly minted OCK is deliberately NOT cached here. The relay upserts grants, so a second
+    // owner device that PUT its own grants for the same generation between our PUT and our POST
+    // would have its key committed while ours is the one we hold — and everything we then sealed
+    // under this generation would be unreadable to everybody, ourselves included after a restart.
+    // Leaving the cache cold costs one round-trip on next use and makes `acquire_org_ock` fetch and
+    // OPEN the grant the relay actually stored, which is the only copy that can be authoritative.
     state.db.clear_org_rotation_pending(&org.org_id)?;
     crate::share::ledger_row(&state.db, &client.host(), "org_rotate_generation", 0);
     Ok(committed)
@@ -3841,15 +3862,21 @@ pub(crate) async fn rotate_org_generation(state: &AppState, org_id: &str) -> Res
 /// removed member's old key, so it must be closed by a retry rather than by the user noticing.
 pub(crate) async fn drive_pending_org_rotations(state: &AppState) -> Result<u32, AppError> {
     let mut settled = 0u32;
-    for org_id in state.db.list_org_rotations_pending()? {
-        match rotate_org_generation(state, &org_id).await {
+    for org_id in state.db.list_org_rotations_due()? {
+        let mut progress = RotationProgress { learned_keys: 0 };
+        match rotate_org_generation(state, &org_id, &mut progress).await {
             Ok(_) => settled = settled.saturating_add(1),
             Err(e) => {
                 // Keep the debt and record WHICH failure, in the same content-free vocabulary the
                 // org log uses. A rotation that keeps failing for one reason is a different problem
                 // from one that fails for a new reason every time, and the row is the only place
-                // that distinction survives a restart.
-                let _ = state.db.record_org_rotation_failure(&org_id, &brief_err(&e));
+                // that distinction survives a restart. An attempt that learned a key it did not
+                // have is converging, not stuck, so it keeps its place at the front of the queue.
+                let _ = state.db.record_org_rotation_failure(
+                    &org_id,
+                    &brief_err(&e),
+                    progress.learned_keys > 0,
+                );
             }
         }
     }
@@ -3881,6 +3908,16 @@ pub(crate) async fn org_remove_member_inner(
     let access_token = valid_access_token(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
 
+    // Only an owner can rotate, and the relay answers a non-owner's removal with a uniform 404 that
+    // the client maps to Ok. Journaling first in that case would write a debt no later sweep could
+    // ever settle, and every retry would spend key lookups on it. Refusing here is visible and
+    // self-correcting (a membership refresh fixes a stale role); a permanent silent debt is not.
+    if !org.role.eq_ignore_ascii_case("owner") {
+        return Err(AppError::InvalidArg(
+            "only the organization owner can remove a member".into(),
+        ));
+    }
+
     // Journal the rotation debt BEFORE asking the relay to remove anybody. Everything after this
     // point can be interrupted — a dropped connection, a quit, a crash — and the one outcome that
     // must never happen is a member removed from an org that then stays on the generation their key
@@ -3902,12 +3939,15 @@ pub(crate) async fn org_remove_member_inner(
     // rotation that follows lands, because it happened.
     crate::share::ledger_row(&state.db, &client.host(), "org_remove_member", 0);
 
-    match rotate_org_generation(state, &org.org_id).await {
+    let mut progress = RotationProgress { learned_keys: 0 };
+    match rotate_org_generation(state, &org.org_id, &mut progress).await {
         Ok(_) => Ok(()),
         Err(e) => {
-            let _ = state
-                .db
-                .record_org_rotation_failure(&org.org_id, &brief_err(&e));
+            let _ = state.db.record_org_rotation_failure(
+                &org.org_id,
+                &brief_err(&e),
+                progress.learned_keys > 0,
+            );
             // NOT a removal failure — saying so would invite the user to remove somebody who is
             // already gone. This names the half that is outstanding, and the copy for the code says
             // what it means for them: new posts stay readable with the old key until it lands.
@@ -9664,7 +9704,7 @@ async fn org_sweep_pending_with_policy(
     // the sweep, ahead of any publish or access reconcile — a late publish is an inconvenience, a
     // late rotation is the removal not having happened in the way the user was told it had.
     // Failures leave the row in place (with its reason recorded) for the next sweep.
-    if !state.db.list_org_rotations_pending()?.is_empty() {
+    if !state.db.list_org_rotations_due()?.is_empty() {
         advanced = advanced.saturating_add(drive_pending_org_rotations(state).await?);
         if !policy.is_current() {
             return Ok(advanced);

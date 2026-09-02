@@ -2313,10 +2313,16 @@ impl Db {
              -- row says only that this org owes a rotation; the members list at drive time says to
              -- whom.
              CREATE TABLE IF NOT EXISTS org_rotation_pending (
-               org_id       TEXT PRIMARY KEY,
-               requested_at TEXT NOT NULL,
-               attempts     INTEGER NOT NULL DEFAULT 0,
-               last_error   TEXT
+               org_id          TEXT PRIMARY KEY,
+               requested_at    TEXT NOT NULL,
+               attempts        INTEGER NOT NULL DEFAULT 0,
+               last_error      TEXT,
+               -- When the retry may next run. Without it a debt that can never settle -- a member
+               -- whose account was deactivated while their membership stayed active, say -- is
+               -- re-driven every 60s forever, and each attempt spends one of the owner's 20 daily
+               -- key lookups on the same doomed member. An attempt that LEARNS something resets
+               -- this to now, so a slow-but-progressing rotation is never throttled.
+               next_attempt_at TEXT
              );
              CREATE TABLE IF NOT EXISTS org_shares (
                id             TEXT PRIMARY KEY,

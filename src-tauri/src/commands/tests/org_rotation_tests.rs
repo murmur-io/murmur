@@ -102,6 +102,10 @@ struct RelayLog {
     bump_body: Option<String>,
     /// Every `(user_id, generation)` a key-grant PUT covered, across all calls.
     granted: Vec<(String, u32)>,
+    /// The opaque bytes each grant carried, so a test can OPEN one with the member's own identity
+    /// instead of merely observing that a row exists — the relay's coverage rule counts rows, so a
+    /// test that also counts rows shares the relay's blind spot rather than covering it.
+    granted_material: Vec<(String, u32, Vec<u8>, Vec<u8>)>,
     removed: Vec<String>,
     lookups: Vec<String>,
     /// The bump the relay actually committed, if it committed one.
@@ -120,6 +124,16 @@ struct RotationRelay {
 impl RotationRelay {
     /// `members` is the live roster; `keys` maps an email to the identity the lookup publishes.
     fn start(members: Vec<MockMember>, keys: HashMap<String, (Vec<u8>, Vec<u8>)>) -> Self {
+        Self::start_at_generation(members, keys, 1)
+    }
+
+    /// The same relay, already living at `generation` — the state of an org this device has fallen
+    /// behind on.
+    fn start_at_generation(
+        members: Vec<MockMember>,
+        keys: HashMap<String, (Vec<u8>, Vec<u8>)>,
+        live_generation: u32,
+    ) -> Self {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://{}/", server.server_addr().to_ip().unwrap());
         let log = Arc::new(Mutex::new(RelayLog::default()));
@@ -130,7 +144,7 @@ impl RotationRelay {
         let handle = std::thread::spawn(move || {
             // The relay's own state: the roster and the live generation it would keep in Postgres.
             let mut roster = members;
-            let mut generation: u32 = 1;
+            let mut generation: u32 = live_generation;
             loop {
                 if shutdown_t.load(Ordering::SeqCst) {
                     break;
@@ -251,7 +265,18 @@ impl RotationRelay {
                                     .get("generation")
                                     .and_then(serde_json::Value::as_u64)
                                     .unwrap_or(0) as u32;
-                                guard.granted.push((uid, gen));
+                                let wrapped = g
+                                    .get("wrappedKey")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|s| murmur_protocol::b64::decode(s).ok())
+                                    .unwrap_or_default();
+                                let sig = g
+                                    .get("grantSig")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|s| murmur_protocol::b64::decode(s).ok())
+                                    .unwrap_or_default();
+                                guard.granted.push((uid.clone(), gen));
+                                guard.granted_material.push((uid, gen, wrapped, sig));
                             }
                         }
                     }
@@ -327,6 +352,15 @@ impl RotationRelay {
 
     fn set_refuse_bump(&self, refuse: bool) {
         self.log.lock().unwrap().refuse_bump = refuse;
+    }
+
+    /// The opaque grant one member received at `generation`, if any.
+    fn grant_material_for(&self, user_id: &str, generation: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.log()
+            .granted_material
+            .iter()
+            .find(|(u, g, _, _)| u == user_id && *g == generation)
+            .map(|(_, _, w, s)| (w.clone(), s.clone()))
     }
 
     /// Every user id granted at `generation`, deduplicated and sorted — the set the coverage rule
@@ -640,4 +674,184 @@ fn remembered_member_keys_are_scoped_to_their_org() {
         .get_org_member_key(ORG, STAYS_CACHED_UID)
         .unwrap()
         .is_none());
+}
+
+/// THE ORACLE THE FIRST ROUND OF THIS CHANGE WAS MISSING.
+///
+/// A lock-security review pointed out that every assertion above checks the same predicate the
+/// relay checks — that a grant ROW exists for each member — and never that the bytes in it are a
+/// key that member can actually open. A grant wrapped to the wrong `recipient_acct_id`, or to a
+/// stale `pk_enc`, satisfies the coverage rule perfectly, commits the generation, and locks the
+/// member out of everything published afterwards. That failure looks exactly like success from
+/// every other angle in this file.
+///
+/// So: rotate, take the bytes the relay received for a member, and open them with that member's
+/// own identity through the same `open_own_grant` the app uses. Both members are checked — the one
+/// whose key was remembered and the one whose key was looked up, since those are two different code
+/// paths for producing `(pk_enc, fingerprint)` and only one of them was exercised at invite time.
+#[tokio::test]
+async fn every_rotated_grant_opens_with_its_member_s_own_identity() {
+    let relay = RotationRelay::start(roster(), published_keys());
+    let state = AppState::for_tests(fresh_db("rotate-grants-open"));
+    wire_state(&state, &relay);
+    seed_cached_member_key(&state);
+
+    org_remove_member_inner(&state, ORG.into(), REMOVED_UID.into())
+        .await
+        .expect("removal + rotation must succeed");
+
+    let owner = crate::e2ee::keys::derive_identity(&Zeroizing::new([7u8; 32]), "owner@example.com", 1)
+        .unwrap();
+    let owner_fp = crate::e2ee::key_fingerprint(&owner.pk_enc, &owner.pk_sig);
+
+    let mut opened: Vec<[u8; 32]> = Vec::new();
+    for (uid, seed, email) in [
+        (STAYS_CACHED_UID, 3u8, "cached@example.com"),
+        (STAYS_LOOKED_UP_UID, 4u8, "lookedup@example.com"),
+    ] {
+        let member = member_identity(seed, email);
+        let member_fp = crate::e2ee::key_fingerprint(&member.pk_enc, &member.pk_sig);
+        let (wrapped, sig) = relay
+            .grant_material_for(uid, 2)
+            .unwrap_or_else(|| panic!("no gen-2 grant recorded for {uid}"));
+
+        // The granter identity travels inside the wrapped frame, exactly as `acquire_org_ock`
+        // reads it — nothing here is taken from the test's own knowledge of who granted.
+        let unpacked = crate::e2ee::wrap::unpack_wrapped_key(&wrapped, &sig).unwrap();
+        let granter_fp =
+            crate::e2ee::key_fingerprint(&unpacked.sender_pk_enc, &unpacked.sender_pk_sig);
+        assert_eq!(
+            granter_fp, owner_fp,
+            "the grant must be signed by the owner's identity"
+        );
+
+        let ock = crate::e2ee::org::open_own_grant(
+            &wrapped,
+            &sig,
+            &member,
+            &member_fp,
+            &member_fp,
+            &granter_fp,
+            1,
+            &granter_fp,
+            &unpacked.sender_pk_sig,
+            ORG,
+            2,
+        )
+        .unwrap_or_else(|e| {
+            panic!("{uid} cannot open the key they were granted — a rotation that locks a remaining member out is indistinguishable from success by every other assertion here: {e}")
+        });
+        opened.push(*ock);
+    }
+
+    assert_eq!(
+        opened[0], opened[1],
+        "every member must open the SAME org content key — different keys per member would mean \
+         each of them can read only what they sealed themselves"
+    );
+
+    // And the member who was removed got no grant at all to open.
+    assert!(
+        relay.grant_material_for(REMOVED_UID, 2).is_none(),
+        "the removed member must receive no gen-2 grant"
+    );
+}
+
+/// A rotation that learns NOTHING must back off, or one unresolvable member spends the owner's
+/// twenty daily key lookups every sixty seconds, forever — and the org never rotates at all.
+/// A rotation that DOES learn a key keeps its place in the queue, because a first rotation of an
+/// org invited before keys were remembered converges a few members at a time and throttling that
+/// would turn hours into weeks.
+#[test]
+fn a_rotation_that_learns_nothing_backs_off_and_one_that_learns_does_not() {
+    let db = fresh_db("rotate-backoff");
+    db.mark_org_rotation_pending(ORG).unwrap();
+    assert_eq!(db.list_org_rotations_due().unwrap(), vec![ORG.to_string()]);
+
+    db.record_org_rotation_failure(ORG, "unavailable", false)
+        .unwrap();
+    assert_eq!(db.org_rotation_pending_attempts(ORG).unwrap(), Some(1));
+    assert!(
+        db.list_org_rotations_due().unwrap().is_empty(),
+        "a fruitless attempt must not be re-driven on the very next tick"
+    );
+    assert_eq!(
+        db.list_org_rotations_pending().unwrap(),
+        vec![ORG.to_string()],
+        "backing off must not DROP the debt — the window it protects is the whole point"
+    );
+
+    db.record_org_rotation_failure(ORG, "unavailable", true)
+        .unwrap();
+    assert_eq!(db.org_rotation_pending_attempts(ORG).unwrap(), Some(2));
+    assert_eq!(
+        db.list_org_rotations_due().unwrap(),
+        vec![ORG.to_string()],
+        "an attempt that learned a key is converging and must be retried at once"
+    );
+}
+
+/// Only an owner can rotate. Journaling a debt on a device that can never settle it would leave a
+/// permanent row whose every retry spends key lookups — and the relay answers a non-owner's removal
+/// with a uniform 404 that the client maps to `Ok`, so nothing later in the flow would notice.
+#[tokio::test]
+async fn a_non_owner_removal_is_refused_before_any_debt_is_written() {
+    let state = AppState::for_tests(fresh_db("rotate-non-owner"));
+    seed_live_session(&state);
+    state
+        .db
+        .upsert_org_state(&crate::storage::OrgState {
+            org_id: ORG.into(),
+            name: "Acme".into(),
+            role: "member".into(),
+            joined_at: "2026-07-11T00:00:00Z".into(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+    state.config.lock().unwrap().share_base_url = "http://127.0.0.1:1/".into();
+
+    let err = org_remove_member_inner(&state, ORG.into(), REMOVED_UID.into())
+        .await
+        .expect_err("a member must not be able to drive a removal");
+    assert!(matches!(err, AppError::InvalidArg(_)), "got {err}");
+    assert_eq!(
+        state.db.org_rotation_pending_attempts(ORG).unwrap(),
+        None,
+        "no debt may be written that this device could never settle"
+    );
+}
+
+/// The generation to target is the RELAY's, never this device's cached one.
+///
+/// A device that missed a rotation holds a stale local generation. Aiming at `local + 1` would ask
+/// for a generation the relay already passed, and the monotonic check answers 409 — forever, on
+/// every sweep, with the org never rotating again. Nothing else in this file distinguishes the two
+/// readings, because everywhere else the relay and the local cache happen to agree.
+#[tokio::test]
+async fn the_rotation_targets_the_relay_s_generation_not_the_stale_local_one() {
+    let relay = RotationRelay::start_at_generation(roster(), published_keys(), 3);
+    let state = AppState::for_tests(fresh_db("rotate-stale-local-gen"));
+    wire_state(&state, &relay); // seeds the LOCAL org at generation 1
+    seed_cached_member_key(&state);
+    assert_eq!(state.db.get_org_state(ORG).unwrap().unwrap().generation, 1);
+
+    org_remove_member_inner(&state, ORG.into(), REMOVED_UID.into())
+        .await
+        .expect("a device behind on generations must still be able to rotate");
+
+    assert_eq!(
+        relay.log().bump_body.as_deref(),
+        Some("{\"generation\":4}"),
+        "the bump must follow the RELAY's live generation (3), not the local cache (1)"
+    );
+    assert_eq!(relay.log().committed_generation, Some(4));
+    assert_eq!(
+        relay.granted_at(4).len(),
+        3,
+        "the grants must cover the remaining members at the generation actually being committed"
+    );
+    assert_eq!(state.db.get_org_state(ORG).unwrap().unwrap().generation, 4);
 }
