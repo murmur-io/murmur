@@ -55,7 +55,7 @@ A thin `Open in Murmur` / index-Murmur-notes / insert-`obsidian://`-block-ref pl
 
 ### Not now
 - **The $59 Pro license** — premature at ~20 lifetime downloads; awareness (not monetization) is the constraint, and the twin already owns the one-time-price slot. Ship it once there's a funnel.
-- **Finalize the CLA** — a defensibility/dual-license move (separate from acquisition); Łukasz's ~13 commits need retroactive sign-off.
+- **Finalize the CLA** — a defensibility/dual-license move (separate from acquisition); Lucas's ~13 commits need retroactive sign-off.
 
 ## Also deferred from the code program (honest bar)
 - **The onboarding "capture the whole call" step** (primes the Screen-Recording TCC prompt at setup + the recording-consent/BIPA disclosure) — a fast-follow FE PR; capture-default already degrades gracefully to mic-only without it.
