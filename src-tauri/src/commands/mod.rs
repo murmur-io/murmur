@@ -5959,9 +5959,15 @@ pub(crate) fn rederive_links_for_folder(
             }
             // Fix 4 (brain-v3 audit, INVERSE): re-materialize the `[[Title]]` markers the seal stripped,
             // from the PRESERVED accepted rows (Fix 1) incident on the just-unlocked items, into the
-            // source notes' managed blocks, then re-export those sources' `.md`. A wikilink/manual
-            // marker re-materializes via the source's own body re-index above; an accepted SEMANTIC
-            // marker has no body wikilink to re-derive from, so this explicit re-add restores it.
+            // source notes' managed blocks, then re-export those sources' `.md`. A wikilink marker
+            // re-materializes via the source's own body re-index above; an accepted SEMANTIC marker
+            // has no body wikilink to re-derive from, so this explicit re-add restores it.
+            //
+            // This used to say "wikilink/manual". A manual link has no marker to re-materialize and
+            // no body to re-derive from: `link_items` deliberately stopped writing a `[[Title]]`
+            // block, so the `links` row IS the record. Naming it here made the row's destruction on
+            // seal look recoverable, which is why it went unnoticed that it was not — the row is now
+            // preserved instead (see `LINK_DECISION_KEEP`), and nothing has to be re-materialized.
             match state
                 .db
                 .rematerialize_accepted_markers_for_folder(folder_id, &mids, unlocked)

@@ -1052,7 +1052,8 @@ impl Db {
 
     /// Brain-v3 audit Fix 2 — RE-ASSERT the `companion` edges of a JUST-UNSEALED folder that the seal
     /// purge dropped. A `companion` edge (`note → meeting`, `created_by='user'`) is NOT a preserved
-    /// decision row ([`LINK_DECISION_KEEP`] keeps only dismissed/accepted), and `set_companion_link`
+    /// decision row ([`LINK_DECISION_KEEP`] keeps dismissed tombstones, accepted edges and manual
+    /// links), and `set_companion_link`
     /// only fires at the recording-time write site — so ONE lock cycle permanently deletes it (the
     /// one-time backfill sentinel is spent). This restores both legs in ONE tx on unlock:
     ///
@@ -1627,18 +1628,41 @@ impl Db {
     /// lock→unlock RESURRECTS a dismissed suggestion (the semantic pass re-proposes it) and forgets an
     /// accepted edge, contradicting the spec ("a rejected suggestion never reappears").
     ///
-    /// Two decision classes survive:
+    /// Three decision classes survive:
     ///   - `status='dismissed'` — the tombstone that stops a re-suggest (its `upsert_link_tx`
-    ///     DO-UPDATE guard skips dismissed rows), and
-    ///   - `status='active' AND created_by='accepted'` — a user-CONFIRMED semantic link.
+    ///     DO-UPDATE guard skips dismissed rows),
+    ///   - `status='active' AND created_by='accepted'` — a user-CONFIRMED semantic link, and
+    ///   - `status='active' AND edge_type='manual'` — a link the user MADE.
+    ///
+    /// # Why `manual` had to join them
+    ///
+    /// This list used to end "everything else (wikilink/companion/manual/auto-suggested) is DERIVED
+    /// and re-derivable on unlock, so it is purged". That was true of three of those four and false
+    /// of `manual`, and the sentence is what made the loss look deliberate. A wikilink is re-derived
+    /// by re-indexing the note body; a companion edge from the meeting↔note relation; a semantic
+    /// suggestion by re-running the kNN pass. A manual edge has NO such source:
+    /// `commands::links::link_items` writes the row and DELIBERATELY writes no `[[Title]]` marker
+    /// into the body (that machine block went stale and rendered as junk, so it was removed), which
+    /// its own comment states — "the manual edge is the AUTHORITATIVE record of the link".
+    ///
+    /// So sealing a folder destroyed every hand-made connection touching it, `rederive_links_for_folder`
+    /// brought back only the derivable kinds, and unlocking returned an item with its automatic edges
+    /// intact and the user's own ones gone. Silently: nothing failed, nothing was reported.
+    ///
+    /// The key is `edge_type = 'manual'` and NOT `created_by = 'user'`, though every manual row
+    /// carries both. `created_by='user'` is also written for wikilink and companion edges, and those
+    /// MUST still die on seal — preserving a wikilink across a seal would resurrect a link the user
+    /// had removed from the body while the folder was closed.
     ///
     /// A preserved row carries ONLY ids/kind/edge_type/score inside the SQLCipher DB — NO titles, NO
-    /// plaintext — so keeping it leaks nothing at rest; and the read gate ([`links_for_visible`]) still
-    /// hides it (both-endpoint-gated) while an endpoint is sealed, so only the DECISION STATE survives,
-    /// never its visibility. Everything else (wikilink/companion/manual/auto-suggested) is DERIVED and
-    /// re-derivable on unlock, so it is purged.
-    pub(crate) const LINK_DECISION_KEEP: &'static str =
-        "status = 'dismissed' OR (status = 'active' AND created_by = 'accepted')";
+    /// plaintext — so keeping it leaks nothing at rest; and every reader is both-endpoint-gated, so
+    /// only the DECISION STATE survives, never its visibility: [`links_for_visible`] drops an edge
+    /// whose neighbour is not visible (GATE 2), and the full-brain graph re-checks both endpoints
+    /// against its visible-node set before emitting an edge. Everything genuinely DERIVED
+    /// (wikilink/companion/auto-suggested) is still purged and re-derived on unlock.
+    pub(crate) const LINK_DECISION_KEEP: &'static str = "status = 'dismissed' \
+         OR (status = 'active' AND created_by = 'accepted') \
+         OR (status = 'active' AND edge_type = 'manual')";
 
     fn enqueue_marker_export_cleanup_tx(
         tx: &rusqlite::Transaction<'_>,
@@ -2342,14 +2366,14 @@ impl Db {
 
     /// PURGE every DERIVED link row whose SRC OR DST is a sealed/deleted meeting or document (a note id
     /// IS a `documents` id, so `document_ids` covers the `note` kind too), PRESERVING a user's decision
-    /// rows ([`LINK_DECISION_KEEP`] — dismissed tombstones + accepted edges). Runs INSIDE an existing
+    /// rows ([`LINK_DECISION_KEEP`] — dismissed tombstones, accepted edges, manual links). Runs INSIDE an existing
     /// seal / delete tx so a derived link — which reveals a neighbour's existence + title — never
     /// outlives the plaintext it was derived from. BOTH endpoint kinds for a meeting id are matched
     /// (`src`/`dst`); likewise for a document/note id across `document`/`note` kinds. Re-derived on
     /// unlock. Mirrors the `purge_chunks_tx` / `purge_doc_chunks_tx` choke-point idiom.
     ///
     /// `preserve_decisions`: a SEAL (reversible — the item returns on unlock) passes `true` so a
-    /// user's dismissed/accepted DECISION rows survive ([`LINK_DECISION_KEEP`], Fix 1). A permanent
+    /// user's dismissed/accepted/manual DECISION rows survive ([`LINK_DECISION_KEEP`]). A permanent
     /// DELETE (`delete_meeting`/`delete_document`/the delete-folder derived-doc leg) passes `false` —
     /// the endpoint is gone for good, so leaving a dangling decision row (that a future id reuse could
     /// resurface) would be a bug; purge EVERYTHING incident on it.
