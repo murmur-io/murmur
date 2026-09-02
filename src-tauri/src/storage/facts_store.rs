@@ -568,9 +568,6 @@ impl Db {
         Ok(out)
     }
 
-    /// The persisted `facts.importance` assessments as `(fact_id, importance)` — the reflection
-    /// job's "already assessed" set for ENTITY facts (only never-assessed facts hit the reasoner,
-    /// so steady-state passes are LLM-free). Content-free read (ids + floats).
     // ── The sealed fact ledger ───────────────────────────────────────────────────────────────────
     //
     // A seal DELETES a meeting's facts, user facts and supersessions: their subject/predicate/object
@@ -861,6 +858,9 @@ impl Db {
         Ok(())
     }
 
+    /// The persisted `facts.importance` assessments as `(fact_id, importance)` — the reflection
+    /// job's "already assessed" set for ENTITY facts (only never-assessed facts hit the reasoner,
+    /// so steady-state passes are LLM-free). Content-free read (ids + floats).
     pub fn fact_importance_map(&self) -> Result<std::collections::HashMap<String, f64>> {
         let conn = self.lock();
         let mut stmt = conn
