@@ -2286,6 +2286,44 @@ impl Db {
                last_seq   INTEGER NOT NULL DEFAULT 0,
                generation INTEGER NOT NULL DEFAULT 1
              );
+             -- The org's member identity keys, as this device learned them. PUBLIC key material
+             -- only: `pk_enc`/`pk_sig` are exactly what `POST /v1/keys/lookup` publishes, plus the
+             -- fingerprint the safety-word check already shows the user. No OCK, no private key,
+             -- no note content ever lands here.
+             --
+             -- It exists because rotation needs EVERY remaining member's key at once and the only
+             -- directory is the email-keyed lookup, capped at 20 calls a day against orgs of up to
+             -- 50 members. Learning each key once, at the invite that already looks it up, turns a
+             -- rotation from a burst of quota-limited lookups into a local read.
+             CREATE TABLE IF NOT EXISTS org_member_keys (
+               org_id      TEXT NOT NULL,
+               user_id     TEXT NOT NULL,
+               email       TEXT,
+               pk_enc      BLOB NOT NULL,
+               pk_sig      BLOB NOT NULL,
+               fingerprint TEXT NOT NULL,
+               updated_at  TEXT NOT NULL,
+               PRIMARY KEY (org_id, user_id)
+             );
+             -- One row per org that OWES a key rotation: a member was removed and the new
+             -- generation has not been committed yet. Written BEFORE the removal call, so an
+             -- interruption anywhere after it is re-drivable rather than silently forgotten --
+             -- the difference between a rotation that is merely late and one that never happens,
+             -- leaving the removed member holding a working key. Carries no member identity: the
+             -- row says only that this org owes a rotation; the members list at drive time says to
+             -- whom.
+             CREATE TABLE IF NOT EXISTS org_rotation_pending (
+               org_id          TEXT PRIMARY KEY,
+               requested_at    TEXT NOT NULL,
+               attempts        INTEGER NOT NULL DEFAULT 0,
+               last_error      TEXT,
+               -- When the retry may next run. Without it a debt that can never settle -- a member
+               -- whose account was deactivated while their membership stayed active, say -- is
+               -- re-driven every 60s forever, and each attempt spends one of the owner's 20 daily
+               -- key lookups on the same doomed member. An attempt that LEARNS something resets
+               -- this to now, so a slow-but-progressing rotation is never throttled.
+               next_attempt_at TEXT
+             );
              CREATE TABLE IF NOT EXISTS org_shares (
                id             TEXT PRIMARY KEY,
                org_id         TEXT NOT NULL,

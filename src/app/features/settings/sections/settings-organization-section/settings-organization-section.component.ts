@@ -358,7 +358,16 @@ export class SettingsOrganizationSectionComponent {
     }
   }
 
-  /** Remove a member from the expanded org (owner) — rotates the OCK. Then refresh. */
+  /**
+   * Remove a member from the expanded org (owner). The backend also rotates the org key, and those
+   * two halves can land separately: `org-rotation-pending` means the person IS gone and only the
+   * key rotation is still outstanding.
+   *
+   * So the roster is reloaded on BOTH paths. Reloading only on success left the removed member
+   * listed underneath a message saying they had been removed, and a second click then re-ran the
+   * whole removal against a relay that answers 404-as-success — a redundant rotation driven by a
+   * screen that had not caught up with its own backend.
+   */
   async removeMember(orgId: string, member: OrgMember): Promise<void> {
     if (this._removingId() !== null) {
       return;
@@ -367,11 +376,12 @@ export class SettingsOrganizationSectionComponent {
     this._membersError.set(null);
     try {
       await this.ipc.orgRemoveMember(orgId, member.userId);
-      await this.loadMembers(orgId);
-      this.reload();
+      this._membersError.set(null);
     } catch (e) {
       this._membersError.set(this.errorCopy.humanize(e));
     } finally {
+      await this.loadMembers(orgId).catch(() => undefined);
+      this.reload();
       this._removingId.set(null);
     }
   }

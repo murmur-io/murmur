@@ -14347,6 +14347,12 @@ mod workspace_tree_tests;
 #[path = "tests/org_diagnosability_tests.rs"]
 mod org_diagnosability_tests;
 
+// ── The member-removal key rotation: the JSON body, full member coverage, and the re-drivable debt
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+#[path = "tests/org_rotation_tests.rs"]
+mod org_rotation_tests;
+
 // ── Shared containers: the share plan's leak oracles + the received-forest read model ────────────
 #[cfg(test)]
 #[path = "tests/container_share_tests.rs"]

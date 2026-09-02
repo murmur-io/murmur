@@ -3578,6 +3578,20 @@ pub(crate) async fn org_invite_member_inner(
     // recipient_acct_id = the member's FINGERPRINT (the crypto binding THEY open with via `self_fp` in
     // `acquire_org_ock`); the DB grant key stays their server user id (`added.user_id`).
     let member_fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+    // Remember the key this invite just resolved. A later rotation has to wrap the new OCK for
+    // EVERY remaining member in one pass, and the only directory the relay offers is this same
+    // email-keyed lookup, capped at 20 calls a day against orgs of up to 50 members — so a rotation
+    // that re-looked-up everybody would fail on quota long before it failed on anything interesting.
+    // Remembering it here also means rotation prefers the key this device already saw over whatever
+    // the relay answers later, which is the strictly safer of the two.
+    state.db.upsert_org_member_key(
+        &org.org_id,
+        &added.user_id,
+        Some(&email),
+        &key.pk_enc,
+        &key.pk_sig,
+        &member_fp,
+    )?;
     let grant = crate::e2ee::org::wrap_ock_for_member(
         &ock,
         &org.org_id,
@@ -3678,6 +3692,197 @@ async fn task_org_members_read_with_permit(
     client.org_list_members(access_token, org_id).await
 }
 
+/// Mint a new org content key, wrap it for EVERY remaining active member, and commit the new
+/// generation.
+///
+/// # Why this is a whole function and not three lines inside the removal
+///
+/// The relay enforces the only rule that matters here: `POST /v1/orgs/{id}/generation` succeeds
+/// only when a key grant for the new generation already exists for every member whose `removed_at`
+/// is null, checked inside the same transaction that flips the generation. So a rotation is
+/// all-or-nothing by construction, and a rotation that reaches only the owner is not a partial
+/// success — it is a 409 and no rotation at all.
+///
+/// # Order
+///
+/// The removal MUST already have happened. While the departing member is still active the relay
+/// counts them in the coverage check, so a "rotate first, then remove" ordering could only succeed
+/// by granting the new key to the very person being removed. That is why the caller journals the
+/// debt first and rotates second, rather than the other way round.
+///
+/// # Resolving keys
+///
+/// Each member's public key comes from this device's own `org_member_keys` cache when it has one,
+/// and only otherwise from `POST /v1/keys/lookup` (which is then remembered). Preferring the cached
+/// copy is deliberate: it means a relay cannot substitute a key for a member this device has
+/// already met, and it keeps a 50-member org inside the 20-lookups-a-day quota.
+///
+/// Returns the generation the relay committed.
+/// How many identity lookups one rotation attempt may spend. The relay allows 20 a day per
+/// account against orgs of up to 50 members, so an org invited before member keys were remembered
+/// cannot resolve everyone in one pass. Bounding it per attempt means a first rotation converges
+/// over a few attempts instead of spending the whole day's quota — and leaving none for the
+/// invites and shares the same quota pays for.
+const ROTATION_LOOKUP_BUDGET: usize = 8;
+
+/// What one rotation attempt achieved when it did not finish: whether it LEARNED a key it did not
+/// have. A slow-but-progressing rotation must not be backed off; a doomed one must.
+pub(crate) struct RotationProgress {
+    pub learned_keys: usize,
+}
+
+pub(crate) async fn rotate_org_generation(
+    state: &AppState,
+    org_id: &str,
+    progress: &mut RotationProgress,
+) -> Result<u32, AppError> {
+    let org = resolve_org(state, org_id)?;
+    let base = share_base_url(state)?;
+    let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
+    let server_user_id = session_server_user_id(state)?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // The generation to target is the RELAY's current one, never the local cache: a device that
+    // missed a rotation would otherwise aim at an already-used generation and take a 409 forever.
+    let status = client.org_status(&access_token, &org.org_id).await?;
+    let new_gen = status.current_generation.saturating_add(1);
+
+    let members = client
+        .org_list_members(&access_token, &org.org_id)
+        .await?
+        .members;
+    if members.is_empty() {
+        // The relay refuses a bump for a memberless org anyway; saying so here keeps the failure
+        // legible instead of arriving as an opaque 409.
+        return Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::ORG_ROTATION_PENDING,
+            "org has no active members to rotate to",
+        )));
+    }
+
+    let new_ock = crate::e2ee::org::generate_ock()?;
+    let owner = crate::e2ee::keys::derive_identity(&mk, &account_id, gen_id)?;
+    let owner_fp = crate::e2ee::key_fingerprint(&owner.pk_enc, &owner.pk_sig);
+
+    let mut grants: Vec<crate::share::org_dto::KeyGrantInput> = Vec::with_capacity(members.len());
+    for member in &members {
+        // (pk_enc, recipient fingerprint) for this member. Ours is derived locally; everyone
+        // else's is remembered or, failing that, looked up once and then remembered.
+        let (pk_enc, recipient_fp) = if member.user_id == server_user_id {
+            (owner.pk_enc.to_vec(), owner_fp.clone())
+        } else if let Some(known) = state.db.get_org_member_key(&org.org_id, &member.user_id)? {
+            (known.pk_enc, known.fingerprint)
+        } else {
+            let Some(email) = member.email.as_deref().filter(|e| !e.trim().is_empty()) else {
+                // Without an address there is no directory to ask. Refusing keeps the debt on the
+                // journal instead of committing a generation somebody cannot open.
+                return Err(AppError::Unavailable(crate::errcode::tag(
+                    crate::errcode::ORG_ROTATION_PENDING,
+                    "a remaining member's identity key is unknown and cannot be resolved",
+                )));
+            };
+            if progress.learned_keys >= ROTATION_LOOKUP_BUDGET {
+                return Err(AppError::Unavailable(crate::errcode::tag(
+                    crate::errcode::ORG_ROTATION_PENDING,
+                    "resolved this attempt's share of the remaining members' keys; \
+                     the rotation continues on the next pass",
+                )));
+            }
+            let lookup = client.lookup_key(&access_token, email).await?;
+            let Some(key) = lookup.key.filter(|_| lookup.registered) else {
+                return Err(AppError::Unavailable(crate::errcode::tag(
+                    crate::errcode::ORG_ROTATION_PENDING,
+                    "a remaining member is not a registered account",
+                )));
+            };
+            let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+            state.db.upsert_org_member_key(
+                &org.org_id,
+                &member.user_id,
+                Some(email),
+                &key.pk_enc,
+                &key.pk_sig,
+                &fp,
+            )?;
+            progress.learned_keys += 1;
+            (key.pk_enc, fp)
+        };
+
+        let grant = crate::e2ee::org::wrap_ock_for_member(
+            &new_ock,
+            &org.org_id,
+            new_gen,
+            &pk_enc,
+            // recipient_acct_id = the member's FINGERPRINT, matching what `acquire_org_ock` opens
+            // with as `self_fp`. Keying it on anything else produces a grant nobody can open.
+            &recipient_fp,
+            &owner,
+            &owner_fp,
+            gen_id,
+        )?;
+        grants.push(crate::share::org_dto::KeyGrantInput {
+            user_id: member.user_id.clone(),
+            generation: new_gen,
+            wrapped_key: grant.wrapped_key,
+            grant_sig: grant.grant_sig,
+        });
+    }
+
+    client
+        .org_put_key_grants(&access_token, &org.org_id, grants)
+        .await?;
+    let committed = client
+        .org_bump_generation(&access_token, &org.org_id, new_gen)
+        .await?;
+    if committed != new_gen {
+        // The grants were wrapped for `new_gen`. A relay that committed something else has left a
+        // live generation nobody holds a key for, so record nothing locally and keep the debt.
+        return Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::ORG_ROTATION_PENDING,
+            "the server committed a different generation than the one the grants cover",
+        )));
+    }
+
+    state.db.set_org_generation(&org.org_id, committed)?;
+    // The freshly minted OCK is deliberately NOT cached here. The relay upserts grants, so a second
+    // owner device that PUT its own grants for the same generation between our PUT and our POST
+    // would have its key committed while ours is the one we hold — and everything we then sealed
+    // under this generation would be unreadable to everybody, ourselves included after a restart.
+    // Leaving the cache cold costs one round-trip on next use and makes `acquire_org_ock` fetch and
+    // OPEN the grant the relay actually stored, which is the only copy that can be authoritative.
+    state.db.clear_org_rotation_pending(&org.org_id)?;
+    crate::share::ledger_row(&state.db, &client.host(), "org_rotate_generation", 0);
+    Ok(committed)
+}
+
+/// Re-drive every org that still owes a key rotation. Returns how many settled.
+///
+/// A debt survives a restart on purpose: the window between "member removed" and "new generation
+/// committed" is exactly the window in which anything newly published stays readable with the
+/// removed member's old key, so it must be closed by a retry rather than by the user noticing.
+pub(crate) async fn drive_pending_org_rotations(state: &AppState) -> Result<u32, AppError> {
+    let mut settled = 0u32;
+    for org_id in state.db.list_org_rotations_due()? {
+        let mut progress = RotationProgress { learned_keys: 0 };
+        match rotate_org_generation(state, &org_id, &mut progress).await {
+            Ok(_) => settled = settled.saturating_add(1),
+            Err(e) => {
+                // Keep the debt and record WHICH failure, in the same content-free vocabulary the
+                // org log uses. A rotation that keeps failing for one reason is a different problem
+                // from one that fails for a new reason every time, and the row is the only place
+                // that distinction survives a restart. An attempt that learned a key it did not
+                // have is converging, not stuck, so it keeps its place at the front of the queue.
+                let _ = state.db.record_org_rotation_failure(
+                    &org_id,
+                    &brief_err(&e),
+                    progress.learned_keys > 0,
+                );
+            }
+        }
+    }
+    Ok(settled)
+}
+
 /// `org_remove_member(org_id, user_id)` — owner soft-removes a member from the TARGETED org, then
 /// ROTATES that org's OCK: generate gen N+1, wrap it to every REMAINING member, PUT the grants, and
 /// bump the server generation. The removed member keeps only the old-gen OCK (can't read anything
@@ -3700,72 +3905,58 @@ pub(crate) async fn org_remove_member_inner(
     let user_id = user_id.trim().to_string();
     let org = resolve_org(state, &org_id)?;
     let base = share_base_url(state)?;
-    let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
-    // DB grant key = the owner's server user id (UUID), not the email `account_id`.
-    let server_user_id = session_server_user_id(state)?;
+    let access_token = valid_access_token(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
+
+    // Only an owner can rotate, and the relay answers a non-owner's removal with a uniform 404 that
+    // the client maps to Ok. Journaling first in that case would write a debt no later sweep could
+    // ever settle, and every retry would spend key lookups on it. Refusing here is visible and
+    // self-correcting (a membership refresh fixes a stale role); a permanent silent debt is not.
+    if !org.role.eq_ignore_ascii_case("owner") {
+        return Err(AppError::InvalidArg(
+            "only the organization owner can remove a member".into(),
+        ));
+    }
+
+    // Journal the rotation debt BEFORE asking the relay to remove anybody. Everything after this
+    // point can be interrupted — a dropped connection, a quit, a crash — and the one outcome that
+    // must never happen is a member removed from an org that then stays on the generation their key
+    // still opens. The row is what makes that window closable by a retry instead of by luck. It is
+    // deliberately NOT cleared when the removal itself fails: a failure whose response was lost is
+    // indistinguishable from a success, and a redundant rotation costs one generation while a
+    // skipped one costs the whole point of removing the member.
+    state.db.mark_org_rotation_pending(&org.org_id)?;
 
     client
         .org_remove_member(&access_token, &org.org_id, &user_id)
         .await?;
 
-    // Rotate: new generation = current + 1. The owner generates the new OCK and MUST wrap it to every
-    // REMAINING active member (keyed by their published identity key) before bumping the generation.
-    //
-    // HONEST V1 BOUNDARY: the members endpoint is content-min (user_id/role/created_at only) and there
-    // is no "fetch a member's identity key by user_id" endpoint yet — only the email-keyed
-    // `keys/lookup`. So this v1 rotation re-grants the new OCK to the OWNER (whose key we derive
-    // locally) and bumps the generation; the removed member immediately loses access to anything sealed
-    // under gen N+1. Re-granting to OTHER remaining members needs a by-user_id key-directory read that
-    // the feed-sync slice adds — until then a rotation should be followed by re-inviting the remaining
-    // members (which re-wraps the current-gen OCK to each). This is a documented scope cut, not a leak:
-    // no content is exposed and the removed member is correctly locked out of future items.
-    let new_gen = org.generation.saturating_add(1);
-    let new_ock = crate::e2ee::org::generate_ock()?;
-    let owner = crate::e2ee::keys::derive_identity(&mk, &account_id, gen_id)?;
-    let owner_fp = crate::e2ee::key_fingerprint(&owner.pk_enc, &owner.pk_sig);
+    // Forget the departing member's key so a later re-invite has to learn it afresh rather than
+    // reusing one this device kept while they were outside the org.
+    state.db.forget_org_member_key(&org.org_id, &user_id)?;
 
-    let owner_grant = crate::e2ee::org::wrap_ock_for_member(
-        &new_ock,
-        &org.org_id,
-        new_gen,
-        &owner.pk_enc,
-        &owner_fp, // recipient_acct_id = our FINGERPRINT (matches `acquire_org_ock`'s open)
-        &owner,
-        &owner_fp,
-        gen_id,
-    )?;
-    client
-        .org_put_key_grants(
-            &access_token,
-            &org.org_id,
-            vec![crate::share::org_dto::KeyGrantInput {
-                user_id: server_user_id.clone(),
-                generation: new_gen,
-                wrapped_key: owner_grant.wrapped_key,
-                grant_sig: owner_grant.grant_sig,
-            }],
-        )
-        .await?;
-    // Bump the server generation (monotonic +1) — the server checks grant counts only.
-    client
-        .org_bump_generation(&access_token, &org.org_id)
-        .await?;
-
-    // Update the cached generation + OCK.
-    state.db.set_org_generation(&org.org_id, new_gen)?;
-    {
-        let mut cache = state
-            .org_ock_cache
-            .lock()
-            .map_err(|_| AppError::Storage("org-ock cache mutex poisoned".into()))?;
-        cache.insert(
-            (org.org_id.clone(), new_gen),
-            zeroize::Zeroizing::new(*new_ock),
-        );
-    }
+    // The removal is done and durable at the relay; the ledger records it whether or not the
+    // rotation that follows lands, because it happened.
     crate::share::ledger_row(&state.db, &client.host(), "org_remove_member", 0);
-    Ok(())
+
+    let mut progress = RotationProgress { learned_keys: 0 };
+    match rotate_org_generation(state, &org.org_id, &mut progress).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let _ = state.db.record_org_rotation_failure(
+                &org.org_id,
+                &brief_err(&e),
+                progress.learned_keys > 0,
+            );
+            // NOT a removal failure — saying so would invite the user to remove somebody who is
+            // already gone. This names the half that is outstanding, and the copy for the code says
+            // what it means for them: new posts stay readable with the old key until it lands.
+            Err(AppError::Unavailable(crate::errcode::tag(
+                crate::errcode::ORG_ROTATION_PENDING,
+                "member removed; the key rotation did not complete and will be retried",
+            )))
+        }
+    }
 }
 
 /// `org_leave(org_id)` — the caller leaves the TARGETED org (member self-removal). Drops that org's
@@ -9506,6 +9697,19 @@ async fn org_sweep_pending_with_policy(
     }
     let client = crate::share::client::ShareClient::new(&base)?;
     let direct_actor_user_id = Some(authenticated_actor_user_id);
+
+    // 0b-rot) OWED KEY ROTATIONS, first of the network passes. A member was removed and the new
+    // generation never committed, so until this settles anything published into that org is still
+    // readable with the key the removed member holds. That makes it the most time-critical debt in
+    // the sweep, ahead of any publish or access reconcile — a late publish is an inconvenience, a
+    // late rotation is the removal not having happened in the way the user was told it had.
+    // Failures leave the row in place (with its reason recorded) for the next sweep.
+    if !state.db.list_org_rotations_due()?.is_empty() {
+        advanced = advanced.saturating_add(drive_pending_org_rotations(state).await?);
+        if !policy.is_current() {
+            return Ok(advanced);
+        }
+    }
 
     // 0c) Initial stable POST ambiguity is resolved from its pre-dispatch witness before any source
     // reread. Never overwrite the committed hash with a newer local edit and never redispatch while

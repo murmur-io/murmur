@@ -106,6 +106,27 @@ pub struct OrgMembersResponse {
     pub members: Vec<OrgMemberEntry>,
 }
 
+/// `POST /v1/orgs/{id}/generation {generation}` — bump the org's live OCK generation.
+///
+/// The body is NOT optional. The server extracts it with axum's `Json`, which rejects a request
+/// carrying no `Content-Type: application/json` with **415 before the handler runs** — so a
+/// body-less POST here never reached the owner check, let alone the rotation. That was the whole
+/// of the dead-rotation defect: every member removal ended in a refusal the user could not act on,
+/// and the org stayed on the generation the removed member still held a key for.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BumpGenerationRequest {
+    /// MUST equal the server's `current_generation + 1`; anything else is a content-free 409.
+    pub generation: u32,
+}
+
+/// Response to a successful bump: the org's new live generation, as the server recorded it.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BumpGenerationResponse {
+    pub current_generation: u32,
+}
+
 /// `PUT /v1/orgs/{id}/key-grants` — upload/replace opaque wrapped-OCK grants for a generation.
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]

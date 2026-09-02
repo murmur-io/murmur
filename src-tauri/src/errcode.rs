@@ -171,6 +171,15 @@ pub const CONTAINER_UNAVAILABLE: &str = "container-unavailable";
 /// wedged holder left "Loading organizations…" on screen until the app was restarted.
 pub const SHARE_BUSY: &str = "share-busy";
 
+/// A member was removed, but the key rotation that must follow did not complete.
+///
+/// The removal itself SUCCEEDED — this is not a failed operation, it is a half-finished one, and
+/// saying "couldn't remove them" would be a lie that invites the user to try again on a member who
+/// is already gone. The org still owes a new generation, the debt is journaled in
+/// `org_rotation_pending`, and the org sync tick re-drives it. Until it lands, anything published
+/// stays readable to the removed member's old key.
+pub const ORG_ROTATION_PENDING: &str = "org-rotation-pending";
+
 /// Every code this crate emits, in declaration order. The frontend's allowlist mirrors it;
 /// `error_codes_are_unique_and_kebab_case` keeps the shape a machine can rely on.
 pub const ALL: &[&str] = &[
@@ -207,6 +216,7 @@ pub const ALL: &[&str] = &[
     FOLDER_CLOSING,
     SHARE_BUSY,
     CONTAINER_UNAVAILABLE,
+    ORG_ROTATION_PENDING,
 ];
 
 #[cfg(test)]
@@ -305,6 +315,10 @@ mod tests {
             // Added 2026-09-01 with the bounded org-refresh wait. See `SHARE_BUSY`.
             "share-busy",
             "container-unavailable",
+            // Added 2026-09-02 with the member-removal key rotation. See `ORG_ROTATION_PENDING`:
+            // the removal succeeded and the rotation is owed, which is a different sentence from
+            // any existing failure code and the only one that must not read as "try again".
+            "org-rotation-pending",
         ];
         assert_eq!(ALL, expected);
     }
