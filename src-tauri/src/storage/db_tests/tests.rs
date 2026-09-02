@@ -13063,10 +13063,19 @@ fn links_for_visible_non_manual_pair_not_flagged() {
     );
 }
 
-/// PURGE-ON-SEAL is edge-type-AGNOSTIC: a `manual` edge is dropped at rest exactly like a
-/// wikilink when either endpoint's folder is sealed (the `purge_links_tx` leg on relock reblank).
+/// PURGE-ON-SEAL is NOT edge-type-agnostic, and this test used to say it was.
+///
+/// It pinned the behaviour that sealing a folder destroys every `manual` edge touching it, and by
+/// pinning it made the loss look deliberate. It is not survivable: a manual edge is the ONLY record
+/// of a link the user made by hand — `link_items` writes the row and no body marker — so nothing
+/// re-derives it on unlock. Locking a folder for an afternoon silently deleted the connections the
+/// user built, and returned the automatic ones.
+///
+/// What must hold instead, and what this test now checks: the row SURVIVES the seal at rest, stays
+/// INVISIBLE through the gated reader from the still-open side while the neighbour is sealed, and is
+/// visible again once the folder is unlocked. Only the decision survives, never its visibility.
 #[test]
-fn purge_links_tx_drops_manual_on_seal() {
+fn a_manual_link_survives_a_seal_at_rest_but_stays_invisible_until_unlock() {
     let db = mem_db();
     seed_folder(&db, "f-open", "Open");
     seed_folder(&db, "f-secret", "Secret");
@@ -13075,11 +13084,7 @@ fn purge_links_tx_drops_manual_on_seal() {
 
     db.upsert_manual_link("note", "open", "note", "secret")
         .unwrap();
-    assert_eq!(
-        link_count(&db, "note", "secret", "manual"),
-        1,
-        "manual edge exists pre-seal"
-    );
+    assert_eq!(link_count(&db, "note", "secret", "manual"), 1);
 
     // Seal the SECRET folder and run the relock reblank (carries the `purge_links_tx` leg).
     db.set_folder_locked("f-secret", true, None).unwrap();
@@ -13087,16 +13092,139 @@ fn purge_links_tx_drops_manual_on_seal() {
     folders.insert("f-secret".to_string());
     db.blank_sealed_notes_in_folders(&folders).unwrap();
 
-    // The manual row is GONE at rest — both directions (the sealed dst side and the open src side).
+    // AT REST: the user's decision is still on the books. It carries ids only — no title, no body.
     assert_eq!(
         link_count(&db, "note", "secret", "manual"),
-        0,
-        "sealed endpoint's manual edge purged (dst side)"
+        1,
+        "a hand-made link is not derivable from anything else, so the seal must not destroy it"
     );
+
+    // THROUGH THE GATE: from the still-open side the sealed neighbour is not disclosed at all —
+    // neither its title nor the fact that an edge reaches it.
+    let sealed = HashSet::new();
+    let edges = db
+        .links_for_visible(crate::links::LinkKind::Note, "open", &sealed)
+        .unwrap();
+    assert!(
+        !edges.iter().any(|e| e.other_id == "secret"),
+        "the preserved row must stay invisible while its neighbour is sealed — got {edges:?}"
+    );
+
+    // UNLOCKED: the same edge the user made is back, unchanged.
+    db.set_folder_locked("f-secret", false, None).unwrap();
+    let mut unlocked = HashSet::new();
+    unlocked.insert("f-secret".to_string());
+    let edges = db
+        .links_for_visible(crate::links::LinkKind::Note, "open", &unlocked)
+        .unwrap();
+    let restored = edges
+        .iter()
+        .find(|e| e.other_id == "secret")
+        .expect("the manual link must be visible again after unlock");
+    assert_eq!(restored.edge_type, "manual");
+    assert!(restored.manual, "and it must still read as a removable link");
+}
+
+/// The invisibility above is checked from the OPEN side; this checks the other three surfaces a
+/// preserved row could escape through, because "the row survives" and "the row is hidden" are
+/// separate properties and only the first is obvious from the constant.
+#[test]
+fn a_preserved_manual_link_is_hidden_from_the_sealed_side_and_from_the_graph() {
+    let db = mem_db();
+    seed_folder(&db, "f-open", "Open");
+    seed_folder(&db, "f-secret", "Secret");
+    seed_note_doc(&db, "open", "f-open", "Open Note", "");
+    seed_note_doc(&db, "secret", "f-secret", "Secret Note", "");
+    db.upsert_manual_link("note", "open", "note", "secret")
+        .unwrap();
+
+    db.set_folder_locked("f-secret", true, None).unwrap();
+    let mut folders = HashSet::new();
+    folders.insert("f-secret".to_string());
+    db.blank_sealed_notes_in_folders(&folders).unwrap();
+    let sealed = HashSet::new();
+
+    // The SEALED side answers nothing at all — GATE 1 refuses before any edge is considered, so the
+    // open neighbour's id never appears either.
+    assert!(
+        db.links_for_visible(crate::links::LinkKind::Note, "secret", &sealed)
+            .unwrap()
+            .is_empty(),
+        "querying the sealed item itself must disclose no edges"
+    );
+
+    // The full-brain graph reads `links` raw and filters in the caller, so it is the surface where a
+    // preserved row is most likely to escape. No node for the sealed note, and no edge touching it.
+    let graph = db
+        .build_full_graph(&sealed, crate::storage::models::FullGraphOpts::default())
+        .unwrap();
+    assert!(
+        !graph.nodes.iter().any(|n| n.id == "secret"),
+        "the sealed note must not be a graph node"
+    );
+    assert!(
+        !graph
+            .edges
+            .iter()
+            .any(|e| e.src == "secret" || e.dst == "secret"),
+        "no edge may touch the sealed note — got {:?}",
+        graph.edges
+    );
+}
+
+/// The other three edge kinds are genuinely derived, so the seal must STILL purge them — otherwise a
+/// wikilink the user deleted from a note body while the folder was closed would come back on unlock.
+/// This is the control that keeps the fix above from widening into "seals stop purging links".
+#[test]
+fn a_seal_still_purges_the_derived_edge_kinds() {
+    let db = mem_db();
+    seed_folder(&db, "f-open", "Open");
+    seed_folder(&db, "f-secret", "Secret");
+    seed_note_doc(&db, "open", "f-open", "Open Note", "links [[Secret Note]]");
+    seed_note_doc(&db, "secret", "f-secret", "Secret Note", "body");
+
+    let nothing = HashSet::new();
+    db.index_wikilinks_for_source(
+        crate::links::LinkKind::Note,
+        "open",
+        "links [[Secret Note]]",
+        &nothing,
+    )
+    .unwrap();
+    assert_eq!(link_count(&db, "note", "open", "wikilink"), 1);
+
+    db.set_folder_locked("f-secret", true, None).unwrap();
+    let mut folders = HashSet::new();
+    folders.insert("f-secret".to_string());
+    db.blank_sealed_notes_in_folders(&folders).unwrap();
+
     assert_eq!(
-        link_count(&db, "note", "open", "manual"),
+        link_count(&db, "note", "open", "wikilink"),
         0,
-        "open source's manual edge to the sealed note purged (src side)"
+        "a wikilink is re-derived from the body on unlock, so it must not be preserved"
+    );
+
+    // Companion is the other `created_by='user'` derived kind, and the one that would silently ride
+    // along if the preserved class were ever keyed on `created_by` instead of `edge_type`.
+    let db2 = mem_db();
+    seed_folder(&db2, "f-locked", "Secret");
+    db2.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+        .unwrap();
+    note_for(&db2, "m1", "claude_code", "meeting note body");
+    db2.set_note_folder("m1", Some("f-locked")).unwrap();
+    seed_note_doc(&db2, "companion", "f-locked", "Companion", "typed notes");
+    db2.set_document_meeting_id("companion", "m1").unwrap();
+    db2.set_companion_link("companion", "m1").unwrap();
+    assert_eq!(link_count(&db2, "meeting", "m1", "companion"), 1);
+
+    db2.set_folder_locked("f-locked", true, None).unwrap();
+    let mut folders2 = HashSet::new();
+    folders2.insert("f-locked".to_string());
+    db2.blank_sealed_notes_in_folders(&folders2).unwrap();
+    assert_eq!(
+        link_count(&db2, "meeting", "m1", "companion"),
+        0,
+        "a companion edge is structural and re-derived on unlock — it must not be preserved"
     );
 }
 

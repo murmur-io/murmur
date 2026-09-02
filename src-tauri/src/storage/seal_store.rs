@@ -944,7 +944,7 @@ impl Db {
         // id, so the document leg's `IN ('note','document')` covers both kinds.
         //
         // Brain-v3 audit Fix 1: PRESERVE a user's decision rows (`LINK_DECISION_KEEP` — dismissed
-        // tombstones + accepted edges) across this reconcile, mirroring `purge_links_tx`, so a restart
+        // tombstones, accepted edges and manual links) across this reconcile, mirroring `purge_links_tx`, so a restart
         // (like a lock→unlock) never resurrects a dismissed suggestion or forgets an accepted edge.
         // These rows carry ids/kind/edge_type/score only — no titles/plaintext — and stay invisible
         // via the both-endpoint read gate while an endpoint is sealed.

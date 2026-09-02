@@ -136,16 +136,12 @@ pub(crate) fn accept_link_inner(state: &AppState, id: i64) -> Result<(), AppErro
         else {
             return Err(AppError::InvalidArg(format!("no link {id}")));
         };
-        // ── Fix 5 (brain-v3 audit): accept is ONLY for an unconfirmed SUGGESTION. Refuse anything else
-        //    (a deterministic wikilink/companion, an already-active manual/accepted, or a dismissed
-        //    tombstone) — "accepting" those is meaningless and would let a caller flip arbitrary rows. ──
-        if !(et == "semantic" && status == "suggested") {
-            return Err(AppError::InvalidArg(format!(
-                "link {id} is not an acceptable suggestion (edge_type={et}, status={status})"
-            )));
-        }
-        // ── GATE both endpoints BEFORE flipping the row (never accept behind a lock, never reveal a
-        //    locked neighbour by activating an edge to it). Fail-closed on a sealed/unknown endpoint. ──
+        // ── GATE both endpoints FIRST — before the row is described back to the caller. The type
+        //    refusal below names `edge_type` and `status`, so running it first answered "this id is
+        //    an active manual edge" for a row whose endpoint is sealed. That mattered little while a
+        //    seal purged manual rows outright; now that a manual decision SURVIVES a seal, the ids
+        //    outlive the lock and the ordering becomes the difference between a probe that answers
+        //    and one that refuses. Fail-closed on a sealed/unknown endpoint. ──
         let (Some(sk), Some(dk)) = (
             crate::links::LinkKind::parse(&src_kind),
             crate::links::LinkKind::parse(&dst_kind),
@@ -160,6 +156,14 @@ pub(crate) fn accept_link_inner(state: &AppState, id: i64) -> Result<(), AppErro
             return Err(AppError::Locked(
                 "one of these items is locked — unlock it to accept the link".into(),
             ));
+        }
+        // ── Fix 5 (brain-v3 audit): accept is ONLY for an unconfirmed SUGGESTION. Refuse anything else
+        //    (a deterministic wikilink/companion, an already-active manual/accepted, or a dismissed
+        //    tombstone) — "accepting" those is meaningless and would let a caller flip arbitrary rows. ──
+        if !(et == "semantic" && status == "suggested") {
+            return Err(AppError::InvalidArg(format!(
+                "link {id} is not an acceptable suggestion (edge_type={et}, status={status})"
+            )));
         }
         // Flip the row active — that edge is the AUTHORITATIVE link. The accept is GRAPH-ONLY: we do
         // NOT materialize the neighbour's `[[Title]]` / `murmur:links` block into any note body (that
@@ -192,15 +196,8 @@ pub(crate) fn dismiss_link_inner(state: &AppState, id: i64) -> Result<(), AppErr
     let Some((src_kind, src_id, dst_kind, dst_id, et, _status)) = state.db.link_by_id(id)? else {
         return Err(AppError::InvalidArg(format!("no link {id}")));
     };
-    // Only a suggestion (semantic) or an accepted-then-regretted semantic edge is dismissable. A
-    // deterministic wikilink/companion edge is NOT (it would just come back); a manual edge is
-    // removed by `unlink_items`. Refuse the rest with a clear InvalidArg.
-    if et != "semantic" {
-        return Err(AppError::InvalidArg(format!(
-            "link {id} is a deterministic {et} edge — dismissal is for semantic suggestions (remove a manual link via unlink)"
-        )));
-    }
-    // ── GATE both endpoints (fail-closed on a sealed/unknown endpoint). ──
+    // ── GATE both endpoints FIRST, for the reason spelled out in `accept_link_inner`: the type
+    //    refusal below names `edge_type`, and preserved manual rows now outlive a seal. ──
     let (Some(sk), Some(dk)) = (
         crate::links::LinkKind::parse(&src_kind),
         crate::links::LinkKind::parse(&dst_kind),
@@ -215,6 +212,14 @@ pub(crate) fn dismiss_link_inner(state: &AppState, id: i64) -> Result<(), AppErr
         return Err(AppError::Locked(
             "one of these items is locked — unlock it to dismiss the suggestion".into(),
         ));
+    }
+    // Only a suggestion (semantic) or an accepted-then-regretted semantic edge is dismissable. A
+    // deterministic wikilink/companion edge is NOT (it would just come back); a manual edge is
+    // removed by `unlink_items`. Refuse the rest with a clear InvalidArg.
+    if et != "semantic" {
+        return Err(AppError::InvalidArg(format!(
+            "link {id} is a deterministic {et} edge — dismissal is for semantic suggestions (remove a manual link via unlink)"
+        )));
     }
     state.db.dismiss_link(id)?;
     tracing::info!(target: "links", link_id = id, "dismiss_link");
