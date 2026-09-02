@@ -1974,6 +1974,51 @@ pub struct OrgMemberKey {
     pub updated_at: String,
 }
 
+/// One `supersessions` row, in the shape the sealed ledger round-trips.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SealedSupersession {
+    pub id: String,
+    pub superseding_meeting_id: String,
+    pub source_meeting_id: String,
+    pub entity: String,
+    pub predicate: String,
+    pub old_value: String,
+    pub new_value: String,
+    pub created_at: String,
+    pub applied_at: Option<String>,
+    pub source_pre_image: Option<Vec<u8>>,
+    pub superseding_pre_image: Option<Vec<u8>>,
+}
+
+/// One meeting's whole fact ledger — what a seal encrypts and an unlock puts back.
+///
+/// Serialized as JSON and sealed under the folder content key, exactly like the note markdown and
+/// the timeline. The rows themselves still leave the database on seal, so the at-rest guarantee is
+/// unchanged; what changes is that the seal is now reversible, as every other piece of user content
+/// in a locked folder already was.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SealedFactLedger {
+    pub facts: Vec<crate::facts::Fact>,
+    /// `facts.importance` per fact id. It lives on the ROW but not on `crate::facts::Fact`, and
+    /// leaving it out would have made "restored identical" quietly false for the one column the
+    /// reflection pass reads to decide what is worth revisiting — it would silently re-assess every
+    /// restored fact through the reasoner.
+    #[serde(default)]
+    pub fact_importance: Vec<(String, f64)>,
+    /// User-scoped facts live in their own table with no entity; `Fact::entity_id` is empty for
+    /// these and is never written back into `facts`.
+    pub user_facts: Vec<crate::facts::Fact>,
+    pub supersessions: Vec<SealedSupersession>,
+}
+
+impl SealedFactLedger {
+    /// Nothing to seal — used to skip a meeting that never had a ledger rather than storing an
+    /// empty ciphertext for it.
+    pub fn is_empty(&self) -> bool {
+        self.facts.is_empty() && self.user_facts.is_empty() && self.supersessions.is_empty()
+    }
+}
+
 /// M6 Shared Brain — one row of the outbound org-share state machine (`org_shares`). Anchors on a
 /// local `meeting_id` XOR `document_id`; carries the item kind, the content-hash dedup key, the
 /// server `item_id` once published, and the current `state`. NO note title/body/OCK.

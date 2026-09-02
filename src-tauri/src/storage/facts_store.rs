@@ -571,6 +571,296 @@ impl Db {
     /// The persisted `facts.importance` assessments as `(fact_id, importance)` — the reflection
     /// job's "already assessed" set for ENTITY facts (only never-assessed facts hit the reasoner,
     /// so steady-state passes are LLM-free). Content-free read (ids + floats).
+    // ── The sealed fact ledger ───────────────────────────────────────────────────────────────────
+    //
+    // A seal DELETES a meeting's facts, user facts and supersessions: their subject/predicate/object
+    // are plaintext derived from the meeting. That part is right and stays. What was missing is the
+    // other half of the contract every other piece of user content already has — the ciphertext that
+    // lets an unlock put it back. Re-extraction is not a substitute: it needs a provider call, and it
+    // cannot reconstruct `valid_from`/`valid_to` or the supersession chain, because nothing in the
+    // current note text records when a fact STOPPED being true.
+
+    /// Every ledger row anchored on `meeting_id`, in a form that round-trips through a seal.
+    /// Reads the raw tables directly — the caller is the seal, which runs while the folder is still
+    /// readable and is the one place that must see rows a gated reader would hide.
+    pub fn raw_fact_ledger_for_meeting(&self, meeting_id: &str) -> Result<crate::storage::SealedFactLedger> {
+        let conn = self.lock();
+        let mut facts = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, entity_id, subject, predicate, object, valid_from, valid_to,
+                            recorded_at, meeting_id, confidence
+                       FROM facts WHERE meeting_id = ?1 ORDER BY id",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![meeting_id], |r| {
+                    Ok(crate::facts::Fact {
+                        id: r.get(0)?,
+                        entity_id: r.get(1)?,
+                        subject: r.get(2)?,
+                        predicate: r.get(3)?,
+                        object: r.get(4)?,
+                        valid_from: r.get(5)?,
+                        valid_to: r.get(6)?,
+                        recorded_at: r.get(7)?,
+                        meeting_id: r.get(8)?,
+                        confidence: r.get(9)?,
+                    })
+                })
+                .map_err(map_err)?;
+            for row in rows {
+                facts.push(row.map_err(map_err)?);
+            }
+        }
+        let mut user_facts = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, subject, predicate, object, valid_from, valid_to, recorded_at,
+                            meeting_id, confidence
+                       FROM user_facts WHERE meeting_id = ?1 ORDER BY id",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![meeting_id], |r| {
+                    Ok(crate::facts::Fact {
+                        id: r.get(0)?,
+                        // A user fact has no entity; the empty id keeps ONE serialized shape for
+                        // both tables and is never written back into `facts`.
+                        entity_id: String::new(),
+                        subject: r.get(1)?,
+                        predicate: r.get(2)?,
+                        object: r.get(3)?,
+                        valid_from: r.get(4)?,
+                        valid_to: r.get(5)?,
+                        recorded_at: r.get(6)?,
+                        meeting_id: r.get(7)?,
+                        confidence: r.get(8)?,
+                    })
+                })
+                .map_err(map_err)?;
+            for row in rows {
+                user_facts.push(row.map_err(map_err)?);
+            }
+        }
+        let mut supersessions = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, superseding_meeting_id, source_meeting_id, entity, predicate,
+                            old_value, new_value, created_at, applied_at, source_pre_image,
+                            superseding_pre_image
+                       FROM supersessions
+                      WHERE superseding_meeting_id = ?1 OR source_meeting_id = ?1
+                      ORDER BY id",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![meeting_id], |r| {
+                    Ok(crate::storage::SealedSupersession {
+                        id: r.get(0)?,
+                        superseding_meeting_id: r.get(1)?,
+                        source_meeting_id: r.get(2)?,
+                        entity: r.get(3)?,
+                        predicate: r.get(4)?,
+                        old_value: r.get(5)?,
+                        new_value: r.get(6)?,
+                        created_at: r.get(7)?,
+                        applied_at: r.get(8)?,
+                        source_pre_image: r.get(9)?,
+                        superseding_pre_image: r.get(10)?,
+                    })
+                })
+                .map_err(map_err)?;
+            for row in rows {
+                supersessions.push(row.map_err(map_err)?);
+            }
+        }
+        let mut fact_importance = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, importance FROM facts
+                      WHERE meeting_id = ?1 AND importance IS NOT NULL ORDER BY id",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![meeting_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+                })
+                .map_err(map_err)?;
+            for row in rows {
+                fact_importance.push(row.map_err(map_err)?);
+            }
+        }
+        Ok(crate::storage::SealedFactLedger {
+            facts,
+            fact_importance,
+            user_facts,
+            supersessions,
+        })
+    }
+
+    /// Store the ciphertext of a meeting's ledger. The caller has already proven it decrypts back
+    /// byte-identical; this only records it, and the rows are deleted by the seal's own purge.
+    pub fn seal_fact_ledger(&self, meeting_id: &str, data_blob: &[u8]) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO sealed_fact_ledgers (meeting_id, data_blob, sealed_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(meeting_id) DO UPDATE SET
+               data_blob = excluded.data_blob, sealed_at = excluded.sealed_at",
+            rusqlite::params![
+                meeting_id,
+                data_blob,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The stored ciphertext for a meeting's ledger, if it has ever been sealed.
+    pub fn fact_ledger_blob(&self, meeting_id: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT data_blob FROM sealed_fact_ledgers WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Put a decrypted ledger back. One transaction, and `INSERT OR IGNORE` throughout: a session
+    /// unlock may run against rows that a concurrent re-extraction already re-created, and a restore
+    /// must never overwrite a fresher row with the snapshot taken before the seal.
+    pub fn restore_fact_ledger(
+        &self,
+        meeting_id: &str,
+        ledger: &crate::storage::SealedFactLedger,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        for f in &ledger.facts {
+            // The entity FK is `ON DELETE CASCADE`, and SQLite's ON CONFLICT clause does not apply
+            // to foreign keys — a fact whose entity is gone would fail the WHOLE transaction and
+            // make the unlock impossible, every time. Skipping it keeps the unlock working; the
+            // fact is unreachable anyway without its entity.
+            tx.execute(
+                "INSERT OR IGNORE INTO facts
+                   (id, entity_id, subject, predicate, object, valid_from, valid_to, recorded_at,
+                    meeting_id, confidence)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                  WHERE EXISTS (SELECT 1 FROM entities WHERE id = ?2)",
+                rusqlite::params![
+                    f.id,
+                    f.entity_id,
+                    f.subject,
+                    f.predicate,
+                    f.object,
+                    f.valid_from,
+                    f.valid_to,
+                    f.recorded_at,
+                    f.meeting_id,
+                    f.confidence
+                ],
+            )
+            .map_err(map_err)?;
+        }
+        for f in &ledger.user_facts {
+            tx.execute(
+                "INSERT OR IGNORE INTO user_facts
+                   (id, subject, predicate, object, valid_from, valid_to, recorded_at, meeting_id,
+                    confidence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    f.id,
+                    f.subject,
+                    f.predicate,
+                    f.object,
+                    f.valid_from,
+                    f.valid_to,
+                    f.recorded_at,
+                    f.meeting_id,
+                    f.confidence
+                ],
+            )
+            .map_err(map_err)?;
+        }
+        for (fact_id, importance) in &ledger.fact_importance {
+            tx.execute(
+                "UPDATE facts SET importance = ?2 WHERE id = ?1",
+                rusqlite::params![fact_id, importance],
+            )
+            .map_err(map_err)?;
+        }
+        for s in &ledger.supersessions {
+            // A supersession spans TWO meetings, and its old/new values plus its note pre-images are
+            // plaintext from both. Restoring it because THIS meeting was unlocked would put the
+            // other one's content back into a live table while its folder is still sealed — the
+            // exact thing purge-on-seal exists to prevent. Fail closed: the row waits until the
+            // other anchor is readable too, and the ciphertext still holds it.
+            let other = if s.superseding_meeting_id == meeting_id {
+                &s.source_meeting_id
+            } else {
+                &s.superseding_meeting_id
+            };
+            if other != meeting_id {
+                // Gone, not merely sealed: `supersessions` carries no foreign key, so a row whose
+                // other anchor was deleted while this folder sat locked would come back pointing at
+                // a meeting that no longer exists.
+                let other_exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1)",
+                        rusqlite::params![other],
+                        |r| Ok(r.get::<_, i64>(0)? != 0),
+                    )
+                    .map_err(map_err)?;
+                if !other_exists
+                    || crate::storage::links::meeting_sealed_at_rest_tx(&tx, other)?
+                {
+                    continue;
+                }
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO supersessions
+                   (id, superseding_meeting_id, source_meeting_id, entity, predicate, old_value,
+                    new_value, created_at, applied_at, source_pre_image, superseding_pre_image)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    s.id,
+                    s.superseding_meeting_id,
+                    s.source_meeting_id,
+                    s.entity,
+                    s.predicate,
+                    s.old_value,
+                    s.new_value,
+                    s.created_at,
+                    s.applied_at,
+                    s.source_pre_image,
+                    s.superseding_pre_image
+                ],
+            )
+            .map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Drop the stored ciphertext (permanent remove-lock: the plaintext rows are back for good).
+    pub fn clear_fact_ledger_blob(&self, meeting_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM sealed_fact_ledgers WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     pub fn fact_importance_map(&self) -> Result<std::collections::HashMap<String, f64>> {
         let conn = self.lock();
         let mut stmt = conn

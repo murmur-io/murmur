@@ -1316,6 +1316,21 @@ pub(crate) fn relock_folder_inner_with_visibility_notice(
     enqueue_marker_cleanup_for_folders(state, &sealed)?;
     // The re-blank tx also purges ALL memory rollups (may paraphrase the re-sealed facts) and
     // returns their exported vault paths — the files are removed here (command layer).
+    // FACT LEDGER, RE-SEALED BEFORE THE PURGE. `blank_sealed_notes_in_folders` deletes facts, user
+    // facts and supersessions, and on a RELOCK those rows are whatever the unlocked session ended
+    // with — restored ones plus anything extracted while the folder was open. Sealing after that
+    // call would encrypt nothing and leave the session's additions destroyed, so it happens here,
+    // with the content key the preflight already verified. A folder whose key could not be verified
+    // is skipped HERE — its ledger is not re-sealed — but the purge below still runs for it, so this
+    // is not a guarantee that its facts survive; it is only a refusal to encrypt under a key nobody
+    // proved. In practice that folder has no live plaintext left for the key to be missing over.
+    for (id, verified) in &verified_plans {
+        if let Some(ck) = verified.ck() {
+            for mid in state.db.meeting_ids_in_folder(id)? {
+                crate::commands::seal_fact_ledger_for_meeting(&state.db, id, &mid, ck)?;
+            }
+        }
+    }
     remove_rollup_exports_before_seal_purge(&state.db)?;
     let rollup_exports = state.db.blank_sealed_notes_in_folders(&sealed)?;
     remove_rollup_export_files(&rollup_exports);
@@ -1470,6 +1485,21 @@ pub(crate) fn relock_all_inner_with_visibility_notice(
     // folder that was materialized while this folder was session-unlocked) + re-export those sources'
     // `.md`. Resolve the relocked folders' meeting + document ids first.
     enqueue_marker_cleanup_for_folders(state, &locked)?;
+    // FACT LEDGER, RE-SEALED BEFORE THE PURGE. `blank_sealed_notes_in_folders` deletes facts, user
+    // facts and supersessions, and on a RELOCK those rows are whatever the unlocked session ended
+    // with — restored ones plus anything extracted while the folder was open. Sealing after that
+    // call would encrypt nothing and leave the session's additions destroyed, so it happens here,
+    // with the content key the preflight already verified. A folder whose key could not be verified
+    // is skipped HERE — its ledger is not re-sealed — but the purge below still runs for it, so this
+    // is not a guarantee that its facts survive; it is only a refusal to encrypt under a key nobody
+    // proved. In practice that folder has no live plaintext left for the key to be missing over.
+    for (folder_id, verified) in &verified_relocks {
+        if let Some(ck) = verified.ck() {
+            for mid in state.db.meeting_ids_in_folder(folder_id)? {
+                crate::commands::seal_fact_ledger_for_meeting(&state.db, folder_id, &mid, ck)?;
+            }
+        }
+    }
     remove_rollup_exports_before_seal_purge(&state.db)?;
     let rollup_exports = state.db.blank_sealed_notes_in_folders(&locked)?;
     remove_rollup_export_files(&rollup_exports);
