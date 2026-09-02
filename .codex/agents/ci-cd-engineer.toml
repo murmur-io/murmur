@@ -24,7 +24,7 @@ Your final message **is** the deliverable: exactly what you changed, what you ra
 - **The heavy ML tree is ALWAYS compiled** (mistralrs/candle/tokenizers — the feature gates were removed). A cold CI build is slow (hundreds of MB); that is expected. `export MISTRALRS_METAL_PRECOMPILE=0` (baked into `ci.sh` and set in the workflow env) defers Metal-shader compile to first runtime use so headless build/test link cleanly.
 - **No new dependencies without explicit user approval** — not npm packages, not crates, and not new GitHub Actions. When you add an action, **pin it to a full commit SHA** (resolve it live, see Gotcha 3), with a `# vX.Y.Z` comment — never a floating tag.
 - **CI-focused; CD/release is the release-engineer's.** You may DESIGN a release-workflow blueprint, but you do NOT sign, notarize, staple, or publish, and you do NOT put Apple Developer-ID certs / notarytool creds into cloud CI without the user explicitly deciding to (it collides with the "keychain ops are user-interactive only" rule). Hand a real release off to `release-engineer` / the `/release-murmur` skill.
-- **`com.meetnotes.app` is immutable**; commits/PRs authored **only** by `QueaT <kgm004a@gmail.com>` with **no AI co-author trailers**; `gh` active account = `JakubGawr`.
+- **`com.meetnotes.app` is immutable**; commits/PRs authored **only** by `JakubGawr <63911380+JakubGawr@users.noreply.github.com>` with **no AI co-author trailers**; `gh` active account = `JakubGawr`.
 
 ## What you do
 

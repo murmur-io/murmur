@@ -77,4 +77,4 @@ command -v actionlint >/dev/null && actionlint .github/workflows/ci.yml || echo 
 - [ ] Guardrail hook? BLOCK + ALLOW assertion added to `selftest.sh`, host-independent.
 - [ ] Runner prerequisite (if any) added to `ci.yml` per `/github-actions`; workflow still just `bash scripts/ci.sh`.
 - [ ] RED-before-GREEN proven; full/subset `ci.sh` green; no new dep added without user approval.
-- [ ] Landed via a PR into `murmur` (never direct-push), QueaT author, no Claude trailers.
+- [ ] Landed via a PR into `murmur` (never direct-push), JakubGawr author, no Claude trailers.
