@@ -65,6 +65,17 @@ impl Db {
             rusqlite::params![folder_id],
         )
         .map_err(map_err)?;
+        // The sealed fact ledger retires in THIS transaction, with every other ciphertext. Dropping
+        // it earlier (inside the restore) would open a window where the folder still reads
+        // `locked=1`, the rows are back, and the only ciphertext is gone — the state the atomic
+        // commit exists to make unobservable.
+        tx.execute(
+            &format!(
+                "DELETE FROM sealed_fact_ledgers WHERE meeting_id IN ({FOLDER_MEETINGS})"
+            ),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
         tx.execute(
             &format!(
                 "UPDATE meetings SET manual_notes_blob = NULL WHERE id IN ({FOLDER_MEETINGS})"
@@ -314,6 +325,13 @@ impl Db {
             // row at discard time only ever digests never-sealed plaintext, but the "purge every
             // derived table" contract must not silently exclude one table).
             "live_bullets",
+            // The SEALED FACT LEDGER. A discard returns the folder to OPEN, so its ciphertext is
+            // both pointless and ACTIVELY DANGEROUS to keep: a later re-lock mints a NEW content
+            // key, and the seal authenticates any blob it finds. A blob from the discarded key
+            // cannot open under the new one, so the re-lock would fail AFTER `locked=1` is already
+            // durable — and the startup repair would hit the same wall on every launch afterwards.
+            // Purging it here is what keeps discard the clean rollback it claims to be.
+            "sealed_fact_ledgers",
         ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE meeting_id IN ({FOLDER_MEETINGS})"),

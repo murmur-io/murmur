@@ -848,6 +848,28 @@ impl Db {
              -- rows referencing EITHER meeting via `purge_supersessions_tx` instead. The pre-images
              -- hold plaintext note bytes, so a sealed source contributes NONE (the read command is
              -- folder-lock + unlock gated, and rows are only ever recorded for open-folder sources).
+             -- THE FACT LEDGER, SEALED. Facts, user facts and supersessions are DELETED when a
+             -- folder seals, because their `subject`/`predicate`/`object` are plaintext derived
+             -- from the meeting -- keeping them readable at rest would defeat the seal. But they
+             -- were never re-derived on unlock either, so locking a folder for an afternoon
+             -- destroyed the ledger permanently.
+             --
+             -- Re-extraction is not a recovery: it costs a provider call, and it CANNOT restore the
+             -- bitemporal history. `valid_from`/`valid_to` and the supersession chain record WHEN a
+             -- fact stopped being true, and nothing in the current note text says that. Knowledge
+             -- diff, dossiers and the entity timeline are exactly the surfaces built on that
+             -- history.
+             --
+             -- So the ledger is SEALED-AND-RESTORED like the note markdown, not purged like a chunk:
+             -- one ciphertext per meeting holding its rows, written (verify-before-destroy) before
+             -- the rows are deleted, and re-inserted on unlock. The rows themselves still leave the
+             -- database on seal, so the at-rest guarantee is exactly what it was.
+             CREATE TABLE IF NOT EXISTS sealed_fact_ledgers (
+               meeting_id TEXT PRIMARY KEY,
+               data_blob  BLOB NOT NULL,
+               sealed_at  TEXT NOT NULL,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
              CREATE TABLE IF NOT EXISTS supersessions (
                id TEXT PRIMARY KEY,
                superseding_meeting_id TEXT NOT NULL,
@@ -4677,7 +4699,7 @@ impl Db {
     /// (and on `delete_meeting` / the startup reconcile). Facts are plaintext-derived (entity ·
     /// predicate · object) content that mirrors a meeting; a sealed meeting must surface NOTHING, so
     /// — exactly like `correction_log` / `note_chunks` / `assistant_interactions` — we DELETE rather
-    /// than key-seal. Dropped by design + not recoverable (never keyed); the underlying transcript is
+    /// than key-seal. Dropped by design; the rows are RECOVERABLE from `sealed_fact_ledgers`, which the seal writes before this purge runs; the underlying transcript is
     /// still sealed + restorable, and a later re-summarize re-derives facts.
     pub(crate) fn purge_facts_tx(
         tx: &rusqlite::Transaction<'_>,
@@ -8175,7 +8197,7 @@ impl Db {
     /// on a seal (and on `delete_meeting` / the startup reconcile). Live bullets are
     /// plaintext-DERIVED running notes mirroring the meeting's transcript; a sealed meeting must
     /// surface NOTHING, so — exactly like `assistant_interactions` / `facts` / `note_chunks` — we
-    /// DELETE rather than key-seal. Dropped by design + not recoverable (never keyed); the
+    /// DELETE rather than key-seal. Dropped by design; the rows are RECOVERABLE from `sealed_fact_ledgers`, which the seal writes before this purge runs; the
     /// underlying transcript is still sealed + restorable.
     pub(crate) fn purge_live_bullets_tx(
         tx: &rusqlite::Transaction<'_>,

@@ -11870,6 +11870,18 @@ fn repair_locked_audio_at_rest(
 /// locked folder (BLK-2) without touching the folder's other meetings. Verify-before-destroy
 /// throughout (no transcript / audio loss); idempotent on already-sealed rows.
 fn seal_meeting_extras(db: &Db, folder_id: &str, mid: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+    // FACT LEDGER: facts, user facts and supersessions are DELETED a few steps later by the seal's
+    // own purge, because their subject/predicate/object are plaintext derived from this meeting.
+    // That is correct and unchanged. What was missing is the ciphertext that lets an unlock put them
+    // back — without it, locking a folder destroyed the ledger for good, and re-extraction is not a
+    // recovery: it needs a provider call and it cannot reconstruct `valid_from`/`valid_to` or the
+    // supersession chain, because nothing in the note text records when a fact stopped being true.
+    //
+    // Verify-before-destroy, and RE-SEAL every time rather than skipping an already-sealed meeting:
+    // a session unlock puts the rows back and may add more, so a stale blob would silently drop
+    // whatever the unlocked session learned.
+    seal_fact_ledger_for_meeting(db, folder_id, mid, ck)?;
+
     // Transcript: encrypt each segment's plaintext text, verify, then seal (blank text).
     let segs = db.raw_segments(mid)?;
     let mut sealed_segs: Vec<(i64, Vec<u8>)> = Vec::new();
@@ -12053,6 +12065,12 @@ fn unseal_meeting_extras(
     mid: &str,
     ck: &[u8; 32],
 ) -> Result<(), AppError> {
+    // FACT LEDGER first, and HERE rather than at the folder level, so every caller gets it. The
+    // move-into-locked path seals and purges a meeting's ledger and then restores the meeting for
+    // the session through this function; without the restore here that meeting sat factless behind
+    // an open padlock, and the next relock re-sealed whatever had been re-extracted — overwriting
+    // the only copy of the pre-move history.
+    restore_fact_ledger_for_meeting(&state.db, folder_id, mid, ck)?;
     for s in state.db.raw_segments(mid)? {
         let Some(blob) = &s.text_blob else { continue };
         let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "segment");
@@ -12230,6 +12248,107 @@ fn unseal_dashboards_in_folder(db: &Db, folder_id: &str, ck: &[u8; 32]) -> Resul
 /// (rather than resolved internally like the document re-index below) so the model-PRESENT re-index
 /// is deterministically testable without a real model on disk — meetings have no model-absent
 /// chunk-only path, unlike documents.
+/// AAD for a meeting's sealed fact ledger: binds the ciphertext to this folder AND this meeting, so
+/// a blob cannot be swapped between meetings or between folders.
+fn aad_fact_ledger(folder_id: &str, meeting_id: &str) -> Vec<u8> {
+    aad_content(folder_id, meeting_id, AAD_NO_PROVIDER, "fact-ledger")
+}
+
+/// Encrypt one meeting's fact ledger under the folder key and store it, having proved it decrypts
+/// back byte-identical FIRST. Returns without writing anything when the meeting has no ledger.
+pub(crate) fn seal_fact_ledger_for_meeting(
+    db: &Db,
+    folder_id: &str,
+    meeting_id: &str,
+    ck: &[u8; 32],
+) -> Result<(), AppError> {
+    let mut ledger = db.raw_fact_ledger_for_meeting(meeting_id)?;
+
+    // NEVER replace a ciphertext with a strict SUBSET of itself. A restore deliberately skips a
+    // supersession whose other anchor is still sealed — its values are that meeting's plaintext —
+    // so those rows are absent from the live tables by design. Re-sealing from the live rows alone
+    // would then overwrite the only copy that still held them, and they would be gone for good:
+    // unlock folder A, relock A, and a supersession spanning A and a still-locked B has vanished
+    // from both ciphertexts. An adversarial review reproduced exactly that.
+    //
+    // So carry forward anything the existing ciphertext holds that is not live right now. Live rows
+    // always win; the old blob only fills gaps. Nothing can be resurrected this way that a user
+    // deleted, because facts are closed bitemporally rather than deleted, and a supersession whose
+    // meeting is gone is dropped by the CASCADE on `sealed_fact_ledgers` along with the blob.
+    if let Some(existing) = db.fact_ledger_blob(meeting_id)? {
+        if let Ok(plain) =
+            crate::crypto::decrypt(ck, &existing, &aad_fact_ledger(folder_id, meeting_id))
+        {
+            if let Ok(prev) = serde_json::from_slice::<crate::storage::SealedFactLedger>(&plain) {
+                ledger.merge_missing_from(prev);
+            }
+        }
+    }
+
+    if ledger.is_empty() {
+        // Nothing live to seal. If a blob exists it holds a ledger sealed earlier and the rows are
+        // simply already purged — AUTHENTICATE it, the same way the document and segment seals
+        // treat an already-sealed row, so a corrupt ciphertext is caught while the key is in hand.
+        //
+        // A blob that will not open under THIS key is neither deleted nor raised.
+        //
+        // Deleting it destroys the only copy: with the rows purged, the ciphertext IS the ledger,
+        // and "the key I happen to be holding cannot read it" is not evidence that nobody can. An
+        // earlier revision of this function did delete it, and an adversarial review reproduced the
+        // loss by presenting a second key. Raising is no better: it would abort a lock whose
+        // `locked=1` is already durable and make the startup repair fail on every launch.
+        //
+        // The one path that genuinely produced a stale blob — a discarded seal followed by a
+        // re-lock under a fresh key — is closed at its root: `discard_folder_seal` drops the row
+        // with every other sealed payload. So warn, keep it, and let the lock finish.
+        if let Some(blob) = db.fact_ledger_blob(meeting_id)? {
+            if crate::crypto::decrypt(ck, &blob, &aad_fact_ledger(folder_id, meeting_id)).is_err() {
+                tracing::warn!(
+                    target: "lock",
+                    meeting_id,
+                    "a sealed fact ledger did not open under this folder key; keeping it"
+                );
+            }
+        }
+        return Ok(());
+    }
+    let plaintext = serde_json::to_vec(&ledger)
+        .map_err(|e| AppError::Storage(format!("fact ledger serialize failed: {e}")))?;
+    let aad = aad_fact_ledger(folder_id, meeting_id);
+    let blob = crate::crypto::encrypt(ck, &plaintext, &aad)?;
+    if crate::crypto::decrypt(ck, &blob, &aad)? != plaintext {
+        return Err(AppError::Storage(
+            "fact ledger seal verification failed (blob mismatch)".into(),
+        ));
+    }
+    db.seal_fact_ledger(meeting_id, &blob)?;
+    Ok(())
+}
+
+/// Put one meeting's sealed fact ledger back.
+///
+/// The ciphertext is always KEPT here. A session unlock needs it for the next relock, and the
+/// permanent unlock retires it inside `commit_folder_permanent_unlock` together with every other
+/// blob, so that no crash point can observe a folder that still says locked with its rows back and
+/// its only ciphertext already gone. This function used to take a `clear_blob` flag; both
+/// production callers passed `false` and only a test passed `true`, which meant the test exercised
+/// a path the app never took while the real retire went unpinned.
+pub(crate) fn restore_fact_ledger_for_meeting(
+    db: &Db,
+    folder_id: &str,
+    meeting_id: &str,
+    ck: &[u8; 32],
+) -> Result<(), AppError> {
+    let Some(blob) = db.fact_ledger_blob(meeting_id)? else {
+        return Ok(());
+    };
+    let plaintext = crate::crypto::decrypt(ck, &blob, &aad_fact_ledger(folder_id, meeting_id))?;
+    let ledger: crate::storage::SealedFactLedger = serde_json::from_slice(&plaintext)
+        .map_err(|e| AppError::Storage(format!("fact ledger deserialize failed: {e}")))?;
+    db.restore_fact_ledger(meeting_id, &ledger)?;
+    Ok(())
+}
+
 pub(crate) fn unseal_folder_extras(
     state: &AppState,
     folder_id: &str,
@@ -13084,6 +13203,14 @@ pub(crate) fn unseal_folder_extras_permanent(
     // dropped only after it is durably readable. The lock is going away for good, so an entry left
     // with only a blob and no key would be unrecoverable content loss.
     trash_commands::unseal_trash_in_folder_permanent(&state.db, folder_id, ck)?;
+
+    // FACT LEDGER: restore every meeting's facts, user facts and supersessions. The ciphertext is
+    // NOT dropped here — it retires with every other blob inside `commit_folder_permanent_unlock`,
+    // so no crash point can observe a folder that still says locked with its rows back and its only
+    // ciphertext already gone.
+    for mid in &meeting_ids {
+        restore_fact_ledger_for_meeting(&state.db, folder_id, mid, ck)?;
+    }
 
     Ok(sealed_audio_to_retire)
 }

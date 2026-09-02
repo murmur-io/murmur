@@ -106,7 +106,10 @@ fn document_seal_aad(folder_id: &str, document_id: &str) -> Vec<u8> {
 /// rest behind the lock. Returns `true` ⇒ the endpoint is sealed-at-rest and the caller must NOT
 /// write an edge touching it. UNSEAL/session-unlock un-blanks `markdown` before re-deriving, so this
 /// reads `false` there and the re-derive proceeds — the same contract the chunk indexers carry.
-fn meeting_sealed_at_rest_tx(tx: &rusqlite::Transaction<'_>, meeting_id: &str) -> Result<bool> {
+pub(crate) fn meeting_sealed_at_rest_tx(
+    tx: &rusqlite::Transaction<'_>,
+    meeting_id: &str,
+) -> Result<bool> {
     tx.query_row(
         "SELECT EXISTS(
            SELECT 1 FROM meetings m
