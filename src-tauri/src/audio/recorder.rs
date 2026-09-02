@@ -22,6 +22,23 @@ static CALLBACK_RACE_HOOK: Mutex<Option<RecorderRaceHook>> = Mutex::new(None);
 #[cfg(test)]
 static READER_RACE_HOOK: Mutex<Option<RecorderRaceHook>> = Mutex::new(None);
 
+/// Serializes the two tests that drive [`READER_RACE_HOOK`], which is ONE global slot shared by
+/// both while libtest runs them on parallel threads.
+///
+/// Each test publishes `(its own reader thread id, arrived, resume)` into that slot and then blocks
+/// on a two-party barrier until its reader trips it. Run concurrently, the second writer overwrites
+/// the first's entry, so the first test's reader finds an id that is not its own, sails past without
+/// tripping anything, and its `arrived.wait()` waits on a barrier no one else will ever reach — a
+/// permanent hang, not a failure: the run prints every test as passing and then never terminates.
+/// The clear-to-`None` at the end of each test is a second way to lose the other's entry.
+///
+/// Observed twice in a row on a loaded machine, and passing on the same commit when the machine was
+/// quiet, which is exactly the shape that gets re-run rather than fixed. The mutex is poison-
+/// tolerant because a panic in one of these tests must surface as that test's own failure, not as a
+/// second, misleading failure in the other.
+#[cfg(test)]
+static READER_RACE_HOOK_SERIAL: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 fn callback_race_hook() {
     let hook = CALLBACK_RACE_HOOK
@@ -1562,6 +1579,11 @@ mod tests {
     fn reader_crossed_by_full_slot_reuse_rejects_mixed_generation() {
         use std::sync::Barrier;
 
+        // ONE global hook slot, two tests, parallel threads — see `READER_RACE_HOOK_SERIAL`.
+        let _serial = READER_RACE_HOOK_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let shared = test_shared(4);
         accumulate_frames(&shared, &[0.0f32, 1.0, 2.0, 3.0], 1);
         let reader = SampleReader {
@@ -1611,6 +1633,11 @@ mod tests {
     #[test]
     fn tail_snapshot_retries_trim_race_and_returns_absolute_generation_bounds() {
         use std::sync::Barrier;
+
+        // ONE global hook slot, two tests, parallel threads — see `READER_RACE_HOOK_SERIAL`.
+        let _serial = READER_RACE_HOOK_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let shared = test_shared(4);
         accumulate_frames(&shared, &[0.0f32, 1.0, 2.0, 3.0], 1);
