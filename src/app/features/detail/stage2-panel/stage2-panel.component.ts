@@ -31,7 +31,6 @@ import { ErrorCopyService } from "../../../core/copy/error-copy.service";
  */
 @Component({
   selector: "app-stage2-panel",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./stage2-panel.component.html",
   styleUrl: "./stage2-panel.component.scss",

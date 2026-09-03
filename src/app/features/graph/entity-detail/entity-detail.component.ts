@@ -237,7 +237,13 @@ export class EntityDetailComponent {
    * ledger on, so it's the safe identity.
    */
   protected ledgerKey(c: FactStateChange): string {
-    return `${c.validFrom} ${c.subject} ${c.predicate}`;
+    // Separator written as an ESCAPE, never as a literal control byte: the source used to carry
+    // two raw NULs here, invisible in every editor and diff and liable to truncate in tooling
+    // that treats them as terminators. The CHARACTER is deliberately unchanged — NUL cannot occur
+    // in a subject or predicate, which is what keeps this key collision-free. Substituting a
+    // space, as first proposed, would have introduced one: "a b"+"c" and "a"+"b c" would share a
+    // key. Same convention and same reasoning as `settings/model-id.ts`.
+    return `${c.validFrom}\u0000${c.subject}\u0000${c.predicate}`;
   }
 
   /** Localized short date for a ledger row's `validFrom`; empty on unparseable. */
