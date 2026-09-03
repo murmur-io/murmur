@@ -397,6 +397,17 @@ pub(crate) fn capture_meeting(state: &AppState, meeting_id: &str) -> Result<Stri
             if restored.timeline != snapshot.timeline {
                 return Some("the speaker timeline did not round-trip".to_string());
             }
+            // Named explicitly for the same reason every sibling field is. The generic
+            // byte-identical payload check in `store_and_verify` already proves these survived the
+            // SQLCipher round-trip, so this adds no safety — it adds a diagnosis. A corruption here
+            // would otherwise report "the payload did not store byte-identically", which tells the
+            // next person nothing about which of a dozen fields went wrong.
+            if restored.links != snapshot.links {
+                return Some("the meeting's graph edges did not round-trip".to_string());
+            }
+            if restored.entity_mentions != snapshot.entity_mentions {
+                return Some("the meeting's entity mentions did not round-trip".to_string());
+            }
             None
         },
     )
@@ -1570,7 +1581,7 @@ fn restore_meeting(state: &AppState, payload: &str) -> Result<(), AppError> {
     //
     // Best-effort, like the re-export below and for the same reason: the meeting itself is already
     // back, and failing the whole restore over an edge would trade a large loss for a small one.
-    match state.db.restore_link_rows(&s.links) {
+    match state.db.restore_link_rows(&s.links, &state.unlocked_folders.lock().map(|g| g.clone()).unwrap_or_default()) {
         Ok(n) => {
             if n < s.links.len() {
                 // Not an error. `INSERT OR IGNORE` skips an edge the user has since dismissed or

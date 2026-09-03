@@ -660,3 +660,71 @@ fn restoring_a_meeting_brings_back_its_links_and_mentions() {
          the top of the entity's timeline"
     );
 }
+
+/// A DERIVED edge to a neighbour sealed since the delete must not come back; a user's own must.
+///
+/// `purge_links_tx` strips derived edges when a folder seals, but a meeting sitting in the trash is
+/// invisible to that pass — so a plain verbatim restore resurrects a `wikilink`/`companion`/
+/// suggested `semantic` edge pointing at something that has been sealed meanwhile, which the
+/// ordinary lifecycle would have removed. Lock-security review traced that such a row is INERT today
+/// (every reader re-gates both endpoints live) — but inertness is a property of today's readers, and
+/// the row still should not exist.
+///
+/// The manual edge is the control, and it is the half that makes this test mean something: it proves
+/// the filter is discriminating between derived and decided rather than simply dropping edges to
+/// sealed folders. A seal already preserves user decisions (`LINK_DECISION_KEEP`); a restore must
+/// not be stricter than a seal.
+#[test]
+fn restore_drops_derived_edges_to_a_since_sealed_neighbour_but_keeps_the_users_own() {
+    let state = build_state("trash-derived-sealed");
+    open_folder(&state, "f1", "Work");
+    open_folder(&state, "f2", "Later-sealed");
+    seed_meeting(&state, "m1", Some("f1"));
+    state
+        .db
+        .insert_note("n-far", "f2", "Far", "Far", "body", 1_760_000_000_000)
+        .expect("note in the folder that will be sealed");
+
+    state
+        .db
+        .upsert_manual_link("meeting", "m1", "document", "n-far")
+        .expect("the user's own link");
+    {
+        let mut conn = state.db.lock();
+        let tx = conn.transaction().unwrap();
+        crate::storage::Db::upsert_link_tx(
+            &tx, "meeting", "m1", "document", "n-far", "semantic", 0.9, "auto", "active",
+            1_760_000_000_000,
+        )
+        .expect("a derived suggestion between the same pair");
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        state.db.link_rows_for_meeting("m1").unwrap().len(),
+        2,
+        "one decided edge and one derived one"
+    );
+
+    block_on(delete_meeting_inner(&state, "m1")).expect("delete to trash");
+
+    // The far side seals while the meeting sits in the trash, and stays NOT session-unlocked.
+    state
+        .db
+        .set_folder_locked_for_test("f2", true)
+        .expect("seal the neighbour's folder");
+
+    let entries = state.db.list_trash_entries().unwrap();
+    block_on(restore_trash_item_inner(&state, &entries[0].id)).expect("restore");
+
+    let after = state.db.link_rows_for_meeting("m1").unwrap();
+    let kinds: Vec<&str> = after.iter().map(|r| r.edge_type.as_str()).collect();
+    assert!(
+        kinds.contains(&"manual"),
+        "the user's own link survives, exactly as a seal preserves it. Got {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"semantic"),
+        "the DERIVED edge must not be resurrected into a folder that sealed meanwhile — the \
+         ordinary lifecycle would have purged it. Got {kinds:?}"
+    );
+}

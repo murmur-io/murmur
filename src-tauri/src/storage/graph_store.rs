@@ -79,8 +79,6 @@ impl Db {
         Ok(resolved)
     }
 
-    /// Record that `entity_id` was mentioned in `meeting_id`. Idempotent via the PK
-    /// `(entity_id, meeting_id)` — re-summarize / re-extract never double-counts.
     /// This meeting's entity mentions, for a trash snapshot: `(entity_id, created_at)` pairs.
     ///
     /// These cascade off `meetings` on delete, so after the delete there is nothing to read. Their
@@ -150,6 +148,8 @@ impl Db {
         Ok(restored)
     }
 
+    /// Record that `entity_id` was mentioned in `meeting_id`. Idempotent via the PK
+    /// `(entity_id, meeting_id)` — re-summarize / re-extract never double-counts.
     pub fn add_mention(&self, entity_id: &str, meeting_id: &str) -> Result<()> {
         let conn = self.lock();
         let created_at = chrono::Utc::now().to_rfc3339();
