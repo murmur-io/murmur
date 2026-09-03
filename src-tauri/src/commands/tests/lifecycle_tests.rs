@@ -42761,14 +42761,8 @@ fn recording_filing_attachment_rollback_preserves_replacement_symlink_and_unknow
         let addr = listener.local_addr().unwrap();
         let (saw_tx, saw_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            // POST /v1/orgs/{id}/members — the FIRST request on this path: `resolve_org` reads
-            // locally and the seeded session's token is unexpired, so nothing precedes it.
-            let (mut add, _) = accept_with_timeout(&listener);
-            let _ = read_http_request(&mut add);
-            let body = r#"{"userId":"u-invitee"}"#;
-            write!(add,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
-
-            // POST /v1/keys/lookup — the SUBSTITUTED key (all 0x02, vs the 0x01 already pinned).
+            // POST /v1/keys/lookup is now the FIRST request: the key is verified BEFORE the member
+            // is added, so a refusal leaves nothing behind server-side. — the SUBSTITUTED key (all 0x02, vs the 0x01 already pinned).
             let (mut lookup, _) = accept_with_timeout(&listener);
             let request = read_http_request(&mut lookup);
             assert!(String::from_utf8_lossy(&request).starts_with("POST /v1/keys/lookup "));
@@ -42781,7 +42775,7 @@ fn recording_filing_attachment_rollback_preserves_replacement_symlink_and_unknow
             );
             write!(lookup,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
 
-            // Anything further would be the key grant leaving — which must NOT happen.
+            // Anything further — the member add OR the key grant — must NOT happen.
             listener
                 .set_nonblocking(true)
                 .expect("poll for an unexpected follow-up");
@@ -42828,8 +42822,9 @@ fn recording_filing_attachment_rollback_preserves_replacement_symlink_and_unknow
 
         assert!(
             !saw_rx.recv().unwrap(),
-            "NOTHING may leave after the refusal — a key grant posted before erroring would hand \
-             the org content key to whoever supplied the substituted public key"
+            "NOTHING may leave after the refusal — not the key grant, which would hand the org \
+             content key to whoever supplied the substituted key, and not even the member add, \
+             which would leave a row that blocks every future rotation"
         );
         server.join().unwrap();
 
