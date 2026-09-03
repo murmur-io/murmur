@@ -4,6 +4,21 @@
 
 Zakres, o który prosił właściciel: architektura brain i połączenia między encjami, MCP i łączenie kontekstu, wycieki pamięci, nagrywanie/transkrypcja, stabilność, gotowość produkcyjna, „czy to naprawdę brain", org sharing — plus własna pogłębiona analiza.
 
+> **STATUS (2026-09-03) — ten dokument opisuje stan 2.3.1, który już NIE OBOWIĄZUJE.**
+>
+> Audyt był podstawą programu naprawczego; **31 zmian wjechało na trunk i zostało wydanych jako
+> [v2.4.0](https://github.com/murmur-io/murmur/releases/tag/v2.4.0)** (2026-09-03). Dlatego publikacja
+> jest bezpieczna dopiero teraz: opis mechaniki dziury przed dostępną łatką byłby mapą dla atakującego
+> na każdą zainstalowaną kopię.
+>
+> Trzy ustalenia o najwyższym ciężarze, wszystkie **naprawione i wydane**:
+> **O1** rotacja klucza org po usunięciu członka nigdy się nie kończyła (PR #652) ·
+> **O2** brak pinowania klucza przy zaproszeniu do org, czyli podmiana `pk_enc` przez relay (PR #667) ·
+> **O3** zmodyfikowany klient mógł zablokować cudzy revoke/erase (naprawione po stronie serwera,
+> `murmur-server` PR #22, wdrożone).
+>
+> Oceny w tabeli poniżej są historyczne — nie odczytuj ich jako bieżącego stanu aplikacji.
+
 ---
 
 ## 0. Werdykt w jednym ekranie
