@@ -42740,3 +42740,102 @@ fn recording_filing_attachment_rollback_preserves_replacement_symlink_and_unknow
         // changed only its test-helper wording; the production tool path above delegates to the
         // canonical `search_visible` gate exercised directly and through `execute_tool`.
     }
+
+    /// A relay that swaps the invitee's key between invites must not get the OCK wrapped to it.
+    ///
+    /// `lookup_key` answers with whatever the relay says an address's key is, and the invite path
+    /// fed that straight into `wrap_ock_for_member`. So a dishonest relay could hand back its OWN
+    /// `pk_enc` and receive the org content key wrapped for itself — the whole shared brain, one
+    /// substituted lookup away. The mode-B share path has refused this for a while via `tofu_check`;
+    /// the invite path did not.
+    ///
+    /// The two halves are asserted separately on purpose. Refusing is not enough on its own: what
+    /// matters is that NOTHING was sent, so the assertion on the relay's side (no key-grant request
+    /// arrived) is the one that actually pins the security property. A version that returned the
+    /// error after posting the grant would satisfy the first assertion and none of the point.
+    #[test]
+    fn an_invite_refuses_when_the_relay_swaps_the_invitees_key() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (saw_tx, saw_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            // POST /v1/orgs/{id}/members — the FIRST request on this path: `resolve_org` reads
+            // locally and the seeded session's token is unexpired, so nothing precedes it.
+            let (mut add, _) = accept_with_timeout(&listener);
+            let _ = read_http_request(&mut add);
+            let body = r#"{"userId":"u-invitee"}"#;
+            write!(add,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+
+            // POST /v1/keys/lookup — the SUBSTITUTED key (all 0x02, vs the 0x01 already pinned).
+            let (mut lookup, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut lookup);
+            assert!(String::from_utf8_lossy(&request).starts_with("POST /v1/keys/lookup "));
+            // `pk_enc`/`pk_sig` cross the wire as base64URL with NO padding (`b64` in the shared
+            // protocol crate) — not hex, and not standard base64. 32 bytes of 0x02, against the
+            // 0x01 key this device already pinned.
+            let swapped = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
+            let body = format!(
+                r#"{{"registered":true,"key":{{"userId":"u-invitee","generation":1,"pkEnc":"{swapped}","pkSig":"{swapped}","fingerprint":"whatever-the-relay-claims"}}}}"#
+            );
+            write!(lookup,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+
+            // Anything further would be the key grant leaving — which must NOT happen.
+            listener
+                .set_nonblocking(true)
+                .expect("poll for an unexpected follow-up");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+            while std::time::Instant::now() < deadline {
+                if listener.accept().is_ok() {
+                    saw_tx.send(true).unwrap();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            saw_tx.send(false).unwrap();
+        });
+
+        let state = build_state("org-invite-tofu");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "owner", 1);
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        // The invitee's key as this device first saw it: all 0x01.
+        let original = crate::e2ee::key_fingerprint(&[0x01u8; 32], &[0x01u8; 32]);
+        state
+            .db
+            .pin_contact(
+                "u-invitee",
+                Some("invitee@example.com"),
+                &original,
+                "2026-09-01T00:00:00Z",
+            )
+            .unwrap();
+
+        let err = block_on(org_invite_member_inner(
+            &state,
+            STABLE_ORG_ID.to_string(),
+            "invitee@example.com".to_string(),
+        ))
+        .expect_err("a swapped key must refuse the invite");
+        assert!(
+            matches!(err, AppError::Auth(ref m) if m.contains(crate::errcode::ORG_INVITE_KEY_CHANGED)),
+            "the refusal must carry the stable code so the UI can say the right thing, got: {err:?}"
+        );
+
+        assert!(
+            !saw_rx.recv().unwrap(),
+            "NOTHING may leave after the refusal — a key grant posted before erroring would hand \
+             the org content key to whoever supplied the substituted public key"
+        );
+        server.join().unwrap();
+
+        assert_eq!(
+            state.db.get_pinned_contact("u-invitee").unwrap().unwrap().1,
+            original,
+            "and the pin still holds the ORIGINAL key — a refusal must never quietly re-pin"
+        );
+    }

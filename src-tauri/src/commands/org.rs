@@ -3571,6 +3571,34 @@ pub(crate) async fn org_invite_member_inner(
         .filter(|_| lookup.registered)
         .ok_or_else(|| AppError::InvalidArg("that address is not a registered account".into()))?;
 
+    // TOFU on the invitee's key, BEFORE the OCK is wrapped to it.
+    //
+    // `lookup_key` answers with whatever the relay says the address's key is. Without this check a
+    // relay that substitutes `pk_enc` between the lookup and the wrap receives the org content key
+    // wrapped to a key it holds — the exact substitution the mode-B share path already refuses
+    // (`share_note_with_account`). This path skipped it, so the org's whole shared brain was one
+    // dishonest lookup away from a stranger.
+    //
+    // First contact PINS. A change REFUSES and sends nothing: a changed key is either a legitimate
+    // re-key or an attack, and the two are indistinguishable from here, so the only honest move is
+    // to stop and ask the human to re-verify out of band.
+    let member_fp_pre = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+    match crate::commands::tofu_check(&state.db, &key.user_id, &member_fp_pre)? {
+        crate::commands::TofuState::Changed => {
+            return Err(AppError::Auth(crate::errcode::tag(
+                crate::errcode::ORG_INVITE_KEY_CHANGED,
+                "this person's key changed since you last invited them — re-verify the safety words \
+                 with them out of band, then invite again",
+            )));
+        }
+        _ => state.db.pin_contact(
+            &key.user_id,
+            Some(&email),
+            &member_fp_pre,
+            &chrono::Utc::now().to_rfc3339(),
+        )?,
+    }
+
     let generation = org.generation;
     let ock = acquire_org_ock(state, &org.org_id, generation).await?;
     let owner = crate::e2ee::keys::derive_identity(&mk, &account_id, gen_id)?;
