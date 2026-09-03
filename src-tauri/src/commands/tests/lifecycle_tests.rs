@@ -647,7 +647,12 @@
             while let Some(start) = rest.find(open) {
                 let after = &rest[start + open.len()..];
                 let Some(end) = after.find(close) else {
-                    break;
+                    // An opener with no closer anywhere after it is a THIRD kind of ambiguity, and
+                    // it gets the same answer as the other two. Breaking here quietly kept whatever
+                    // had already been collected, which review turned into a bypass: delete the real
+                    // snippet's closing tag, put a well-formed decoy earlier, and the scan never
+                    // learns the real region exists.
+                    return Vec::new();
                 };
                 let block = &after[..end];
                 if block.contains("mcpServers") {
