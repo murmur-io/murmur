@@ -18,6 +18,7 @@ import type {
 import { SharingAuthFlowComponent } from "../../../sharing/sharing-auth-flow/sharing-auth-flow.component";
 import { ErrorCopyService } from "../../../../core/copy/error-copy.service";
 import { AccountSessionService } from "../../../../services/account-session.service";
+import { DateFormatService } from "../../../../core/date-format.service";
 
 /** A flattened, depth-indented folder option for the accept-into picker. */
 interface FolderOption {
@@ -51,6 +52,8 @@ interface FolderOption {
   styleUrl: "./settings-account-section.component.scss",
 })
 export class SettingsAccountSectionComponent {
+  private readonly dates = inject(DateFormatService);
+
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly errorCopy = inject(ErrorCopyService);
@@ -344,16 +347,9 @@ export class SettingsAccountSectionComponent {
   }
 
   /** Presentational: render an ISO timestamp as a friendly local date. */
+  /** Formatted through {@link DateFormatService} — the one place a date becomes user-visible text. */
   formatDate(iso: string): string {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) {
-      return iso;
-    }
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
+    return this.dates.day(iso);
   }
 
   /** Presentational: render a byte count as a compact size. */

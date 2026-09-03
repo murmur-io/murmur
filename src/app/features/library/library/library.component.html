@@ -683,6 +683,13 @@
               }
             </li>
           }
+          <!-- The window must always be escapable: hiding rows with no way to reach them would
+               be a loss of function dressed up as a performance fix. -->
+          @if (listCapped()) {
+            <button type="button" class="btn btn-ghost show-all" (click)="showAllList()">
+              Show all {{ totalListCount() }}
+            </button>
+          }
         </ul>
       }
     }
