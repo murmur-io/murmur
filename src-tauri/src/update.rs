@@ -134,6 +134,21 @@ pub(crate) async fn check_for_update_inner(
     state: &crate::state::AppState,
     manual: bool,
 ) -> Result<UpdateInfo> {
+    check_for_update_against(state, manual, LATEST_RELEASE_API).await
+}
+
+/// As [`check_for_update_inner`], with the endpoint injected.
+///
+/// The seam exists for ONE test: that the ledger row is written even when the request FAILS. That
+/// property cannot be tested against the real endpoint, because the real endpoint answers — review
+/// moved the `ledger_row` call to after the request and the test stayed green, since GitHub is
+/// reachable from CI. Pointing this at an unroutable host makes the failure deterministic, so the
+/// ordering is actually pinned rather than merely asserted in a comment.
+pub(crate) async fn check_for_update_against(
+    state: &crate::state::AppState,
+    manual: bool,
+    api_url: &str,
+) -> Result<UpdateInfo> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
 
     if !manual {
@@ -160,7 +175,7 @@ pub(crate) async fn check_for_update_inner(
     // GitHub's API 403s without a User-Agent; also request the recommended media type.
     let user_agent = format!("Murmur/{current_version}");
     let resp = client
-        .get(LATEST_RELEASE_API)
+        .get(api_url)
         .header(reqwest::header::USER_AGENT, user_agent)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()

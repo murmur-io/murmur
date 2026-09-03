@@ -15699,6 +15699,97 @@
         );
     }
 
+    /// A save that omits the field must NOT re-enable a check the user turned off.
+    ///
+    /// This is the test review wrote to disprove the doc comment I had written, and it was right:
+    /// the field was a bare `bool` defaulted `true` by serde, passed straight through, so a DTO
+    /// missing it flipped a stored `false` to `true`. The comment promised a guarantee the code did
+    /// not deliver, which is worse than no comment.
+    ///
+    /// The neighbouring `mcp_require_token` really is a bare `bool` defaulting to `true`, and that
+    /// is correct THERE: for a security requirement `true` is the safe direction. Here `true` means
+    /// "call home", so the same default is the unsafe one. Copying the wrong sibling is how this
+    /// happened, and it is why the field is now `Option<bool>` preserved against the live config.
+    #[test]
+    fn a_config_save_that_omits_the_update_flag_preserves_the_users_choice() {
+        let current = crate::settings::config::AppConfig {
+            update_check_enabled: false,
+            ..crate::settings::config::AppConfig::default()
+        };
+
+        let mut json = serde_json::to_value(config_to_dto(&current)).unwrap();
+        assert!(
+            json.as_object_mut()
+                .unwrap()
+                .remove("updateCheckEnabled")
+                .is_some(),
+            "precondition: the field is present under this exact camelCase name before removal"
+        );
+        let omitted: AppConfigDto = serde_json::from_value(json).unwrap();
+
+        assert!(
+            !dto_to_config(omitted, &current).update_check_enabled,
+            "an omitted field means 'the client said nothing', not 'turn it back on'"
+        );
+    }
+
+    /// The ledger row survives a FAILED request, which is the whole reason it is written first.
+    ///
+    /// Review moved the `ledger_row` call to after the request and the previous test stayed green,
+    /// because it hit the real `api.github.com` — which answers, from CI too. An ordering guard that
+    /// only ever sees success proves nothing about the case it exists for. Pointing at an unroutable
+    /// host makes the failure deterministic, so this pins the property instead of describing it: a
+    /// request that left the machine and then failed still left the machine.
+    #[test]
+    fn a_failed_check_still_leaves_exactly_one_ledger_row() {
+        let state = build_state("update-ledger-order");
+
+        let result = block_on(crate::update::check_for_update_against(
+            &state,
+            true,
+            // `.invalid` is reserved by RFC 2606 and never resolves.
+            "http://murmur-update-check.invalid/latest",
+        ));
+        assert!(result.is_err(), "an unroutable host must fail the request");
+        assert_eq!(
+            state.db.count_share_egress_by_kind("update_check").unwrap(),
+            1,
+            "exactly one row: the attempt is logged before the request, and a failure neither \
+             skips it nor duplicates it"
+        );
+    }
+
+    /// The default is ON, and the automatic check must actually run under it.
+    ///
+    /// Both other gate tests set the flag to `false`, so a regression that ignored the stored config
+    /// and simply refused every automatic check would pass them — while silently disabling update
+    /// checking for every user who never touches the toggle, which is nearly all of them. This is
+    /// the only test that would notice.
+    #[test]
+    fn an_automatic_check_proceeds_under_the_default_flag() {
+        let state = build_state("update-consent-default");
+        assert!(
+            state.config.lock().unwrap().update_check_enabled,
+            "precondition: the shipped default is ON"
+        );
+
+        let result = block_on(crate::update::check_for_update_against(
+            &state,
+            false,
+            "http://murmur-update-check.invalid/latest",
+        ));
+        // The network fails by construction; what matters is that it got PAST the gate to try.
+        assert!(
+            !matches!(result, Err(AppError::Unavailable(ref m)) if m.contains("turned off")),
+            "an automatic check must not be refused while the flag is on, got: {result:?}"
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("update_check").unwrap(),
+            1,
+            "and it must be ledgered like any other egress"
+        );
+    }
+
     /// A manual check ignores the flag, and is ledgered like any other egress.
     ///
     /// Pressing a button that says it asks GitHub IS the consent; the flag governs what happens
