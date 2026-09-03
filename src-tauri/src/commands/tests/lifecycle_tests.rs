@@ -15669,6 +15669,174 @@
         assert!(n.content_blob.is_none(), "never sealed");
     }
 
+    /// The automatic update check is the only network call Murmur makes on its own initiative, so
+    /// turning it off must mean NOTHING leaves the machine — and leaving it on must leave a trace.
+    ///
+    /// Both halves matter and they fail differently. A gate that lives only in the frontend is not a
+    /// gate: the command is reachable over IPC regardless of what the UI decides, which is why the
+    /// refusal is in `check_for_update_inner` before a request is built. And an unlogged call is one
+    /// the user cannot audit after the fact, which is the whole point of the egress ledger.
+    ///
+    /// The refusal is asserted by its ERROR, not by counting packets — the check returns before any
+    /// client exists, so there is no request to observe. What the ledger count proves is the
+    /// converse: with the flag off, not even the intent-to-send was recorded, because there was no
+    /// intent.
+    #[test]
+    fn the_automatic_update_check_is_refused_and_unledgered_when_it_is_turned_off() {
+        let state = build_state("update-consent-off");
+        state.config.lock().unwrap().update_check_enabled = false;
+
+        let err = block_on(crate::update::check_for_update_inner(&state, false))
+            .expect_err("an automatic check must refuse when the flag is off");
+        assert!(
+            matches!(err, AppError::Unavailable(ref m) if m.contains("turned off")),
+            "the refusal must name itself rather than look like a network failure, got: {err:?}"
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("update_check").unwrap(),
+            0,
+            "a refused check must leave NO egress row — nothing was sent, so nothing is logged"
+        );
+    }
+
+    /// The toggle must SHOW what is actually stored, not a constant.
+    ///
+    /// Its sibling test covers the inbound direction only: it strips the key before deserializing,
+    /// so it never looks at what `config_to_dto` put there. Review demonstrated the consequence by
+    /// hardcoding `Some(true)` on the way out — all five update-check tests stayed green.
+    ///
+    /// The enforcement gate reads `AppConfig` directly rather than through the DTO, so a regression
+    /// here would not re-enable the network call. It would do something subtler and arguably worse:
+    /// show a user who turned the check OFF a switch that says ON, while the check stays off. A
+    /// privacy control that misreports its own state is not a control.
+    #[test]
+    fn the_config_the_ui_reads_reports_the_stored_update_flag() {
+        for stored in [false, true] {
+            let cfg = crate::settings::config::AppConfig {
+                update_check_enabled: stored,
+                ..crate::settings::config::AppConfig::default()
+            };
+            assert_eq!(
+                config_to_dto(&cfg).update_check_enabled,
+                Some(stored),
+                "the DTO must carry the stored value, not a constant"
+            );
+        }
+    }
+
+    /// A save that omits the field must NOT re-enable a check the user turned off.
+    ///
+    /// This is the test review wrote to disprove the doc comment I had written, and it was right:
+    /// the field was a bare `bool` defaulted `true` by serde, passed straight through, so a DTO
+    /// missing it flipped a stored `false` to `true`. The comment promised a guarantee the code did
+    /// not deliver, which is worse than no comment.
+    ///
+    /// The neighbouring `mcp_require_token` really is a bare `bool` defaulting to `true`, and that
+    /// is correct THERE: for a security requirement `true` is the safe direction. Here `true` means
+    /// "call home", so the same default is the unsafe one. Copying the wrong sibling is how this
+    /// happened, and it is why the field is now `Option<bool>` preserved against the live config.
+    #[test]
+    fn a_config_save_that_omits_the_update_flag_preserves_the_users_choice() {
+        let current = crate::settings::config::AppConfig {
+            update_check_enabled: false,
+            ..crate::settings::config::AppConfig::default()
+        };
+
+        let mut json = serde_json::to_value(config_to_dto(&current)).unwrap();
+        assert!(
+            json.as_object_mut()
+                .unwrap()
+                .remove("updateCheckEnabled")
+                .is_some(),
+            "precondition: the field is present under this exact camelCase name before removal"
+        );
+        let omitted: AppConfigDto = serde_json::from_value(json).unwrap();
+
+        assert!(
+            !dto_to_config(omitted, &current).update_check_enabled,
+            "an omitted field means 'the client said nothing', not 'turn it back on'"
+        );
+    }
+
+    /// The ledger row survives a FAILED request, which is the whole reason it is written first.
+    ///
+    /// Review moved the `ledger_row` call to after the request and the previous test stayed green,
+    /// because it hit the real `api.github.com` — which answers, from CI too. An ordering guard that
+    /// only ever sees success proves nothing about the case it exists for. Pointing at an unroutable
+    /// host makes the failure deterministic, so this pins the property instead of describing it: a
+    /// request that left the machine and then failed still left the machine.
+    #[test]
+    fn a_failed_check_still_leaves_exactly_one_ledger_row() {
+        let state = build_state("update-ledger-order");
+
+        let result = block_on(crate::update::check_for_update_against(
+            &state,
+            true,
+            // `.invalid` is reserved by RFC 2606 and never resolves.
+            "http://murmur-update-check.invalid/latest",
+        ));
+        assert!(result.is_err(), "an unroutable host must fail the request");
+        assert_eq!(
+            state.db.count_share_egress_by_kind("update_check").unwrap(),
+            1,
+            "exactly one row: the attempt is logged before the request, and a failure neither \
+             skips it nor duplicates it"
+        );
+    }
+
+    /// The default is ON, and the automatic check must actually run under it.
+    ///
+    /// Both other gate tests set the flag to `false`, so a regression that ignored the stored config
+    /// and simply refused every automatic check would pass them — while silently disabling update
+    /// checking for every user who never touches the toggle, which is nearly all of them. This is
+    /// the only test that would notice.
+    #[test]
+    fn an_automatic_check_proceeds_under_the_default_flag() {
+        let state = build_state("update-consent-default");
+        assert!(
+            state.config.lock().unwrap().update_check_enabled,
+            "precondition: the shipped default is ON"
+        );
+
+        let result = block_on(crate::update::check_for_update_against(
+            &state,
+            false,
+            "http://murmur-update-check.invalid/latest",
+        ));
+        // The network fails by construction; what matters is that it got PAST the gate to try.
+        assert!(
+            !matches!(result, Err(AppError::Unavailable(ref m)) if m.contains("turned off")),
+            "an automatic check must not be refused while the flag is on, got: {result:?}"
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("update_check").unwrap(),
+            1,
+            "and it must be ledgered like any other egress"
+        );
+    }
+
+    /// A manual check ignores the flag, and is ledgered like any other egress.
+    ///
+    /// Pressing a button that says it asks GitHub IS the consent; the flag governs what happens
+    /// without the user asking. This test does not assert the network result — CI has no reachable
+    /// GitHub and should not — only that the gate let it through and the ledger recorded the attempt
+    /// BEFORE the request. A ledger that recorded only successes would hide exactly the calls worth
+    /// auditing: one that left the machine and then timed out.
+    #[test]
+    fn a_manual_update_check_ignores_the_flag_and_is_ledgered_before_the_request() {
+        let state = build_state("update-consent-manual");
+        state.config.lock().unwrap().update_check_enabled = false;
+
+        // The network call itself may fail in CI; the gate and the ledger are what is under test.
+        let _ = block_on(crate::update::check_for_update_inner(&state, true));
+
+        assert_eq!(
+            state.db.count_share_egress_by_kind("update_check").unwrap(),
+            1,
+            "a manual check is consented by the press, so it proceeds past the flag and is logged"
+        );
+    }
+
     /// Moving a meeting into a locked folder must revoke the Ask conversations that drew on the
     /// folder it came FROM — the end-to-end oracle for a leak this repo actually shipped a fix for.
     ///
