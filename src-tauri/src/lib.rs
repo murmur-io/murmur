@@ -208,7 +208,6 @@ pub fn run() {
             commands::append_to_companion_note,
             commands::get_or_create_companion_note,
             commands::convert_meeting_to_note,
-            commands::delete_companion_note_if_empty,
             commands::import_document,
             commands::import_text,
             commands::scan_import,
@@ -315,7 +314,6 @@ pub fn run() {
             commands::org_get_item,
             commands::add_org_item_to_container,
             commands::org_update_item,
-            commands::org_update_own_item,
             commands::org_set_item_access,
             // Shared containers — publish a whole Folder or Space to an org (2026-08-29).
             commands::preview_container_share,
@@ -406,7 +404,6 @@ pub fn run() {
             commands::list_meeting_action_summaries,
             commands::run_recipe,
             commands::get_action_items,
-            commands::list_open_commitments,
             commands::patch_note_tasks,
             // First-class Murmur reminder store. `add_reminder` immediately below remains the
             // separate Apple Reminders osascript integration.
