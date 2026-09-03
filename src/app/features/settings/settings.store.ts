@@ -220,6 +220,7 @@ export class SettingsStore {
     proactiveHintsEnabled: true,
     // Cross-meeting USER MEMORY master gate; default ON. Off turns memory off entirely (backend).
     userMemoryEnabled: true,
+    updateCheckEnabled: true,
     /** Selected registry brain-model id. Empty → null on save. */
     brainModelId: "",
     /** Explicit custom GGUF file PATH (wins over brainModelId). Empty → null on save. */
@@ -1703,6 +1704,7 @@ export class SettingsStore {
         realtimeReactions: cfg.realtimeReactions ?? false,
         proactiveHintsEnabled: cfg.proactiveHintsEnabled ?? true,
         userMemoryEnabled: cfg.userMemoryEnabled ?? true,
+        updateCheckEnabled: cfg.updateCheckEnabled ?? true,
         brainModelId: cfg.brainModelId ?? "",
         brainModelPath: cfg.brainModelPath ?? "",
         // Mirrors backend default semantic_search_enabled = true (settings/config.rs; #159/#160).
@@ -2460,6 +2462,7 @@ export class SettingsStore {
       proactiveHintsEnabled: v.proactiveHintsEnabled,
       // Cross-meeting user memory — round-tripped so a save preserves the choice.
       userMemoryEnabled: v.userMemoryEnabled,
+      updateCheckEnabled: v.updateCheckEnabled,
       brainModelId: v.brainModelId || null,
       // A custom GGUF file path (settable; wins over brainModelId in the resolver).
       brainModelPath: v.brainModelPath || null,

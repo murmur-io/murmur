@@ -715,6 +715,9 @@ export class OnboardingComponent implements OnInit {
       // defaults would otherwise clobber mcpRequireToken / cloudEgressConsented to
       // false). Defaults here mirror AppConfig::default() for a truly fresh install.
       mcpRequireToken: base?.mcpRequireToken ?? true,
+      // Preserve-only, like its neighbours: onboarding must not silently re-enable a check the
+      // user turned off in Settings. Default ON for a first run, where `base` is null.
+      updateCheckEnabled: base?.updateCheckEnabled ?? true,
       lockRequireBiometric: base?.lockRequireBiometric ?? true,
       relockOnScreenshare: base?.relockOnScreenshare ?? true,
       // The consent signal is seeded from the snapshot and flips true only via
