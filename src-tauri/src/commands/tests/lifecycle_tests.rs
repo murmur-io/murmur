@@ -565,6 +565,53 @@
         );
     }
 
+    /// The config we DOCUMENT must be the config we EMIT.
+    ///
+    /// `get_mcp_config_carries_token_when_required_and_omits_it_when_off` above already pins what
+    /// the code produces, and it always passed — the code was never the problem. What drifted was
+    /// the prose: README told the reader a bearer token is required by default and then printed a
+    /// snippet with no token in it, so the line people copy was the one the server answers `401`
+    /// to, and both snippets were also missing `type: http`.
+    ///
+    /// A test that only checks the emitted JSON cannot see that. This one reads the shipped
+    /// documentation and requires each snippet to carry the two things a working entry needs.
+    #[test]
+    fn the_documented_mcp_snippets_carry_what_the_server_requires() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+
+        // (file, what the snippet must contain). The landing page escapes its JSON for HTML, so it
+        // is matched on the same tokens rather than on a literal block.
+        for (relative, needles) in [
+            (
+                "README.md",
+                vec!["\"type\": \"http\"", "\"Authorization\": \"Bearer"],
+            ),
+            (
+                "docs/USE-WITH-YOUR-AGENT.md",
+                vec!["\"type\": \"http\"", "\"Authorization\": \"Bearer"],
+            ),
+            (
+                "landing/docs.html",
+                vec![">\"type\"<", ">\"http\"<", ">\"Authorization\"<", "Bearer"],
+            ),
+        ] {
+            let path = repo.join(relative);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for needle in needles {
+                assert!(
+                    text.contains(needle),
+                    "{relative} documents an MCP config without {needle:?}. The server requires a \
+                     bearer token by default and Claude Code needs `type: http`, so a reader who \
+                     copies this snippet gets a 401 or an entry that is never treated as an HTTP \
+                     server. Copy what `get_mcp_config_inner` emits."
+                );
+            }
+        }
+    }
+
     /// ENRICH lock gate (RED-before-GREEN): both `enrich_note_context` (read/egress) and
     /// `apply_note_enrichment` (write) MUST refuse a SEALED-and-not-session-unlocked meeting with
     /// `AppError::Locked` BEFORE any note read / connector egress / write. With NO connectors
