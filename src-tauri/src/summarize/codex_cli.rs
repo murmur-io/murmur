@@ -138,9 +138,29 @@ struct VerifiedCodexBinary {
     version: String,
 }
 
-fn verified_codex_binary_cache() -> &'static Mutex<Option<VerifiedCodexBinary>> {
-    static CACHE: OnceLock<Mutex<Option<VerifiedCodexBinary>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+/// How many verified binaries the cache remembers at once.
+///
+/// Production holds exactly ONE: there is a single Codex executable, and a replaced one simply
+/// misses on its new identity. The capacity exists because the cache is process-global and the test
+/// suite drives many distinct fake binaries through it concurrently.
+const VERIFIED_CODEX_BINARY_CACHE_CAP: usize = 32;
+
+/// Verified Codex executables, keyed by the identity+boundary they were verified under.
+///
+/// This used to be a single `Option`, which stored whatever was verified LAST and threw away
+/// everything else. With one real executable that is indistinguishable from a keyed cache, so
+/// production never noticed. Under `cargo test --lib` — one process, many threads, each test
+/// pointing at its own fake `codex` in its own temp dir — every store clobbered somebody else's
+/// entry, so a caller that had just populated the cache could find a stranger's identity in it and
+/// re-run a probe it had already paid for. That is how
+/// `availability_runs_only_the_local_version_probe_and_finds_gui_install_paths` came to fail in a
+/// full run and pass on its own: its second `availability_from` re-probed, writing a second `v` to
+/// the execution marker.
+///
+/// Keying the entries removes the sharing rather than scheduling around it.
+fn verified_codex_binary_cache() -> &'static Mutex<Vec<VerifiedCodexBinary>> {
+    static CACHE: OnceLock<Mutex<Vec<VerifiedCodexBinary>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Evaluator-only capability token binding model attribution to one vetted executable identity.
@@ -677,11 +697,10 @@ async fn probe_supported_codex_version_with_boundary(
     if let Some(verified) = verified_codex_binary_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
+        .iter()
+        .find(|entry| entry.identity == identity && entry.boundary == boundary)
     {
-        if verified.identity == identity && verified.boundary == boundary {
-            return Ok(verified.clone());
-        }
+        return Ok(verified.clone());
     }
 
     let mut command = codex_version_probe_command(bin, boundary);
@@ -715,9 +734,25 @@ async fn probe_supported_codex_version_with_boundary(
         #[cfg(test)]
         version: version.trim().to_string(),
     };
-    *verified_codex_binary_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(verified.clone());
+    {
+        let mut cache = verified_codex_binary_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Replace this key's own entry rather than the whole cache, so a concurrent verification of
+        // a DIFFERENT binary cannot evict one that is still in use.
+        if let Some(slot) = cache
+            .iter_mut()
+            .find(|entry| entry.identity == verified.identity && entry.boundary == verified.boundary)
+        {
+            *slot = verified.clone();
+        } else {
+            if cache.len() >= VERIFIED_CODEX_BINARY_CACHE_CAP {
+                // Oldest first. A cache that grew without bound would be the worse bug.
+                cache.remove(0);
+            }
+            cache.push(verified.clone());
+        }
+    }
     Ok(verified)
 }
 
@@ -3293,6 +3328,70 @@ mod tests {
             network_boundary.marker()
         ));
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Two different executables must each keep their OWN verified entry.
+    ///
+    /// The cache used to be a single `Option`, so a store for binary B threw away the entry for
+    /// binary A. With one real Codex that is invisible, but `cargo test --lib` runs the whole suite
+    /// in ONE process with many threads, each test pointing at its own fake `codex` — so tests
+    /// silently evicted each other and a caller re-ran a probe it had already paid for.
+    ///
+    /// This test is deliberately DIRECT rather than a full-suite reproduction. The original symptom
+    /// (`availability_runs_only_the_local_version_probe_…` finding `vava` instead of `vaa`) needs a
+    /// specific interleaving and does not reproduce on demand, so it is a coin flip as an oracle.
+    /// Driving the eviction by hand is deterministic: on the old single-slot cache the final probe
+    /// below is a MISS and the assertion fails.
+    #[tokio::test]
+    async fn a_verified_binary_survives_another_binary_being_verified() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A fake `codex` that appends one byte per --version call, so "did it probe again?" is
+        // answered by the file rather than by timing.
+        fn fake_codex(tag: &str) -> (PathBuf, PathBuf) {
+            let root = crate::storage::db::unique_temp_path(
+                &format!("murmur-codex-cache-{tag}"),
+                "dir",
+            );
+            fs::create_dir_all(&root).unwrap();
+            let marker = root.join("probes");
+            let bin = root.join("codex");
+            fs::write(
+                &bin,
+                format!(
+                    "#!/bin/sh\n/usr/bin/printf v >> '{}'\n/usr/bin/printf 'codex-cli 0.146.7\\n'\nexit 0\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+            (bin, marker)
+        }
+
+        let (bin_a, marker_a) = fake_codex("a");
+        let (bin_b, _marker_b) = fake_codex("b");
+        let boundary = VersionProbeNetworkBoundary::InheritedTestSandbox;
+        let probes = |m: &PathBuf| fs::read(m).map(|b| b.len()).unwrap_or(0);
+
+        probe_supported_codex_version_with_boundary(bin_a.to_str().unwrap(), boundary)
+            .await
+            .expect("A verifies");
+        let after_first_a = probes(&marker_a);
+        assert_eq!(after_first_a, 1, "the first verification must actually probe");
+
+        probe_supported_codex_version_with_boundary(bin_b.to_str().unwrap(), boundary)
+            .await
+            .expect("B verifies");
+
+        probe_supported_codex_version_with_boundary(bin_a.to_str().unwrap(), boundary)
+            .await
+            .expect("A verifies again");
+        assert_eq!(
+            probes(&marker_a),
+            after_first_a,
+            "verifying a DIFFERENT binary must not evict A's entry — A re-probed, so the cache is \
+             still a single shared slot"
+        );
     }
 
     #[cfg(unix)]
