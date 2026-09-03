@@ -51,7 +51,7 @@ Add it to your Claude Code MCP config and restart Claude. (If the user turned th
 requirement off in Settings, the `headers` block is omitted and the server serves
 unauthenticated — but on by default is the norm.)
 
-## The tool catalog (9 read-only tools)
+## The tool catalog (20 read-only tools)
 
 Every tool returns text; every tool excludes sealed-and-not-unlocked content.
 
@@ -102,6 +102,57 @@ Every tool returns text; every tool excludes sealed-and-not-unlocked content.
    leaves the device). Results are attributed `[org · <author>]` and must be cited as coming from
    that colleague. Returns nothing when no org is joined.
    *e.g.* `org_search({ "query": "onboarding checklist" })`.
+
+10. **`search_transcript`** — `{ query, meetingId?, limit?, maxPerMeeting?, channel? }` — located
+    lexical search INSIDE transcript segments. Each hit carries a timestamp, a stable segment id,
+    the speaker, and character offsets in the same channel `get_meeting` accepts — so you can quote
+    a moment, not just a meeting.
+    *e.g.* `search_transcript({ "query": "we agreed to postpone", "limit": 10 })`.
+
+11. **`get_meeting_chapters`** — `{ meetingId, channel? }` — the topic map for one meeting, each
+    topic with a character range in the transcript. Use it to jump to a section instead of pulling
+    the whole transcript.
+    *e.g.* `get_meeting_chapters({ "meetingId": "m-abc123" })`.
+
+12. **`get_document_outline`** — `{ documentId }` — the heading/section map and page numbers of one
+    note or imported document. Read this before `get_document` when the document is long: it tells
+    you which part is worth fetching.
+    *e.g.* `get_document_outline({ "documentId": "doc-xyz" })`.
+
+13. **`knowledge_diff`** — `{ entity, … }` — the DECISION LEDGER for one person or project: how
+    what was known about it CHANGED over time, from the bitemporal fact store. Answers "when did
+    this change, and what did it replace", which a dossier alone does not.
+    *e.g.* `knowledge_diff({ "entity": "Project Atlas" })`.
+
+14. **`list_entities`** — `{}` — every visible person and project with its exact id, type, and
+    visible mention count. Call this BEFORE `get_entity_dossier` rather than guessing a name.
+    *e.g.* `list_entities({})`.
+
+15. **`list_note_folders`** — `{}` — visible note folders with the exact id/name `query_database`
+    accepts, their record counts, and their typed columns. Call this before guessing a folder name
+    or a column.
+    *e.g.* `list_note_folders({})`.
+
+16. **`list_workspace_hierarchy`** — `{}` — the workspace shape: every visible project, the folders
+    inside it, and how many meetings / notes / tasks / dashboards each holds. The right first call
+    when you do not yet know how this vault is organised.
+    *e.g.* `list_workspace_hierarchy({})`.
+
+17. **`list_dashboards`** — `{}` — the boards the user composed BY HAND out of meetings, notes,
+    documents, people and derived views. These encode what the user thinks matters.
+    *e.g.* `list_dashboards({})`.
+
+18. **`get_dashboard`** — `{ dashboardId }` — one dashboard with every tile already resolved: the
+    notes and recordings on it, who is on it, which values drifted, what was promised.
+    *e.g.* `get_dashboard({ "dashboardId": "d-123" })`.
+
+19. **`list_tasks`** — `{}` — SHARED ORG tasks the user and colleagues track together (title, id,
+    status, due date, org). Empty when no org is joined.
+    *e.g.* `list_tasks({})`.
+
+20. **`get_task`** — `{ taskId }` — one shared org task: description, status, due date, assignee,
+    subtask checklist, and the shared org notes it points at.
+    *e.g.* `get_task({ "taskId": "t-456" })`.
 
 ## Limits — know these before you rely on it
 

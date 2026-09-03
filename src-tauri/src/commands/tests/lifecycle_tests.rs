@@ -561,6 +561,150 @@
         );
     }
 
+    /// The shipped skill catalog must list every tool the server actually registers.
+    ///
+    /// `vault-skills/murmur-mcp/SKILL.md` is not documentation about the product — the setup guide
+    /// tells the user to copy it into `~/.claude/skills/`, where a real agent loads it as operating
+    /// instructions. It described nine tools while `tools_spec()` registered twenty, so eleven were
+    /// invisible to every agent that followed it: an agent cannot call a tool it was never told
+    /// about, and it has no way to discover the omission.
+    #[test]
+    fn the_shipped_skill_catalog_lists_every_registered_mcp_tool() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+        let skill = std::fs::read_to_string(repo.join("vault-skills/murmur-mcp/SKILL.md"))
+            .expect("read the shipped MCP skill");
+
+        let spec = crate::mcp::tools_spec();
+        let registered: Vec<String> = spec
+            .as_array()
+            .expect("tools_spec is an array")
+            .iter()
+            .map(|tool| {
+                tool["name"]
+                    .as_str()
+                    .expect("every tool has a name")
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            registered.len() >= 20,
+            "tools_spec shrank unexpectedly ({}) — check this test still means what it says",
+            registered.len()
+        );
+
+        let missing: Vec<&String> = registered
+            .iter()
+            // `name(` — the invocation-example shape every real catalog entry uses — rather than
+            // a bare `name`. Review removed one tool's whole entry, left a stray cross-reference to
+            // it in another entry's prose, and the bare-name check accepted that. The file's own
+            // convention already cross-references tools by name inside other entries, so a bare
+            // mention genuinely cannot distinguish "documented" from "alluded to".
+            .filter(|name| !skill.contains(&format!("`{name}(")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "vault-skills/murmur-mcp/SKILL.md does not mention {missing:?}. That file is COPIED \
+             INTO an agent's skills directory and read as instructions, so a tool missing from it \
+             is a tool no agent will ever call. Add it to the catalog."
+        );
+    }
+
+    /// The config we DOCUMENT must be the config we EMIT.
+    ///
+    /// `get_mcp_config_carries_token_when_required_and_omits_it_when_off` above already pins what
+    /// the code produces, and it always passed — the code was never the problem. What drifted was
+    /// the prose: README told the reader a bearer token is required by default and then printed a
+    /// snippet with no token in it, so the line people copy was the one the server answers `401`
+    /// to, and both snippets were also missing `type: http`.
+    ///
+    /// The assertion is scoped to the SNIPPET, not the file. A first version searched whole files,
+    /// and review broke it immediately: revert the real snippet to the broken form, drop the
+    /// required words into an HTML comment elsewhere on the page, and the test went green on the
+    /// exact bug it exists to catch. A whole-file `contains` in a large, growing document proves
+    /// nothing — some other section will eventually mention `Bearer` for unrelated reasons.
+    #[test]
+    fn the_documented_mcp_snippets_carry_what_the_server_requires() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+
+        /// Every documented block that configures the MCP server. Markdown fences and the landing
+        /// page's `<pre>` are both bounded by their own delimiters.
+        ///
+        /// Returns ALL of them rather than the first, because first-match-wins was a bypass:
+        /// review broke the real snippet and put a satisfying decoy block EARLIER in the same file,
+        /// and the check went green on the historical bug. The caller therefore refuses ambiguity
+        /// instead of guessing which block the reader will copy.
+        fn mcp_blocks<'a>(text: &'a str, open: &str, close: &str) -> Vec<&'a str> {
+            let mut found = Vec::new();
+            let mut rest = text;
+            while let Some(start) = rest.find(open) {
+                let after = &rest[start + open.len()..];
+                let Some(end) = after.find(close) else {
+                    // An opener with no closer anywhere after it is a THIRD kind of ambiguity, and
+                    // it gets the same answer as the other two. Breaking here quietly kept whatever
+                    // had already been collected, which review turned into a bypass: delete the real
+                    // snippet's closing tag, put a well-formed decoy earlier, and the scan never
+                    // learns the real region exists.
+                    return Vec::new();
+                };
+                let block = &after[..end];
+                if block.contains("mcpServers") {
+                    found.push(block);
+                }
+                rest = &after[end + close.len()..];
+            }
+            found
+        }
+
+        for (relative, open, close, needles) in [
+            (
+                "README.md",
+                "```",
+                "```",
+                vec!["\"type\": \"http\"", "\"Authorization\": \"Bearer"],
+            ),
+            (
+                "docs/USE-WITH-YOUR-AGENT.md",
+                "```",
+                "```",
+                vec!["\"type\": \"http\"", "\"Authorization\": \"Bearer"],
+            ),
+            (
+                "landing/docs.html",
+                "<pre class=\"code-block\">",
+                "</pre>",
+                vec![">\"type\"<", ">\"http\"<", ">\"Authorization\"<", "Bearer"],
+            ),
+        ] {
+            let path = repo.join(relative);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let blocks = mcp_blocks(&text, open, close);
+            assert_eq!(
+                blocks.len(),
+                1,
+                "{relative} should document exactly ONE `mcpServers` block; found {}. With more \
+                 than one there is no way to tell which the reader copies, and a satisfying decoy \
+                 would let a broken real snippet pass. With none, the documentation this test \
+                 exists to police is gone.",
+                blocks.len()
+            );
+            let block = blocks[0];
+            for needle in needles {
+                assert!(
+                    block.contains(needle),
+                    "{relative}'s MCP snippet is missing {needle:?}. The server requires a bearer \
+                     token by default and Claude Code needs `type: http`, so a reader who copies \
+                     this block gets a 401 or an entry that is never treated as an HTTP server. \
+                     Copy what `get_mcp_config_inner` emits."
+                );
+            }
+        }
+    }
+
     /// ENRICH lock gate (RED-before-GREEN): both `enrich_note_context` (read/egress) and
     /// `apply_note_enrichment` (write) MUST refuse a SEALED-and-not-session-unlocked meeting with
     /// `AppError::Locked` BEFORE any note read / connector egress / write. With NO connectors

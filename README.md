@@ -528,10 +528,18 @@ memory **with zero egress** — your notes stay on your Mac, and the client read
 // ~/Library/Application Support/Claude/claude_desktop_config.json
 {
   "mcpServers": {
-    "murmur": { "url": "http://127.0.0.1:8765" }
+    "murmur": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765",
+      "headers": { "Authorization": "Bearer <your-token>" }
+    }
   }
 }
 ```
+
+Copy the real block — with your own token already filled in — from **Settings → Privacy &
+Integrations**. Without the header the server answers `401`, because the token is required by
+default (the line above this snippet is not aspirational).
 
 The MCP config is shown (with a copy button) in **Settings → Privacy & Integrations**.
 

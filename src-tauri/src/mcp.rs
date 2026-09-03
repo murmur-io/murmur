@@ -1710,7 +1710,11 @@ fn text_result(id: Value, text: String) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": text }] } })
 }
 
-fn tools_spec() -> Value {
+/// The tool registry served by `tools/list`.
+///
+/// `pub(crate)` so the shipped-skill-catalog guard in `commands::lifecycle_tests` can read the
+/// registry itself rather than keeping a second list that would drift from this one.
+pub(crate) fn tools_spec() -> Value {
     json!([
         {
             "name": "search_meetings",
