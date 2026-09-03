@@ -124,6 +124,29 @@ pub fn get_or_create_db_dek() -> Result<String> {
     if let Some(dek) = existing {
         return Ok(dek);
     }
+    // LAST LINE OF DEFENCE before an irreversible mint. The `-34018` refusal above covers one
+    // known way a read wrongly reports "absent"; this covers every other way, by asking the only
+    // question that actually matters — is there already an encrypted database whose sole key is the
+    // one we are about to replace? If so, minting does not "recover" anything: it permanently
+    // orphans the user's entire history, and no later fix can undo it.
+    //
+    // Deliberately NOT refused: a PLAINTEXT database. That is the pre-encryption shape, and
+    // `storage::migration` encrypts it with the freshly-minted key by design.
+    //
+    // The dev hatch returned long before this point, so `MURMUR_DEV_DEK` is unaffected.
+    if crate::state::encrypted_db_exists() {
+        tracing::error!(
+            target: "secrets",
+            "the database key read as absent while an ENCRYPTED database exists — REFUSING to mint a replacement (it would orphan every meeting)"
+        );
+        return Err(AppError::Secrets(
+            "your database is encrypted but its key could not be read. Murmur refuses to create a \
+             new key, because that would make every existing meeting permanently unreadable. \
+             Restore the key from your recovery export, or from a Keychain backup."
+                .into(),
+        ));
+    }
+
     // Mint a fresh DEK. Zeroize the raw byte buffer once the hex form is derived (the hex is the
     // returned secret — the caller is responsible for its lifetime, e.g. wrapping in Zeroizing at
     // the PRAGMA-key site in db.rs/migration.rs, C6).
