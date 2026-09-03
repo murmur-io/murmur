@@ -16823,3 +16823,125 @@ fn sweep_leaves_fixtures_younger_than_min_age() {
     );
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// Deleting a meeting must revoke the conversations that could have drawn on ITS folder, and leave
+/// every other conversation alone.
+///
+/// Before this, `delete_meeting` called the global sweep, whose predicate
+/// (`provenance_mode = 'globalDerived'`) matches EVERY durable row — so tidying up one recording
+/// destroyed the entire Ask history of the vault, including conversations about folders that had
+/// not changed at all. A feature whose headline is that it persists did not survive a delete.
+///
+/// The three assertions are deliberately separate: "the unrelated one survives" is the fix, "the
+/// related one dies" is the property the fix must NOT trade away, and "it is still readable" is
+/// what makes survival meaningful — a row that outlives the purge but is stamped at a stale
+/// visibility generation is invisible, which is the same loss wearing a different hat.
+#[test]
+fn deleting_a_meeting_revokes_only_conversations_that_could_have_seen_its_folder() {
+    use crate::storage::models::AskConversationScope;
+
+    let db = mem_db();
+    seed_folder(&db, "f-a", "Alpha");
+    seed_folder(&db, "f-b", "Beta");
+
+    let mut meeting = sample_meeting("m-in-a", "2026-09-03T09:00:00Z");
+    meeting.folder_id = Some("f-a".to_string());
+    db.insert_meeting(&meeting).unwrap();
+
+    // One conversation per folder, each declaring only that folder as its dependency.
+    for (folder, question) in [("f-a", "about alpha"), ("f-b", "about beta")] {
+        db.persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            question,
+            "an answer",
+            &[],
+            &[],
+            &[],
+            &[folder.to_string()],
+            "2026-09-03T09:01:00Z",
+        )
+        .unwrap();
+    }
+    let unlocked = HashSet::new();
+    assert_eq!(
+        db.list_ask_conversation_ids(&AskConversationScope::Vault, &unlocked)
+            .unwrap()
+            .len(),
+        2,
+        "both conversations start visible"
+    );
+
+    db.delete_meeting("m-in-a").unwrap();
+
+    let surviving = db
+        .list_ask_conversation_ids(&AskConversationScope::Vault, &unlocked)
+        .unwrap();
+    assert_eq!(
+        surviving.len(),
+        1,
+        "exactly one conversation should survive — the one that never depended on the deleted \
+         meeting's folder. Got {surviving:?}"
+    );
+
+    let rows: Vec<(String, String)> = {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id, d.dependency_ref
+                   FROM ask_conversations c
+                   JOIN ask_conversation_dependencies d ON d.conversation_id = c.id
+                  WHERE d.dependency_kind = 'folder'",
+            )
+            .unwrap();
+        let out = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        out
+    };
+    assert_eq!(
+        rows.iter().map(|(_, f)| f.as_str()).collect::<Vec<_>>(),
+        vec!["f-b"],
+        "the survivor must be the folder-B conversation, not whichever one happened to be left"
+    );
+}
+
+/// The same delete, for an UNFILED meeting, still takes the whole history.
+///
+/// This is not an oversight to fix later. An unfiled meeting has no folder row, so
+/// `visible_folder_ids` never records a dependency naming it, so no conversation can be matched by
+/// folder — and a conversation may well paraphrase content the user just deleted. The global sweep
+/// is the only fail-closed answer, and pinning it here stops a later "optimisation" from scoping a
+/// case that cannot be scoped.
+#[test]
+fn deleting_an_unfiled_meeting_still_revokes_everything() {
+    use crate::storage::models::AskConversationScope;
+
+    let db = mem_db();
+    seed_folder(&db, "f-b", "Beta");
+    db.insert_meeting(&sample_meeting("m-unfiled", "2026-09-03T09:00:00Z"))
+        .unwrap();
+    db.persist_ask_exchange(
+        &AskConversationScope::Vault,
+        None,
+        "about beta",
+        "an answer",
+        &[],
+        &[],
+        &[],
+        &["f-b".to_string()],
+        "2026-09-03T09:01:00Z",
+    )
+    .unwrap();
+
+    db.delete_meeting("m-unfiled").unwrap();
+
+    assert!(
+        db.list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+            .unwrap()
+            .is_empty(),
+        "an unfiled meeting names no folder, so the fail-closed global sweep must still run"
+    );
+}

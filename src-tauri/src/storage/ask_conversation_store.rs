@@ -927,6 +927,129 @@ impl Db {
         Ok(deleted)
     }
 
+    /// Purge scoped when the caller could name the folders, globally when it could not.
+    ///
+    /// `None` is NOT "nothing to do" — it is "I cannot name the scope", and the only fail-closed
+    /// answer there is still the global sweep. Keeping that decision in one place is what stops a
+    /// caller quietly passing an empty set and silently purging nothing.
+    pub(crate) fn purge_ask_conversations_for_scope_tx(
+        tx: &rusqlite::Transaction<'_>,
+        scope: Option<&HashSet<String>>,
+    ) -> Result<usize> {
+        match scope {
+            Some(folders) => Self::purge_ask_conversations_for_folders_tx(tx, folders),
+            None => Self::purge_all_ask_conversations_tx(tx),
+        }
+    }
+
+    /// Every folder these meetings live in, or `None` if ANY of them is unfiled.
+    ///
+    /// Unfiled content has no folder row, so `visible_folder_ids` never records a dependency naming
+    /// it, so a conversation that drew on an unfiled meeting cannot be matched by folder. That is
+    /// exactly the case the global sweep exists for — see
+    /// [`Self::purge_ask_conversations_for_scope_tx`].
+    pub(crate) fn ask_scope_for_meetings_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+    ) -> Result<Option<HashSet<String>>> {
+        if meeting_ids.is_empty() {
+            return Ok(Some(HashSet::new()));
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(meeting_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = tx
+            .prepare(&format!(
+                "SELECT folder_id FROM meetings WHERE id IN ({placeholders})"
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(meeting_ids.iter()), |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        let mut folders = HashSet::new();
+        for row in rows {
+            match row {
+                Some(folder) => {
+                    folders.insert(folder);
+                }
+                // One unfiled meeting is enough to make the whole batch unnameable.
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(folders))
+    }
+
+    /// Every folder these documents live in. `documents.folder_id` is `NOT NULL`, so unlike
+    /// meetings this is always nameable — but it is still written to fail closed if that ever
+    /// changes.
+    pub(crate) fn ask_scope_for_documents_tx(
+        tx: &rusqlite::Transaction<'_>,
+        document_ids: &[String],
+    ) -> Result<Option<HashSet<String>>> {
+        if document_ids.is_empty() {
+            return Ok(Some(HashSet::new()));
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(document_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = tx
+            .prepare(&format!(
+                "SELECT folder_id FROM documents WHERE id IN ({placeholders})"
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(document_ids.iter()), |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        let mut folders = HashSet::new();
+        for row in rows {
+            match row {
+                Some(folder) => {
+                    folders.insert(folder);
+                }
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(folders))
+    }
+
+    /// A folder and every folder beneath it.
+    ///
+    /// Descendants belong in the scope because their content goes away with the parent — a child
+    /// folder's documents cascade off `documents.folder_id`. Scoping to the named folder alone
+    /// would leave a conversation that drew on a grandchild's content readable after the content
+    /// itself was gone.
+    pub(crate) fn ask_scope_for_folder_tree_tx(
+        tx: &rusqlite::Transaction<'_>,
+        folder_id: &str,
+    ) -> Result<HashSet<String>> {
+        let mut stmt = tx
+            .prepare(
+                "WITH RECURSIVE tree(id) AS (
+                     SELECT ?1
+                     UNION
+                     SELECT f.id FROM folders f JOIN tree t ON f.parent_id = t.id
+                 )
+                 SELECT id FROM tree",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |row| row.get::<_, String>(0))
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// The [`Self::purge_ask_conversations_for_folders_tx`] scope for a startup reconcile: every
     /// folder that is sealed AT REST. Nothing was derived from a folder while it was sealed, so a
     /// conversation that never saw one of these is not the reconcile's business.

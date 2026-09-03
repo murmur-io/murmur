@@ -3904,7 +3904,13 @@ impl Db {
         // deleted meeting's (now-gone) facts; the survivors regenerate on the next hourly pass
         // from the remaining visible facts only. The caller deletes the exported `.md`s.
         let rollup_exports = Self::purge_memory_rollups_tx(&tx)?;
-        Self::purge_all_ask_conversations_tx(&tx)?;
+        // Scoped to THIS meeting's folder. Deleting one meeting used to destroy every durable Ask
+        // conversation in the vault, because the sweep's predicate matched every `globalDerived`
+        // row — a conversation about an unrelated folder did not survive somebody tidying up a
+        // recording. An unfiled meeting has no folder row for a dependency to name, so it still
+        // takes the global sweep; that is the case the sweep exists for.
+        let ask_scope = Self::ask_scope_for_meetings_tx(&tx, &[id.to_string()])?;
+        Self::purge_ask_conversations_for_scope_tx(&tx, ask_scope.as_ref())?;
         Self::purge_retired_recording_generations_tx(&tx, id)?;
         tx.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
@@ -4625,8 +4631,11 @@ impl Db {
         // invalidates the pass's visibility snapshot). Resolved rows were blanked on resolve.
         Self::purge_all_pending_audit_findings_tx(&tx)?;
         // Ask history v1 is global-derived because current citations are not a complete typed
-        // provenance log. Any seal therefore revokes every durable conversation atomically.
-        Self::purge_all_ask_conversations_tx(&tx)?;
+        // provenance log — so a conversation is revoked whenever a folder it could have drawn on
+        // loses content. Scoped to the affected meetings' folders; unfiled meetings have no folder
+        // to name and keep the atomic global sweep.
+        let ask_scope = Self::ask_scope_for_meetings_tx(&tx, meeting_ids)?;
+        Self::purge_ask_conversations_for_scope_tx(&tx, ask_scope.as_ref())?;
         // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose SRC OR DST is a
         // just-sealed meeting in this SAME seal tx — a link names a neighbour (its title/existence
         // reveals a possibly-sealed item), so it must not survive at rest for a sealed endpoint.
@@ -5718,7 +5727,9 @@ impl Db {
         // Vault Audit: a pending finding sourcing or targeting this document/note quotes its
         // content/title — drop it in the same delete tx (mirrors `delete_meeting`'s purge).
         Self::purge_pending_audit_findings_tx(&tx, &[id.to_string()])?;
-        Self::purge_all_ask_conversations_tx(&tx)?;
+        // Resolved BEFORE the row goes: after the DELETE there is no `folder_id` left to read.
+        let ask_scope = Self::ask_scope_for_documents_tx(&tx, &[id.to_string()])?;
+        Self::purge_ask_conversations_for_scope_tx(&tx, ask_scope.as_ref())?;
         tx.execute("DELETE FROM documents WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
         if has_share_closure {
@@ -6086,7 +6097,8 @@ impl Db {
         // may cite third-party titles no document id can match). Findings are cheap re-derivable
         // rows — the next pass re-stages anything still true (never content loss).
         Self::purge_all_pending_audit_findings_tx(&tx)?;
-        Self::purge_all_ask_conversations_tx(&tx)?;
+        let ask_scope = Self::ask_scope_for_documents_tx(&tx, document_ids)?;
+        Self::purge_ask_conversations_for_scope_tx(&tx, ask_scope.as_ref())?;
         tx.commit().map_err(map_err)?;
         Ok(())
     }
@@ -7376,10 +7388,13 @@ impl Db {
             rusqlite::params![id],
         )
         .map_err(map_err)?;
+        // The folder AND its descendants, resolved BEFORE the delete — afterwards the tree is
+        // unwalkable. Descendants count because their content goes away with the parent.
+        let ask_scope = Self::ask_scope_for_folder_tree_tx(&tx, id)?;
         let n = tx
             .execute("DELETE FROM folders WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
-        Self::purge_all_ask_conversations_tx(&tx)?;
+        Self::purge_ask_conversations_for_scope_tx(&tx, Some(&ask_scope))?;
         tx.commit().map_err(map_err)?;
         Ok(n)
     }
