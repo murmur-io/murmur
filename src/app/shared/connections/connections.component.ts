@@ -11,22 +11,27 @@ import {
   inject,
   input,
   signal,
+  untracked,
   viewChild,
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
 
 import { IpcService } from "../../core/ipc.service";
+import { AskHistoryPrivacyBarrierService } from "../../core/ask-history-privacy-barrier.service";
 import { TabsService } from "../../core/tabs.service";
 import type {
   BacklinkSource,
+  ContainerLevel,
   LinkEdge,
   LinkKind,
-  NoteCitation,
 } from "../../core/models";
 import { DocumentPreviewService } from "../../services/document-preview.service";
 import { FoldersService } from "../../services/folders.service";
 import { ToastService } from "../../services/toast.service";
-import { LinkPickerComponent } from "../../features/notes/link-picker/link-picker.component";
+import {
+  RelatedHierarchyPickerComponent,
+  type PickerTarget,
+} from "../related-hierarchy-picker/related-hierarchy-picker.component";
 
 /** The small direction/type tag shown on a Related chip. */
 type RelationTag = "linked" | "mentions" | "companion" | "related";
@@ -55,6 +60,11 @@ interface RelatedRow {
   readonly navigationId: string | null;
   readonly title: string;
   readonly route: unknown[];
+  /**
+   * Space vs folder, for a `container` chip's glyph and its noun. NON-CONTENT
+   * metadata carried on the edge, so the chip needs no second IPC round-trip.
+   */
+  readonly containerLevel: ContainerLevel | null;
   /** The small direction/type tag ("linked" / "mentions" / "companion" / "related"). */
   readonly tag: RelationTag;
   /** True when this row is a user-created MANUAL link that shows a removable hover `×`. */
@@ -109,19 +119,28 @@ interface SuggestionRow {
  * triplication with the inline chip).
  *
  * PR-1 (user-initiated linking) keeps two write affordances: the `+ Link`
- * header chooser (`link_items` via the shared opaque {@link LinkPickerComponent})
- * and the hover-`×` unlink on a MANUAL chip (`unlink_items`). Both are gated by
- * the same pending set and surface failures via the {@link ToastService}.
+ * header trigger, which opens the opaque
+ * {@link RelatedHierarchyPickerComponent} modal (`link_items` on the picked
+ * target — a leaf, a Shared Brain document, or a whole Space/folder as ONE
+ * relation), and the hover-`×` unlink on a MANUAL chip (`unlink_items`). Both are
+ * gated by the same pending set and surface failures via the {@link ToastService}.
+ *
+ * The flat autocomplete chooser this panel used to own is GONE — with it went the
+ * popover geometry (anchor rect, reposition-on-scroll), the query/active-index
+ * state and the candidate list. The modal owns all of that now, including its own
+ * gated reads and its own invalidation, so this panel is back to what it is: a
+ * list of relationships and two commands.
  */
 @Component({
   selector: "app-connections",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, LinkPickerComponent],
+  imports: [RouterLink, RelatedHierarchyPickerComponent],
   templateUrl: "./connections.component.html",
   styleUrl: "./connections.component.scss",
 })
 export class ConnectionsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
+  private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
   private readonly tabs = inject(TabsService);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
@@ -168,51 +187,27 @@ export class ConnectionsComponent implements OnInit {
   /** Whether the whole Related section is expanded (Notion-style collapse-by-default). */
   readonly expanded = signal(false);
 
-  /** The single-pick `+ Link` chooser element (the header `<input>`) for anchoring. */
-  private readonly pickerAnchor =
-    viewChild<ElementRef<HTMLElement>>("pickerAnchor");
-  /** Current button/input node passed to the teleported picker for motion filtering. */
-  readonly pickerAnchorElement = computed(
-    () => this.pickerAnchor()?.nativeElement ?? null,
-  );
+  /**
+   * The exact `+ Link` trigger, so closing the modal restores focus to the control
+   * that opened it rather than dropping it on `<body>`.
+   */
+  private readonly pickerTrigger =
+    viewChild<ElementRef<HTMLElement>>("pickerTrigger");
 
-  /** Whether the `+ Link` picker is open. */
+  /** Whether the `+ Link` hierarchy modal is open. */
   readonly pickerOpen = signal(false);
-  /** True while a `link_items` call from a pick is in flight (disables the chooser). */
+  /** True while a `link_items` call from a pick is in flight (disables the trigger + the modal). */
   readonly linking = signal(false);
-  /** The picker's live filter text (this panel owns it — the picker is presentational). */
-  readonly pickerQuery = signal("");
-  /** Keyboard-highlighted row in the open picker (↑/↓). */
-  readonly pickerActiveIndex = signal(0);
-  /** The picker's resolved candidates for the current query (drives keyboard nav). */
-  readonly pickerCandidates = signal<NoteCitation[]>([]);
-  /**
-   * The chooser's viewport anchor rect for the popover. A NEW object re-positions
-   * it; recomputed from the header `<input>` on open and on every reposition tick.
-   */
-  readonly pickerRect = signal<{
-    top: number;
-    left: number;
-    right: number;
-    bottom: number;
-  }>({ top: 0, left: 0, right: 0, bottom: 0 });
-  /** Coalesce a burst of captured scroll events into one post-render anchor read. */
-  private pickerRepositionQueued = false;
 
   /**
-   * A candidate kind that is NOT a valid `link_items` endpoint. Shared Brain
-   * `org` rows are valid revision-stable endpoints; people and entities are not.
+   * `${kind}:${id}` of every endpoint ALREADY related, fed to the modal so those
+   * rows read `Linked` and stay inactive. Derived from the panel's own gated
+   * `list_links` read — the picker never asks a second time, so it can never
+   * disclose a relation this panel would not.
    */
-  private static readonly NON_LINKABLE_KINDS: ReadonlySet<NoteCitation["kind"]> =
-    new Set<NoteCitation["kind"]>(["person", "entity"]);
-
-  /** True when a candidate is a linkable document/org endpoint (not person/entity or self). */
-  private isLinkable(c: NoteCitation): boolean {
-    return (
-      !ConnectionsComponent.NON_LINKABLE_KINDS.has(c.kind) &&
-      !(c.kind === this.kind() && c.id === this.id())
-    );
-  }
+  readonly linkedKeys = computed(
+    () => new Set(this.edges().map((e) => `${e.otherKind}:${e.otherId}`)),
+  );
 
   /**
    * Monotonic request token — a late `list_links`/`get_backlinks` reply for a
@@ -228,7 +223,8 @@ export class ConnectionsComponent implements OnInit {
   private readonly orgFeedRevision = signal(0);
   private feedUnlisten: (() => void) | null = null;
   private feedDestroyed = false;
-  private observedOrgFeedRevision = 0;
+  /** Relationship titles are readable only after this panel can revoke them on org changes. */
+  private readonly orgFeedListenerReady = this.installOrgFeedListener();
 
   /**
    * DETERMINISTIC edges only — everything that is NOT a pending semantic suggestion:
@@ -238,7 +234,8 @@ export class ConnectionsComponent implements OnInit {
    */
   private readonly deterministic = computed(() =>
     this.edges().filter(
-      (e) => !(e.edgeType === "semantic" && e.status === "suggested" && !e.manual),
+      (e) =>
+        !(e.edgeType === "semantic" && e.status === "suggested" && !e.manual),
     ),
   );
 
@@ -294,6 +291,7 @@ export class ConnectionsComponent implements OnInit {
         navigationId: edge.navigationId ?? null,
         title: edge.otherTitle,
         route: this.routeForKind(edge.otherKind, edge.otherId),
+        containerLevel: edge.otherContainerLevel ?? null,
         tag: this.tagForEdge(edge),
         removable: edge.manual === true,
         pending: pending.has(edge.id),
@@ -315,6 +313,7 @@ export class ConnectionsComponent implements OnInit {
         navigationId: null,
         title: bl.title,
         route: this.routeForKind(bl.kind, bl.id),
+        containerLevel: null,
         tag: "mentions",
         removable: false,
         pending: false,
@@ -404,24 +403,37 @@ export class ConnectionsComponent implements OnInit {
   }
 
   constructor() {
+    const unregisterPrivacy = this.privacyBarrier.registerInvalidator(() =>
+      this.invalidateVisibleRelationships(),
+    );
     this.destroyRef.onDestroy(() => {
       this.feedDestroyed = true;
       this.feedUnlisten?.();
+      this.feedUnlisten = null;
+      unregisterPrivacy();
     });
-    void this.ipc
-      .onOrgFeedUpdated(() => {
+  }
+
+  /**
+   * Install the panel-owned org-feed listener and expose its acknowledgement as a hard read
+   * barrier. An event revokes visible titles and invalidates in-flight replies synchronously,
+   * before the revision signal schedules the replacement fetch.
+   */
+  private async installOrgFeedListener(): Promise<boolean> {
+    try {
+      const unlisten = await this.ipc.onOrgFeedUpdated(() => {
+        this.invalidateVisibleRelationships();
         this.orgFeedRevision.update((revision) => revision + 1);
-      })
-      .then((unlisten) => {
-        if (this.feedDestroyed) {
-          unlisten();
-        } else {
-          this.feedUnlisten = unlisten;
-        }
-      })
-      .catch(() => {
-        /* best-effort: no Tauri host (plain browser) → no live convergence */
       });
+      if (this.feedDestroyed) {
+        unlisten();
+        return false;
+      }
+      this.feedUnlisten = unlisten;
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -440,23 +452,15 @@ export class ConnectionsComponent implements OnInit {
     // Establish the lock-tree dependency (value unused — the backend is the
     // authority on visibility; we just re-ask when it may have changed).
     this.folders.tree();
-    const orgFeedRevision = this.orgFeedRevision();
-    const orgFeedChanged =
-      orgFeedRevision !== this.observedOrgFeedRevision;
-    this.observedOrgFeedRevision = orgFeedRevision;
+    this.orgFeedRevision();
     const seq = ++this.seq;
-    if (orgFeedChanged) {
-      // The event means an org endpoint may have been withdrawn or advanced to
-      // a new head. Hide the old title/navigation target and destroy the
-      // picker's cached candidate rows BEFORE starting the replacement read.
-      // Bumping `seq` above also prevents any pre-event reply restoring them.
-      this.edges.set([]);
-      this.backlinksIn.set([]);
-      this.closePicker();
-    }
+    // A new anchor, ANY lock-tree publication, or an org-feed revision may
+    // revoke a neighbour that supplied a title. Clear synchronously before the
+    // replacement read; privacy wins over stale-while-revalidate here.
+    this.edges.set([]);
+    this.backlinksIn.set([]);
+    untracked(() => this.closePicker());
     if (locked || !id) {
-      this.edges.set([]);
-      this.backlinksIn.set([]);
       return;
     }
     void this.fetch(kind, id, seq);
@@ -469,6 +473,18 @@ export class ConnectionsComponent implements OnInit {
    * have note-backlinks) skips the backlink read entirely.
    */
   private async fetch(kind: LinkKind, id: string, seq: number): Promise<void> {
+    const [privacyReady, orgFeedReady] = await Promise.all([
+      this.privacyBarrier.ensureReady(),
+      this.orgFeedListenerReady,
+    ]);
+    if (seq !== this.seq) {
+      return;
+    }
+    if (!privacyReady || !orgFeedReady) {
+      this.edges.set([]);
+      this.backlinksIn.set([]);
+      return;
+    }
     // `get_backlinks` takes a `SourceKind` (`meeting | note`), so a
     // `document`-anchored panel (which can't have note-backlinks) skips it.
     const backlinksP: Promise<BacklinkSource[]> =
@@ -491,6 +507,14 @@ export class ConnectionsComponent implements OnInit {
         this.backlinksIn.set([]);
       }
     }
+  }
+
+  /** Process privacy barrier: synchronously revoke every title and stale reply. */
+  private invalidateVisibleRelationships(): void {
+    this.seq += 1;
+    this.edges.set([]);
+    this.backlinksIn.set([]);
+    untracked(() => this.closePicker());
   }
 
   /** The direction/type tag for a deterministic edge. */
@@ -518,7 +542,19 @@ export class ConnectionsComponent implements OnInit {
    * (kept as the identity for the row) but the template never binds it there.
    */
   private routeForKind(kind: LinkKind, id: string): unknown[] {
-    return kind === "meeting" ? ["/meeting", id] : ["/notes", id];
+    // EXHAUSTIVE on purpose: a new endpoint kind that silently fell through to
+    // `["/notes", id]` would produce a chip that navigates to a dead end. A
+    // `container` chip routes to the container view the sidebar already opens.
+    switch (kind) {
+      case "meeting":
+        return ["/meeting", id];
+      case "container":
+        return ["/container", id];
+      case "note":
+      case "document":
+      case "org":
+        return ["/notes", id];
+    }
   }
 
   /**
@@ -571,14 +607,7 @@ export class ConnectionsComponent implements OnInit {
     const dstId = e.direction === "in" ? anchorId : e.otherId;
     void this.mutate(
       e.id,
-      () =>
-        this.ipc.unlinkItems(
-          srcKind,
-          srcId,
-          dstKind,
-          dstId,
-          e.manualEdges,
-        ),
+      () => this.ipc.unlinkItems(srcKind, srcId, dstKind, dstId, e.manualEdges),
       "Couldn't remove the link.",
     );
   }
@@ -617,155 +646,81 @@ export class ConnectionsComponent implements OnInit {
     }
   }
 
-  // --- `+ Link` chooser (reuses the note editor's LinkPickerComponent) --------
+  // --- `+ Link` (the opaque hierarchy modal) ---------------------------------
 
   /**
-   * Open the single-pick `+ Link` chooser: anchor the popover under the header
-   * `<input>`, reset its query/keyboard state. The picker is presentational, so
-   * THIS panel owns `pickerQuery` / `pickerActiveIndex` and feeds the picker an
-   * `anchorRect`; the header input is the query field + keyboard target.
+   * Open the "Add related" modal. It owns its own gated reads, its own keyboard
+   * model and its own invalidation; this panel supplies the anchor, the
+   * already-linked keys, and the write.
    */
   openPicker(): void {
     if (this.linking()) {
       return;
     }
-    this.pickerQuery.set("");
-    this.pickerActiveIndex.set(0);
-    this.pickerCandidates.set([]);
     this.pickerOpen.set(true);
-    this.repositionPicker();
-    // Focus the query field once it's in the DOM (zoneless-safe, no setTimeout).
-    afterNextRender(() => this.pickerAnchor()?.nativeElement.focus?.(), {
-      injector: this.injector,
-    });
-  }
-
-  /** Close the chooser without linking anything (Esc / outside / after a pick). */
-  closePicker(): void {
-    this.pickerOpen.set(false);
-    this.pickerQuery.set("");
-    this.pickerCandidates.set([]);
-    this.pickerActiveIndex.set(0);
-  }
-
-  /** The chooser query changed (input event) → refresh the anchored query + reset selection. */
-  onQueryInput(event: Event): void {
-    const value = (event.target as HTMLInputElement).value;
-    this.pickerQuery.set(value);
-    this.pickerActiveIndex.set(0);
   }
 
   /**
-   * The picker's resolved candidates for the current query (drives keyboard nav).
-   * The picker renders + click-emits its OWN rows, so `pickerActiveIndex` indexes
-   * THIS same list (kept in lockstep with what the popover shows).
+   * Close the modal and restore focus to the EXACT `+ Link` trigger that opened
+   * it — otherwise focus falls to `<body>` and the next Tab restarts from the top
+   * of the page, which is the difference between a dialog and a trapdoor.
    */
-  onPickerCandidates(rows: NoteCitation[]): void {
-    this.pickerCandidates.set(rows);
-    // A shrunk list can leave the highlight past the end — clamp it.
-    const max = rows.length - 1;
-    if (this.pickerActiveIndex() > max) {
-      this.pickerActiveIndex.set(Math.max(0, max));
-    }
-  }
-
-  /** ↑/↓/Enter/Esc while the chooser input has focus (nav over the picker's rows). */
-  onQueryKey(event: KeyboardEvent): void {
+  closePicker(): void {
     if (!this.pickerOpen()) {
       return;
     }
-    const rows = this.pickerCandidates();
-    switch (event.key) {
-      case "ArrowDown":
-        event.preventDefault();
-        if (rows.length > 0) {
-          this.pickerActiveIndex.update((i) => (i + 1) % rows.length);
+    this.pickerOpen.set(false);
+    this.restorePickerTriggerFocus();
+  }
+
+  private restorePickerTriggerFocus(): void {
+    afterNextRender(
+      () => {
+        const trigger = this.pickerTrigger()?.nativeElement;
+        if (trigger && !trigger.hasAttribute("disabled")) {
+          trigger.focus();
         }
-        break;
-      case "ArrowUp":
-        event.preventDefault();
-        if (rows.length > 0) {
-          this.pickerActiveIndex.update(
-            (i) => (i - 1 + rows.length) % rows.length,
-          );
-        }
-        break;
-      case "Enter":
-        event.preventDefault();
-        if (rows.length > 0) {
-          this.pickCandidate(rows[this.pickerActiveIndex()]);
-        }
-        break;
-      case "Escape":
-        event.preventDefault();
-        this.closePicker();
-        break;
-    }
+      },
+      { injector: this.injector },
+    );
   }
 
   /**
-   * A candidate was picked (click or Enter): create the link from this panel's
-   * anchor `(kind, id)` → the picked candidate, then re-fetch so the new chip
-   * appears. The picker renders its own rows, so a non-linkable kind (`person` /
-   * `entity`, or the anchor itself) is REFUSED here with a
-   * toast rather than sent to `link_items`. Guarded by `linking` (a stuck spinner is
-   * impossible — cleared in `finally`); a failure surfaces a toast.
+   * A target was picked: create the directed link from this panel's anchor to it,
+   * then re-fetch so the new chip appears. Exactly ONE `link_items` call — a
+   * `container` target links the PLACE, never its contents. Guarded by `linking`
+   * (a stuck spinner is impossible — cleared in `finally`); a failure toasts.
    */
-  pickCandidate(candidate: NoteCitation): void {
+  onPicked(target: PickerTarget): void {
     if (this.linking()) {
       return;
     }
-    if (!this.isLinkable(candidate)) {
-      // Distinguish the two refusals so the toast is honest (the anchor is now excluded from the
-      // candidate list, so the self-case is belt-and-braces — but a stale/edge pick must still read
-      // right, not the generic "wrong type" message it used to show for a self-link).
-      const isSelf =
-        candidate.kind === this.kind() && candidate.id === this.id();
-      this.toast.info(
-        isSelf
-          ? "You can't link an item to itself."
-          : "You can only link meetings, notes, documents, and Shared Brain items.",
-      );
+    if (target.kind === this.kind() && target.id === this.id()) {
+      // The picker already disables the anchor's own row; this is the
+      // belt-and-braces refusal for a stale row that survived a reload.
+      this.toast.info("You can't link an item to itself.");
       return;
     }
-    const dstKind = candidate.kind as LinkKind;
     this.linking.set(true);
     this.closePicker();
     void (async () => {
       try {
-        await this.ipc.linkItems(this.kind(), this.id(), dstKind, candidate.id);
+        await this.ipc.linkItems(
+          this.kind(),
+          this.id(),
+          target.kind,
+          target.id,
+        );
         const seq = ++this.seq;
         await this.fetch(this.kind(), this.id(), seq);
       } catch {
         this.toast.danger("Couldn't create the link.");
       } finally {
         this.linking.set(false);
+        // `closePicker()` ran while the trigger was disabled by `linking`; focus
+        // can only be restored after the mutation settles and the trigger is enabled again.
+        this.restorePickerTriggerFocus();
       }
     })();
-  }
-
-  /** Recompute the popover anchor rect from the header chooser input. */
-  repositionPicker(): void {
-    if (this.pickerRepositionQueued) {
-      return;
-    }
-    this.pickerRepositionQueued = true;
-    afterNextRender(
-      () => {
-        this.pickerRepositionQueued = false;
-        const el = this.pickerAnchor()?.nativeElement;
-        if (!el) {
-          return;
-        }
-        const r = el.getBoundingClientRect();
-        this.pickerRect.set({
-          top: r.top,
-          left: r.left,
-          right: r.right,
-          bottom: r.bottom,
-        });
-      },
-      { injector: this.injector },
-    );
   }
 }

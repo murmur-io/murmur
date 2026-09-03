@@ -6288,9 +6288,10 @@
     }
 
     #[test]
-    fn conversion_private_org_links_never_enter_provider_context() {
+    fn conversion_metadata_only_links_never_enter_provider_context() {
         const ORG_TITLE_SENTINEL: &str = "ORG_CONVERSION_PRIVATE_TITLE_SENTINEL";
         const ORG_BODY_SENTINEL: &str = "ORG_CONVERSION_PRIVATE_BODY_SENTINEL";
+        const CONTAINER_TITLE_SENTINEL: &str = "CONTAINER_CONVERSION_TITLE_SENTINEL";
 
         struct CapturingProvider {
             request: std::sync::Mutex<Option<crate::summarize::provider::SummarizeRequest>>,
@@ -6326,6 +6327,25 @@
             "# Primary meeting note",
             None,
         );
+        state
+            .db
+            .insert_folder(&crate::storage::Folder {
+                id: "container-private-context".into(),
+                name: CONTAINER_TITLE_SENTINEL.into(),
+                path: "conversion-container".into(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-08-13T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE folders SET level='project' WHERE id='container-private-context'",
+                rusqlite::params![],
+            )
+            .unwrap();
         seed_org(&state.db, STABLE_ORG_ID, "Private org", "member", 1);
         state
             .db
@@ -6371,6 +6391,16 @@
             .db
             .upsert_manual_link("meeting", "m-private-org-context", "org", &org_link_id)
             .unwrap();
+        state
+            .db
+            .upsert_manual_link_visible(
+                "meeting",
+                "m-private-org-context",
+                "container",
+                "container-private-context",
+                &HashSet::new(),
+            )
+            .unwrap();
 
         let org_item = state
             .db
@@ -6393,12 +6423,17 @@
                 && edge.other_id == org_link_id
                 && edge.other_title == ORG_TITLE_SENTINEL
         }));
+        assert!(visible_links.iter().any(|edge| {
+            edge.other_kind == crate::links::LinkKind::Container.as_str()
+                && edge.other_id == "container-private-context"
+                && edge.other_title == CONTAINER_TITLE_SENTINEL
+        }));
         assert!(
             capture_meeting_content_snapshot(&state, "m-private-org-context")
                 .unwrap()
                 .active_related
                 .is_empty(),
-            "a private org relation must not enter the conversion admission witness"
+            "metadata-only org/container relations must not enter the conversion admission witness"
         );
 
         let provider = std::sync::Arc::new(CapturingProvider {
@@ -6422,7 +6457,11 @@
             .unwrap()
             .clone()
             .expect("conversion provider was called exactly once");
-        for sentinel in [ORG_TITLE_SENTINEL, ORG_BODY_SENTINEL] {
+        for sentinel in [
+            ORG_TITLE_SENTINEL,
+            ORG_BODY_SENTINEL,
+            CONTAINER_TITLE_SENTINEL,
+        ] {
             assert!(
                 !request.transcript.contains(sentinel),
                 "private org content entered conversion transcript: {sentinel}"
@@ -29200,6 +29239,8 @@
         seq: u64,
         tombstoned: bool,
         content_sha256: Option<Vec<u8>>,
+        doc_id: Option<String>,
+        is_current: Option<bool>,
     }
 
     impl MockFeedEntry {
@@ -29212,6 +29253,21 @@
                 seq,
                 tombstoned: true,
                 content_sha256: None,
+                doc_id: None,
+                is_current: None,
+            }
+        }
+
+        /// An authoritative durable-document withdrawal. `is_current=true` means the resource was
+        /// deleted; `false` is only an obsolete revision being superseded.
+        fn stable_tombstone(item_id: &str, seq: u64, doc_id: &str, is_current: bool) -> Self {
+            Self {
+                item_id: item_id.into(),
+                seq,
+                tombstoned: true,
+                content_sha256: None,
+                doc_id: Some(doc_id.into()),
+                is_current: Some(is_current),
             }
         }
 
@@ -29223,6 +29279,8 @@
                 seq,
                 tombstoned: false,
                 content_sha256: Some(content_sha256.to_vec()),
+                doc_id: None,
+                is_current: None,
             }
         }
 
@@ -29240,10 +29298,17 @@
                 }
                 None => String::new(),
             };
+            let stable_document = match (&self.doc_id, self.is_current) {
+                (Some(doc_id), Some(is_current)) => format!(
+                    ",\"docId\":\"{doc_id}\",\"access\":\"view\",\
+                     \"documentOwnerUserId\":\"author-1\",\"isCurrent\":{is_current}"
+                ),
+                _ => String::new(),
+            };
             format!(
                             "{{\"itemId\":\"{}\",\"seq\":{},\"authorUserId\":\"author-1\",\"rev\":1,\
-                                  \"generation\":1,\"createdAt\":\"2026-07-01T00:00:00Z\",\"tombstoned\":{}{}}}",
-                            self.item_id, self.seq, self.tombstoned, sha
+                                  \"generation\":1,\"createdAt\":\"2026-07-01T00:00:00Z\",\"tombstoned\":{}{}{}}}",
+                            self.item_id, self.seq, self.tombstoned, stable_document, sha
                         )
         }
     }
@@ -29522,6 +29587,205 @@
         seed_live_session(state);
         seed_ock(state, STABLE_ORG_ID, 1);
         state.config.lock().unwrap().org_egress_consented = true;
+    }
+
+    fn seed_stable_org_revision_for_tombstone(
+        state: &AppState,
+        item_id: &str,
+        seq: u64,
+        rev: u32,
+        is_current: bool,
+    ) {
+        state
+            .db
+            .upsert_org_item(
+                item_id,
+                STABLE_ORG_ID,
+                seq,
+                "author",
+                "Shared document",
+                "shared body",
+                "2026-08-13T00:00:00Z",
+                rev,
+                1,
+                &[7u8; 32],
+                Some("document"),
+                Some("author-1"),
+                None,
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_item_document_metadata(
+                item_id,
+                Some(STABLE_DOC_ID),
+                "view",
+                Some("author-1"),
+            )
+            .unwrap();
+        state
+            .db
+            .repair_org_reconcile_metadata(
+                item_id,
+                STABLE_ORG_ID,
+                1,
+                Some(STABLE_DOC_ID),
+                "view",
+                Some("author-1"),
+                is_current,
+            )
+            .unwrap();
+    }
+
+    fn seed_current_stable_org_item_for_tombstone(state: &AppState, item_id: &str, seq: u64) {
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        seed_stable_org_revision_for_tombstone(state, item_id, seq, 1, true);
+    }
+
+    fn org_document_terminal_marker_count(state: &AppState) -> i64 {
+        state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM org_document_terminal_deletions
+                  WHERE org_id = ?1 AND doc_id = ?2",
+                rusqlite::params![STABLE_ORG_ID, STABLE_DOC_ID],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn org_document_reauthorization_count(state: &AppState) -> i64 {
+        let endpoint = format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}");
+        state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM org_link_reauthorizations
+                  WHERE (src_kind = 'org' AND src_id = ?1)
+                     OR (dst_kind = 'org' AND dst_id = ?1)",
+                rusqlite::params![endpoint],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn exercise_org_tombstone_container_restore(
+        tag: &str,
+        reconcile: bool,
+        is_current: bool,
+    ) {
+        const ITEM_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const FOLDER_ID: &str = "related-folder";
+        const ITEM_SEQ: u64 = 5;
+
+        let mock = MockOrgServer::start();
+        let state = build_state(tag);
+        seed_current_stable_org_item_for_tombstone(&state, ITEM_ID, ITEM_SEQ);
+        make_open_folder(&state.db, FOLDER_ID, "Related folder");
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+
+        let org_endpoint = format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}");
+        link_items_inner(&state, "container", FOLDER_ID, "org", &org_endpoint)
+            .expect("seed one visible folder-to-org decision through the command gate");
+        let original = state.db.link_rows_for_container(FOLDER_ID).unwrap();
+        assert_eq!(original.len(), 1, "precondition: exactly one manual relation");
+
+        delete_folder_inner(&state, FOLDER_ID.into()).expect("snapshot and delete related folder");
+        assert!(
+            state.db.link_rows_for_container(FOLDER_ID).unwrap().is_empty(),
+            "folder delete purges the live row, leaving the trash snapshot as its only copy"
+        );
+        let trash_id = state
+            .db
+            .list_trash_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.source_id == FOLDER_ID)
+            .expect("folder trash snapshot")
+            .id;
+
+        mock.seed_feed(vec![MockFeedEntry::stable_tombstone(
+            ITEM_ID,
+            ITEM_SEQ,
+            STABLE_DOC_ID,
+            is_current,
+        )]);
+        if reconcile {
+            assert_eq!(
+                block_on(org_reconcile_now_inner(&state)).unwrap(),
+                1,
+                "reconcile applies exactly this tombstone"
+            );
+        } else {
+            let report = block_on(org_sync_one_now_inner(&state, STABLE_ORG_ID)).unwrap();
+            assert_eq!(
+                report.tombstoned, 1,
+                "live feed applies exactly this tombstone"
+            );
+        }
+        assert!(
+            state.db.get_org_item(ITEM_ID).unwrap().is_none(),
+            "the withdrawn revision leaves the org read path"
+        );
+        assert_eq!(
+            org_document_terminal_marker_count(&state),
+            if is_current { 1 } else { 0 },
+            "only an authoritative current-head tombstone is a terminal resource deletion"
+        );
+
+        block_on(restore_trash_item_inner(&state, &trash_id))
+            .expect("folder restore consumes a valid snapshot");
+        assert!(
+            state.db.get_trash_entry(&trash_id).unwrap().is_none(),
+            "successful restore consumes the journal"
+        );
+        let restored = state.db.link_rows_for_container(FOLDER_ID).unwrap();
+        if is_current {
+            assert!(
+                restored.is_empty(),
+                "an old snapshot cannot resurrect a relation to a terminally deleted document"
+            );
+        } else {
+            assert_eq!(
+                restored, original,
+                "a predecessor tombstone preserves the exact opaque user decision"
+            );
+            assert!(
+                state
+                    .db
+                    .links_for_visible(
+                        crate::links::LinkKind::Container,
+                        FOLDER_ID,
+                        &HashSet::new(),
+                    )
+                    .unwrap()
+                    .is_empty(),
+                "the preserved row stays dormant while no current org revision is visible"
+            );
+        }
+    }
+
+    #[test]
+    fn org_tombstone_live_feed_current_blocks_old_container_link_restore() {
+        exercise_org_tombstone_container_restore("org-link-live-current", false, true);
+    }
+
+    #[test]
+    fn org_tombstone_live_feed_predecessor_preserves_container_link_restore() {
+        exercise_org_tombstone_container_restore("org-link-live-predecessor", false, false);
+    }
+
+    #[test]
+    fn org_tombstone_reconcile_current_blocks_old_container_link_restore() {
+        exercise_org_tombstone_container_restore("org-link-reconcile-current", true, true);
+    }
+
+    #[test]
+    fn org_tombstone_reconcile_predecessor_preserves_container_link_restore() {
+        exercise_org_tombstone_container_restore("org-link-reconcile-predecessor", true, false);
     }
 
     fn direct_put_lost_response_server(
@@ -35676,6 +35940,374 @@
 
         // Converged ⇒ the next pass is a pure no-op (it must not keep counting the same row forever).
         assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+    }
+
+    #[test]
+    fn org_terminal_revoked_orphan_sweep_terminalizes_all_revisions_and_consumes_witness() {
+        const OLD_ITEM: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const CURRENT_ITEM: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        const TRASH_FOLDER: &str = "revoked-trash-folder";
+        const LIVE_FOLDER: &str = "revoked-live-folder";
+
+        let state = build_state("org-stable-revoked-orphan");
+        state.config.lock().unwrap().share_base_url = String::new();
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        seed_stable_org_revision_for_tombstone(&state, OLD_ITEM, 5, 1, false);
+        state.db.evict_org_item(OLD_ITEM).unwrap();
+        seed_stable_org_revision_for_tombstone(&state, CURRENT_ITEM, 6, 2, true);
+
+        state
+            .db
+            .insert_org_share(
+                "stable-revoked-orphan",
+                STABLE_ORG_ID,
+                None,
+                Some("n-orphan"),
+                "note",
+                Some("Shared document"),
+                1,
+                1,
+                &[7u8; 32],
+                "2026-08-13T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_document_metadata(
+                "stable-revoked-orphan",
+                STABLE_DOC_ID,
+                "view",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded(
+                "stable-revoked-orphan",
+                OLD_ITEM,
+                "2026-08-13T00:01:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_state(
+                "stable-revoked-orphan",
+                "revoked",
+                "2026-08-13T00:02:00Z",
+            )
+            .unwrap();
+
+        make_open_folder(&state.db, TRASH_FOLDER, "Revoked trash");
+        make_open_folder(&state.db, LIVE_FOLDER, "Revoked live");
+        let endpoint = format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}");
+        for folder_id in [TRASH_FOLDER, LIVE_FOLDER] {
+            link_items_inner(&state, "container", folder_id, "org", &endpoint)
+                .expect("current stable document is linkable before terminal repair");
+        }
+        let old_snapshot = state.db.link_rows_for_container(TRASH_FOLDER).unwrap();
+        assert_eq!(old_snapshot.len(), 1);
+        delete_folder_inner(&state, TRASH_FOLDER.into()).expect("move one relation into trash");
+        let trash_id = state
+            .db
+            .list_trash_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.source_id == TRASH_FOLDER)
+            .expect("folder trash snapshot")
+            .id;
+
+        assert_eq!(org_document_terminal_marker_count(&state), 0);
+        assert_eq!(
+            org_document_reauthorization_count(&state),
+            2,
+            "both gated manual decisions carry exact reauthorization witnesses"
+        );
+        assert!(state.db.get_org_item(OLD_ITEM).unwrap().is_none());
+        assert!(state.db.get_org_item(CURRENT_ITEM).unwrap().is_some());
+        assert_eq!(
+            state
+                .db
+                .get_org_share("stable-revoked-orphan")
+                .unwrap()
+                .unwrap()
+                .item_id
+                .as_deref(),
+            Some(OLD_ITEM),
+            "the retained landed-item witness makes this revoked row repairable"
+        );
+
+        assert_eq!(
+            block_on(org_sweep_pending_inner(&state)).unwrap(),
+            1,
+            "the local-only sweep repairs exactly one stable revoked orphan"
+        );
+        let (total_revisions, live_revisions): (i64, i64) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*), SUM(CASE WHEN tombstoned = 0 THEN 1 ELSE 0 END)
+                   FROM org_items WHERE org_id = ?1 AND doc_id = ?2",
+                rusqlite::params![STABLE_ORG_ID, STABLE_DOC_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(total_revisions, 2, "both revisions remain as tombstone headers");
+        assert_eq!(live_revisions, 0, "terminal repair evicts every revision, not only item_id");
+        assert_eq!(org_document_terminal_marker_count(&state), 1);
+        assert_eq!(org_document_reauthorization_count(&state), 0);
+        assert!(state.db.link_rows_for_container(LIVE_FOLDER).unwrap().is_empty());
+        assert!(
+            state
+                .db
+                .get_org_share("stable-revoked-orphan")
+                .unwrap()
+                .unwrap()
+                .item_id
+                .is_none(),
+            "the same transaction consumes the landed-item witness"
+        );
+
+        block_on(restore_trash_item_inner(&state, &trash_id)).expect("restore folder shell");
+        assert!(
+            state.db.link_rows_for_container(TRASH_FOLDER).unwrap().is_empty(),
+            "the newly installed terminal marker blocks the stale trash relation"
+        );
+        assert_eq!(
+            state.db.restore_link_rows(&old_snapshot, &HashSet::new()).unwrap(),
+            0,
+            "even a second copy of the old snapshot cannot reanimate the relation"
+        );
+        assert_eq!(
+            block_on(org_sweep_pending_inner(&state)).unwrap(),
+            0,
+            "the consumed item_id makes the next local-only sweep a strict no-op"
+        );
+    }
+
+    #[test]
+    fn org_terminal_never_landed_revoked_share_does_not_mark_or_purge() {
+        const ITEM_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const FOLDER_ID: &str = "never-landed-folder";
+
+        let state = build_state("org-stable-never-landed-revoked");
+        state.config.lock().unwrap().share_base_url = String::new();
+        seed_current_stable_org_item_for_tombstone(&state, ITEM_ID, 5);
+        make_open_folder(&state.db, FOLDER_ID, "Never landed");
+        let endpoint = format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}");
+        link_items_inner(&state, "container", FOLDER_ID, "org", &endpoint).unwrap();
+        let relation = state.db.link_rows_for_container(FOLDER_ID).unwrap();
+
+        state
+            .db
+            .insert_org_share(
+                "stable-never-landed",
+                STABLE_ORG_ID,
+                None,
+                Some("n-never-landed"),
+                "note",
+                Some("Never landed"),
+                1,
+                1,
+                &[7u8; 32],
+                "2026-08-13T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_document_metadata("stable-never-landed", STABLE_DOC_ID, "view")
+            .unwrap();
+        state
+            .db
+            .set_org_share_state(
+                "stable-never-landed",
+                "revoked",
+                "2026-08-13T00:01:00Z",
+            )
+            .unwrap();
+        assert!(
+            state
+                .db
+                .get_org_share("stable-never-landed")
+                .unwrap()
+                .unwrap()
+                .item_id
+                .is_none(),
+            "precondition: this share never acquired a server item witness"
+        );
+
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+        assert_eq!(org_document_terminal_marker_count(&state), 0);
+        assert_eq!(state.db.link_rows_for_container(FOLDER_ID).unwrap(), relation);
+        assert!(state.db.get_org_item(ITEM_ID).unwrap().is_some());
+    }
+
+    #[test]
+    fn org_terminal_legacy_dormant_restore_stays_hidden_then_cannot_outlive_current_tombstone() {
+        const ITEM_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const FOLDER_ID: &str = "legacy-dormant-folder";
+
+        let mock = MockOrgServer::start();
+        let state = build_state("org-legacy-dormant-terminal");
+        seed_current_stable_org_item_for_tombstone(&state, ITEM_ID, 5);
+        make_open_folder(&state.db, FOLDER_ID, "Legacy dormant");
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+
+        let endpoint = format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}");
+        link_items_inner(&state, "container", FOLDER_ID, "org", &endpoint).unwrap();
+        let old_snapshot = state.db.link_rows_for_container(FOLDER_ID).unwrap();
+        delete_folder_inner(&state, FOLDER_ID.into()).expect("snapshot folder relation");
+        let trash_id = state
+            .db
+            .list_trash_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.source_id == FOLDER_ID)
+            .expect("folder trash snapshot")
+            .id;
+
+        state.db.set_org_context_enabled(STABLE_ORG_ID, false).unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "DELETE FROM org_link_reauthorizations
+                  WHERE src_kind = 'container' AND src_id = ?1
+                    AND dst_kind = 'org' AND dst_id = ?2 AND edge_type = 'manual'",
+                rusqlite::params![FOLDER_ID, endpoint],
+            )
+            .unwrap();
+        assert_eq!(org_document_terminal_marker_count(&state), 0);
+        assert_eq!(org_document_reauthorization_count(&state), 0);
+        block_on(restore_trash_item_inner(&state, &trash_id))
+            .expect("legacy snapshot restores as an opaque dormant decision");
+        assert_eq!(state.db.link_rows_for_container(FOLDER_ID).unwrap(), old_snapshot);
+        assert!(
+            state
+                .db
+                .links_for_visible(
+                    crate::links::LinkKind::Container,
+                    FOLDER_ID,
+                    &HashSet::new(),
+                )
+                .unwrap()
+                .is_empty(),
+            "the public reader must not disclose a dormant org endpoint"
+        );
+
+        mock.seed_feed(vec![MockFeedEntry::stable_tombstone(
+            ITEM_ID,
+            5,
+            STABLE_DOC_ID,
+            true,
+        )]);
+        let report = block_on(org_sync_one_now_inner(&state, STABLE_ORG_ID)).unwrap();
+        assert_eq!(report.tombstoned, 1);
+        assert_eq!(org_document_terminal_marker_count(&state), 1);
+        assert!(state.db.link_rows_for_container(FOLDER_ID).unwrap().is_empty());
+        assert_eq!(
+            state.db.restore_link_rows(&old_snapshot, &HashSet::new()).unwrap(),
+            0,
+            "a stale legacy snapshot cannot resurrect the row after terminal deletion"
+        );
+        assert!(state.db.link_rows_for_container(FOLDER_ID).unwrap().is_empty());
+    }
+
+    #[test]
+    fn org_terminal_reconcile_current_absent_named_revision_evicts_live_sibling_and_relations() {
+        const TOMBSTONED_ITEM: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const CURRENT_ITEM: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        const FOLDER_ID: &str = "current-sibling-folder";
+
+        let state = build_state("org-current-absent-named-revision");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+
+        seed_replica_item(&state, TOMBSTONED_ITEM, STABLE_ORG_ID, 5);
+        state
+            .db
+            .set_org_item_document_metadata(
+                TOMBSTONED_ITEM,
+                Some(STABLE_DOC_ID),
+                "view",
+                Some("author-1"),
+            )
+            .unwrap();
+        state
+            .db
+            .repair_org_reconcile_metadata(
+                TOMBSTONED_ITEM,
+                STABLE_ORG_ID,
+                1,
+                Some(STABLE_DOC_ID),
+                "view",
+                Some("author-1"),
+                false,
+            )
+            .unwrap();
+        state.db.evict_org_item(TOMBSTONED_ITEM).unwrap();
+
+        seed_replica_item(&state, CURRENT_ITEM, STABLE_ORG_ID, 6);
+        state
+            .db
+            .set_org_item_document_metadata(
+                CURRENT_ITEM,
+                Some(STABLE_DOC_ID),
+                "view",
+                Some("author-1"),
+            )
+            .unwrap();
+        state
+            .db
+            .repair_org_reconcile_metadata(
+                CURRENT_ITEM,
+                STABLE_ORG_ID,
+                1,
+                Some(STABLE_DOC_ID),
+                "view",
+                Some("author-1"),
+                true,
+            )
+            .unwrap();
+
+        make_open_folder(&state.db, FOLDER_ID, "Current sibling");
+        let endpoint = format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}");
+        link_items_inner(&state, "container", FOLDER_ID, "org", &endpoint).unwrap();
+        let current_counts = replica_counts(&state, CURRENT_ITEM);
+        assert!(
+            current_counts.0 > 0
+                && current_counts.1 > 0
+                && current_counts.2 > 0
+                && current_counts.3 > 0,
+            "precondition: A is a fully indexed current replica with an attachment"
+        );
+        assert!(state.db.get_org_item(TOMBSTONED_ITEM).unwrap().is_none());
+        assert!(state.db.get_org_item(CURRENT_ITEM).unwrap().is_some());
+        assert_eq!(state.db.link_rows_for_container(FOLDER_ID).unwrap().len(), 1);
+        assert_eq!(org_document_reauthorization_count(&state), 1);
+        assert_eq!(org_document_terminal_marker_count(&state), 0);
+
+        assert!(
+            state
+                .db
+                .evict_org_reconcile_tombstone_with_metadata(
+                    STABLE_ORG_ID,
+                    TOMBSTONED_ITEM,
+                    Some(STABLE_DOC_ID),
+                    true,
+                )
+                .unwrap(),
+            "a current tombstone reports the live sibling revision it evicted"
+        );
+
+        assert!(state.db.get_org_item(CURRENT_ITEM).unwrap().is_none());
+        assert_eq!(
+            replica_counts(&state, CURRENT_ITEM),
+            (0, 0, 0, 0),
+            "A's chunks, vectors, FTS projection and attachment are all purged"
+        );
+        assert!(state.db.link_rows_for_container(FOLDER_ID).unwrap().is_empty());
+        assert_eq!(org_document_reauthorization_count(&state), 0);
+        assert_eq!(org_document_terminal_marker_count(&state), 1);
     }
 
     /// Records every [`crate::events::EVENT_ORG_FEED_UPDATED`] notice a command fires, so the "does the

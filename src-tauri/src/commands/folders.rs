@@ -730,6 +730,14 @@ pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result
                 "unlock this folder first to delete it (its notes are sealed)".into(),
             ));
         }
+    }
+
+    // A prior failed relation replay leaves this exact folder as a retry shell. Check only after
+    // the lock gate (the journal's existence is itself private lifecycle state), but before
+    // `remove_lock_inner` or any other mutation.
+    super::trash_commands::refuse_pending_recovery_journal(state, &folder_id)?;
+
+    if folder.locked {
         // Permanently unseal back to plaintext + re-export the `.md`s, then the folder is OPEN.
         // remove_lock_inner takes the lifecycle guard itself (so we do NOT hold it across this call —
         // the std Mutex is non-reentrant and would self-deadlock).

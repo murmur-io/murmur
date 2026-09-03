@@ -24,8 +24,8 @@ async function emitOrgFeedUpdated(page: Page): Promise<void> {
  *  - `list_links` renders a mix of chips; ONLY the `manual:true` chip shows a `×`.
  *  - clicking that `×` invokes `unlink_items` with the anchor→neighbour args and
  *    then re-fetches `list_links` (the chip drops out).
- *  - the `+ Link` chooser opens the OPAQUE single-pick popover (`app-link-picker`),
- *    and picking a candidate invokes `link_items(anchorKind, anchorId, kind, id)`
+ *  - the `+ Link` chooser opens the OPAQUE hierarchy modal, and picking a leaf
+ *    invokes `link_items(anchorKind, anchorId, kind, id)`
  *    then re-fetches (the new chip appears).
  *
  * The mock records every link_items/unlink_items call on `window.__linkCalls` so the
@@ -102,9 +102,9 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
         out.push({
           id: 9,
           direction: "out",
-          otherKind: "note",
-          otherId: "n-picked",
-          otherTitle: "Picked Note",
+          otherKind: "meeting",
+          otherId: "m-cand",
+          otherTitle: "Some meeting",
           edgeType: "manual",
           createdBy: "user",
           status: "active",
@@ -115,19 +115,6 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
       }
       return out;
     },
-
-    // The single-pick chooser's candidate feed includes a revision-stable Shared
-    // Brain endpoint. It used to be rejected by Connections after selection.
-    list_link_candidates: () => [
-      { kind: "note", id: "n-picked", title: "Picked Note", snippet: "" },
-      { kind: "meeting", id: "m-cand", title: "Some meeting", snippet: "" },
-      {
-        kind: "org",
-        id: "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        title: "Shared roadmap",
-        snippet: "",
-      },
-    ],
 
     // Record link/unlink calls + flip the re-fetch flag so list_links changes.
     link_items: (args: unknown) => {
@@ -170,10 +157,8 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
   });
   await expect(collapsedLink).toBeVisible();
   await collapsedLink.click();
-  await expect(panel.getByPlaceholder(/Link a meeting, note/)).toBeVisible();
-  await expect(
-    page.locator(".link-pop").getByRole("option", { name: /Picked Note/ }),
-  ).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Add related" })).toBeVisible();
+  await expect(page.getByPlaceholder("Search every Space…")).toBeFocused();
   await expect(collapsed).toHaveAttribute("aria-expanded", "false");
   await expect(panel.locator(".cx-group")).toHaveCount(0);
   await page.keyboard.press("Escape");
@@ -218,52 +203,31 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
     },
   ]);
 
-  // Open the + Link chooser → the query input + the opaque picker popover appear.
+  // Open the + Link chooser → the opaque hierarchy modal appears.
   // `exact` so the substring name doesn't also match a suggestion chip's
   // "Add link to …" aria-label (2026-07-19 ambient suggestion chips are buttons).
   await panel.getByRole("button", { name: "Link", exact: true }).click();
-  await expect(panel.getByPlaceholder(/Link a meeting, note/)).toBeVisible();
-  // The link-picker popover box is TELEPORTED to <body> (appTeleportToBody) —
-  // locate it by class, not by the `app-link-picker` host.
-  const picker = page.locator(".link-pop");
+  const picker = page.getByRole("dialog", { name: "Add related" });
   await expect(picker).toBeVisible();
 
-  // Picking a local note invokes link_items(anchor=note/n1 → note/n-picked);
-  // the Shared Brain candidate is exercised separately below.
-  const pickedRow = picker.getByRole("option", { name: /Picked Note/ });
+  // The anchor's note group opens automatically. Expand the sibling recordings
+  // group, then link a leaf immediately.
+  await picker.getByRole("button", { name: "Expand Recordings" }).click();
+  const pickedRow = picker.getByRole("button", {
+    name: "Some meeting",
+    exact: true,
+  });
   await expect(pickedRow).toBeVisible();
-  // mousedown is prevented on the popover (no focus steal), then click emits picked.
-  await pickedRow.dispatchEvent("click");
+  await pickedRow.click();
 
   // The new manual chip appears from the re-fetch; link_items was called correctly.
-  await expect(panel.getByText("Picked Note")).toBeVisible();
+  await expect(panel.getByText("Some meeting")).toBeVisible();
   const afterLink = await page.evaluate(
     () => (window as unknown as { __linkCalls?: unknown[] }).__linkCalls || [],
   );
   expect(afterLink).toContainEqual({
     cmd: "link_items",
-    args: { srcKind: "note", srcId: "n1", dstKind: "note", dstId: "n-picked" },
-  });
-
-  // Regression: a received Shared Brain candidate is a valid private endpoint,
-  // keyed by the backend-composed stable link id (not the current revision id).
-  await panel.getByRole("button", { name: "Link", exact: true }).click();
-  const sharedRow = page
-    .locator(".link-pop")
-    .getByRole("option", { name: /Shared roadmap/ });
-  await expect(sharedRow).toBeVisible();
-  await sharedRow.dispatchEvent("click");
-  const afterOrgLink = await page.evaluate(
-    () => (window as unknown as { __linkCalls?: unknown[] }).__linkCalls || [],
-  );
-  expect(afterOrgLink).toContainEqual({
-    cmd: "link_items",
-    args: {
-      srcKind: "note",
-      srcId: "n1",
-      dstKind: "org",
-      dstId: ORG_OUT_LINK_ID,
-    },
+    args: { srcKind: "note", srcId: "n1", dstKind: "meeting", dstId: "m-cand" },
   });
 
   expect(consoleErrors).toEqual([]);
@@ -377,7 +341,9 @@ test("unlink preserves the exact directed tuple for outgoing and incoming links"
     .getByRole("button", { name: "Show related items and suggestions" })
     .click();
 
-  await expect(panel.getByText("Outgoing meeting", { exact: true })).toBeVisible();
+  await expect(
+    panel.getByText("Outgoing meeting", { exact: true }),
+  ).toBeVisible();
   await expect(
     panel.getByText("Incoming shared note", { exact: true }),
   ).toBeVisible();
@@ -385,7 +351,9 @@ test("unlink preserves the exact directed tuple for outgoing and incoming links"
   await panel
     .getByRole("button", { name: "Remove link to Outgoing meeting" })
     .click();
-  await expect(panel.getByText("Outgoing meeting", { exact: true })).toHaveCount(0);
+  await expect(
+    panel.getByText("Outgoing meeting", { exact: true }),
+  ).toHaveCount(0);
   await expect(
     panel.getByText("Incoming shared note", { exact: true }),
   ).toBeVisible();
@@ -498,7 +466,9 @@ test("collapsed opposite manual tuple is removed while the wikilink survives", a
     .getByRole("button", { name: "Remove link to Opposite target" })
     .click();
 
-  await expect(panel.getByText("Opposite target", { exact: true })).toBeVisible();
+  await expect(
+    panel.getByText("Opposite target", { exact: true }),
+  ).toBeVisible();
   await expect(
     panel.getByRole("button", { name: "Remove link to Opposite target" }),
   ).toHaveCount(0);
@@ -522,7 +492,9 @@ test("collapsed opposite manual tuple is removed while the wikilink survives", a
   });
 });
 
-test("one collapsed unlink removes both directed manual tuples", async ({ page }) => {
+test("one collapsed unlink removes both directed manual tuples", async ({
+  page,
+}) => {
   await mockNotes(page, {
     list_links: () => {
       const w = window as unknown as {
@@ -595,12 +567,17 @@ test("one collapsed unlink removes both directed manual tuples", async ({ page }
   await panel
     .getByRole("button", { name: "Remove link to Both directions" })
     .click();
-  await expect(panel.getByText("Both directions", { exact: true })).toHaveCount(0);
+  await expect(panel.getByText("Both directions", { exact: true })).toHaveCount(
+    0,
+  );
 
   const call = await page.evaluate(
     () =>
-      (window as unknown as { __bidirectionalUnlink?: { manualEdges?: unknown[] } })
-        .__bidirectionalUnlink,
+      (
+        window as unknown as {
+          __bidirectionalUnlink?: { manualEdges?: unknown[] };
+        }
+      ).__bidirectionalUnlink,
   );
   expect(call?.manualEdges).toEqual([
     {
@@ -675,7 +652,7 @@ test("Shared Brain chip follows its stable link to the current live revision", a
   await expect(page.getByText("revision 9")).toBeVisible();
 });
 
-test("org-anchored picker keeps same-org and cross-org stable targets but excludes only exact self", async ({
+test("org-anchored hierarchy keeps same-org and cross-org stable targets and marks exact self Current", async ({
   page,
 }) => {
   await mockNotes(page, {
@@ -695,26 +672,83 @@ test("org-anchored picker keeps same-org and cross-org stable targets but exclud
       canManage: false,
     }),
     list_links: () => [],
-    list_link_candidates: () => [
-      {
-        kind: "org",
-        id: "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        title: "Anchor roadmap",
-        snippet: "",
+    list_shared_workspace: () => ({
+      spaces: [
+        {
+          containerId: "shared-a",
+          orgId: "11111111-1111-4111-8111-111111111111",
+          orgName: "Team A",
+          name: "Team A Space",
+          level: "space",
+          access: "view",
+          authorHint: "kasia",
+          folders: [],
+          items: [
+            {
+              itemId: "self-r3",
+              docId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              title: "Anchor roadmap",
+              kind: "document",
+              authorHint: "kasia",
+              createdAt: "2026-08-12T10:00:00Z",
+              orgId: "11111111-1111-4111-8111-111111111111",
+              orgName: "Team A",
+              access: "view",
+              position: 0,
+            },
+            {
+              itemId: "same-r1",
+              docId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+              title: "Same org neighbour",
+              kind: "document",
+              authorHint: "kasia",
+              createdAt: "2026-08-12T10:00:00Z",
+              orgId: "11111111-1111-4111-8111-111111111111",
+              orgName: "Team A",
+              access: "view",
+              position: 1,
+            },
+          ],
+          position: 0,
+        },
+        {
+          containerId: "shared-b",
+          orgId: "22222222-2222-4222-8222-222222222222",
+          orgName: "Team B",
+          name: "Team B Space",
+          level: "space",
+          access: "view",
+          authorHint: "ola",
+          folders: [],
+          items: [
+            {
+              itemId: "cross-r1",
+              docId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              title: "Same document id in another org",
+              kind: "document",
+              authorHint: "ola",
+              createdAt: "2026-08-12T10:00:00Z",
+              orgId: "22222222-2222-4222-8222-222222222222",
+              orgName: "Team B",
+              access: "view",
+              position: 0,
+            },
+          ],
+          position: 1,
+        },
+      ],
+      sharedBrains: {
+        orgId: "shared",
+        orgName: "Shared",
+        name: "Shared Brains",
+        level: "virtual",
+        access: "view",
+        authorHint: "",
+        folders: [],
+        items: [],
+        position: 2,
       },
-      {
-        kind: "org",
-        id: "11111111-1111-4111-8111-111111111111:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-        title: "Same org neighbour",
-        snippet: "",
-      },
-      {
-        kind: "org",
-        id: "22222222-2222-4222-8222-222222222222:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        title: "Same document id in another org",
-        snippet: "",
-      },
-    ],
+    }),
     link_items: (args: unknown) => {
       const target = window as unknown as { __orgToOrgLinkCalls?: unknown[] };
       (target.__orgToOrgLinkCalls ??= []).push(args);
@@ -729,27 +763,29 @@ test("org-anchored picker keeps same-org and cross-org stable targets but exclud
   await expect(panel).toBeVisible();
 
   await panel.getByRole("button", { name: "Link", exact: true }).click();
-  const picker = page.locator(".link-pop");
+  const picker = page.getByRole("dialog", { name: "Add related" });
   await expect(
-    picker.getByRole("option", { name: /Anchor roadmap/ }),
-  ).toHaveCount(0);
+    picker.getByRole("button", { name: "Collapse Team A Space" }),
+  ).toBeVisible();
+  await picker.getByRole("button", { name: "Expand Team B Space" }).click();
   await expect(
-    picker.getByRole("option", { name: /Same org neighbour/ }),
+    picker.getByText("Anchor roadmap", { exact: true }),
+  ).toBeVisible();
+  await expect(picker.getByText("Current", { exact: true })).toBeVisible();
+  await expect(
+    picker.locator('[data-row="si:same-r1"] .rhp-row-main'),
   ).toBeVisible();
   await expect(
-    picker.getByRole("option", {
-      name: /Same document id in another org/,
-    }),
+    picker.locator('[data-row="si:cross-r1"] .rhp-row-main'),
   ).toBeVisible();
 
-  await picker
-    .getByRole("option", { name: /Same org neighbour/ })
-    .dispatchEvent("click");
+  await picker.locator('[data-row="si:same-r1"] .rhp-row-main').click();
   await panel.getByRole("button", { name: "Link", exact: true }).click();
-  await page
-    .locator(".link-pop")
-    .getByRole("option", { name: /Same document id in another org/ })
-    .dispatchEvent("click");
+  const secondPicker = page.getByRole("dialog", { name: "Add related" });
+  await secondPicker
+    .getByRole("button", { name: "Expand Team B Space" })
+    .click();
+  await secondPicker.locator('[data-row="si:cross-r1"] .rhp-row-main').click();
 
   const calls = await page.evaluate(
     () =>
@@ -801,11 +837,7 @@ test("org feed invalidates Connections immediately and converges revised, withdr
         __orgLinkMode?: string;
         __resolveOrgLinkReload?: () => void;
       };
-      const edge = (
-        title: string,
-        navigationId: string,
-        id: number,
-      ) => ({
+      const edge = (title: string, navigationId: string, id: number) => ({
         id,
         direction: "out",
         otherKind: "org",
@@ -839,9 +871,6 @@ test("org feed invalidates Connections immediately and converges revised, withdr
           return [edge("Shared roadmap r1", "item-neighbour-r1", 701)];
       }
     },
-    list_link_candidates: () => [
-      { kind: "note", id: "n-picker", title: "Picker stale row", snippet: "" },
-    ],
     org_refresh: () => null,
     org_list_statuses: () => [],
     list_meeting_org_shares: () => [],
@@ -851,7 +880,9 @@ test("org feed invalidates Connections immediately and converges revised, withdr
 
   await page.goto("/org-item/item-anchor-r1");
   const panel = page.locator("app-connections");
-  await expect(panel.getByText("Shared roadmap r1", { exact: true })).toBeVisible();
+  await expect(
+    panel.getByText("Shared roadmap r1", { exact: true }),
+  ).toBeVisible();
 
   await expect
     .poll(() =>
@@ -866,9 +897,7 @@ test("org feed invalidates Connections immediately and converges revised, withdr
     .toBeGreaterThanOrEqual(2);
 
   await panel.getByRole("button", { name: "Link", exact: true }).click();
-  await expect(
-    page.locator(".link-pop").getByRole("option", { name: /Picker stale row/ }),
-  ).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Add related" })).toBeVisible();
   await page.evaluate(() => {
     (window as unknown as { __orgLinkMode?: string }).__orgLinkMode =
       "revision-pending";
@@ -876,8 +905,12 @@ test("org feed invalidates Connections immediately and converges revised, withdr
   await emitOrgFeedUpdated(page);
 
   // Invalidated synchronously, before the replacement `list_links` promise resolves.
-  await expect(panel.getByText("Shared roadmap r1", { exact: true })).toHaveCount(0);
-  await expect(page.locator(".link-pop")).toHaveCount(0);
+  await expect(
+    panel.getByText("Shared roadmap r1", { exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("dialog", { name: "Add related" })).toHaveCount(
+    0,
+  );
   await expect
     .poll(() =>
       page.evaluate(
@@ -888,10 +921,13 @@ test("org feed invalidates Connections immediately and converges revised, withdr
     )
     .toBe("function");
   await page.evaluate(() => {
-    (window as unknown as { __resolveOrgLinkReload: () => void })
-      .__resolveOrgLinkReload();
+    (
+      window as unknown as { __resolveOrgLinkReload: () => void }
+    ).__resolveOrgLinkReload();
   });
-  await expect(panel.getByText("Shared roadmap r2", { exact: true })).toBeVisible();
+  await expect(
+    panel.getByText("Shared roadmap r2", { exact: true }),
+  ).toBeVisible();
 
   // A later withdrawal clears the revised chip. A still-later stale request cannot restore it.
   await page.evaluate(() => {
@@ -899,23 +935,31 @@ test("org feed invalidates Connections immediately and converges revised, withdr
       "stale-pending";
   });
   await emitOrgFeedUpdated(page);
-  await expect(panel.getByText("Shared roadmap r2", { exact: true })).toHaveCount(0);
+  await expect(
+    panel.getByText("Shared roadmap r2", { exact: true }),
+  ).toHaveCount(0);
   await page.evaluate(() => {
-    (window as unknown as { __orgLinkMode?: string }).__orgLinkMode = "withdrawn";
+    (window as unknown as { __orgLinkMode?: string }).__orgLinkMode =
+      "withdrawn";
   });
   await emitOrgFeedUpdated(page);
   await page.evaluate(() => {
-    (window as unknown as { __resolveOrgLinkReload: () => void })
-      .__resolveOrgLinkReload();
+    (
+      window as unknown as { __resolveOrgLinkReload: () => void }
+    ).__resolveOrgLinkReload();
   });
-  await expect(panel.getByText("Stale roadmap r3", { exact: true })).toHaveCount(0);
+  await expect(
+    panel.getByText("Stale roadmap r3", { exact: true }),
+  ).toHaveCount(0);
 
   // A fresh live head refreshes both the title and the navigation item id.
   await page.evaluate(() => {
     (window as unknown as { __orgLinkMode?: string }).__orgLinkMode = "revived";
   });
   await emitOrgFeedUpdated(page);
-  await expect(panel.getByText("Shared roadmap r4", { exact: true })).toBeVisible();
+  await expect(
+    panel.getByText("Shared roadmap r4", { exact: true }),
+  ).toBeVisible();
   await panel
     .getByRole("button", { name: "Open Shared Brain item Shared roadmap r4" })
     .click();
@@ -962,21 +1006,39 @@ test("empty Related state keeps + Link reachable and creates the first relations
         : [];
     },
     get_backlinks: () => [],
-    list_link_candidates: (args: unknown) => {
+    get_related_picker_bootstrap: (args: unknown) => {
       const w = window as unknown as {
-        __emptyCandidateCalls?: unknown[];
+        __emptyBootstrapCalls?: unknown[];
       };
-      (w.__emptyCandidateCalls ??= []).push(args);
-      return [
-        // The picker must exclude its own anchor while retaining a valid target.
-        { kind: "note", id: "n1", title: "My First Note", snippet: "" },
-        {
+      (w.__emptyBootstrapCalls ??= []).push(args);
+      return {
+        spaces: [
+          {
+            id: "p-root",
+            name: "Workspace",
+            level: "project",
+            emoji: null,
+            locked: false,
+            unlocked: false,
+            linkable: true,
+            groups: [{ kind: "note", total: 2 }],
+            folders: [],
+          },
+        ],
+        unclassified: [],
+        anchor: {
           kind: "note",
-          id: "n-first",
-          title: "First linked note",
-          snippet: "",
+          containerId: "p-root",
+          path: ["p-root"],
+          index: 0,
+          offset: 0,
+          items: [
+            { kind: "note", id: "n1", title: "My First Note" },
+            { kind: "note", id: "n-first", title: "First linked note" },
+          ],
+          total: 2,
         },
-      ];
+      };
     },
     link_items: (args: unknown) => {
       const w = window as unknown as {
@@ -1000,18 +1062,19 @@ test("empty Related state keeps + Link reachable and creates the first relations
   await expect(linkTrigger).toBeVisible();
   await linkTrigger.click();
 
-  await expect(panel.getByPlaceholder(/Link a meeting, note/)).toBeVisible();
-  const picker = page.locator(".link-pop");
+  const picker = page.getByRole("dialog", { name: "Add related" });
   await expect(picker).toBeVisible();
   await expect(
-    picker.getByRole("option", { name: /My First Note/ }),
-  ).toHaveCount(0);
+    picker.getByText("My First Note", { exact: true }),
+  ).toBeVisible();
+  await expect(picker.getByText("Current", { exact: true })).toBeVisible();
 
-  const firstTarget = picker.getByRole("option", {
-    name: /First linked note/,
+  const firstTarget = picker.getByRole("button", {
+    name: "First linked note",
+    exact: true,
   });
   await expect(firstTarget).toBeVisible();
-  await firstTarget.dispatchEvent("click");
+  await firstTarget.click();
 
   // The write re-fetches server truth: the empty trigger becomes the normal
   // collapsed Related row, and expanding it reveals the newly linked chip.
@@ -1024,7 +1087,9 @@ test("empty Related state keeps + Link reachable and creates the first relations
     panel.getByRole("button", { name: "Link", exact: true }),
   ).toBeVisible();
   await collapsed.click();
-  await expect(panel.getByText("First linked note", { exact: true })).toBeVisible();
+  await expect(
+    panel.getByText("First linked note", { exact: true }),
+  ).toBeVisible();
 
   const linkCalls = await page.evaluate(
     () =>
@@ -1040,12 +1105,12 @@ test("empty Related state keeps + Link reachable and creates the first relations
     },
   ]);
 
-  const candidateCalls = await page.evaluate(
+  const bootstrapCalls = await page.evaluate(
     () =>
-      (window as unknown as { __emptyCandidateCalls?: unknown[] })
-        .__emptyCandidateCalls ?? [],
+      (window as unknown as { __emptyBootstrapCalls?: unknown[] })
+        .__emptyBootstrapCalls ?? [],
   );
-  expect(candidateCalls).toContainEqual({ prefix: "", offset: 0, limit: 40 });
+  expect(bootstrapCalls).toContainEqual({ anchorKind: "note", anchorId: "n1" });
   expect(consoleErrors).toEqual([]);
 });
 
@@ -1068,13 +1133,13 @@ test("locked note hides Related and performs no relationship picker reads", asyn
       (w.__lockedConnectionReads ??= []).push({ cmd: "get_backlinks", args });
       return [];
     },
-    list_link_candidates: (args: unknown) => {
+    get_related_picker_bootstrap: (args: unknown) => {
       const w = window as unknown as { __lockedConnectionReads?: unknown[] };
       (w.__lockedConnectionReads ??= []).push({
-        cmd: "list_link_candidates",
+        cmd: "get_related_picker_bootstrap",
         args,
       });
-      return [];
+      return { spaces: [], unclassified: [], anchor: null };
     },
   });
 
@@ -1085,7 +1150,7 @@ test("locked note hides Related and performs no relationship picker reads", asyn
   await expect(
     page.getByRole("button", { name: "Link", exact: true }),
   ).toHaveCount(0);
-  await expect(page.locator(".link-pop")).toHaveCount(0);
+  await expect(page.locator(".rhp")).toHaveCount(0);
 
   const reads = await page.evaluate(
     () =>
@@ -1093,141 +1158,4 @@ test("locked note hides Related and performs no relationship picker reads", asyn
         .__lockedConnectionReads ?? [],
   );
   expect(reads).toEqual([]);
-});
-
-/**
- * WKWebView regression: a teleported fixed picker used to re-measure/write its
- * layer once for every captured scroll event. A fast scroll of the note pane
- * queued dozens of forced layouts and WebKit temporarily painted the opaque
- * picker shell with none of its already-mounted rows.
- */
-test("fast note-pane scrolling coalesces picker layout and keeps its rows painted", async ({
-  page,
-}) => {
-  await mockNotes(page, {
-    get_note: (args: { id: string }) => ({
-      id: args.id,
-      title: "Long standalone note",
-      folderId: "nf1",
-      markdown: Array.from(
-        { length: 180 },
-        (_, index) => `Paragraph ${index}: enough text to make the note pane scroll.`,
-      ).join("\n\n"),
-      tags: [],
-      properties: {},
-      updatedAt: 1_720_000_000_000,
-      createdAt: 1_719_000_000_000,
-      exportedPath: null,
-      locked: false,
-      shared: false,
-    }),
-    list_links: () => [
-      {
-        id: 601,
-        direction: "out",
-        otherKind: "meeting",
-        otherId: "m-existing",
-        otherTitle: "Existing meeting",
-        edgeType: "manual",
-        createdBy: "user",
-        status: "active",
-        score: 1,
-        createdAt: 1_720_000_000,
-        manual: true,
-      },
-    ],
-    get_backlinks: () => [],
-    list_link_candidates: () =>
-      Array.from({ length: 30 }, (_, index) => ({
-        kind: "note",
-        id: `page-scroll-candidate-${index}`,
-        title: `Page scroll candidate ${String(index).padStart(2, "0")}`,
-        snippet: "",
-      })),
-  });
-
-  await page.goto("/notes/n1");
-
-  const panel = page.locator("app-connections");
-  await expect(panel).toBeVisible();
-  const collapsed = panel.getByRole("button", {
-    name: "Show related items and suggestions",
-  });
-  await collapsed.click();
-  await panel.getByRole("button", { name: "Link", exact: true }).click();
-
-  const input = panel.getByPlaceholder(/Link a meeting, note/);
-  const picker = page.locator(".link-pop");
-  await expect(input).toBeVisible();
-  await expect(picker.locator(".link-pop-row")).toHaveCount(30);
-
-  const measurements = await input.evaluate(async (element) => {
-    const inputElement = element as HTMLInputElement & {
-      getBoundingClientRect: () => DOMRect;
-    };
-    const originalRect = inputElement.getBoundingClientRect.bind(inputElement);
-    const heightDescriptor = Object.getOwnPropertyDescriptor(
-      HTMLElement.prototype,
-      "offsetHeight",
-    );
-    const pickerElement = document.querySelector<HTMLElement>(".link-pop");
-    if (!heightDescriptor?.get || !heightDescriptor.configurable || !pickerElement) {
-      return { supported: false, anchorReads: -1, pickerHeightReads: -1 };
-    }
-
-    let anchorReads = 0;
-    let pickerHeightReads = 0;
-    inputElement.getBoundingClientRect = () => {
-      anchorReads += 1;
-      return originalRect();
-    };
-    Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
-      configurable: true,
-      get() {
-        if (this === pickerElement) {
-          pickerHeightReads += 1;
-        }
-        return heightDescriptor.get!.call(this);
-      },
-    });
-
-    try {
-      const scroller = document.querySelector<HTMLElement>(".editor-body");
-      if (!scroller || scroller.scrollHeight <= scroller.clientHeight) {
-        return { supported: false, anchorReads: -1, pickerHeightReads: -1 };
-      }
-      const max = scroller.scrollHeight - scroller.clientHeight;
-      const travel = Math.min(max, 160);
-      for (let index = 0; index < 24; index += 1) {
-        scroller.scrollTop = index % 2 === 0 ? travel : 0;
-        scroller.dispatchEvent(new Event("scroll"));
-        await new Promise<void>((resolve) =>
-          requestAnimationFrame(() => resolve()),
-        );
-      }
-      await new Promise<void>((resolve) =>
-        requestAnimationFrame(() => resolve()),
-      );
-      return { supported: true, anchorReads, pickerHeightReads };
-    } finally {
-      inputElement.getBoundingClientRect = originalRect;
-      Object.defineProperty(
-        HTMLElement.prototype,
-        "offsetHeight",
-        heightDescriptor,
-      );
-    }
-  });
-
-  expect(measurements.supported).toBe(true);
-  // One live-anchor measurement per animation frame is required to follow the
-  // input, but the already-fitted picker must not synchronously remeasure its
-  // own layout while the scroll compositor is moving it.
-  expect(measurements.anchorReads).toBeLessThanOrEqual(26);
-  expect(measurements.pickerHeightReads).toBeLessThanOrEqual(2);
-  await expect(picker.locator(".link-pop-row")).toHaveCount(30);
-  await expect(picker.locator(".link-pop-empty")).toHaveCount(0);
-  await expect(
-    picker.getByRole("option", { name: /Page scroll candidate 29/ }),
-  ).toBeVisible();
 });

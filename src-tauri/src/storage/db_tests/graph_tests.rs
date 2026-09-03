@@ -794,6 +794,41 @@ fn full_graph_links_are_bounded_and_flag_truncation() {
     assert!(truncated, "one past the cap sets the truncated flag");
 }
 
+/// Metadata-only Related rows are filtered BEFORE the graph edge cap. Otherwise a large set of
+/// high-score container relations can consume `LIMIT + 1`, falsely set truncation, and starve the
+/// material meeting/note/document edge that the graph is actually able to render.
+#[test]
+fn full_graph_link_cap_ignores_container_rows_before_limit_and_count() {
+    let db = file_db("links-container-before-cap");
+    for i in 0..=MAX_FULL_GRAPH_LINK_EDGES {
+        seed_link(
+            &db,
+            ("meeting", &format!("m{i:05}")),
+            ("container", &format!("c{i:05}")),
+            "manual",
+            "active",
+            1.0,
+        );
+    }
+    seed_link(
+        &db,
+        ("meeting", "material-source"),
+        ("note", "material-target"),
+        "manual",
+        "active",
+        0.1,
+    );
+
+    let (rows, truncated) = db.full_graph_links(false).unwrap();
+    assert_eq!(rows.len(), 1, "only the material graph edge belongs in this leg");
+    assert_eq!(rows[0].0, "meeting");
+    assert_eq!(rows[0].2, "note");
+    assert!(
+        !truncated,
+        "container metadata must not consume the graph cap or inflate truncation"
+    );
+}
+
 /// PR-9 F4 (edges carry endpoint kinds): a `FullGraphEdge` now names its `src_kind`/`dst_kind`
 /// (the endpoint node kinds the backend gated on) so the FE can match endpoints by `(kind, id)`,
 /// safe against a cross-kind id collision. A mention edge is entity→meeting; a companion link is

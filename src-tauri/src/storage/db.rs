@@ -7447,6 +7447,12 @@ impl Db {
         // layer), never deleted here, so their edges stay valid. Same choke-point as the seal purge. A
         // permanent DELETE keeps NO decision row (`preserve_decisions=false`).
         Self::purge_links_tx(&tx, &[], &document_ids, false)?;
+        // The container ITSELF can be a link endpoint ("this note is about that Space"), and its
+        // id is about to stop existing. Purge every incident row in the SAME transaction so no
+        // relation is left dangling at a deleted place. Reversible: `capture_folder` snapshotted
+        // these exact directed rows immediately before this call, and a restore replays them with
+        // `INSERT OR IGNORE` so a newer user decision wins.
+        Self::purge_container_links_tx(&tx, id)?;
         // Explicit (rather than FK-cascade) so the delete is deterministic and trigger-visible. Scoped
         // to non-authored documents — authored notes were reparented out above (and refused if not).
         tx.execute(
@@ -9467,7 +9473,7 @@ pub(crate) fn row_to_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting>>
 // readers that are its only callers.
 
 /// Escape LIKE wildcards so user input is matched literally (paired with `ESCAPE '\'`).
-fn escape_like(s: &str) -> String {
+pub(crate) fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")

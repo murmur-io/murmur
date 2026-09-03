@@ -1758,7 +1758,11 @@ fn source_is_visible(
                 && db.dashboard_ref_exists("meeting", &source.id)?
         }
         LinkKind::Document => db.document_is_visible(&source.id, unlocked)?,
-        LinkKind::Org => false,
+        // Metadata-only endpoints (`is_content_source == false`): a Shared Brain relation is
+        // somebody else's document, and a `container` names a PLACE that holds no text of its own.
+        // Neither may enter an Ask scope — and a container in particular must NEVER be expanded
+        // into what it contains.
+        LinkKind::Org | LinkKind::Container => false,
     })
 }
 

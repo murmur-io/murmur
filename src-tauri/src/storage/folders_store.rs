@@ -1129,6 +1129,31 @@ impl Db {
     /// marker in the SAME transaction, so no caller can associate unmanaged plaintext audio behind
     /// a folder lock even if it bypasses the command-side recovery seam.
     pub fn set_meeting_folder(&self, meeting_id: &str, folder_id: Option<&str>) -> Result<()> {
+        self.set_meeting_folder_with_restore_progress(meeting_id, folder_id, None)
+    }
+
+    /// Folder-trash restore twin of [`Db::set_meeting_folder`]. The placement and its durable
+    /// per-member progress witness commit in ONE transaction, so a crash can never publish the
+    /// restored placement without also teaching a retry not to overwrite a later user move.
+    pub(crate) fn set_meeting_folder_for_trash_restore(
+        &self,
+        entry_id: &str,
+        meeting_id: &str,
+        folder_id: &str,
+    ) -> Result<()> {
+        self.set_meeting_folder_with_restore_progress(
+            meeting_id,
+            Some(folder_id),
+            Some(entry_id),
+        )
+    }
+
+    fn set_meeting_folder_with_restore_progress(
+        &self,
+        meeting_id: &str,
+        folder_id: Option<&str>,
+        restore_entry_id: Option<&str>,
+    ) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         let blocked: bool = match folder_id {
@@ -1172,6 +1197,25 @@ impl Db {
             rusqlite::params![meeting_id, folder_id],
         )
         .map_err(map_err)?;
+        if let Some(entry_id) = restore_entry_id {
+            let progress = tx
+                .execute(
+                    "INSERT INTO trash_folder_restore_members(entry_id,member_kind,member_id)
+                     SELECT ?1,'meeting',?2
+                      WHERE EXISTS(
+                        SELECT 1 FROM trash_items
+                         WHERE id=?1 AND kind IN ('folder','noteFolder')
+                      )",
+                    rusqlite::params![entry_id, meeting_id],
+                )
+                .map_err(map_err)?;
+            if progress != 1 {
+                return Err(AppError::Storage(
+                    "folder restore lost its recovery journal before recording meeting progress"
+                        .into(),
+                ));
+            }
+        }
         tx.commit().map_err(map_err)
     }
 

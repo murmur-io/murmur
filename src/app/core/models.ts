@@ -1851,6 +1851,13 @@ export interface LinkEdge {
    */
   navigationId?: string | null;
   otherTitle: string;
+  /**
+   * For an `otherKind === "container"` neighbour only: `"project"` (a Space) or
+   * `"folder"`. NON-CONTENT metadata (the same `folders.level` the sidebar draws),
+   * carried so the chip can pick its glyph and its noun without a second IPC call.
+   * Absent for every other kind (`#[serde(skip_serializing_if)]`).
+   */
+  otherContainerLevel?: ContainerLevel | null;
   edgeType: "wikilink" | "companion" | "semantic" | "manual";
   createdBy: "user" | "auto" | "accepted";
   status: "active" | "suggested";
@@ -1869,8 +1876,38 @@ export interface LinkEdge {
   manualEdges?: ManualLinkEdge[];
 }
 
-/** The link-endpoint kind an `app-connections` panel is anchored to (`list_links` `kind`). */
-export type LinkKind = "meeting" | "note" | "document" | "org";
+/**
+ * The link-endpoint kind an `app-connections` panel is anchored to (`list_links` `kind`).
+ *
+ * `container` is a whole LOCAL place — a Space or a folder, discriminated by
+ * {@link LinkEdge.otherContainerLevel}, not by a second kind. It is Related-panel
+ * METADATA: it never expands to what the container holds and never enters a Brain
+ * scope, a provider context or a conversion source (see {@link CONTENT_LINK_KINDS}).
+ */
+export type LinkKind = "meeting" | "note" | "document" | "org" | "container";
+
+/** Space vs folder — `folders.level`, mirrored for the container chip's glyph + copy. */
+export type ContainerLevel = "project" | "folder";
+
+/**
+ * The MATERIAL content kinds — the ones that carry text a Brain/provider may read.
+ *
+ * The frontend twin of the Rust `LinkKind::is_content_source`. Every place that turns
+ * a {@link LinkEdge} into a Brain source must filter through {@link isContentLinkKind}
+ * rather than accepting whatever kind the edge happens to carry: `org` is somebody
+ * else's Shared Brain document and `container` is a PLACE, so neither has a body to
+ * put in a prompt.
+ */
+export const CONTENT_LINK_KINDS: readonly LinkKind[] = [
+  "meeting",
+  "note",
+  "document",
+];
+
+/** Whether this endpoint kind carries material content a Brain scope may include. */
+export function isContentLinkKind(kind: LinkKind): boolean {
+  return CONTENT_LINK_KINDS.includes(kind);
+}
 
 /**
  * One source the Brain has been scoped to (the `mur-source-picker` chip model) —
@@ -3742,6 +3779,98 @@ export interface ContainerNode {
 export interface ItemPage {
   kind: ItemKind;
   items: ItemRow[];
+  total: number;
+}
+
+// ── RELATED PICKER (the gated hierarchy the "Add related" modal walks) ────────
+// Mirrors `src-tauri/src/commands/related_picker.rs` + `storage/models.rs`. A
+// DELIBERATELY separate family from `ItemKind`/`ContainerNode` above: the global
+// `ItemKind` carries `task`/`dashboard`, which this surface must never offer, and
+// "four variants of which two are filtered at every call site" is exactly how one
+// gets back in. Three variants, no filtering.
+
+/** The three LINKABLE leaf kinds: a recording, an authored note, an imported document. */
+export type PickerItemKind = "meeting" | "note" | "document";
+
+/** One linkable leaf row. No path, no snippet — a title and an id are the whole row. */
+export interface PickerRow {
+  kind: PickerItemKind;
+  id: string;
+  /** Always present: the backend substitutes the per-kind placeholder. */
+  title: string;
+}
+
+/** One leaf kind a scope holds, with its true visible total. */
+export interface PickerGroup {
+  kind: PickerItemKind;
+  total: number;
+}
+
+/**
+ * One container in the picker hierarchy. Metadata only — leaves arrive lazily
+ * through {@link IpcService.listRelatedPickerItems}, which is what keeps the
+ * bootstrap bounded however large a container grows.
+ */
+export interface PickerContainerNode {
+  id: string;
+  name: string;
+  level: ContainerLevel;
+  emoji: string | null;
+  /** Sealed on disk. */
+  locked: boolean;
+  /** Sealed AND session-unlocked. */
+  unlocked: boolean;
+  /** Whether this container is a valid `container` link endpoint right now. */
+  linkable: boolean;
+  /** EMPTY for a sealed-not-unlocked container — not even a zero. */
+  groups: PickerGroup[];
+  folders: PickerContainerNode[];
+}
+
+/** Where the anchor sits, and the bounded window the modal opens on. */
+export interface PickerAnchorLocation {
+  kind: PickerItemKind;
+  /** `null` ⇒ the synthetic "Not classified" node. */
+  containerId: string | null;
+  /** Ancestors ROOT-FIRST, so exactly that path is expanded and nothing else. */
+  path: string[];
+  /** The anchor's 0-based position in its `(scope, kind)` ordering. */
+  index: number;
+  /** Where `items` starts — `index - offset` is the anchor's row inside it. */
+  offset: number;
+  items: PickerRow[];
+  total: number;
+}
+
+/** The picker's first frame. */
+export interface RelatedPickerBootstrap {
+  spaces: PickerContainerNode[];
+  /** "Not classified" groups. Disclosure-only — it is not a container and never linkable. */
+  unclassified: PickerGroup[];
+  /** `null` when the anchor has no place in the local hierarchy (a Shared Brain item). */
+  anchor: PickerAnchorLocation | null;
+}
+
+/** One lazy page of a scope's leaves. */
+export interface RelatedPickerPage {
+  kind: PickerItemKind;
+  offset: number;
+  items: PickerRow[];
+  total: number;
+}
+
+/** One search hit with its full `Space / folder` breadcrumb. */
+export interface RelatedPickerHit {
+  kind: PickerItemKind;
+  id: string;
+  title: string;
+  breadcrumb: string[];
+}
+
+/** One bounded page of search results. */
+export interface RelatedPickerSearchPage {
+  offset: number;
+  hits: RelatedPickerHit[];
   total: number;
 }
 

@@ -1550,25 +1550,7 @@ impl Db {
         require_stable_uuid(doc_id, "invalid org document id")?;
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        let item_ids: Vec<String> =
-            {
-                let mut stmt = tx.prepare(
-                "SELECT item_id FROM org_items WHERE org_id=?1 AND doc_id=?2 AND tombstoned=0",
-            ).map_err(map_err)?;
-                let rows = stmt
-                    .query_map(rusqlite::params![org_id, doc_id], |row| row.get(0))
-                    .map_err(map_err)?;
-                let mut ids = Vec::new();
-                for row in rows {
-                    ids.push(row.map_err(map_err)?);
-                }
-                ids
-            };
-        let mut evicted = false;
-        for item_id in item_ids {
-            evicted |= Self::tombstone_org_item_tx(&tx, &item_id)?;
-        }
-        Self::purge_org_document_links_tx(&tx, org_id, doc_id)?;
+        let evicted = Self::evict_org_document_tx(&tx, org_id, doc_id)?;
         tx.execute(
             "UPDATE org_shares SET state='revoked', last_error=NULL, item_id=NULL,
                     dispatch_id=NULL, updated_at=?3
@@ -1583,6 +1565,60 @@ impl Db {
         .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
         Ok(evicted)
+    }
+
+    /// Repair the legacy crash shape where a stable share was already marked `revoked` after the
+    /// server DELETE, but its landed `item_id` survived because local document terminalization did
+    /// not. The exact non-null item witness distinguishes this from a proven-never-landed local
+    /// cancellation. Consume that witness in the same transaction as all-revision eviction, the
+    /// terminal marker and incident-link purge, so a second sweep is a strict no-op.
+    pub(crate) fn repair_revoked_org_share_terminal_state(
+        &self,
+        share_id: &str,
+        org_id: &str,
+        doc_id: &str,
+    ) -> Result<bool> {
+        require_stable_uuid(org_id, "invalid organization id")?;
+        require_stable_uuid(doc_id, "invalid org document id")?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let repairable: i64 = tx
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM org_shares
+                    WHERE id = ?1 AND org_id = ?2 AND doc_id = ?3
+                      AND state = 'revoked' AND item_id IS NOT NULL
+                 )",
+                rusqlite::params![share_id, org_id, doc_id],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        if repairable == 0 {
+            tx.commit().map_err(map_err)?;
+            return Ok(false);
+        }
+        Self::evict_org_document_tx(&tx, org_id, doc_id)?;
+        let consumed = tx
+            .execute(
+                "UPDATE org_shares
+                    SET item_id = NULL, dispatch_id = NULL, last_error = NULL
+                  WHERE id = ?1 AND org_id = ?2 AND doc_id = ?3
+                    AND state = 'revoked' AND item_id IS NOT NULL",
+                rusqlite::params![share_id, org_id, doc_id],
+            )
+            .map_err(map_err)?;
+        if consumed != 1 {
+            return Err(crate::error::AppError::Storage(
+                "revoked Shared document repair changed concurrently".into(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM org_access_attempts WHERE org_id = ?1 AND doc_id = ?2",
+            rusqlite::params![org_id, doc_id],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
     }
 
     pub(crate) fn org_source_version(
@@ -2947,18 +2983,62 @@ impl Db {
             .map(|(applied, _)| applied)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_org_feed_tombstone_outcome(
         &self,
         org_id: &str,
         item_id: &str,
         seq: u64,
     ) -> Result<(bool, bool)> {
+        self.commit_org_feed_tombstone_with_metadata_outcome(
+            org_id, item_id, seq, None, false,
+        )
+    }
+
+    /// Metadata-aware feed tombstone commit. A durable-document tombstone marked `is_current=true`
+    /// is the cross-device signal for an authoritative stable-document DELETE; a predecessor row
+    /// marked false is only a revision transition and must keep opaque private link decisions.
+    /// Cursor claim, content eviction, terminal witness and link purge are one transaction.
+    pub(crate) fn commit_org_feed_tombstone_with_metadata_outcome(
+        &self,
+        org_id: &str,
+        item_id: &str,
+        seq: u64,
+        doc_id: Option<&str>,
+        is_current: bool,
+    ) -> Result<(bool, bool)> {
+        if let Some(doc_id) = doc_id {
+            require_stable_uuid(org_id, "invalid organization id")?;
+            require_stable_uuid(doc_id, "invalid org document id")?;
+        } else if is_current {
+            return Err(crate::error::AppError::InvalidArg(
+                "a current org tombstone requires a stable document id".into(),
+            ));
+        }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         if !Self::claim_org_feed_seq_tx(&tx, org_id, seq)? {
             return Ok((false, false));
         }
-        let evicted = Self::tombstone_org_item_tx(&tx, item_id)?;
+        let evicted = if let (Some(doc_id), true) = (doc_id, is_current) {
+            // An authoritative stable-document DELETE withdraws the whole durable resource, not
+            // merely the item id named by this feed row. Evict every locally held revision in the
+            // same transaction as the terminal witness so a missed predecessor can never remain
+            // searchable after the current head is gone.
+            Self::evict_org_document_tx(&tx, org_id, doc_id)?
+        } else {
+            // Do NOT route ordinary item/predecessor tombstones through the document primitive; a
+            // successor may still arrive and must retain the user's opaque relation decision.
+            let evicted = Self::tombstone_org_item_tx(&tx, item_id)?;
+            if doc_id.is_some() {
+                tx.execute(
+                    "UPDATE org_items SET is_current = 0 WHERE item_id = ?1",
+                    rusqlite::params![item_id],
+                )
+                .map_err(map_err)?;
+            }
+            evicted
+        };
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute(
             "UPDATE org_shares SET last_error='org_edit_conflict',updated_at=?2
@@ -3016,6 +3096,53 @@ impl Db {
         require_stable_uuid(doc_id, "invalid org document id")?;
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        let evicted = Self::evict_org_document_tx(&tx, org_id, doc_id)?;
+        tx.commit().map_err(map_err)?;
+        Ok(evicted)
+    }
+
+    /// Reconcile-side tombstone application with the same durable-document semantics as the live
+    /// feed. Reconcile progress has its own cursor and is recorded by the caller afterwards, but
+    /// content eviction, terminal witness creation and incident-link purge remain one transaction.
+    pub(crate) fn evict_org_reconcile_tombstone_with_metadata(
+        &self,
+        org_id: &str,
+        item_id: &str,
+        doc_id: Option<&str>,
+        is_current: bool,
+    ) -> Result<bool> {
+        if let Some(doc_id) = doc_id {
+            require_stable_uuid(org_id, "invalid organization id")?;
+            require_stable_uuid(doc_id, "invalid org document id")?;
+        } else if is_current {
+            return Err(crate::error::AppError::InvalidArg(
+                "a current org tombstone requires a stable document id".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let evicted = if let (Some(doc_id), true) = (doc_id, is_current) {
+            Self::evict_org_document_tx(&tx, org_id, doc_id)?
+        } else {
+            let evicted = Self::tombstone_org_item_tx(&tx, item_id)?;
+            if doc_id.is_some() {
+                tx.execute(
+                    "UPDATE org_items SET is_current = 0 WHERE item_id = ?1",
+                    rusqlite::params![item_id],
+                )
+                .map_err(map_err)?;
+            }
+            evicted
+        };
+        tx.commit().map_err(map_err)?;
+        Ok(evicted)
+    }
+
+    fn evict_org_document_tx(
+        tx: &rusqlite::Transaction<'_>,
+        org_id: &str,
+        doc_id: &str,
+    ) -> Result<bool> {
         let item_ids: Vec<String> = {
             let mut stmt = tx
                 .prepare(
@@ -3038,7 +3165,6 @@ impl Db {
             evicted |= Self::tombstone_org_item_tx(&tx, &item_id)?;
         }
         Self::purge_org_document_links_tx(&tx, org_id, doc_id)?;
-        tx.commit().map_err(map_err)?;
         Ok(evicted)
     }
 
@@ -3048,6 +3174,25 @@ impl Db {
         doc_id: &str,
     ) -> Result<usize> {
         let endpoint = format!("{org_id}:{doc_id}");
+        // Unlike a feed-item tombstone (which may merely precede a successor revision), both
+        // callers reached this primitive only after an authoritative stable-document DELETE. Keep
+        // a content-free negative witness so a relation living solely in a trash snapshot cannot
+        // be resurrected later. A second terminal DELETE always invalidates every exact relink
+        // authorization from the previous document incarnation, even though the marker upsert is
+        // idempotent. All three mutations share this transaction with the replica eviction.
+        tx.execute(
+            "INSERT OR IGNORE INTO org_document_terminal_deletions (org_id, doc_id)
+             VALUES (?1, ?2)",
+            rusqlite::params![org_id, doc_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM org_link_reauthorizations
+              WHERE (src_kind = 'org' AND src_id = ?1)
+                 OR (dst_kind = 'org' AND dst_id = ?1)",
+            rusqlite::params![endpoint],
+        )
+        .map_err(map_err)?;
         tx.execute(
             "DELETE FROM links
               WHERE (src_kind='org' AND src_id=?1)

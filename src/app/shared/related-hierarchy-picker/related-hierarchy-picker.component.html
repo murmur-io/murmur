@@ -1,0 +1,281 @@
+<!-- The whole modal is TELEPORTED to <body>: it is `position: fixed` and centred, and any ancestor
+     with a transform / filter / backdrop-filter would otherwise become its containing block (the
+     frosted `.card` and the note drawer both do). The teleport is also why the tab-detach signal in
+     the component matters — a detached route keeps its component alive, so without it this box
+     would outlive the tab it belongs to. -->
+<div
+  class="rhp-scrim"
+  appTeleportToBody
+  (mousedown)="onBackdropPointerDown($event)"
+>
+  <section
+    #dialog
+    class="rhp"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="rhp-title"
+    aria-describedby="rhp-subtitle"
+    (keydown)="onDialogKeydown($event)"
+  >
+    <header class="rhp-head">
+      <span class="rhp-mark" aria-hidden="true">
+        <mur-icon icon="link" />
+      </span>
+      <div class="rhp-heading">
+        <h2 id="rhp-title">Add related</h2>
+        <p id="rhp-subtitle">
+          Choose a Space, folder, recording, note, or document.
+        </p>
+      </div>
+      <button
+        type="button"
+        class="rhp-close"
+        aria-label="Close the related picker"
+        (click)="close()"
+      >
+        <mur-icon icon="close" />
+      </button>
+    </header>
+
+    <!-- FIXED search row — the tree below is the only scrollport in this modal. -->
+    <div class="rhp-search">
+      <span class="rhp-search-glyph" aria-hidden="true">
+        <mur-icon icon="search" />
+      </span>
+      <input
+        #searchField
+        type="search"
+        class="rhp-search-field"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="Search every Space…"
+        aria-label="Search items to link"
+        [value]="query()"
+        (input)="onQueryInput($event)"
+        (keydown)="onSearchKeydown($event)"
+      />
+      @if (searching()) {
+        <button
+          type="button"
+          class="rhp-search-clear"
+          aria-label="Clear search"
+          (click)="clearSearch()"
+        >
+          <mur-icon icon="close" />
+        </button>
+      }
+    </div>
+
+    @if (contextLabel(); as context) {
+      <p class="rhp-context">
+        @if (searching()) {
+          <span>{{ context }}</span>
+        } @else {
+          <span class="rhp-context-lead">Opened at</span>
+          <strong>{{ context }}</strong>
+        }
+      </p>
+    }
+
+    <!-- THE ONLY SCROLLPORT. Real tree semantics + a roving tabindex: exactly one row is tabbable,
+         and ↑/↓/←/→/Home/End move that single tab stop. -->
+    <div
+      #tree
+      class="rhp-tree"
+      [attr.role]="searching() ? 'listbox' : 'tree'"
+      [attr.aria-label]="
+        searching() ? 'Search results' : 'Spaces, folders and items'
+      "
+    >
+      @if (loading()) {
+        <p class="rhp-state">Loading…</p>
+      } @else if (error(); as message) {
+        <p class="rhp-state rhp-state--error">{{ message }}</p>
+      } @else if (empty()) {
+        <p class="rhp-state">
+          @if (searching()) {
+            No matching items. Try a title, folder, or Space name.
+          } @else {
+            Nothing to link yet.
+          }
+        </p>
+      } @else {
+        @for (line of lines(); track line.key) {
+          <div
+            class="rhp-row"
+            [attr.data-row]="line.key"
+            [attr.role]="searching() ? 'option' : 'treeitem'"
+            [attr.aria-level]="searching() ? null : line.level"
+            [attr.aria-expanded]="line.expandable ? line.expanded : null"
+            [attr.aria-selected]="
+              searching() ? line.key === tabbableKey() : null
+            "
+            [attr.aria-current]="line.isCurrent ? 'true' : null"
+            [class.is-current]="line.isCurrent"
+            [class.is-linked]="line.status === 'linked'"
+            [class.is-locked]="line.status === 'locked'"
+            [style.--rhp-depth]="line.level - 1"
+          >
+            <!-- DISCLOSURE — its own control. Expanding or collapsing can never create a relation. -->
+            @if (line.expandable) {
+              <button
+                type="button"
+                class="rhp-disclosure"
+                tabindex="-1"
+                [attr.aria-label]="
+                  (line.expanded ? 'Collapse ' : 'Expand ') + line.label
+                "
+                [attr.aria-expanded]="line.expanded"
+                (click)="toggle(line)"
+              >
+                <span class="rhp-chevron" [class.is-open]="line.expanded">
+                  <mur-icon icon="chevron-right" />
+                </span>
+              </button>
+            } @else {
+              <span class="rhp-disclosure-spacer" aria-hidden="true"></span>
+            }
+
+            <span
+              class="rhp-glyph"
+              [attr.data-tone]="line.tone"
+              aria-hidden="true"
+            >
+              <mur-icon [icon]="line.glyph" />
+            </span>
+
+            <button
+              type="button"
+              class="rhp-row-main"
+              [tabindex]="line.key === tabbableKey() ? 0 : -1"
+              [attr.aria-disabled]="
+                line.isCurrent ||
+                line.status === 'locked' ||
+                (line.status === 'linked' && !line.expandable)
+                  ? 'true'
+                  : null
+              "
+              (focus)="onRowFocus(line)"
+              (click)="activate(line)"
+              (keydown)="onRowKeydown($event, line)"
+            >
+              <span class="rhp-line">
+                <span class="rhp-label">{{ line.label }}</span>
+                @switch (line.status) {
+                  @case ("current") {
+                    <span class="rhp-tag rhp-tag--current">Current</span>
+                  }
+                  @case ("linked") {
+                    <span class="rhp-tag rhp-tag--linked">Linked</span>
+                  }
+                  @case ("contains") {
+                    <span class="rhp-tag rhp-tag--contains">
+                      Contains current item
+                    </span>
+                  }
+                  @case ("locked") {
+                    <span class="rhp-tag rhp-tag--locked">Locked</span>
+                  }
+                }
+              </span>
+              @if (line.meta) {
+                <span class="rhp-meta">{{ line.meta }}</span>
+              }
+            </button>
+
+            <!-- TRAILING ACTION — a separate focusable control from the disclosure above. -->
+            @if (line.action === "linkContainer") {
+              <button
+                type="button"
+                class="rhp-action"
+                tabindex="0"
+                [disabled]="busy()"
+                [attr.aria-label]="
+                  'Link ' +
+                  (line.containerLevel === 'project' ? 'Space ' : 'folder ') +
+                  line.label
+                "
+                (click)="openContainerConfirm(line)"
+              >
+                <mur-icon icon="link" />
+                <span>{{
+                  line.containerLevel === "project"
+                    ? "Link Space"
+                    : "Link folder"
+                }}</span>
+              </button>
+            } @else if (line.action === "linkLeaf") {
+              <button
+                type="button"
+                class="rhp-action rhp-action--icon"
+                tabindex="-1"
+                [disabled]="busy()"
+                [attr.aria-label]="'Link ' + line.label"
+                (click)="activate(line)"
+              >
+                <mur-icon icon="link" />
+              </button>
+            } @else if (line.status === "linked") {
+              <span class="rhp-action rhp-action--done" aria-hidden="true">
+                <mur-icon icon="check" />
+              </span>
+            }
+          </div>
+        }
+      }
+    </div>
+
+    <footer class="rhp-foot">
+      <span class="rhp-foot-copy">
+        <strong>A Space or folder creates one relation.</strong>
+        Its contents are not added.
+      </span>
+      <button type="button" class="btn btn-ghost rhp-cancel" (click)="close()">
+        Cancel
+      </button>
+    </footer>
+
+    <!-- CONFIRMATION — the copy has to say what the relation IS, because "link a folder" reads like
+         "link everything in it" and that is precisely what this never does. -->
+    @if (pendingContainer(); as pending) {
+      <div class="rhp-confirm-layer">
+        <div
+          #confirmDialog
+          class="rhp-confirm"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="rhp-confirm-title"
+        >
+          <p class="rhp-confirm-kicker">Link a place</p>
+          <h3 id="rhp-confirm-title">Link {{ pending.name }}?</h3>
+          <p class="rhp-confirm-body">
+            This creates <strong>one</strong> stable relation to the
+            {{ pendingNoun() }} itself — not links to the items inside it. It
+            keeps working if you rename or move the {{ pendingNoun() }}.
+          </p>
+          @if (pending.breadcrumb) {
+            <p class="rhp-confirm-path">{{ pending.breadcrumb }}</p>
+          }
+          <div class="rhp-confirm-actions">
+            <button
+              #confirmCancel
+              type="button"
+              class="btn"
+              (click)="cancelContainer()"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              class="btn btn-primary"
+              [disabled]="busy()"
+              (click)="confirmContainer()"
+            >
+              Link {{ pendingNoun() }}
+            </button>
+          </div>
+        </div>
+      </div>
+    }
+  </section>
+</div>

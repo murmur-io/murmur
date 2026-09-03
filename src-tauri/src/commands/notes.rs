@@ -651,9 +651,31 @@ pub(crate) fn move_note_doc_inner(
 /// indivisible authorization interval. Calling it without that guard is a bug.
 pub(crate) fn move_note_doc_under_lifecycle(
     state: &AppState,
+    lifecycle: &std::sync::MutexGuard<'_, ()>,
+    id: &str,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    move_note_doc_under_lifecycle_impl(state, lifecycle, id, folder_id, None)
+}
+
+/// Folder-trash restore variant. The storage seam commits the open-folder move and its durable
+/// progress witness together, so a later retry cannot overwrite a newer filing decision.
+pub(crate) fn move_note_doc_for_trash_restore_under_lifecycle(
+    state: &AppState,
+    lifecycle: &std::sync::MutexGuard<'_, ()>,
+    entry_id: &str,
+    id: &str,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    move_note_doc_under_lifecycle_impl(state, lifecycle, id, folder_id, Some(entry_id))
+}
+
+fn move_note_doc_under_lifecycle_impl(
+    state: &AppState,
     _lifecycle: &std::sync::MutexGuard<'_, ()>,
     id: &str,
     folder_id: &str,
+    restore_entry_id: Option<&str>,
 ) -> Result<(), AppError> {
     let Some((source_folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Err(AppError::InvalidArg(crate::errcode::tag(
@@ -713,6 +735,11 @@ pub(crate) fn move_note_doc_under_lifecycle(
         .folder_by_id(folder_id)?
         .map(|f| f.locked)
         .unwrap_or(false);
+    if target_locked && restore_entry_id.is_some() {
+        return Err(AppError::Storage(
+            "a folder retry shell unexpectedly became locked before member restore".into(),
+        ));
+    }
     let target_closing = state.db.org_folder_closure_exists(folder_id)?;
     if target_closing {
         return Err(AppError::Unavailable(
@@ -781,9 +808,20 @@ pub(crate) fn move_note_doc_under_lifecycle(
     } else {
         remove_note_export_before_move(row.exported_path.as_deref())?;
         remove_attachment_exports_before_move(&attachment_rows)?;
-        state
-            .db
-            .move_note_with_attachments_open(id, folder_id, &attachment_plaintext)?;
+        if let Some(entry_id) = restore_entry_id {
+            state
+                .db
+                .move_note_with_attachments_open_for_trash_restore(
+                    entry_id,
+                    id,
+                    folder_id,
+                    &attachment_plaintext,
+                )?;
+        } else {
+            state
+                .db
+                .move_note_with_attachments_open(id, folder_id, &attachment_plaintext)?;
+        }
     }
     if let Err(e) = export_note_to_vault_under_lifecycle_authorized(state, id) {
         tracing::warn!(target: "notes", error = %e, "note re-export after move failed (moved in db)");
@@ -853,6 +891,7 @@ async fn delete_note_inner_notifying(
             "unlock this folder to delete a note",
         )));
     }
+    super::trash_commands::refuse_pending_recovery_journal(state, id)?;
     let _org_mutation = state.lock_org_mutation().await;
     state.db.begin_org_source_closure("document", id)?;
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact note

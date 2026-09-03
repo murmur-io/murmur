@@ -22,54 +22,13 @@
           <span>Related</span>
           <span class="cx-count" aria-hidden="true">0</span>
         </span>
-        @if (pickerOpen()) {
-          <input
-            #pickerAnchor
-            type="text"
-            class="cx-link-input"
-            placeholder="Link a meeting, note, document, or Shared Brain item…"
-            [value]="pickerQuery()"
-            (input)="onQueryInput($event)"
-            (keydown)="onQueryKey($event)"
-            (blur)="closePicker()"
-            aria-label="Search items to link"
-          />
-        } @else {
-          <button
-            #pickerAnchor
-            type="button"
-            class="cx-add"
-            [disabled]="linking()"
-            (click)="openPicker()"
-          >
-            @if (linking()) {
-              <span class="cx-add-label">Linking…</span>
-            } @else {
-              <span class="cx-add-plus" aria-hidden="true">+</span>
-              <span class="cx-add-label">Link</span>
-            }
-          </button>
-        }
-      </div>
-    } @else {
-      @if (pickerOpen()) {
-        <input
-          #pickerAnchor
-          type="text"
-          class="cx-link-input"
-          placeholder="Link a meeting, note, document, or Shared Brain item…"
-          [value]="pickerQuery()"
-          (input)="onQueryInput($event)"
-          (keydown)="onQueryKey($event)"
-          (blur)="closePicker()"
-          aria-label="Search items to link"
-        />
-      } @else {
         <button
-          #pickerAnchor
+          #pickerTrigger
           type="button"
-          class="cx-add cx-add--empty"
+          class="cx-add"
           [disabled]="linking()"
+          [attr.aria-haspopup]="'dialog'"
+          [attr.aria-expanded]="pickerOpen()"
           (click)="openPicker()"
         >
           @if (linking()) {
@@ -79,7 +38,24 @@
             <span class="cx-add-label">Link</span>
           }
         </button>
-      }
+      </div>
+    } @else {
+      <button
+        #pickerTrigger
+        type="button"
+        class="cx-add cx-add--empty"
+        [disabled]="linking()"
+        [attr.aria-haspopup]="'dialog'"
+        [attr.aria-expanded]="pickerOpen()"
+        (click)="openPicker()"
+      >
+        @if (linking()) {
+          <span class="cx-add-label">Linking…</span>
+        } @else {
+          <span class="cx-add-plus" aria-hidden="true">+</span>
+          <span class="cx-add-label">Link</span>
+        }
+      </button>
     }
   } @else if (!expanded()) {
     <!-- COLLAPSED (default) — disclosure hides only the relationship rows.
@@ -111,37 +87,25 @@
         <span class="cx-collapsed-label">Related</span>
         <span class="cx-count" aria-hidden="true">{{ totalCount() }}</span>
       </button>
-      @if (pickerOpen()) {
-        <input
-          #pickerAnchor
-          type="text"
-          class="cx-link-input"
-          placeholder="Link a meeting, note, document, or Shared Brain item…"
-          [value]="pickerQuery()"
-          (input)="onQueryInput($event)"
-          (keydown)="onQueryKey($event)"
-          (blur)="closePicker()"
-          aria-label="Search items to link"
-        />
-      } @else {
-        <button
-          #pickerAnchor
-          type="button"
-          class="cx-add"
-          [disabled]="linking()"
-          (click)="openPicker()"
-        >
-          @if (linking()) {
-            <span class="cx-add-label">Linking…</span>
-          } @else {
-            <span class="cx-add-plus" aria-hidden="true">+</span>
-            <span class="cx-add-label">Link</span>
-          }
-        </button>
-      }
+      <button
+        #pickerTrigger
+        type="button"
+        class="cx-add"
+        [disabled]="linking()"
+        [attr.aria-haspopup]="'dialog'"
+        [attr.aria-expanded]="pickerOpen()"
+        (click)="openPicker()"
+      >
+        @if (linking()) {
+          <span class="cx-add-label">Linking…</span>
+        } @else {
+          <span class="cx-add-plus" aria-hidden="true">+</span>
+          <span class="cx-add-label">Link</span>
+        }
+      </button>
     </div>
   } @else {
-    <!-- EXPANDED — the collapse toggle + `+ Link` chooser, then the two chip groups. -->
+    <!-- EXPANDED — the collapse toggle + `+ Link` trigger, then the two chip groups. -->
     <div class="cx-head">
       <button
         type="button"
@@ -169,34 +133,22 @@
         <span class="cx-collapsed-label">Related</span>
         <span class="cx-count" aria-hidden="true">{{ totalCount() }}</span>
       </button>
-      @if (pickerOpen()) {
-        <input
-          #pickerAnchor
-          type="text"
-          class="cx-link-input"
-          placeholder="Link a meeting, note, document, or Shared Brain item…"
-          [value]="pickerQuery()"
-          (input)="onQueryInput($event)"
-          (keydown)="onQueryKey($event)"
-          (blur)="closePicker()"
-          aria-label="Search items to link"
-        />
-      } @else {
-        <button
-          #pickerAnchor
-          type="button"
-          class="cx-add"
-          [disabled]="linking()"
-          (click)="openPicker()"
-        >
-          @if (linking()) {
-            <span class="cx-add-label">Linking…</span>
-          } @else {
-            <span class="cx-add-plus" aria-hidden="true">+</span>
-            <span class="cx-add-label">Link</span>
-          }
-        </button>
-      }
+      <button
+        #pickerTrigger
+        type="button"
+        class="cx-add"
+        [disabled]="linking()"
+        [attr.aria-haspopup]="'dialog'"
+        [attr.aria-expanded]="pickerOpen()"
+        (click)="openPicker()"
+      >
+        @if (linking()) {
+          <span class="cx-add-label">Linking…</span>
+        } @else {
+          <span class="cx-add-plus" aria-hidden="true">+</span>
+          <span class="cx-add-label">Link</span>
+        }
+      </button>
     </div>
 
     <!-- MERGED "Related" chips — inbound backlinks + incident deterministic edges,
@@ -213,7 +165,7 @@
           >
             <!-- A `document` neighbour has NO route (`get_note` rejects a doc id) —
                  its chip is a <button> that opens the read-only preview modal.
-                 `meeting`/`note` chips stay routed <a>s exactly as before. -->
+                 `meeting`/`note`/`container` chips stay routed <a>s. -->
             @if (row.kind === "document") {
               <button
                 type="button"
@@ -241,6 +193,13 @@
                 @switch (row.kind) {
                   @case ("meeting") {
                     <span class="cx-kind cx-kind--meeting" aria-hidden="true">meeting</span>
+                  }
+                  @case ("container") {
+                    <!-- A container chip names a PLACE. Space vs folder comes from the
+                         edge's non-content `otherContainerLevel` metadata. -->
+                    <span class="cx-kind cx-kind--container" aria-hidden="true">
+                      {{ row.containerLevel === "project" ? "space" : "folder" }}
+                    </span>
                   }
                   @default {
                     <span class="cx-kind cx-kind--note" aria-hidden="true">note</span>
@@ -318,22 +277,17 @@
   }
 </div>
 
-  <!-- The single-pick chooser popover (reused note-editor LinkPickerComponent):
-       OPAQUE, paginated autocomplete over list_link_candidates. THIS panel owns the
-       query / activeIndex (fed as inputs) + keyboard nav; the picker renders + emits
-       the picked candidate. Anchored under the header <input> (only reachable while
-       expanded). -->
+  <!-- The "Add related" hierarchy modal: OPAQUE, centred, body-teleported, and the owner of
+       its own gated reads + invalidation. This panel supplies only the anchor, the
+       already-linked keys (from its own gated `list_links`) and the write. -->
   @if (pickerOpen()) {
-    <app-link-picker
-      [anchorRect]="pickerRect()"
-      [anchorElement]="pickerAnchorElement()"
-      [query]="pickerQuery()"
-      [activeIndex]="pickerActiveIndex()"
-      [excludeKind]="kind()"
-      [excludeId]="id()"
-      (candidatesChange)="onPickerCandidates($event)"
-      (picked)="pickCandidate($event)"
-      (repositionRequest)="repositionPicker()"
+    <app-related-hierarchy-picker
+      [anchorKind]="kind()"
+      [anchorId]="id()"
+      [linkedKeys]="linkedKeys()"
+      [busy]="linking()"
+      (picked)="onPicked($event)"
+      (closed)="closePicker()"
     />
   }
 }

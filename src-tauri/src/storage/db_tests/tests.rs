@@ -2556,7 +2556,11 @@ fn locked_manual_marker_cleanup_verifies_seal_before_atomic_replacement() {
         content_key: zeroize::Zeroizing::new([8_u8; 32]),
     };
     assert!(db
-        .delete_manual_links_with_marker_seals(std::slice::from_ref(&edge), &[invalid])
+        .delete_manual_links_with_marker_seals(
+            std::slice::from_ref(&edge),
+            &[invalid],
+            &HashSet::new(),
+        )
         .is_err());
     assert_eq!(
         db.get_note_row("marker-left").unwrap().unwrap().text,
@@ -2573,7 +2577,7 @@ fn locked_manual_marker_cleanup_verifies_seal_before_atomic_replacement() {
         content_key: content_key.clone(),
     };
     assert!(db
-        .delete_manual_links_with_marker_seals(&[edge], &[valid])
+        .delete_manual_links_with_marker_seals(&[edge], &[valid], &HashSet::new())
         .unwrap());
     let stored = db.get_note_row("marker-left").unwrap().unwrap();
     let stored_blob: Vec<u8> = db
