@@ -20,6 +20,9 @@ use crate::error::Result;
 /// to this — `open_release_page` refuses any URL not under it.
 const REPO_URL: &str = "https://github.com/murmur-io/murmur";
 /// GitHub API endpoint for the newest published release of the Murmur repo.
+/// The one host Murmur contacts on its own initiative; named for the egress ledger.
+const UPDATE_CHECK_HOST: &str = "api.github.com";
+
 const LATEST_RELEASE_API: &str = "https://api.github.com/repos/murmur-io/murmur/releases/latest";
 
 // ── IPC DTOs (camelCase mirrors) ──
@@ -119,9 +122,39 @@ fn is_newer(current: &str, latest: &str) -> bool {
 /// GET the latest GitHub release for `murmur-io/murmur` and report whether it is newer than the
 /// running build. Sends no user content. Network / non-2xx / rate-limit → `AppError::Unavailable`
 /// with a non-PII message (no tokens, no response body dumped).
-#[tauri::command]
-pub async fn check_for_update() -> Result<UpdateInfo> {
+/// Headless core of [`check_for_update`], so the consent gate and the ledger row are testable
+/// without a Tauri `State`.
+///
+/// `manual` is the whole distinction. An automatic launch-time check is something the app decides
+/// to do to the user, so it is governed by `update_check_enabled` and refuses BEFORE a request is
+/// built — the gate is here rather than in the frontend precisely so it cannot be routed around. A
+/// manual check is the user pressing a button that says it asks GitHub; pressing it IS the consent,
+/// and the flag does not apply.
+pub(crate) async fn check_for_update_inner(
+    state: &crate::state::AppState,
+    manual: bool,
+) -> Result<UpdateInfo> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
+
+    if !manual {
+        // Fail CLOSED on a poisoned lock: a broken config must not turn a silent network call back
+        // on. The user cannot see this decision, so the safe default is not to make the request.
+        let enabled = state
+            .config
+            .lock()
+            .map(|c| c.update_check_enabled)
+            .unwrap_or(false);
+        if !enabled {
+            return Err(AppError::Unavailable(
+                "automatic update checks are turned off".into(),
+            ));
+        }
+    }
+
+    // Logged BEFORE the request, not after. A ledger that only records calls which SUCCEEDED is a
+    // ledger that hides exactly the ones worth auditing — a request that reached GitHub and then
+    // timed out still left the machine. No content is sent, so the byte count is zero.
+    crate::share::ledger_row(&state.db, UPDATE_CHECK_HOST, "update_check", 0);
 
     let client = build_client();
     // GitHub's API 403s without a User-Agent; also request the recommended media type.

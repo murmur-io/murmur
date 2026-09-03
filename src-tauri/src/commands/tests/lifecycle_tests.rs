@@ -15669,6 +15669,58 @@
         assert!(n.content_blob.is_none(), "never sealed");
     }
 
+    /// The automatic update check is the only network call Murmur makes on its own initiative, so
+    /// turning it off must mean NOTHING leaves the machine — and leaving it on must leave a trace.
+    ///
+    /// Both halves matter and they fail differently. A gate that lives only in the frontend is not a
+    /// gate: the command is reachable over IPC regardless of what the UI decides, which is why the
+    /// refusal is in `check_for_update_inner` before a request is built. And an unlogged call is one
+    /// the user cannot audit after the fact, which is the whole point of the egress ledger.
+    ///
+    /// The refusal is asserted by its ERROR, not by counting packets — the check returns before any
+    /// client exists, so there is no request to observe. What the ledger count proves is the
+    /// converse: with the flag off, not even the intent-to-send was recorded, because there was no
+    /// intent.
+    #[test]
+    fn the_automatic_update_check_is_refused_and_unledgered_when_it_is_turned_off() {
+        let state = build_state("update-consent-off");
+        state.config.lock().unwrap().update_check_enabled = false;
+
+        let err = block_on(crate::update::check_for_update_inner(&state, false))
+            .expect_err("an automatic check must refuse when the flag is off");
+        assert!(
+            matches!(err, AppError::Unavailable(ref m) if m.contains("turned off")),
+            "the refusal must name itself rather than look like a network failure, got: {err:?}"
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("update_check").unwrap(),
+            0,
+            "a refused check must leave NO egress row — nothing was sent, so nothing is logged"
+        );
+    }
+
+    /// A manual check ignores the flag, and is ledgered like any other egress.
+    ///
+    /// Pressing a button that says it asks GitHub IS the consent; the flag governs what happens
+    /// without the user asking. This test does not assert the network result — CI has no reachable
+    /// GitHub and should not — only that the gate let it through and the ledger recorded the attempt
+    /// BEFORE the request. A ledger that recorded only successes would hide exactly the calls worth
+    /// auditing: one that left the machine and then timed out.
+    #[test]
+    fn a_manual_update_check_ignores_the_flag_and_is_ledgered_before_the_request() {
+        let state = build_state("update-consent-manual");
+        state.config.lock().unwrap().update_check_enabled = false;
+
+        // The network call itself may fail in CI; the gate and the ledger are what is under test.
+        let _ = block_on(crate::update::check_for_update_inner(&state, true));
+
+        assert_eq!(
+            state.db.count_share_egress_by_kind("update_check").unwrap(),
+            1,
+            "a manual check is consented by the press, so it proceeds past the flag and is logged"
+        );
+    }
+
     /// BLK-2 (seal half): moving a note INTO a locked + SESSION-UNLOCKED folder seals it AT REST
     /// (`content_blob`/`text_blob` set) but keeps it READABLE IN-SESSION — the restored plaintext
     /// markdown + transcript come back exactly like the folder's other unlocked notes, so it never

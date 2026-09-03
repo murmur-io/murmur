@@ -189,6 +189,22 @@
                 </span>
                 <mur-toggle formControlName="userMemoryEnabled" />
               </label>
+              <label class="toggle-row">
+                <span class="toggle-copy">
+                  <span class="toggle-title">Check for updates on launch</span>
+                  <span class="text-secondary toggle-sub">
+                    Asks GitHub once at launch whether a newer Murmur exists.
+                    It sends nothing about you — no meetings, no notes, not
+                    even which version you run beyond the request itself — and
+                    every check is recorded in your egress log. This is the
+                    only network call Murmur makes on its own initiative, so
+                    you can turn it off; the manual
+                    <b>Check for updates</b> button under About keeps working
+                    either way, because pressing it is you asking.
+                  </span>
+                </span>
+                <mur-toggle formControlName="updateCheckEnabled" />
+              </label>
             </div>
 
             <!-- (2) Locked folders (honest encryption boundary) -->

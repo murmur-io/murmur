@@ -826,6 +826,12 @@ pub struct AppConfigDto {
     /// off; now defaults ON like its Stage-E siblings (BLK-3).
     #[serde(default = "default_true")]
     pub mcp_require_token: bool,
+    /// Same defaulting reason as its neighbour, and the same failure it prevents: a partial save
+    /// that omits this field must not silently re-enable a network call the user turned off. The
+    /// serde default is ON because that is the shipped behaviour; the user's OFF is what a missing
+    /// field would otherwise erase.
+    #[serde(default = "default_true")]
+    pub update_check_enabled: bool,
     /// Stage E: default true (matches AppConfig::default) when the FE omits it on an older payload.
     #[serde(default = "default_true")]
     pub lock_require_biometric: bool,
@@ -7002,6 +7008,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         ground_summary: Some(c.ground_summary),
         glossary: Some(c.glossary.clone()),
         mcp_require_token: c.mcp_require_token,
+        update_check_enabled: c.update_check_enabled,
         lock_require_biometric: c.lock_require_biometric,
         relock_on_screenshare: c.relock_on_screenshare,
         cloud_egress_consented: c.cloud_egress_consented,
@@ -7333,6 +7340,7 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // while an explicit empty string intentionally clears it.
         glossary: d.glossary.unwrap_or_else(|| current.glossary.clone()),
         mcp_require_token: d.mcp_require_token,
+        update_check_enabled: d.update_check_enabled,
         lock_require_biometric: d.lock_require_biometric,
         relock_on_screenshare: d.relock_on_screenshare,
         // BLK-4: consent is NEVER set from the DTO. Preserve the live value; only the dedicated
