@@ -63,6 +63,21 @@ pub(crate) fn ensure_dev_kek() {
 /// understand the code; it fails on any new mention anywhere else, whatever the mention looks like.
 /// Every one of those three bypasses re-introduces the literal into a file that is not on this list.
 ///
+/// # What this scan is, and what it is NOT
+///
+/// It is a best-effort EARLY WARNING, not a proof. Three rounds of review established that the
+/// question "where could a writer live?" has no bounded answer in Rust: `#[path]` compiles a file
+/// from anywhere on disk into this binary, so any walker rooted at any directory is trusting a
+/// boundary the language does not honour. Each round closed one escape (`.rs`-only filtering, then
+/// `src/`-only rooting) and the next appeared. Rooting at the crate covers every escape that stays
+/// inside the crate, which is where an accident actually lands; it does not cover a `#[path]` that
+/// leaves it, and no amount of walking will.
+///
+/// The ACTUAL guard is the runtime assertion in [`ensure_dev_kek`]: it compares the live value and
+/// therefore catches any writer, however it spells the call and wherever it lives, as soon as one
+/// test calls the fixture after it. This scan exists to fail EARLIER and more legibly than that —
+/// naming the offending file instead of surfacing as a wrong-key error somewhere unrelated.
+///
 /// # What this deliberately does NOT catch
 ///
 /// Two gaps are known and accepted, because in both the runtime assertion in `ensure_dev_kek` fires
@@ -80,16 +95,20 @@ pub(crate) fn ensure_dev_kek() {
 /// cannot match its own source.
 const FILES_THAT_MAY_NAME_THE_HATCH: &[&str] = &[
     // Owns the hatch: declares its name and value, and reads it.
-    "secrets/keychain.rs",
+    "src/secrets/keychain.rs",
     // Strips it from every spawned provider's environment (`NEVER_INHERIT_ENV`).
-    "summarize/claude_code.rs",
+    "src/summarize/claude_code.rs",
 ];
 
 #[test]
 fn only_the_fixture_and_the_hatch_owner_may_name_the_dev_kek() {
     use std::path::{Path, PathBuf};
 
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // The CRATE ROOT, not `src/`. `#[path = "../../elsewhere.rs"]` is ordinary Rust and compiles a
+    // file from anywhere into this very binary, so a walker rooted at `src/` trusts a directory
+    // boundary the language does not honour. Review escaped to `src-tauri/` and watched the guard
+    // report `ok` while the rogue test ran.
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
     let needle = concat!("\"MURMUR", "_DEV_KEK\"");
 
     // EVERY regular file, not just `*.rs`. Filtering by extension was a real hole: `#[path =
@@ -102,13 +121,32 @@ fn only_the_fixture_and_the_hatch_owner_may_name_the_dev_kek() {
     fn walk(dir: &Path, needle: &str, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("read src dir") {
             let path = entry.expect("dir entry").path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            // Build output and VCS/tooling directories are not compiled into this binary and are
+            // enormous; everything else under the crate root is fair game.
+            if name == "target" || name == "gen" || name.starts_with('.') {
+                continue;
+            }
             if path.is_dir() {
                 walk(&path, needle, out);
-            } else if std::fs::read(&path)
-                .map(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
-                .unwrap_or(false)
-            {
-                out.push(path);
+            } else {
+                // A read failure is NOT "no match". Collapsing those two is the exact shape that
+                // cost a reviewer 19 of 20 hits in an unrelated sweep this same week, and it is
+                // reachable here without any adversarial code at all: review built a rogue file
+                // while it was readable, ran `chmod 000`, and the guard went green while the
+                // already-compiled test kept corrupting the key. Permission bits are not part of
+                // Cargo's fingerprint, so nothing even rebuilds.
+                let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "could not read {} while scanning for the debug-KEK hatch ({e}). Fix its \
+                         permissions or exclude it deliberately — a file this guard cannot read is \
+                         a file it cannot clear.",
+                        path.display()
+                    )
+                });
+                if String::from_utf8_lossy(&bytes).contains(needle) {
+                    out.push(path);
+                }
             }
         }
     }
