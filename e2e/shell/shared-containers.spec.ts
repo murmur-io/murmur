@@ -470,6 +470,50 @@ test("an unreachable shared workspace shows an error, not an empty one", async (
   await expect(page.getByText("Nothing shared with you yet")).toHaveCount(0);
 });
 
+/// A shared read still IN FLIGHT must say so, not assert that nothing is shared.
+///
+/// `WorkspaceTreeComponent` renders both halves of the tree, and `loading` read
+/// `WorkspaceService.loading` in BOTH — `SharedWorkspaceService.loading` was never referenced
+/// anywhere in the component. So while the shared fetch was outstanding the shared section fell
+/// through to its empty state and told the user "Nothing shared with you yet" about content that
+/// was still arriving. That is wrong content, not merely a missing spinner, and it is the spinner
+/// half of the same reload-flash contract the template already spells out for cached rows.
+///
+/// RED CONTROL: revert `loading` to `this.workspace.loading` and this fails on the first
+/// assertion — the own-workspace read resolves immediately, so its flag is already false while the
+/// shared one is still true.
+test("a shared workspace still loading says so instead of claiming nothing is shared", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {
+      // Slow enough to sample mid-flight, short enough not to pad the suite.
+      list_shared_workspace: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        return SHARED_WORKSPACE;
+      },
+    },
+    {
+      list_workspace_tree: LOCAL_FOREST,
+      list_container_share_status: CONTAINER_SHARES,
+    },
+  );
+  await page.goto("/");
+  await expect(
+    page.getByRole("navigation", { name: "Primary navigation" }),
+  ).toBeVisible();
+
+  await expect(page.getByText("Loading shared content…")).toBeVisible();
+  await expect(page.getByText("Nothing shared with you yet")).toHaveCount(0);
+
+  // And the control: once it resolves, the loading line goes away and the rows arrive — so the
+  // assertion above is about the in-flight window, not about a spinner that never clears.
+  await expect(page.getByText("Loading shared content…")).toHaveCount(0, {
+    timeout: 5000,
+  });
+});
+
 test("a healthy shared workspace shows no error banner", async ({ page }) => {
   await openSidebar(page);
   await expect(page.getByText(/Couldn't read what's shared with you/)).toHaveCount(0);
