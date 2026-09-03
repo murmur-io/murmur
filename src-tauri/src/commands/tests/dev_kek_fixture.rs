@@ -63,12 +63,21 @@ pub(crate) fn ensure_dev_kek() {
 /// understand the code; it fails on any new mention anywhere else, whatever the mention looks like.
 /// Every one of those three bypasses re-introduces the literal into a file that is not on this list.
 ///
-/// A determined author can still assemble the string (`concat!("MURMUR", "_DEV_KEK")`). That is not
-/// worth defending against: this guard exists to catch the accidental second writer — a revert, a
-/// cherry-pick, a copied test-setup block — not somebody working around it on purpose. This module
-/// itself is not on the list, and does not need to be: it reaches the hatch through `DEV_KEK_ENV`
-/// like every other caller should, and builds its search needle in pieces so it cannot match its
-/// own source.
+/// # What this deliberately does NOT catch
+///
+/// Two gaps are known and accepted, because in both the runtime assertion in `ensure_dev_kek` fires
+/// deterministically on the next call and names the problem:
+///
+/// - A name assembled at compile time (`concat!("MURMUR", "_DEV_KEK")`). Defending against this
+///   means parsing, which is the approach that already failed.
+/// - A second `set_var` inside a file that is ALREADY on the list. Trust here is file-grained, not
+///   call-site-grained, so an allowlisted file is immune for its whole length — and `keychain.rs`,
+///   the one place a careless KEK-adjacent `set_var` is most likely to be added, is exactly that
+///   file. Review demonstrated both, and in both the runtime assertion caught it.
+///
+/// This module itself is not on the list, and does not need to be: it reaches the hatch through
+/// `DEV_KEK_ENV` like every other caller should, and builds its search needle in pieces so it
+/// cannot match its own source.
 const FILES_THAT_MAY_NAME_THE_HATCH: &[&str] = &[
     // Owns the hatch: declares its name and value, and reads it.
     "secrets/keychain.rs",
@@ -83,15 +92,21 @@ fn only_the_fixture_and_the_hatch_owner_may_name_the_dev_kek() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let needle = concat!("\"MURMUR", "_DEV_KEK\"");
 
+    // EVERY regular file, not just `*.rs`. Filtering by extension was a real hole: `#[path =
+    // "tests/whatever.inc"] mod x;` is ordinary Rust, compiles into this very test binary, and its
+    // `set_var` runs in this very process — while a `.rs`-only walker never even opens it. Review
+    // built exactly that and watched the guard report `ok` while 620 of 3618 tests failed on the
+    // corrupted key. A scanner whose blind spot is reachable by a normal language feature is worse
+    // than no scanner, because it is trusted. Bytes rather than `read_to_string`, so a non-UTF-8
+    // file is skipped over rather than panicking the guard.
     fn walk(dir: &Path, needle: &str, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("read src dir") {
             let path = entry.expect("dir entry").path();
             if path.is_dir() {
                 walk(&path, needle, out);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && std::fs::read_to_string(&path)
-                    .expect("read source file")
-                    .contains(needle)
+            } else if std::fs::read(&path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
+                .unwrap_or(false)
             {
                 out.push(path);
             }
