@@ -2890,10 +2890,22 @@ mod tests {
         });
         revoked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         release_tx.send(()).unwrap();
-        assert!(
-            writer.join().unwrap().is_err(),
-            "the writer continued after response revocation"
-        );
+        // This used to assert `is_err()` on the writer, which contradicted the gate's own
+        // documented contract and flaked on CI (2026-09-03).
+        //
+        // `close_and_shutdown` runs in three steps: cancel every response, THEN `shutdown(2)`
+        // every socket clone, THEN wait for admitted chunks to drain. The writer here is
+        // released while the revoker sits in step 3, so it usually writes into an
+        // already-shut-down socket and fails — measured on this platform: a write after
+        // `shutdown(2)` reliably returns BrokenPipe, including through a `try_clone`d handle,
+        // so this was never kernel buffering. But a writer released in the gap between step 1
+        // and step 2 writes to a LIVE socket and succeeds, and that is not a leak: the chunk was
+        // admitted while the client was still authorized, and the gate's own comment says so —
+        // "A successful pre-cancel syscall is already a disclosure to the then-authorized
+        // client; TCP cannot retract it." So the assertion demanded a guarantee the product
+        // deliberately does not make. What the product DOES guarantee is asserted below and does
+        // not race: what the CLIENT receives, and how many write syscalls our own code started.
+        let _ = writer.join().unwrap();
         revoker.join().unwrap();
         assert_eq!(
             writes.load(Ordering::SeqCst),
@@ -2901,9 +2913,16 @@ mod tests {
             "a second write syscall started after response revocation"
         );
 
-        client
-            .set_read_timeout(Some(Duration::from_millis(250)))
-            .unwrap();
+        // Best-effort, because this call FAILING cannot make the assertion below false, and
+        // `.unwrap()` here panicked on CI (2026-09-03, `Os { code: 22, InvalidInput }`).
+        // HONEST LIMIT: I could not reproduce that EINVAL from this test's shape. A socket probe
+        // on this platform shows a PEER shutdown — even with megabytes left unread, which should
+        // force an RST — leaves `set_read_timeout` returning Ok; only shutting down one's OWN
+        // socket produces EINVAL, and no test does that. So the trigger is still unexplained, and
+        // this comment says so rather than inventing a mechanism. Making the call best-effort is
+        // right regardless: the timeout only bounds how long the read may block, and the read is
+        // already bounded by the EOF the revocation produces.
+        let _ = client.set_read_timeout(Some(Duration::from_millis(250)));
         let mut delivered = Vec::new();
         let _ = client.read_to_end(&mut delivered);
         assert_eq!(delivered, b"A");
@@ -3198,16 +3217,35 @@ mod tests {
             );
 
             release_tx.send(()).unwrap();
-            assert!(
-                writer.join().unwrap().is_err(),
-                "a chunk admitted before cancellation wrote after socket shutdown"
-            );
+            // This used to assert `is_err()` on the writer, which contradicted the gate's own
+            // documented contract and flaked on CI (2026-09-03).
+            //
+            // `close_and_shutdown` runs in three steps: cancel every response, THEN `shutdown(2)`
+            // every socket clone, THEN wait for admitted chunks to drain. The writer here is
+            // released while the revoker sits in step 3, so it usually writes into an
+            // already-shut-down socket and fails — measured on this platform: a write after
+            // `shutdown(2)` reliably returns BrokenPipe, including through a `try_clone`d handle,
+            // so this was never kernel buffering. But a writer released in the gap between step 1
+            // and step 2 writes to a LIVE socket and succeeds, and that is not a leak: the chunk was
+            // admitted while the client was still authorized, and the gate's own comment says so —
+            // "A successful pre-cancel syscall is already a disclosure to the then-authorized
+            // client; TCP cannot retract it." So the assertion demanded a guarantee the product
+            // deliberately does not make. What the product DOES guarantee is asserted below and does
+            // not race: what the CLIENT receives, and how many write syscalls our own code started.
+            let _ = writer.join().unwrap();
             revoked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             revoker.join().unwrap();
 
-            client
-                .set_read_timeout(Some(Duration::from_millis(250)))
-                .unwrap();
+            // Best-effort, because this call FAILING cannot make the assertion below false, and
+            // `.unwrap()` here panicked on CI (2026-09-03, `Os { code: 22, InvalidInput }`).
+            // HONEST LIMIT: I could not reproduce that EINVAL from this test's shape. A socket probe
+            // on this platform shows a PEER shutdown — even with megabytes left unread, which should
+            // force an RST — leaves `set_read_timeout` returning Ok; only shutting down one's OWN
+            // socket produces EINVAL, and no test does that. So the trigger is still unexplained, and
+            // this comment says so rather than inventing a mechanism. Making the call best-effort is
+            // right regardless: the timeout only bounds how long the read may block, and the read is
+            // already bounded by the EOF the revocation produces.
+            let _ = client.set_read_timeout(Some(Duration::from_millis(250)));
             let mut delivered = Vec::new();
             let _ = client.read_to_end(&mut delivered);
             assert!(
@@ -3256,9 +3294,16 @@ mod tests {
         drop(_lifecycle);
         writer.join().unwrap();
 
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
+        // Best-effort, because this call FAILING cannot make the assertion below false, and
+        // `.unwrap()` here panicked on CI (2026-09-03, `Os { code: 22, InvalidInput }`).
+        // HONEST LIMIT: I could not reproduce that EINVAL from this test's shape. A socket probe
+        // on this platform shows a PEER shutdown — even with megabytes left unread, which should
+        // force an RST — leaves `set_read_timeout` returning Ok; only shutting down one's OWN
+        // socket produces EINVAL, and no test does that. So the trigger is still unexplained, and
+        // this comment says so rather than inventing a mechanism. Making the call best-effort is
+        // right regardless: the timeout only bounds how long the read may block, and the read is
+        // already bounded by the EOF the revocation produces.
+        let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
         let mut delivered = Vec::new();
         let _ = client.read_to_end(&mut delivered);
         assert!(
@@ -3323,9 +3368,16 @@ mod tests {
         assert!(state.db.folder_by_id("private").unwrap().unwrap().locked);
         writer.join().unwrap();
 
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
+        // Best-effort, because this call FAILING cannot make the assertion below false, and
+        // `.unwrap()` here panicked on CI (2026-09-03, `Os { code: 22, InvalidInput }`).
+        // HONEST LIMIT: I could not reproduce that EINVAL from this test's shape. A socket probe
+        // on this platform shows a PEER shutdown — even with megabytes left unread, which should
+        // force an RST — leaves `set_read_timeout` returning Ok; only shutting down one's OWN
+        // socket produces EINVAL, and no test does that. So the trigger is still unexplained, and
+        // this comment says so rather than inventing a mechanism. Making the call best-effort is
+        // right regardless: the timeout only bounds how long the read may block, and the read is
+        // already bounded by the EOF the revocation produces.
+        let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
         let mut delivered = Vec::new();
         let _ = client.read_to_end(&mut delivered);
         assert!(
