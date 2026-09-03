@@ -135,6 +135,7 @@ export const ERROR_CODES = [
   "folder-closing",
   "container-unavailable",
   "org-rotation-pending",
+  "org-invite-key-changed",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -246,6 +247,11 @@ const BASE_COPY: Readonly<Record<ErrorCode, string>> = {
     "Removed. Their access key is still being rotated — until that finishes, anything new you share here could still be readable by them. Murmur keeps retrying.",
   "container-unavailable":
     "This recording isn’t in a folder Murmur can add a note to. Move it, then try again.",
+  // Deliberately does NOT offer "try again": retrying is the one thing that must not happen here.
+  // A changed key is either an honest re-key or somebody in the middle, and nothing this app can
+  // see tells the two apart — so the copy asks for out-of-band verification instead.
+  "org-invite-key-changed":
+    "This person’s security key has changed since you last invited them. That can happen after they reinstall — or if someone is impersonating them. Check the safety words with them another way before inviting again.",
 };
 
 /**

@@ -4,6 +4,11 @@
      underneath. Gating on loading() alone is the 2026-07-12 "reload flash". -->
 @if (sectionEmpty() && loading()) {
   <p class="tree-state">Loading{{ isOwnScope() ? " workspace" : " shared content" }}…</p>
+} @else if (sectionEmpty() && error(); as message) {
+  <!-- The error must OUTRANK the empty state, or it is unreachable in the one case it exists to
+       describe: a failed read has no rows, so "nothing shared with you" would win and assert
+       something false. This branch is why the emptiness is explained rather than reported. -->
+  <p class="tree-error" role="status">{{ message }}</p>
 } @else if (sectionEmpty()) {
   <p class="tree-state">{{ isOwnScope() ? "No Workspaces yet" : "Nothing shared with you yet" }}</p>
 } @else {
