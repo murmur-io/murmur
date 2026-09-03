@@ -278,6 +278,20 @@ pub struct AppConfig {
     /// unauthenticated localhost process must not be able to even enumerate the meeting tools.
     /// Bind is always 127.0.0.1.
     pub mcp_require_token: bool,
+    /// Let the app ask GitHub, once at launch, whether a newer release exists. Default ON, and
+    /// visible — this is the only network call Murmur makes on its own initiative, so it is opt-OUT
+    /// rather than silent. Turning it off makes the automatic check send nothing at all: the refusal
+    /// is enforced in `check_for_update` before any request is built, not in the frontend.
+    ///
+    /// The MANUAL "Check for updates" button in Settings ignores this flag on purpose. A user who
+    /// presses a button asking GitHub a question has consented to that question by pressing it; the
+    /// flag governs what happens WITHOUT them asking.
+    ///
+    /// Defaulted so an older config that predates this field deserializes to the shipped behaviour
+    /// rather than failing to parse — and so a partial write can never erase a user's OFF by
+    /// omission.
+    #[serde(default = "default_true")]
+    pub update_check_enabled: bool,
     /// Require a passing biometric (Touch ID, falling back to device passcode) before unlocking a
     /// sealed folder. Default ON. Degrades to allow when no biometric/passcode policy is available
     /// (no Touch ID hardware / CI), so it never locks the user out.
@@ -715,6 +729,7 @@ impl Default for AppConfig {
             note_language: "auto".to_string(),
             glossary: String::new(),
             mcp_require_token: true,
+            update_check_enabled: true,
             lock_require_biometric: true,
             relock_on_screenshare: true,
             cloud_egress_consented: false,
@@ -815,6 +830,7 @@ const K_USER_DISPLAY_NAME: &str = "user_display_name";
 const K_NOTE_LANGUAGE: &str = "note_language";
 const K_GLOSSARY: &str = "glossary";
 const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
+const K_UPDATE_CHECK_ENABLED: &str = "update_check_enabled";
 const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
 const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
 const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
@@ -1038,6 +1054,9 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_MCP_REQUIRE_TOKEN)? {
             cfg.mcp_require_token = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_UPDATE_CHECK_ENABLED)? {
+            cfg.update_check_enabled = v == "true";
         }
         if let Some(v) = db.get_setting(K_LOCK_REQUIRE_BIOMETRIC)? {
             cfg.lock_require_biometric = v == "true";
@@ -1385,6 +1404,14 @@ impl AppConfig {
         db.set_setting(
             K_MCP_REQUIRE_TOKEN,
             if self.mcp_require_token {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        db.set_setting(
+            K_UPDATE_CHECK_ENABLED,
+            if self.update_check_enabled {
                 "true"
             } else {
                 "false"
