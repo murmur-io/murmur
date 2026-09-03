@@ -948,6 +948,22 @@ impl Db {
     /// it, so a conversation that drew on an unfiled meeting cannot be matched by folder. That is
     /// exactly the case the global sweep exists for — see
     /// [`Self::purge_ask_conversations_for_scope_tx`].
+    ///
+    /// # The invariant this leans on, which nothing else states
+    ///
+    /// Treating a non-null `meetings.folder_id` as SOLE authority is only safe because every write
+    /// path keeps `notes.folder_id` in lockstep with it: `upsert_note`'s `COALESCE` (which can only
+    /// preserve a note's own value while canonical is still NULL), `upsert_note_sealed`'s atomic
+    /// triple-write plus its `unsafe_sibling` refusal, `set_meeting_folder`'s atomic pair,
+    /// `move_meeting_with_attachments_{sealed,open}`'s atomic pair, and the org-import insert —
+    /// backstopped by `migrate()`, which force-resyncs any disagreeing note on EVERY launch and
+    /// only ever backfills canonical from NULL when the notes unanimously agree.
+    ///
+    /// That guarantee is emergent from those five paths agreeing; a lock-security review had to
+    /// trace all of them to establish it, and found it written down nowhere. A SIXTH write path that
+    /// sets one column without the other would break this function silently — a conversation
+    /// depending on the note's folder would survive a delete that removed content from it. If you
+    /// are adding such a path, either keep the columns in lockstep or make this return `None`.
     pub(crate) fn ask_scope_for_meetings_tx(
         tx: &rusqlite::Transaction<'_>,
         meeting_ids: &[String],
@@ -971,13 +987,21 @@ impl Db {
             .map_err(map_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(map_err)?;
+        // Fewer rows than ids means at least one row is already GONE — its folder is unknowable, so
+        // this is "cannot name the scope", not "the scope happens to be small". Review found the
+        // difference the hard way: reversing `delete_document`'s order so the row is deleted first
+        // made this return `Some(empty)`, which the scoped purge early-returns on, so nothing was
+        // purged at all. A silent no-op is the worst of the three outcomes.
+        if rows.len() != meeting_ids.len() {
+            return Ok(None);
+        }
         let mut folders = HashSet::new();
         for row in rows {
             match row {
                 Some(folder) => {
                     folders.insert(folder);
                 }
-                // One unfiled meeting is enough to make the whole batch unnameable.
+                // One unfiled row is enough to make the whole batch unnameable.
                 None => return Ok(None),
             }
         }
@@ -1010,12 +1034,21 @@ impl Db {
             .map_err(map_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(map_err)?;
+        // Fewer rows than ids means at least one row is already GONE — its folder is unknowable, so
+        // this is "cannot name the scope", not "the scope happens to be small". Review found the
+        // difference the hard way: reversing `delete_document`'s order so the row is deleted first
+        // made this return `Some(empty)`, which the scoped purge early-returns on, so nothing was
+        // purged at all. A silent no-op is the worst of the three outcomes.
+        if rows.len() != document_ids.len() {
+            return Ok(None);
+        }
         let mut folders = HashSet::new();
         for row in rows {
             match row {
                 Some(folder) => {
                     folders.insert(folder);
                 }
+                // One unfiled row is enough to make the whole batch unnameable.
                 None => return Ok(None),
             }
         }

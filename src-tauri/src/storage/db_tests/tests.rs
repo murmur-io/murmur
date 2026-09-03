@@ -17000,3 +17000,129 @@ fn the_seal_side_chunk_purge_stays_global_because_the_folder_may_already_have_mo
          folder this meeting came from — that folder is no longer readable from the meeting row"
     );
 }
+
+/// The DOCUMENT-side seal helper stays global too.
+///
+/// Review reintroduced the scoped call here — the exact shape just proven to leak for its
+/// meetings-side sibling — and the whole 3604-test suite stayed green. The decision was right and
+/// pinned by nothing, which is the same as not having made it.
+#[test]
+fn the_seal_side_doc_purge_stays_global_for_the_same_reason() {
+    use crate::storage::models::AskConversationScope;
+
+    let db = mem_db();
+    seed_folder(&db, "f-source", "Source");
+    seed_folder(&db, "f-elsewhere", "Elsewhere");
+    db.insert_document("d-moved", "f-elsewhere", "Moved", "body", "note", 0)
+        .unwrap();
+
+    for folder in ["f-source", "f-elsewhere"] {
+        db.persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            "a question",
+            "an answer",
+            &[],
+            &[],
+            &[],
+            &[folder.to_string()],
+            "2026-09-03T09:01:00Z",
+        )
+        .unwrap();
+    }
+
+    db.purge_doc_chunks_for_documents(&["d-moved".to_string()])
+        .unwrap();
+
+    assert!(
+        db.list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+            .unwrap()
+            .is_empty(),
+        "the document-side seal purge must revoke EVERY conversation, for the same reason as the \
+         meetings-side one: a move may already have rewritten the row's folder"
+    );
+}
+
+/// `delete_document` must resolve the folder BEFORE the row goes, and the failure mode if it does
+/// not is the quiet one.
+///
+/// Review reversed the order and the whole suite stayed green. Worse than a wrong scope: with the
+/// row already deleted, the lookup returns no rows, which used to yield `Some(empty set)` — and the
+/// scoped purge early-returns on an empty set, so NOTHING was revoked. Not a narrower purge, no
+/// purge. The helpers now treat "fewer rows than ids" as `None`, so even a future reordering fails
+/// closed to the global sweep rather than silently doing nothing; this test pins the ordering as
+/// well, because failing closed is a backstop, not a licence to get the order wrong.
+#[test]
+fn deleting_a_document_revokes_the_conversations_that_depended_on_its_folder() {
+    use crate::storage::models::AskConversationScope;
+
+    let db = mem_db();
+    seed_folder(&db, "f-doc", "DocHome");
+    seed_folder(&db, "f-other", "Other");
+    db.insert_document("d-gone", "f-doc", "Gone", "body", "note", 0)
+        .unwrap();
+
+    for folder in ["f-doc", "f-other"] {
+        db.persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            "a question",
+            "an answer",
+            &[],
+            &[],
+            &[],
+            &[folder.to_string()],
+            "2026-09-03T09:01:00Z",
+        )
+        .unwrap();
+    }
+
+    db.delete_document("d-gone").unwrap();
+
+    let surviving = db
+        .list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+        .unwrap();
+    assert_eq!(
+        surviving.len(),
+        1,
+        "the folder-doc conversation must be revoked and the folder-other one must survive. \
+         Got {surviving:?} — an empty-scope no-op looks exactly like 'both survived'"
+    );
+}
+
+/// `ask_scope_for_folder_tree_tx` really does walk descendants.
+///
+/// Review replaced its whole body with "just the named folder" and the suite stayed green: the only
+/// production caller refuses to delete a folder that still has children, so the recursion is
+/// defence-in-depth that nothing exercises. Defence nothing exercises is defence nobody can trust,
+/// so this drives the helper directly. Review separately confirmed with sqlite3 that the CTE
+/// terminates on a cycle and on a self-loop, and returns the anchor even when its row is gone.
+#[test]
+fn the_folder_scope_walks_descendants_not_just_the_named_folder() {
+    let db = mem_db();
+    seed_folder(&db, "f-root", "Root");
+    for (id, name, parent) in [("f-child", "Child", "f-root"), ("f-grand", "Grand", "f-child")] {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: format!("Root/{name}"),
+            parent_id: Some(parent.to_string()),
+            locked: false,
+            created_at: "2026-09-03T00:00:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
+    let mut conn = db.lock();
+    let tx = conn.transaction().unwrap();
+    let scope = Db::ask_scope_for_folder_tree_tx(&tx, "f-root").unwrap();
+    assert_eq!(
+        scope,
+        HashSet::from([
+            "f-root".to_string(),
+            "f-child".to_string(),
+            "f-grand".to_string()
+        ]),
+        "a grandchild's content goes away with the root, so its conversations must be in scope"
+    );
+}
