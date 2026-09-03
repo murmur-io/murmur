@@ -37,6 +37,7 @@ import {
 import { NotesViewSwitcherComponent } from "../notes-view-switcher/notes-view-switcher.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
+import { DateFormatService } from "../../../core/date-format.service";
 
 const MAX_ORGANIZE_FAILURE_REASON_LENGTH = 240;
 
@@ -74,6 +75,8 @@ const MAX_ORGANIZE_FAILURE_REASON_LENGTH = 240;
   styleUrl: "./notes-home.component.scss",
 })
 export class NotesHomeComponent implements OnInit {
+  private readonly dates = inject(DateFormatService);
+
   private readonly notes = inject(NotesService);
   private readonly notesSavedViews = inject(NotesSavedViewsService);
   private readonly orgBrain = inject(OrgBrainService);
@@ -879,18 +882,9 @@ export class NotesHomeComponent implements OnInit {
   // --- Presentational -----------------------------------------------------
 
   /** Presentational only: epoch-ms → a friendly local date. */
-  formatDate(updatedAt: number): string {
-    const d = new Date(updatedAt);
-    if (Number.isNaN(d.getTime())) {
-      return "";
-    }
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+  /** Formatted through {@link DateFormatService} — the one place a date becomes user-visible text. */
+  formatDate(updatedAt: string): string {
+    return this.dates.day(updatedAt);
   }
 
   /** Presentational only: an ISO timestamp (org item `createdAt`) → a friendly date. */

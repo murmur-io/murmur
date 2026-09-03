@@ -61,6 +61,7 @@ import { SharePanelComponent } from "../share-panel/share-panel.component";
 import { VerifyPanelComponent } from "../verify-panel/verify-panel.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { MeetingCommandBarComponent } from "../meeting-command-bar/meeting-command-bar.component";
+import { DateFormatService } from "../../../core/date-format.service";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 interface ActionItem {
@@ -87,6 +88,8 @@ interface ActionItem {
   styleUrl: "./detail.component.scss",
 })
 export class DetailComponent implements OnInit {
+  private readonly dates = inject(DateFormatService);
+
   private readonly ipc = inject(IpcService);
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
@@ -2309,16 +2312,9 @@ export class DetailComponent implements OnInit {
   }
 
   /** Presentational: stored timestamp → friendly local date. */
+  /** Formatted through {@link DateFormatService} — the one place a date becomes user-visible text. */
   formatDate(startedAt: string): string {
-    const d = new Date(startedAt);
-    if (Number.isNaN(d.getTime())) return startedAt;
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    return this.dates.day(startedAt);
   }
 
   /** Presentational: seconds → compact "Hh Mm" / "Mm Ss" / "Ss". */
