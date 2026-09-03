@@ -16321,6 +16321,68 @@
         let _ = std::fs::remove_file(&wav);
     }
 
+    /// RETRY FROM A DUAL-STREAM ARCHIVE — it is accepted, and it comes back MONO.
+    ///
+    /// A live recording keeps `Me` and `Others` apart by transcribing the microphone and the system
+    /// capture separately and merging them on wall-clock. A retry has neither: the raw per-stream
+    /// files are unlinked once the archive is proven durable (`cleanup_completed_archived_generation`
+    /// runs on the failure path too), so all a retry ever gets is the single archived WAV — and
+    /// `run_salvage_from_disk` opens it through `WavMonoSource`, which AVERAGES whatever channels it
+    /// finds into one.
+    ///
+    /// So a recovered transcript legitimately loses its speaker split. This test pins that as the
+    /// behaviour rather than leaving it to be discovered from a user's transcript: retry must keep
+    /// WORKING for a two-channel archive (the row is claimed, the path resolves), and the audio it
+    /// hands the pipeline is the channel mean, not a stream pair. If retry is ever taught to keep the
+    /// separation, the second half of this test is the assertion that has to go red first.
+    #[test]
+    fn retry_prep_accepts_a_two_channel_archive_and_salvage_reads_it_as_the_channel_mean() {
+        use crate::audio::source::MonoSource;
+
+        let state = build_state("retry-dual-stream-archive");
+        let wav = std::env::temp_dir().join(format!(
+            "murmur-retry-dual-{}-{}.wav",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        // Interleaved L/R: the microphone hard left, the system capture hard right — the most
+        // separable two-channel archive there could be.
+        let interleaved: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        crate::audio::write_wav_f32(&wav, &interleaved, 48_000, 2).unwrap();
+
+        let mid = uuid::Uuid::new_v4().to_string();
+        seed_meeting(&state.db, &mid, "# err", None);
+        state
+            .db
+            .finalize_meeting(&mid, "2026-09-02T10:00:00Z", 60, &wav.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .update_meeting_status(&mid, MeetingStatus::Error)
+            .unwrap();
+
+        // A two-channel archive is still a retryable archive: nothing in the gate rejects it.
+        let got = retry_transcription_prep(&state, &mid).unwrap();
+        assert_eq!(got, wav);
+        assert_eq!(
+            state.db.get_meeting(&mid).unwrap().unwrap().status,
+            MeetingStatus::Recording,
+        );
+
+        // And what salvage will actually feed Whisper is one mono track at the channel mean —
+        // 0.5 everywhere, with neither the 1.0 microphone nor the 0.0 system side recoverable.
+        let mut source = crate::audio::source::WavMonoSource::open(&wav).unwrap();
+        assert_eq!(source.frames(), 4, "4 interleaved stereo frames");
+        let frames = source.read_frames(0, 4).unwrap();
+        assert_eq!(
+            frames,
+            vec![0.5, 0.5, 0.5, 0.5],
+            "salvage averages the two streams together — the speaker split does not survive a retry"
+        );
+
+        let _ = std::fs::remove_file(&wav);
+    }
+
     /// LOCK MODEL — a salvage/retry pins the folder CK at entry. If screen-share relock lands while
     /// Whisper is running, the finalizer seals and decrypt-verifies the exact new transcript/audio;
     /// it never deletes transcript rows merely because old audio exists. An open folder is a no-op.

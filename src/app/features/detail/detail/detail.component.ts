@@ -112,6 +112,22 @@ export class DetailComponent implements OnInit {
   );
   readonly loading = signal(true);
   readonly busy = signal(false);
+  /** A retry is in flight — the offer disables itself rather than allowing a second claim. */
+  readonly retryingTranscription = signal(false);
+  /**
+   * Offer the retry only for a failed recording whose audio is still on disk. Both conditions come
+   * straight from `retry_transcription_prep`'s refusals, so the button appears exactly where the
+   * command can actually do something.
+   */
+  readonly canRetryTranscription = computed(() => {
+    const meeting = this.detail()?.meeting;
+    return (
+      !!meeting &&
+      meeting.status === "ERROR" &&
+      !!meeting.audioPath &&
+      meeting.audioPath.trim().length > 0
+    );
+  });
   private readonly conversionRequest = signal<{
     meetingId: string;
     sequence: number;
@@ -1468,6 +1484,41 @@ export class DetailComponent implements OnInit {
       this.graphError.set(this.errorCopy.because("Couldn’t connect to graph", e));
     } finally {
       this.linking.set(false);
+    }
+  }
+
+  /**
+   * Re-run transcription for a recording that failed, from the audio still on disk.
+   *
+   * The backend command has existed all along, and both the ASR watchdog and the pipeline's
+   * terminal guard tell the user in as many words to "use Retry transcription" — but nothing in the
+   * app ever called it. A meeting that failed during transcription was therefore unrecoverable from
+   * the interface, with its audio sitting intact on disk, and the only advice on screen pointed at
+   * a control that did not exist.
+   *
+   * Every precondition is the backend's: no recording in flight, folder unlocked, status still
+   * Error, plaintext audio present, and a single-flight claim that flips Error → Recording. This
+   * only decides whether the offer is worth showing.
+   */
+  async retryTranscription(id: string): Promise<void> {
+    if (this.retryingTranscription()) {
+      return;
+    }
+    this.retryingTranscription.set(true);
+    this.msg.set("Transcribing again…");
+    try {
+      await this.ipc.retryTranscription(id);
+      const fresh = await this.ipc.getMeetingDetail(id);
+      // Same stale-result guard as `resummarize`: transcription is long, and the user may have
+      // navigated away and opened another meeting while it ran.
+      if (this.detail()?.meeting?.id === id) {
+        this.detail.set(fresh);
+      }
+      this.msg.set("Done.");
+    } catch (e) {
+      this.msg.set(this.errorCopy.because("Couldn’t transcribe this recording", e));
+    } finally {
+      this.retryingTranscription.set(false);
     }
   }
 

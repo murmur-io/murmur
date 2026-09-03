@@ -317,3 +317,24 @@
   }
 }
     
+
+/* The retry-transcription offer: a banner, not a buried menu item — it is the only route back for
+   a recording whose transcription failed, and the watchdog's own message points at it. */
+.retry-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.retry-banner-copy {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.retry-banner-title {
+  margin: 0;
+  font-weight: 600;
+  color: var(--text-primary);
+}
