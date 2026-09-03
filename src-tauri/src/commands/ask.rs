@@ -283,6 +283,56 @@ pub(crate) fn remove_duplicate_dashboard_question(history: &mut Vec<ChatTurn>, q
     }
 }
 
+/// The query vector Ask searches with — or an EMPTY one, which means "no KNN leg".
+///
+/// Both Ask paths go through here so there is one place to get this right, and one place to test.
+/// The bug this replaced: `active_admitted_embedder` falls back to `StubEmbedder`, a hash bag whose
+/// "similarity" carries no semantics, so without the model installed Ask embedded the question into
+/// noise and fused it into the answer at full weight. `active_persistence_embedder_if_available`
+/// returns `None` for a stub snapshot, and `search_hybrid_visible` short-circuits on an empty
+/// vector, so the leg drops out and `score_fuse` redistributes its weight to the legs that have
+/// something to say.
+pub(crate) fn ask_query_vector(question: &str, semantic_enabled: bool) -> Vec<f32> {
+    ask_query_vector_with(
+        question,
+        semantic_enabled,
+        crate::embed::active_persistence_embedder_if_available(),
+    )
+}
+
+/// As [`ask_query_vector`], with the embedder handed in.
+///
+/// The seam exists because resolving the embedder internally made the function untestable in the
+/// direction that matters. Review proved it: a body of `Vec::new()` — ignoring both the flag and the
+/// embedder — passed the test, because the suite only ever runs under the `#[cfg(test)]`-forced
+/// stub, where empty is also the CORRECT answer. That mutant would silently disable semantic search
+/// for every user who has the model, and nothing would have caught it.
+///
+/// With the handle injected, a test can pass a real one and assert the vector actually comes back,
+/// which distinguishes "correctly calls through" from "always returns empty" without needing 470 MB
+/// of weights on disk.
+///
+/// Errors are swallowed on purpose: a failure to embed is the same situation as no model, and Ask
+/// degrading to keyword search beats Ask refusing to answer.
+pub(crate) fn ask_query_vector_with(
+    question: &str,
+    semantic_enabled: bool,
+    embedder: Option<Box<dyn crate::embed::Embedder>>,
+) -> Vec<f32> {
+    if !semantic_enabled {
+        return Vec::new();
+    }
+    embedder
+        .and_then(|embedder| {
+            // QUERY side: the e5 `query:` prefix (asymmetric with the `passage:` index side).
+            embedder
+                .embed_query(std::slice::from_ref(&question.to_string()))
+                .ok()
+        })
+        .and_then(|vectors| vectors.into_iter().next())
+        .unwrap_or_default()
+}
+
 /// Run the vault-scoped agentic attempt for [`ask_vault`]. Returns `Some(result)` ONLY when the
 /// loop CONVERGED; `None` on non-convergence or ordinary loop errors — incl. `Unavailable` (no cloud
 /// consent) — so the caller floors to the pre-agentic path with its original semantics. A
@@ -352,15 +402,7 @@ pub(crate) fn ask_vault_agentic_attempt(
     // Every candidate source is `visibility_clause`-gated, so a sealed-not-unlocked meeting
     // contributes no line; a listing failure degrades to the legacy prompt (never an error).
     let jit_listing = if config.ask_jit_retrieval {
-        let query_vec = if config.semantic_search_enabled {
-            crate::embed::active_admitted_embedder()
-                .embed_query(std::slice::from_ref(&question.to_string()))
-                .ok()
-                .and_then(|v| v.into_iter().next())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let query_vec = ask_query_vector(question, config.semantic_search_enabled);
         crate::summarize::vault_context::build_meeting_listing_visible(
             &state.db,
             question,
@@ -565,13 +607,7 @@ pub(crate) fn build_ask_vault_floor_prompt(
         };
         (corpus, sources)
     } else if config.semantic_search_enabled {
-        let embedder = crate::embed::active_admitted_embedder();
-        // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).
-        let query_vec = embedder
-            .embed_query(std::slice::from_ref(&question.to_string()))?
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        let query_vec = ask_query_vector(question, true);
         crate::summarize::vault_context::build_vault_context_hybrid_visible(
             db, question, &ask_conn, &query_vec, unlocked, reranker,
         )?
