@@ -15669,6 +15669,87 @@
         assert!(n.content_blob.is_none(), "never sealed");
     }
 
+    /// Moving a meeting into a locked folder must revoke the Ask conversations that drew on the
+    /// folder it came FROM — the end-to-end oracle for a leak this repo actually shipped a fix for.
+    ///
+    /// The storage-layer test pins the decision where the bug was introduced (`purge_chunks_for_meetings`
+    /// stays global). It structurally cannot see a DIFFERENT future mistake: someone reintroducing
+    /// scoping with new logic inside `seal_moved_note` itself. This drives the real command path, so
+    /// it would.
+    ///
+    /// Why it matters more than a storage test. `seal_moved_note` runs AFTER
+    /// `move_meeting_with_attachments_sealed` has committed `UPDATE meetings SET folder_id = <dest>`,
+    /// so anything deriving a purge scope there reads the DESTINATION and never the source. A
+    /// conversation depending on the source folder then survives — still readable, still paraphrasing
+    /// content the user has just put behind the biometric gate. The act of protecting it is what
+    /// would leave it exposed. Both reviewers asked for this oracle; the lock model treats a
+    /// sealed-content leak as a class that must carry one.
+    #[test]
+    fn moving_a_meeting_into_a_locked_folder_revokes_conversations_from_its_old_folder() {
+        use crate::storage::models::AskConversationScope;
+
+        const MID: &str = "m-askmove";
+        const SOURCE: &str = "f-askmove-src";
+        const TARGET: &str = "f-askmove-dst";
+
+        let state = build_state("askmove");
+        make_open_folder(&state.db, SOURCE, "Open-Source");
+        seed_meeting(&state.db, MID, "# asked about this", Some(SOURCE));
+        make_open_folder(&state.db, TARGET, "Locked-Target");
+        lock_folder_inner(&state, TARGET.to_string()).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(TARGET.to_string());
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+
+        // A durable conversation whose dependency names the SOURCE folder — what a user gets by
+        // asking about this meeting while it still sits in the open folder.
+        state
+            .db
+            .persist_ask_exchange(
+                &AskConversationScope::Vault,
+                None,
+                "what did we decide",
+                "a durable answer paraphrasing the meeting",
+                &[],
+                &[],
+                &[],
+                &[SOURCE.to_string()],
+                "2026-09-03T10:00:00Z",
+            )
+            .unwrap();
+        let unlocked = state.unlocked_folders.lock().unwrap().clone();
+        assert_eq!(
+            state
+                .db
+                .list_ask_conversation_ids(&AskConversationScope::Vault, &unlocked)
+                .unwrap()
+                .len(),
+            1,
+            "the conversation starts visible"
+        );
+
+        move_note_public_inner_impl(&state, MID.into(), Some(TARGET.into())).unwrap();
+
+        assert_eq!(
+            state.db.folder_for_meeting(MID).unwrap().as_deref(),
+            Some(TARGET),
+            "precondition: the move actually happened"
+        );
+        let unlocked = state.unlocked_folders.lock().unwrap().clone();
+        let surviving = state
+            .db
+            .list_ask_conversation_ids(&AskConversationScope::Vault, &unlocked)
+            .unwrap();
+        assert!(
+            surviving.is_empty(),
+            "a conversation that drew on the SOURCE folder must not outlive the meeting's move into              a locked one — it can paraphrase content that is now sealed. Got {surviving:?}"
+        );
+    }
+
     /// BLK-2 (seal half): moving a note INTO a locked + SESSION-UNLOCKED folder seals it AT REST
     /// (`content_blob`/`text_blob` set) but keeps it READABLE IN-SESSION — the restored plaintext
     /// markdown + transcript come back exactly like the folder's other unlocked notes, so it never
