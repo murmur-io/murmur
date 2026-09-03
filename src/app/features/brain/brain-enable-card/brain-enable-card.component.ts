@@ -15,6 +15,7 @@ import {
   ErrorCopyService,
   UserFacingError,
 } from "../../../core/copy/error-copy.service";
+import { subscribeUntilDestroyed } from "../../../core/subscribe-until-destroyed";
 
 /**
  * "Enable the brain" — the one-click activation card for the two on-device
@@ -93,14 +94,17 @@ export class BrainEnableCardComponent {
    */
   private async subscribeBrainDownload(): Promise<void> {
     try {
-      this.unlistenBrainDownload = await this.ipc.onBrainDownload((p) => {
-        if (this.stage() !== "brain") return;
-        if (p.total && p.total > 0) {
-          this._brainFrac.set(Math.min(1, p.downloaded / p.total));
-        }
-        if (p.done) this._brainFrac.set(1);
-      });
-      this.destroyRef.onDestroy(() => this.unlistenBrainDownload?.());
+      this.unlistenBrainDownload = await subscribeUntilDestroyed(
+        this.destroyRef,
+        () =>
+          this.ipc.onBrainDownload((p) => {
+            if (this.stage() !== "brain") return;
+            if (p.total && p.total > 0) {
+              this._brainFrac.set(Math.min(1, p.downloaded / p.total));
+            }
+            if (p.done) this._brainFrac.set(1);
+          }),
+      );
     } catch {
       // No stream available — progress stays inert.
     }
