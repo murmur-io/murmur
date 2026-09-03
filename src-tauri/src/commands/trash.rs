@@ -86,6 +86,17 @@ struct MeetingSnapshot {
     /// `notes` rows, so the snapshot is their only copy.
     #[serde(default)]
     attachments: Vec<AttachmentSnapshot>,
+    /// Graph edges touching this meeting on EITHER side. Deleting a meeting purges its links
+    /// outright rather than cascading them, so the snapshot is their only copy — and an inbound
+    /// edge matters as much as an outbound one: it is somebody else's link INTO this meeting, and
+    /// losing it is what makes a restored meeting look connected to nothing.
+    #[serde(default)]
+    links: Vec<crate::storage::links::LinkRowSnapshot>,
+    /// `(entity_id, created_at)` for every person/project this meeting mentioned. These cascade off
+    /// `meetings`, so they are gone the moment it is deleted. Their loss is quieter than the note's:
+    /// the meeting comes back intact while every entity's timeline has forgotten it.
+    #[serde(default)]
+    entity_mentions: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +290,10 @@ pub(crate) fn capture_meeting(state: &AppState, meeting_id: &str) -> Result<Stri
         .get_meeting_master_paths(meeting_id)
         .unwrap_or((None, None));
 
+    // Read BEFORE the caller's destructive cascade, like every other field here.
+    let links = state.db.link_rows_for_meeting(meeting_id)?;
+    let entity_mentions = state.db.entity_mentions_for_meeting(meeting_id)?;
+
     let snapshot = MeetingSnapshot {
         version: SNAPSHOT_VERSION,
         id: meeting.id.clone(),
@@ -320,6 +335,8 @@ pub(crate) fn capture_meeting(state: &AppState, meeting_id: &str) -> Result<Stri
             .iter()
             .map(attachment_to_snapshot)
             .collect(),
+        links,
+        entity_mentions,
     };
 
     let label = meeting
@@ -1544,6 +1561,53 @@ fn restore_meeting(state: &AppState, payload: &str) -> Result<(), AppError> {
         },
         &s.attachments,
     );
+
+    // Graph edges. These are NOT re-derivable: deleting a meeting purges its links outright and
+    // cascades away its mentions, and re-indexing only rebuilds what can be inferred from text — a
+    // manual link somebody drew, or an inbound edge from another note, is gone for good otherwise.
+    // Restored BEFORE the re-index so the wikilink pass sees the edges that already exist and does
+    // not duplicate them.
+    //
+    // Best-effort, like the re-export below and for the same reason: the meeting itself is already
+    // back, and failing the whole restore over an edge would trade a large loss for a small one.
+    match state.db.restore_link_rows(&s.links) {
+        Ok(n) => {
+            if n < s.links.len() {
+                // Not an error. `INSERT OR IGNORE` skips an edge the user has since dismissed or
+                // re-created, and a decision made after the delete outranks the snapshot.
+                tracing::info!(
+                    target: "trash",
+                    meeting_id = %s.id,
+                    restored = n,
+                    snapshotted = s.links.len(),
+                    "some snapshotted links were superseded by later decisions"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(target: "trash", meeting_id = %s.id, error = %e, "link restore failed")
+        }
+    }
+    match state
+        .db
+        .restore_entity_mentions(&s.id, &s.entity_mentions)
+    {
+        Ok(n) => {
+            if n < s.entity_mentions.len() {
+                // An entity deleted while the meeting sat in the trash takes its mention with it.
+                tracing::info!(
+                    target: "trash",
+                    meeting_id = %s.id,
+                    restored = n,
+                    snapshotted = s.entity_mentions.len(),
+                    "some mentions were dropped — their entity no longer exists"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(target: "trash", meeting_id = %s.id, error = %e, "mention restore failed")
+        }
+    }
 
     // Derived state: re-export the vault `.md` and re-derive chunks/vectors. Best-effort BY DESIGN —
     // the canonical rows are already back, so a failure here degrades search/Obsidian, never content.

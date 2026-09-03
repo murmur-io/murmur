@@ -594,3 +594,69 @@ fn attachment_hex_codec_round_trips_and_rejects_malformed_input() {
     assert!(hex_decode("zz").is_none(), "non-hex digit is refused");
     assert!(hex_decode("00ff0g").is_none(), "a late bad digit is refused");
 }
+
+/// Trash → restore must bring back the graph edges too, not just the recording.
+///
+/// Before this, the snapshot carried the row, its segments, notes, timeline and tags — everything
+/// that renders the meeting itself — and nothing that connects it to anything. Deleting a meeting
+/// purges its links outright (`preserve_decisions=false`, because the endpoint is gone) and cascades
+/// away its `entity_mentions`, so restore produced a meeting that looked perfectly intact and had
+/// silently forgotten every person it mentioned and every note it was linked to. Re-indexing does
+/// not bring those back: it rebuilds what can be INFERRED from text, so a manual link somebody drew
+/// by hand, or an inbound edge from another note, is gone for good.
+///
+/// The assertions deliberately cover BOTH link directions. An inbound edge is somebody else's link
+/// into this meeting, and losing only that would leave the meeting looking connected while the rest
+/// of the vault had forgotten it.
+#[test]
+fn restoring_a_meeting_brings_back_its_links_and_mentions() {
+    let state = build_state("trash-graph-restore");
+    open_folder(&state, "f1", "Work");
+    seed_meeting(&state, "m1", Some("f1"));
+    state
+        .db
+        .insert_note("n-other", "f1", "Other", "Other", "body", 1_760_000_000_000)
+        .expect("insert the note on the far side of the inbound edge");
+
+    let entity_id = state
+        .db
+        .upsert_entity("Anna", crate::storage::models::EntityKind::Person)
+        .expect("entity");
+    state.db.add_mention(&entity_id, "m1").expect("mention");
+
+    // One edge OUT of the meeting and one INTO it.
+    state
+        .db
+        .upsert_manual_link("meeting", "m1", "document", "n-other")
+        .expect("outbound manual link");
+    state
+        .db
+        .upsert_manual_link("document", "n-other", "meeting", "m1")
+        .expect("inbound manual link");
+
+    let links_before = state.db.link_rows_for_meeting("m1").unwrap();
+    let mentions_before = state.db.entity_mentions_for_meeting("m1").unwrap();
+    assert_eq!(links_before.len(), 2, "one edge each way");
+    assert_eq!(mentions_before.len(), 1, "one mention");
+
+    block_on(delete_meeting_inner(&state, "m1")).expect("delete to trash");
+    assert!(
+        state.db.link_rows_for_meeting("m1").unwrap().is_empty(),
+        "precondition: the delete really does purge the edges — otherwise this test proves nothing"
+    );
+
+    let entries = state.db.list_trash_entries().unwrap();
+    block_on(restore_trash_item_inner(&state, &entries[0].id)).expect("restore");
+
+    let links_after = state.db.link_rows_for_meeting("m1").unwrap();
+    let mentions_after = state.db.entity_mentions_for_meeting("m1").unwrap();
+    assert_eq!(
+        links_after, links_before,
+        "every edge comes back, in both directions, byte-for-byte"
+    );
+    assert_eq!(
+        mentions_after, mentions_before,
+        "and the mention keeps its ORIGINAL created_at — re-dating it would move an old meeting to \
+         the top of the entity's timeline"
+    );
+}
