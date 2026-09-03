@@ -14486,6 +14486,10 @@ mod lock_read_gate_tests;
 #[path = "tests/main_thread_offload_tests.rs"]
 mod main_thread_offload_tests;
 
+#[cfg(test)]
+#[path = "tests/org_mutex_scope_tests.rs"]
+mod org_mutex_scope_tests;
+
 // ── Workspace hierarchy read surface: the container forest, its per-kind groups, and the gate ─────
 #[cfg(test)]
 #[path = "tests/workspace_tree_tests.rs"]
