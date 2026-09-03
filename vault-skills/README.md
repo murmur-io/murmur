@@ -15,7 +15,7 @@ changes Murmur itself.
 | File | For | Teaches |
 | --- | --- | --- |
 | [`murmur-vault/SKILL.md`](murmur-vault/SKILL.md) | your agent | The anatomy of a Murmur note — front-matter keys, managed sections it must never edit, how wikilinks work, entity stubs, where things live, and the coexistence contract (add freely, prefer append, never touch managed regions). |
-| [`murmur-mcp/SKILL.md`](murmur-mcp/SKILL.md) | your agent | When and how to query Murmur's local read-only MCP server (gated, indexed retrieval) instead of grepping raw files, plus the full nine-tool catalog. |
+| [`murmur-mcp/SKILL.md`](murmur-mcp/SKILL.md) | your agent | When and how to query Murmur's local read-only MCP server (gated, indexed retrieval) instead of grepping raw files, plus the full twenty-tool catalog. |
 
 There is also a human-facing setup guide at
 [`docs/USE-WITH-YOUR-AGENT.md`](../docs/USE-WITH-YOUR-AGENT.md).

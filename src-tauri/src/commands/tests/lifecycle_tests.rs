@@ -565,6 +565,51 @@
         );
     }
 
+    /// The shipped skill catalog must list every tool the server actually registers.
+    ///
+    /// `vault-skills/murmur-mcp/SKILL.md` is not documentation about the product — the setup guide
+    /// tells the user to copy it into `~/.claude/skills/`, where a real agent loads it as operating
+    /// instructions. It described nine tools while `tools_spec()` registered twenty, so eleven were
+    /// invisible to every agent that followed it: an agent cannot call a tool it was never told
+    /// about, and it has no way to discover the omission.
+    #[test]
+    fn the_shipped_skill_catalog_lists_every_registered_mcp_tool() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+        let skill = std::fs::read_to_string(repo.join("vault-skills/murmur-mcp/SKILL.md"))
+            .expect("read the shipped MCP skill");
+
+        let spec = crate::mcp::tools_spec();
+        let registered: Vec<String> = spec
+            .as_array()
+            .expect("tools_spec is an array")
+            .iter()
+            .map(|tool| {
+                tool["name"]
+                    .as_str()
+                    .expect("every tool has a name")
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            registered.len() >= 20,
+            "tools_spec shrank unexpectedly ({}) — check this test still means what it says",
+            registered.len()
+        );
+
+        let missing: Vec<&String> = registered
+            .iter()
+            .filter(|name| !skill.contains(&format!("`{name}`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "vault-skills/murmur-mcp/SKILL.md does not mention {missing:?}. That file is COPIED \
+             INTO an agent's skills directory and read as instructions, so a tool missing from it \
+             is a tool no agent will ever call. Add it to the catalog."
+        );
+    }
+
     /// The config we DOCUMENT must be the config we EMIT.
     ///
     /// `get_mcp_config_carries_token_when_required_and_omits_it_when_off` above already pins what
@@ -573,40 +618,68 @@
     /// snippet with no token in it, so the line people copy was the one the server answers `401`
     /// to, and both snippets were also missing `type: http`.
     ///
-    /// A test that only checks the emitted JSON cannot see that. This one reads the shipped
-    /// documentation and requires each snippet to carry the two things a working entry needs.
+    /// The assertion is scoped to the SNIPPET, not the file. A first version searched whole files,
+    /// and review broke it immediately: revert the real snippet to the broken form, drop the
+    /// required words into an HTML comment elsewhere on the page, and the test went green on the
+    /// exact bug it exists to catch. A whole-file `contains` in a large, growing document proves
+    /// nothing — some other section will eventually mention `Bearer` for unrelated reasons.
     #[test]
     fn the_documented_mcp_snippets_carry_what_the_server_requires() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("repo root");
 
-        // (file, what the snippet must contain). The landing page escapes its JSON for HTML, so it
-        // is matched on the same tokens rather than on a literal block.
-        for (relative, needles) in [
+        /// Pull out the one documented block that configures the MCP server, so the assertions
+        /// below cannot be satisfied by text somewhere else in the file. Markdown fences and the
+        /// landing page's `<pre>` are both bounded by their own delimiters; we take the block that
+        /// mentions `mcpServers` and nothing else.
+        fn mcp_block<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+            let mut rest = text;
+            while let Some(start) = rest.find(open) {
+                let after = &rest[start + open.len()..];
+                let end = after.find(close)?;
+                let block = &after[..end];
+                if block.contains("mcpServers") {
+                    return Some(block);
+                }
+                rest = &after[end + close.len()..];
+            }
+            None
+        }
+
+        for (relative, open, close, needles) in [
             (
                 "README.md",
+                "```",
+                "```",
                 vec!["\"type\": \"http\"", "\"Authorization\": \"Bearer"],
             ),
             (
                 "docs/USE-WITH-YOUR-AGENT.md",
+                "```",
+                "```",
                 vec!["\"type\": \"http\"", "\"Authorization\": \"Bearer"],
             ),
             (
                 "landing/docs.html",
+                "<pre class=\"code-block\">",
+                "</pre>",
                 vec![">\"type\"<", ">\"http\"<", ">\"Authorization\"<", "Bearer"],
             ),
         ] {
             let path = repo.join(relative);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let block = mcp_block(&text, open, close).unwrap_or_else(|| {
+                panic!("{relative} no longer contains a documented `mcpServers` block at all")
+            });
             for needle in needles {
                 assert!(
-                    text.contains(needle),
-                    "{relative} documents an MCP config without {needle:?}. The server requires a \
-                     bearer token by default and Claude Code needs `type: http`, so a reader who \
-                     copies this snippet gets a 401 or an entry that is never treated as an HTTP \
-                     server. Copy what `get_mcp_config_inner` emits."
+                    block.contains(needle),
+                    "{relative}'s MCP snippet is missing {needle:?}. The server requires a bearer \
+                     token by default and Claude Code needs `type: http`, so a reader who copies \
+                     this block gets a 401 or an entry that is never treated as an HTTP server. \
+                     Copy what `get_mcp_config_inner` emits."
                 );
             }
         }
