@@ -16823,3 +16823,306 @@ fn sweep_leaves_fixtures_younger_than_min_age() {
     );
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// Deleting a meeting must revoke the conversations that could have drawn on ITS folder, and leave
+/// every other conversation alone.
+///
+/// Before this, `delete_meeting` called the global sweep, whose predicate
+/// (`provenance_mode = 'globalDerived'`) matches EVERY durable row — so tidying up one recording
+/// destroyed the entire Ask history of the vault, including conversations about folders that had
+/// not changed at all. A feature whose headline is that it persists did not survive a delete.
+///
+/// The three assertions are deliberately separate: "the unrelated one survives" is the fix, "the
+/// related one dies" is the property the fix must NOT trade away, and "it is still readable" is
+/// what makes survival meaningful — a row that outlives the purge but is stamped at a stale
+/// visibility generation is invisible, which is the same loss wearing a different hat.
+#[test]
+fn deleting_a_meeting_revokes_only_conversations_that_could_have_seen_its_folder() {
+    use crate::storage::models::AskConversationScope;
+
+    let db = mem_db();
+    seed_folder(&db, "f-a", "Alpha");
+    seed_folder(&db, "f-b", "Beta");
+
+    let mut meeting = sample_meeting("m-in-a", "2026-09-03T09:00:00Z");
+    meeting.folder_id = Some("f-a".to_string());
+    db.insert_meeting(&meeting).unwrap();
+
+    // One conversation per folder, each declaring only that folder as its dependency.
+    for (folder, question) in [("f-a", "about alpha"), ("f-b", "about beta")] {
+        db.persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            question,
+            "an answer",
+            &[],
+            &[],
+            &[],
+            &[folder.to_string()],
+            "2026-09-03T09:01:00Z",
+        )
+        .unwrap();
+    }
+    let unlocked = HashSet::new();
+    assert_eq!(
+        db.list_ask_conversation_ids(&AskConversationScope::Vault, &unlocked)
+            .unwrap()
+            .len(),
+        2,
+        "both conversations start visible"
+    );
+
+    db.delete_meeting("m-in-a").unwrap();
+
+    let surviving = db
+        .list_ask_conversation_ids(&AskConversationScope::Vault, &unlocked)
+        .unwrap();
+    assert_eq!(
+        surviving.len(),
+        1,
+        "exactly one conversation should survive — the one that never depended on the deleted \
+         meeting's folder. Got {surviving:?}"
+    );
+
+    let rows: Vec<(String, String)> = {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id, d.dependency_ref
+                   FROM ask_conversations c
+                   JOIN ask_conversation_dependencies d ON d.conversation_id = c.id
+                  WHERE d.dependency_kind = 'folder'",
+            )
+            .unwrap();
+        let out = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        out
+    };
+    assert_eq!(
+        rows.iter().map(|(_, f)| f.as_str()).collect::<Vec<_>>(),
+        vec!["f-b"],
+        "the survivor must be the folder-B conversation, not whichever one happened to be left"
+    );
+}
+
+/// The same delete, for an UNFILED meeting, still takes the whole history.
+///
+/// This is not an oversight to fix later. An unfiled meeting has no folder row, so
+/// `visible_folder_ids` never records a dependency naming it, so no conversation can be matched by
+/// folder — and a conversation may well paraphrase content the user just deleted. The global sweep
+/// is the only fail-closed answer, and pinning it here stops a later "optimisation" from scoping a
+/// case that cannot be scoped.
+#[test]
+fn deleting_an_unfiled_meeting_still_revokes_everything() {
+    use crate::storage::models::AskConversationScope;
+
+    let db = mem_db();
+    seed_folder(&db, "f-b", "Beta");
+    db.insert_meeting(&sample_meeting("m-unfiled", "2026-09-03T09:00:00Z"))
+        .unwrap();
+    db.persist_ask_exchange(
+        &AskConversationScope::Vault,
+        None,
+        "about beta",
+        "an answer",
+        &[],
+        &[],
+        &[],
+        &["f-b".to_string()],
+        "2026-09-03T09:01:00Z",
+    )
+    .unwrap();
+
+    db.delete_meeting("m-unfiled").unwrap();
+
+    assert!(
+        db.list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+            .unwrap()
+            .is_empty(),
+        "an unfiled meeting names no folder, so the fail-closed global sweep must still run"
+    );
+}
+
+/// The seal-side chunk purge stays GLOBAL, and that is a decision, not an omission.
+///
+/// `purge_chunks_for_meetings` is reached from `seal_moved_note`, which runs AFTER
+/// `move_meeting_with_attachments_sealed` has already committed
+/// `UPDATE meetings SET folder_id = <destination>`. Any scope derived from `meetings.folder_id` at
+/// that point names the folder the meeting moved INTO, never the one it came FROM — so a
+/// conversation depending on the SOURCE folder survives, and goes on paraphrasing content the user
+/// has just put behind the biometric gate. Scoping this call site was an active leak; review caught
+/// it before it shipped.
+///
+/// This test pins the DECISION at the layer the decision lives in. It does not drive the move path
+/// end to end — that needs the command layer and an unlocked folder key — so it would not catch a
+/// regression introduced by re-scoping from inside `seal_moved_note` itself. What it does catch is
+/// somebody scoping THIS helper again, which is exactly how the leak was introduced.
+#[test]
+fn the_seal_side_chunk_purge_stays_global_because_the_folder_may_already_have_moved() {
+    use crate::storage::models::AskConversationScope;
+
+    let db = mem_db();
+    seed_folder(&db, "f-source", "Source");
+    seed_folder(&db, "f-elsewhere", "Elsewhere");
+
+    let mut meeting = sample_meeting("m-moved", "2026-09-03T09:00:00Z");
+    // Stands in for the post-move state: the row already names the destination, so a scope derived
+    // here could never mention `f-source`.
+    meeting.folder_id = Some("f-elsewhere".to_string());
+    db.insert_meeting(&meeting).unwrap();
+
+    for folder in ["f-source", "f-elsewhere"] {
+        db.persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            "a question",
+            "an answer",
+            &[],
+            &[],
+            &[],
+            &[folder.to_string()],
+            "2026-09-03T09:01:00Z",
+        )
+        .unwrap();
+    }
+
+    db.purge_chunks_for_meetings(&["m-moved".to_string()])
+        .unwrap();
+
+    assert!(
+        db.list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+            .unwrap()
+            .is_empty(),
+        "the seal-side purge must revoke EVERY conversation, including the one that depends on the \
+         folder this meeting came from — that folder is no longer readable from the meeting row"
+    );
+}
+
+/// The DOCUMENT-side seal helper stays global too.
+///
+/// Review reintroduced the scoped call here — the exact shape just proven to leak for its
+/// meetings-side sibling — and the whole 3604-test suite stayed green. The decision was right and
+/// pinned by nothing, which is the same as not having made it.
+#[test]
+fn the_seal_side_doc_purge_stays_global_for_the_same_reason() {
+    use crate::storage::models::AskConversationScope;
+
+    let db = mem_db();
+    seed_folder(&db, "f-source", "Source");
+    seed_folder(&db, "f-elsewhere", "Elsewhere");
+    db.insert_document("d-moved", "f-elsewhere", "Moved", "body", "note", 0)
+        .unwrap();
+
+    for folder in ["f-source", "f-elsewhere"] {
+        db.persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            "a question",
+            "an answer",
+            &[],
+            &[],
+            &[],
+            &[folder.to_string()],
+            "2026-09-03T09:01:00Z",
+        )
+        .unwrap();
+    }
+
+    db.purge_doc_chunks_for_documents(&["d-moved".to_string()])
+        .unwrap();
+
+    assert!(
+        db.list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+            .unwrap()
+            .is_empty(),
+        "the document-side seal purge must revoke EVERY conversation, for the same reason as the \
+         meetings-side one: a move may already have rewritten the row's folder"
+    );
+}
+
+/// `delete_document` must resolve the folder BEFORE the row goes, and the failure mode if it does
+/// not is the quiet one.
+///
+/// Review reversed the order and the whole suite stayed green. Worse than a wrong scope: with the
+/// row already deleted, the lookup returns no rows, which used to yield `Some(empty set)` — and the
+/// scoped purge early-returns on an empty set, so NOTHING was revoked. Not a narrower purge, no
+/// purge. The helpers now treat "fewer rows than ids" as `None`, so even a future reordering fails
+/// closed to the global sweep rather than silently doing nothing; this test pins the ordering as
+/// well, because failing closed is a backstop, not a licence to get the order wrong.
+#[test]
+fn deleting_a_document_revokes_the_conversations_that_depended_on_its_folder() {
+    use crate::storage::models::AskConversationScope;
+
+    let db = mem_db();
+    seed_folder(&db, "f-doc", "DocHome");
+    seed_folder(&db, "f-other", "Other");
+    db.insert_document("d-gone", "f-doc", "Gone", "body", "note", 0)
+        .unwrap();
+
+    for folder in ["f-doc", "f-other"] {
+        db.persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            "a question",
+            "an answer",
+            &[],
+            &[],
+            &[],
+            &[folder.to_string()],
+            "2026-09-03T09:01:00Z",
+        )
+        .unwrap();
+    }
+
+    db.delete_document("d-gone").unwrap();
+
+    let surviving = db
+        .list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+        .unwrap();
+    assert_eq!(
+        surviving.len(),
+        1,
+        "the folder-doc conversation must be revoked and the folder-other one must survive. \
+         Got {surviving:?} — an empty-scope no-op looks exactly like 'both survived'"
+    );
+}
+
+/// `ask_scope_for_folder_tree_tx` really does walk descendants.
+///
+/// Review replaced its whole body with "just the named folder" and the suite stayed green: the only
+/// production caller refuses to delete a folder that still has children, so the recursion is
+/// defence-in-depth that nothing exercises. Defence nothing exercises is defence nobody can trust,
+/// so this drives the helper directly. Review separately confirmed with sqlite3 that the CTE
+/// terminates on a cycle and on a self-loop, and returns the anchor even when its row is gone.
+#[test]
+fn the_folder_scope_walks_descendants_not_just_the_named_folder() {
+    let db = mem_db();
+    seed_folder(&db, "f-root", "Root");
+    for (id, name, parent) in [("f-child", "Child", "f-root"), ("f-grand", "Grand", "f-child")] {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: format!("Root/{name}"),
+            parent_id: Some(parent.to_string()),
+            locked: false,
+            created_at: "2026-09-03T00:00:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
+    let mut conn = db.lock();
+    let tx = conn.transaction().unwrap();
+    let scope = Db::ask_scope_for_folder_tree_tx(&tx, "f-root").unwrap();
+    assert_eq!(
+        scope,
+        HashSet::from([
+            "f-root".to_string(),
+            "f-child".to_string(),
+            "f-grand".to_string()
+        ]),
+        "a grandchild's content goes away with the root, so its conversations must be in scope"
+    );
+}
