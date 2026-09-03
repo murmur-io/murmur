@@ -12,7 +12,7 @@ use crate::settings::{AppConfig, BrainBackend};
 use crate::state::AppState;
 use crate::storage::models::{
     ActionItem, Analytics, AskVaultResult, BrainOverview, CalendarContext, CalendarEvent,
-    CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo, EntityDetail,
+    CalendarEventFull, ChatTurn, DigestResult, DocumentInfo, EntityDetail,
     EntityDossierResult, Folder, FolderNode, FullGraphData, FullGraphOpts, GraphData, Meeting,
     MeetingActionSummary, MeetingStatus, MeetingTimeline, NoteAssistRequest, NoteAssistResult,
     NoteCitation, NoteDoc, NoteFolder, NoteRecord, NoteSummary, PeopleList, PinResult,
@@ -4019,29 +4019,10 @@ fn companion_body_is_empty(markdown: &str) -> bool {
     body.trim().is_empty()
 }
 
-/// `delete_companion_note_if_empty(meeting_id) -> bool` — remove an UNUSED auto-created companion note
-/// so a recording the user never jotted into leaves NO clutter. Deletes IFF the companion note's body
-/// (YAML front-matter stripped) is whitespace-only; a note with ANY user content is KEPT untouched.
-/// GATED: refuses a sealed-and-not-session-unlocked meeting (`AppError::Locked`) — never touch content
-/// behind a lock. Returns `true` when a body-empty companion note was deleted, `false` otherwise
-/// (no companion note, or it had content). NO-LOSS: only ever deletes a body-empty note. `async`
-/// because [`delete_note_inner`] runs the org-share revoke cascade.
-#[tauri::command]
-pub async fn delete_companion_note_if_empty(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    meeting_id: String,
-) -> Result<bool, AppError> {
-    let deleted =
-        delete_companion_note_if_empty_inner_notifying(state.inner(), &meeting_id, Some(&app))
-            .await?;
-    if deleted {
-        emit_ask_history_invalidated_fail_closed(&app);
-    }
-    Ok(deleted)
-}
-
-/// Inner of [`delete_companion_note_if_empty`] taking `&AppState` (unit-testable gate).
+/// Empty-companion cleanup taking `&AppState` (unit-testable gate). The FE-facing
+/// `delete_companion_note_if_empty` command was removed 2026-09-03: `stop_recording` already runs
+/// [`delete_companion_note_if_empty_inner_notifying`] on the flush witness, so the separate IPC
+/// door was a second, never-invoked entry point into the same cleanup.
 #[cfg(test)]
 pub(crate) async fn delete_companion_note_if_empty_inner(
     state: &AppState,
@@ -5286,22 +5267,6 @@ pub fn get_action_items(
         Some(n) => crate::summarize::action_items::parse_action_items(&n.markdown),
         None => Vec::new(),
     })
-}
-
-/// OPEN-COMMITMENTS rollup ("what did I promise / what's still open"): deterministically aggregate
-/// every OPEN (`- [ ]`) action item across the VISIBLE library, with each item's meeting context.
-/// No model — pure aggregation over the gated readers. `owner` (optional) filters case-insensitively.
-/// GATED: routes through `Db::list_open_commitments`, which pushes the LIVE session unlock set
-/// through `list_meetings_visible` + `get_note_if_visible` (the same predicate as `ask_vault` /
-/// `generate_digest` / MCP) — a sealed-and-not-session-unlocked meeting contributes nothing.
-#[tauri::command]
-pub fn list_open_commitments(
-    state: State<'_, AppState>,
-    owner: Option<String>,
-) -> Result<Vec<Commitment>, AppError> {
-    let unlocked = unlocked_snapshot(state.inner())?;
-    let owner = owner.as_deref().map(str::trim).filter(|o| !o.is_empty());
-    state.db.list_open_commitments(&unlocked, owner)
 }
 
 /// Pin a meeting moment: append a timestamped ^block-ref to the note (DB + vault file) and

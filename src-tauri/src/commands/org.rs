@@ -12104,22 +12104,6 @@ pub async fn org_update_item(
     Ok(new_item_id)
 }
 
-/// Compatibility alias for older frontend builds. Authorization and CAS are identical.
-#[tauri::command]
-pub async fn org_update_own_item(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    item_id: String,
-    title: String,
-    markdown: String,
-) -> Result<String, AppError> {
-    let new_item_id =
-        org_update_own_item_notifying(state.inner(), &item_id, &title, &markdown, Some(&app))
-            .await?;
-    crate::events::emit_org_feed_updated(&app, 1);
-    Ok(new_item_id)
-}
-
 #[cfg(test)]
 pub(crate) async fn org_update_own_item_inner(
     state: &AppState,
