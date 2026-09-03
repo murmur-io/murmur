@@ -65,13 +65,17 @@ pub(crate) fn ensure_dev_kek() {
 ///
 /// # What this scan is, and what it is NOT
 ///
-/// It is a best-effort EARLY WARNING, not a proof. Three rounds of review established that the
-/// question "where could a writer live?" has no bounded answer in Rust: `#[path]` compiles a file
-/// from anywhere on disk into this binary, so any walker rooted at any directory is trusting a
-/// boundary the language does not honour. Each round closed one escape (`.rs`-only filtering, then
-/// `src/`-only rooting) and the next appeared. Rooting at the crate covers every escape that stays
-/// inside the crate, which is where an accident actually lands; it does not cover a `#[path]` that
-/// leaves it, and no amount of walking will.
+/// It is a best-effort EARLY WARNING, not a proof, and five rounds of review are why that sentence
+/// is worded so carefully. The question "where could a writer live?" has no bounded answer in Rust:
+/// `#[path]` compiles a file from anywhere on disk into this binary. Each round closed one escape
+/// and the next appeared — `.rs`-only filtering, then `src/`-only rooting, then a rogue file inside
+/// `target/`, which never leaves the crate at all and defeats the exclusions below.
+///
+/// So the scan is NOT a fence and no version of it will be. It covers the directories where source
+/// realistically lives, which is where an accidental second writer — a revert, a cherry-pick, a
+/// copied setup block — actually lands. A file placed in `target/`, `gen/`, `binaries/` or a dot
+/// directory and pulled in with `#[path]` is not caught, and closing that would mean walking
+/// gigabytes on every run to defend against something nobody does by accident.
 ///
 /// The ACTUAL guard is the runtime assertion in [`ensure_dev_kek`]: it compares the live value and
 /// therefore catches any writer, however it spells the call and wherever it lives, as soon as one
@@ -85,14 +89,25 @@ pub(crate) fn ensure_dev_kek() {
 ///
 /// - A name assembled at compile time (`concat!("MURMUR", "_DEV_KEK")`). Defending against this
 ///   means parsing, which is the approach that already failed.
+/// - Anything under an excluded directory (`target/`, `gen/`, `binaries/`, dotfiles), reachable
+///   with `#[path]`. Excluded for cost and artifact noise, as above.
 /// - A second `set_var` inside a file that is ALREADY on the list. Trust here is file-grained, not
 ///   call-site-grained, so an allowlisted file is immune for its whole length — and `keychain.rs`,
 ///   the one place a careless KEK-adjacent `set_var` is most likely to be added, is exactly that
 ///   file. Review demonstrated both, and in both the runtime assertion caught it.
 ///
+/// The read is a HARD failure rather than a skip, and that trade is deliberate: an unreadable file
+/// is one this guard cannot clear, so it stops instead of guessing. It will therefore also fire on
+/// an innocent unreadable file — a dangling symlink, a permission-mangled CI cache restore — and
+/// that is accepted. The panic names the path and the OS error, so it cannot be mistaken for a real
+/// key collision.
+///
 /// This module itself is not on the list, and does not need to be: it reaches the hatch through
 /// `DEV_KEK_ENV` like every other caller should, and builds its search needle in pieces so it
 /// cannot match its own source.
+/// Directories the scan does not enter. See the module doc: cost and artifact noise, not safety.
+const EXCLUDED_DIRS: &[&str] = &["target", "gen", "binaries"];
+
 const FILES_THAT_MAY_NAME_THE_HATCH: &[&str] = &[
     // Owns the hatch: declares its name and value, and reads it.
     "src/secrets/keychain.rs",
@@ -122,9 +137,12 @@ fn only_the_fixture_and_the_hatch_owner_may_name_the_dev_kek() {
         for entry in std::fs::read_dir(dir).expect("read src dir") {
             let path = entry.expect("dir entry").path();
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            // Build output and VCS/tooling directories are not compiled into this binary and are
-            // enormous; everything else under the crate root is fair game.
-            if name == "target" || name == "gen" || name.starts_with('.') {
+            // Skipped for cost and for noise, NOT because nothing there can compile: `target` is
+            // multiple gigabytes in this crate, and `binaries` holds bundled Mach-O helpers whose
+            // embedded strings would be read and lossily decoded on every run. See the module doc —
+            // a `#[path]` into any of these defeats the scan, and that is a known limit rather than
+            // an oversight.
+            if EXCLUDED_DIRS.contains(&name.as_str()) || name.starts_with('.') {
                 continue;
             }
             if path.is_dir() {
