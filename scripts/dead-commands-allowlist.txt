@@ -1,0 +1,49 @@
+# Registered Tauri commands that no `invoke` names yet, each with the reason it stays.
+# Enforced by scripts/check-dead-commands.py. Format: `command: reason`.
+#
+# This file is the VISIBLE ledger of "backend built, UI pending" debt. An entry with no reason is
+# rejected, and so is a STALE entry — one naming a command that has since been wired or deleted —
+# so the list cannot quietly become a rubber stamp. Adding a line is a deliberate act that shows up
+# in review; the drift this stops is a command appearing here with nobody noticing.
+#
+# Every command below was checked for the one thing that would make allowlisting wrong: an
+# ungated content read. None of them return meeting content outside `meeting_is_unlocked` /
+# `visibility_clause`, so leaving them registered adds no leak surface — only the (real, recorded)
+# cost of code no product path exercises.
+
+# ── External MCP servers (Murmur as an MCP CLIENT) ──────────────────────────────────────────────
+# A complete, backend-live feature: `connectors/mcp.rs` builds `McpClient::for_server` from these
+# DB rows and the agent tool loop calls out to them, and every call is consent-gated. What is
+# missing is only the Settings UI to add/consent/test a server — so today a user can never
+# configure one. Deleting these six would delete the feature's only possible door; wiring them is a
+# NEW EGRESS surface and belongs in its own PR with an egress review, not in a dead-code chore.
+list_mcp_servers: MCP-client feature is backend-live (connectors/mcp.rs); needs a Settings UI — new egress, own PR
+add_mcp_server: same feature; adding a server opens a new egress path and needs the consent UI reviewed on its own
+remove_mcp_server: same feature; pairs with add_mcp_server in the pending Settings UI
+consent_to_mcp_server: same feature; this IS the per-server consent gate the pending UI must surface
+revoke_mcp_consent: same feature; the revoke half of the consent gate
+test_mcp_server: same feature; a stdio test LAUNCHES the configured binary, so it ships with the consent UI
+
+# ── Built, never wired ─────────────────────────────────────────────────────────────────────────
+# `build_entity_dossier_prompt` has ZERO callers outside this command, so the whole LLM-synthesis
+# dossier path (including its Shared-Brain B2 org-context fold) exists only for this door. It is
+# NOT the MCP `get_entity_dossier` tool, which returns gated STRUCTURED DATA with no egress —
+# these are two different features with confusingly similar names.
+entity_dossier: LLM-synthesised dossier, built and never wired; needs a Dossier action in entity detail
+# `forget_user_fact` (facts about me) IS wired; the per-entity twin is not, so there is no way to
+# forget a fact about a PERSON. A privacy affordance, so worth wiring rather than deleting.
+forget_entity_fact: privacy affordance whose forget_user_fact twin is wired; asymmetry to close in the facts UI
+afm_available: Apple-Foundation-Models probe with no Settings surface yet
+list_embed_models: embedding-model picker has no UI, so the Polish-first mmlw alt cannot be selected
+select_embed_model: the write half of that picker; both land with the model-settings UI
+# The background tick (`org_background_sync_tick`) already sweeps, so convergence does not depend on
+# this command — it is the manual "retry stuck shares now" affordance, kept because deleting a
+# recovery door is riskier than deleting a redundant alias.
+org_sweep_pending: manual retry for stuck org shares; the background tick already converges, UI pending
+
+# ── Debug-only, already fails closed in release ────────────────────────────────────────────────
+# Its body is `#[cfg(debug_assertions)]`; a release build returns AppError::InvalidArg, so the
+# control surface does not exist in a shipped app. Only the REGISTRATION is unconditional, and
+# cfg-gating that would mean maintaining two copies of a 350-entry generate_handler! list — which
+# is precisely the drift class this checker exists to catch. The body gate is the right place.
+reminder_runtime_probe_control: debug-only harness control; already refuses in release via cfg(not(debug_assertions))

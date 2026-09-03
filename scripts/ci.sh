@@ -87,6 +87,17 @@ rust_gate() {
   echo "── guard hooka Bash: self-test ──"
   python3 .agents/h/guard.py --selftest
 
+  # ── Martwe komendy IPC. `generate_handler!` to jedyny rejestr wejsc IPC, a kazde jest wolalne
+  #    z dowolnego JS w webview; komenda, ktorej nie nazywa zadne `invoke`, to czysta powierzchnia
+  #    bez korzysci — nie da sie jej przejsc produktem, wiec gnije, a regresja bramki w jej srodku
+  #    jest niewidoczna dla wszystkich pozostalych checkow (kompiluje sie Rust, kompiluje sie FE,
+  #    nic ich nie lączy). Na trunku 2026-09-03 bylo 16 takich. --self-test pierwszy, bo pilnuje
+  #    INSTRUMENTU: honorowanie `rename` (inaczej zywa komenda wyglada na martwa) i odpornosc na
+  #    przywabiacz-podciag oraz nazwe w komentarzu. Ulamek sekundy, bez modelu. ──
+  echo "── martwe komendy IPC (instrument + gate) ──"
+  python3 scripts/check-dead-commands.py --self-test
+  python3 scripts/check-dead-commands.py
+
   # ── Scaffold eval, control arm only. `--mode fake` runs NO model: it replays each task's
   #    recorded good/bad answers through the real graders and asserts good passes and bad fails.
   #    That is what keeps the graders honest — a grader that has lost its teeth accepts both arms
