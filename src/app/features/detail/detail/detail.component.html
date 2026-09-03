@@ -279,6 +279,33 @@
         }
       </div>
     } @else {
+
+      <!-- ============================================================= -->
+      <!-- RETRY TRANSCRIPTION — a recording whose transcription failed  -->
+      <!-- with its audio still on disk. The backend command existed all -->
+      <!-- along, and the ASR watchdog's own message tells the user to   -->
+      <!-- "use Retry transcription" — but nothing ever called it, so    -->
+      <!-- the advice pointed at a control that did not exist.           -->
+      <!-- ============================================================= -->
+      @if (canRetryTranscription()) {
+        <div class="card banner retry-banner" role="group">
+          <div class="retry-banner-copy">
+            <p class="retry-banner-title">Transcription didn’t finish</p>
+            <p class="empty">
+              The recording is still on disk. You can run it again.
+            </p>
+          </div>
+          <button
+            type="button"
+            class="btn btn-primary"
+            (click)="retryTranscription(d.meeting.id)"
+            [disabled]="retryingTranscription()"
+          >
+            {{ retryingTranscription() ? "Transcribing…" : "Transcribe again" }}
+          </button>
+        </div>
+      }
+
       <app-meeting-command-bar
         [meetingId]="d.meeting.id"
         [folderId]="d.meeting.folderId ?? null"

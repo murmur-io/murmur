@@ -97,6 +97,12 @@ export interface MeetingsListItem {
   /** Pre-derived pill presentation — the template must not call helpers per row. */
   statusPillClass: string;
   statusLabel: string;
+  /**
+   * The recording failed and its audio is still on disk, so re-running transcription can actually
+   * do something. Pre-derived for the same reason as the pill: no helper calls per row under
+   * zoneless change detection.
+   */
+  canRetryTranscription: boolean;
 }
 
 /**
@@ -496,9 +502,39 @@ export class LibraryComponent implements OnInit {
         meeting,
         statusPillClass: meetingStatusPillClass(meeting.status),
         statusLabel: meetingStatusLabel(meeting.status),
+        canRetryTranscription:
+          meeting.status === "ERROR" && !!meeting.audioPath?.trim(),
       }))
       .sort((a, b) => b.sortAt - a.sortAt),
   );
+
+  /** The row whose retry is in flight, so only that one's menu item disables. */
+  readonly retryingId = signal<string | null>(null);
+
+  /**
+   * Re-run transcription for a failed recording straight from the list.
+   *
+   * The meeting view carries the same offer as a banner; this is the reach for somebody scanning
+   * the list who does not want to open a broken meeting first. The backend re-checks every
+   * precondition, so a row that has gone stale simply refuses.
+   */
+  async retryTranscriptionFromMenu(meetingId: string): Promise<void> {
+    if (this.retryingId() !== null) {
+      return;
+    }
+    this.retryingId.set(meetingId);
+    this.rowMenuId.set(null);
+    try {
+      await this.ipc.retryTranscription(meetingId);
+      // The row's status pill is derived from the list, so the list has to be re-read for the
+      // meeting to stop claiming it failed.
+      await this.reloadMeetings();
+    } catch {
+      this.toast.danger("Could not start transcription again. Try opening the meeting.");
+    } finally {
+      this.retryingId.set(null);
+    }
+  }
 
   /** True when the no-query list has zero rows (drives the empty state). */
   readonly listEmpty = computed(() => this.listItems().length === 0);

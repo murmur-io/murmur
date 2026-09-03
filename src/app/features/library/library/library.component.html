@@ -578,6 +578,24 @@
                    click closes via onDocumentClick. -->
               @if (rowMenuId() === m.id) {
                 <div class="menu row-menu" role="menu" aria-label="Meeting actions">
+                  <!-- Recovery comes first, and only for a row that actually failed with its audio
+                       still on disk — the two conditions the backend itself refuses on. -->
+                  @if (it.canRetryTranscription) {
+                    <div class="menu-group">
+                      <button
+                        type="button"
+                        class="menu-item"
+                        role="menuitem"
+                        [disabled]="retryingId() !== null"
+                        (click)="
+                          $event.stopPropagation();
+                          retryTranscriptionFromMenu(m.id)
+                        "
+                      >
+                        Transcribe again
+                      </button>
+                    </div>
+                  }
                   <div class="menu-group">
                     <button
                       type="button"
