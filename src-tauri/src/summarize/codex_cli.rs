@@ -2567,19 +2567,19 @@ mod tests {
         assert!(
             !cache
                 .iter()
-                .any(|e| e.identity.canonical_path == PathBuf::from("/tmp/codex-0")),
+                .any(|e| e.identity.canonical_path.as_path() == Path::new("/tmp/codex-0")),
             "the OLDEST entry must be the one evicted"
         );
         assert!(
             cache
                 .iter()
-                .any(|e| e.identity.canonical_path == PathBuf::from("/tmp/codex-new")),
+                .any(|e| e.identity.canonical_path.as_path() == Path::new("/tmp/codex-new")),
             "the entry just verified must survive — evicting it would re-probe forever"
         );
         assert!(
             cache
                 .iter()
-                .any(|e| e.identity.canonical_path == PathBuf::from("/tmp/codex-1")),
+                .any(|e| e.identity.canonical_path.as_path() == Path::new("/tmp/codex-1")),
             "only ONE entry is evicted per insertion"
         );
     }
