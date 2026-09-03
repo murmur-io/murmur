@@ -163,7 +163,7 @@ pub async fn lock_folder(
             "the task folder cannot be locked".into(),
         ));
     }
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     // PRE-FLIGHT the whole subtree before anything seals. A container can hold containers now, so
     // locking one seals everything inside it (see `lock_container_subtree`) — and this refusal is
     // a property the caller can fix and would want to fix before any container changed state.
@@ -227,7 +227,7 @@ pub async fn lock_folder_allow_remote_access(
             "the task folder cannot be locked".into(),
         ));
     }
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     // The WHOLE subtree, because this command now seals the whole subtree. A descendant already
     // mid-revocation is the same race the target's check exists to refuse, and the cascade would
     // otherwise walk straight into it. This command deliberately opens NO closure of its own — it
@@ -986,7 +986,7 @@ pub async fn unlock_folder(
     // The lock-state race this does NOT need to cover is covered elsewhere: the restore below takes
     // `lifecycle_guard` for its whole synchronous body, which is what serializes against a
     // concurrent `lock_folder` / `relock_all_inner`.
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
 
     // RE-VALIDATE: everything above — `folder`, the `folder.locked` refusal,
     // `preflight_unlock_subtree`, `folder_wrapped_key` — was read BEFORE this lock was held, with an
@@ -1576,7 +1576,7 @@ pub(crate) fn relock_all_inner_with_visibility_notice(
 /// `.md` to the vault. The folder returns to the default OPEN state.
 #[tauri::command]
 pub async fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     remove_lock_inner(state.inner(), folder_id)
 }
 
@@ -1840,7 +1840,7 @@ pub async fn discard_unrecoverable_folder_lock(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     let node =
         discard_unrecoverable_folder_lock_with_enumeration(state.inner(), folder_id, None, || {
             emit_ask_history_invalidated_fail_closed(&app)
@@ -2034,7 +2034,7 @@ pub async fn discard_unrecoverable_meeting_lock(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<Option<FolderNode>, AppError> {
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     let Some(folder_id) = state.db.folder_for_meeting(&meeting_id)? else {
         return Ok(None);
     };

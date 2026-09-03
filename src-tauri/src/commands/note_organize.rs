@@ -835,7 +835,7 @@ pub async fn apply_organize_plan(
     state: State<'_, AppState>,
     plan: OrganizePlan,
 ) -> Result<OrganizeApplyResult, AppError> {
-    let _share_mutation = state.org_share_mutation_lock.lock().await;
+    let _share_mutation = state.lock_org_mutation().await;
     apply_organize_plan_inner(state.inner(), plan)
 }
 

@@ -88,7 +88,7 @@ fn brief_err_still_classifies_the_other_arms() {
 async fn a_held_share_mutation_lock_yields_busy_rather_than_hanging() {
     let state = AppState::for_tests(fresh_db("busy-lock"));
 
-    let held = state.org_share_mutation_lock.lock().await;
+    let held = state.lock_org_mutation().await;
 
     let started = std::time::Instant::now();
     let outcome = acquire_share_mutation_within(&state, std::time::Duration::from_millis(50)).await;

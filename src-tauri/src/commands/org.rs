@@ -435,7 +435,7 @@ pub async fn share_note_to_link(
     password: Option<String>,
     max_downloads: Option<u32>,
 ) -> Result<String, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     share_note_to_link_inner(
         state.inner(),
         meeting_id,
@@ -634,7 +634,7 @@ pub async fn share_note_to_link_doc(
     password: Option<String>,
     max_downloads: Option<u32>,
 ) -> Result<String, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     share_note_to_link_doc_inner(state.inner(), id, expires_days, password, max_downloads).await
 }
 
@@ -935,7 +935,7 @@ fn my_share_local_title_under_lifecycle(
 /// `revoke_share(share_id)` — DELETE the server ciphertext + flip the local state. Idempotent.
 #[tauri::command]
 pub async fn revoke_share(state: State<'_, AppState>, share_id: String) -> Result<(), AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     revoke_share_inner(state.inner(), share_id).await
 }
 
@@ -1379,7 +1379,7 @@ pub async fn share_note_to_user(
     recipient_email: String,
     expires_days: Option<u32>,
 ) -> Result<ShareToUserResult, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     share_note_to_user_inner(state.inner(), meeting_id, recipient_email, expires_days).await
 }
 
@@ -1657,7 +1657,7 @@ pub(crate) fn assemble_user_share_request(
 /// number of shares advanced to `sent`.
 #[tauri::command]
 pub async fn share_rewrap_pending(state: State<'_, AppState>) -> Result<u32, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     share_rewrap_pending_inner(state.inner()).await
 }
 
@@ -2813,7 +2813,7 @@ pub(crate) async fn acquire_org_ock_for_test(
 /// the owner can immediately seal items. Caches the org + generation-1 OCK locally.
 #[tauri::command]
 pub async fn org_create(state: State<'_, AppState>, name: String) -> Result<OrgStatus, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     org_create_inner(state.inner(), name).await
 }
 
@@ -3203,10 +3203,13 @@ pub(crate) const SHARE_MUTATION_WAIT: std::time::Duration = std::time::Duration:
 pub(crate) async fn acquire_share_mutation_within(
     state: &AppState,
     wait: std::time::Duration,
-) -> Result<tokio::sync::MutexGuard<'_, ()>, AppError> {
-    match tokio::time::timeout(wait, state.org_share_mutation_lock.lock()).await {
-        Ok(guard) => Ok(guard),
-        Err(_) => Err(AppError::Unavailable(crate::errcode::tag(
+) -> Result<crate::state::OrgMutationGuard<'_>, AppError> {
+    // Through the guard like every other door: this bounded-wait variant is a SECOND way to
+    // take the same mutex, and a re-entrancy check that misses it misses exactly the kind of
+    // path the deadlock it exists for was reached through.
+    match state.lock_org_mutation_within(wait).await {
+        Some(guard) => Ok(guard),
+        None => Err(AppError::Unavailable(crate::errcode::tag(
             crate::errcode::SHARE_BUSY,
             "another sharing operation is still running",
         ))),
@@ -3541,7 +3544,7 @@ pub async fn org_invite_member(
     org_id: String,
     email: String,
 ) -> Result<(), AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     org_invite_member_inner(state.inner(), org_id, email).await
 }
 
@@ -3957,7 +3960,7 @@ pub async fn org_remove_member(
     org_id: String,
     user_id: String,
 ) -> Result<(), AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     org_remove_member_inner(state.inner(), org_id, user_id).await
 }
 
@@ -4033,7 +4036,7 @@ pub async fn org_leave(
     state: State<'_, AppState>,
     org_id: String,
 ) -> Result<(), AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     let org = resolve_org(state.inner(), &org_id)?;
     let base = share_base_url(state.inner())?;
     let access = valid_access_token(state.inner()).await?;
@@ -4587,7 +4590,7 @@ pub(crate) async fn share_to_org_placed_notifying(
     placement: Option<ContainerPlacement>,
     app: Option<&AppHandle>,
 ) -> Result<OrgShareEntry, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     share_to_org_inner_with_policy(
         state,
         org_id,
@@ -7675,7 +7678,7 @@ pub(crate) async fn republish_org_shares_for_source(
     meeting_id: Option<&str>,
     document_id: Option<&str>,
 ) -> Result<u32, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     republish_org_shares_for_source_with_policy(
         state,
         meeting_id,
@@ -7692,7 +7695,7 @@ pub(crate) async fn republish_org_shares_for_source_notifying(
     document_id: Option<&str>,
     app: &AppHandle,
 ) -> Result<u32, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     republish_org_shares_for_source_with_policy(
         state,
         meeting_id,
@@ -8987,7 +8990,7 @@ pub async fn revoke_org_share(
     state: State<'_, AppState>,
     item_id: String,
 ) -> Result<(), AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     revoke_org_share_inner_with_policy(state.inner(), item_id, OrgWorkPolicy::manual(), Some(&app))
         .await?;
     crate::events::emit_org_feed_updated(&app, 1);
@@ -9004,7 +9007,7 @@ pub(crate) async fn revoke_org_share_notifying(
     item_id: String,
     notifier: &dyn OrgFeedNotifier,
 ) -> Result<(), AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     revoke_org_share_inner_with_policy(state, item_id, OrgWorkPolicy::manual(), None).await?;
     notifier.org_feed_updated(1);
     Ok(())
@@ -9015,7 +9018,7 @@ pub(crate) async fn revoke_org_share_inner(
     state: &AppState,
     item_id: String,
 ) -> Result<(), AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     revoke_org_share_inner_with_policy(state, item_id, OrgWorkPolicy::manual(), None).await
 }
 
@@ -9373,7 +9376,7 @@ pub async fn revoke_shares_for_folder(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     state.db.begin_org_folder_closure(&folder_id)?;
     revoke_shares_for_folder_inner(state.inner(), &folder_id, Some(&app)).await
 }
@@ -9542,7 +9545,7 @@ pub(crate) async fn org_background_sync_tick(state: &AppState, app: Option<AppHa
     // Reconcile membership FIRST so a newly-invited org is present (and synced this same tick) and a
     // departed org is dropped before we pull its feed. Best-effort — a failure never blocks the sync.
     {
-        let _mutation = state.org_share_mutation_lock.lock().await;
+        let _mutation = state.lock_org_mutation().await;
         if let Err(e) = org_reconcile_memberships_with_policy(state, policy, app.as_ref()).await {
             tracing::warn!(target: "org", error = %brief_err(&e), "org membership reconcile tick failed");
         }
@@ -9551,7 +9554,7 @@ pub(crate) async fn org_background_sync_tick(state: &AppState, app: Option<AppHa
         return false;
     }
     {
-        let _mutation = state.org_share_mutation_lock.lock().await;
+        let _mutation = state.lock_org_mutation().await;
         if let Err(e) = org_sweep_pending_with_policy(state, policy, app.as_ref()).await {
             tracing::warn!(target: "org", error = %e, "org outbound sweep tick failed");
         }
@@ -9586,7 +9589,7 @@ pub(crate) async fn org_background_sync_tick(state: &AppState, app: Option<AppHa
         return false;
     }
     let report = {
-        let _mutation = state.org_share_mutation_lock.lock().await;
+        let _mutation = state.lock_org_mutation().await;
         match org_sync_now_inner_with_policy(state, policy, app.clone()).await {
             Ok(r) => r,
             Err(e) => {
@@ -9643,13 +9646,13 @@ pub async fn org_sweep_pending(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<u32, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     org_sweep_pending_with_policy(state.inner(), OrgWorkPolicy::manual(), Some(&app)).await
 }
 
 #[cfg(test)]
 pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     org_sweep_pending_with_policy(state, OrgWorkPolicy::manual(), None).await
 }
 
@@ -9657,7 +9660,7 @@ pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, App
 pub(crate) async fn org_sweep_pending_background_once_inner(
     state: &AppState,
 ) -> Result<u32, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     org_sweep_pending_with_policy(
         state,
         OrgWorkPolicy::background(crate::perf::background_epoch()),
@@ -10218,7 +10221,7 @@ pub async fn org_sync_now(
     state: State<'_, AppState>,
     org_id: Option<String>,
 ) -> Result<crate::storage::models::OrgSyncReport, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     // The FE passes a SPECIFIC org id (→ sync only that org); the background tick / internal callers
     // pass `None` (→ sync the next round-robin org). This is the command-boundary
     // dispatch of the multi-org fix: a user-triggered "Sync now" from a picked org must not sync (or
@@ -10367,7 +10370,7 @@ pub(crate) async fn org_sync_one_now_inner(
     state: &AppState,
     org_id: &str,
 ) -> Result<crate::storage::models::OrgSyncReport, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     org_sync_one_now_with_app(state, org_id, None).await
 }
 
@@ -10384,7 +10387,7 @@ pub(crate) async fn org_sync_one_now_with_pre_task_reader(
     state: &AppState,
     org_id: &str,
 ) -> Result<crate::storage::models::OrgSyncReport, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     org_sync_one_now_with_app_and_policy(state, org_id, None, OrgWorkPolicy::pre_task_reader()).await
 }
 
@@ -10434,7 +10437,7 @@ async fn org_sync_one_now_with_app_and_policy(
 pub(crate) async fn org_sync_now_inner(
     state: &AppState,
 ) -> Result<crate::storage::models::OrgSyncReport, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     org_sync_now_inner_with_policy(state, OrgWorkPolicy::manual(), None).await
 }
 
@@ -11084,7 +11087,7 @@ async fn org_sync_one(
 /// `org_background_sync_tick`; this is the direct entry point for internal callers and for the
 /// regression tests that drive the sweep against a mock feed.
 pub async fn org_reconcile_now_inner(state: &AppState) -> Result<u32, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     org_reconcile_tick_with_policy(state, OrgWorkPolicy::manual(), None).await
 }
 
@@ -11850,7 +11853,7 @@ pub async fn add_org_item_to_container(
     item_id: String,
     container_id: String,
 ) -> Result<crate::storage::models::OrgItemImportResult, AppError> {
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     add_org_item_to_container_inner(state.inner(), &item_id, &container_id)
 }
 
@@ -11967,7 +11970,7 @@ pub(crate) async fn org_set_item_access_inner(
     item_id: &str,
     access: crate::share::org_dto::OrgItemAccess,
 ) -> Result<(), AppError> {
-    let _mutation = st.org_share_mutation_lock.lock().await;
+    let _mutation = st.lock_org_mutation().await;
     let ctx = match st.db.org_item_edit_ctx(item_id)? {
         Some(ctx) => ctx,
         None => {
@@ -12157,7 +12160,7 @@ pub(crate) async fn org_update_own_item_notifying(
     markdown: &str,
     app: Option<&AppHandle>,
 ) -> Result<String, AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     // Resolve the item's edit context (org, current rev, original created_at/source_kind, author id).
     let ctx = state
         .db
@@ -12624,7 +12627,7 @@ pub(crate) async fn delete_org_item_as_author_notifying(
     item_id: &str,
     app: Option<&AppHandle>,
 ) -> Result<(), AppError> {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    let _mutation = state.lock_org_mutation().await;
     let item_id = item_id.trim();
     if item_id.is_empty() {
         return Err(AppError::InvalidArg("item id required".into()));

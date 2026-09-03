@@ -7388,7 +7388,7 @@
             |_ck: &[u8; 32], _blob: &[u8], _aad: &[u8]| -> Result<Vec<u8>, AppError> {
                 Ok(b"not the attachment plaintext".to_vec())
             };
-        let _org_mutation = block_on(state.org_share_mutation_lock.lock());
+        let _org_mutation = block_on(state.lock_org_mutation());
         let error = persist_converted_companion_under_snapshot_with_attachment_verifier(
             &state,
             MEETING,
@@ -8368,7 +8368,7 @@
 
         // Keep cleanup queued before its authoritative recheck. The editor wins while cleanup is
         // waiting, so the recheck must return false without touching the remote-share journal.
-        let mutation = block_on(state.org_share_mutation_lock.lock());
+        let mutation = block_on(state.lock_org_mutation());
         let cleanup_state = state.clone();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let cleanup = std::thread::spawn(move || {
