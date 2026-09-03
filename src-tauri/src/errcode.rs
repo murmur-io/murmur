@@ -182,6 +182,13 @@ pub const ORG_ROTATION_PENDING: &str = "org-rotation-pending";
 
 /// Every code this crate emits, in declaration order. The frontend's allowlist mirrors it;
 /// `error_codes_are_unique_and_kebab_case` keeps the shape a machine can rely on.
+/// The invitee's published identity key differs from the one this device pinned on first contact.
+///
+/// A relay that can substitute `pk_enc` between the lookup and the wrap gets the org content key
+/// wrapped to a key IT holds. Refusing is the only safe answer: the invite is not sent, and the user
+/// is told to re-verify out of band rather than being asked to trust a key that changed silently.
+pub const ORG_INVITE_KEY_CHANGED: &str = "org-invite-key-changed";
+
 pub const ALL: &[&str] = &[
     CLOUD_CONSENT,
     SHARE_CONSENT,
@@ -217,6 +224,7 @@ pub const ALL: &[&str] = &[
     SHARE_BUSY,
     CONTAINER_UNAVAILABLE,
     ORG_ROTATION_PENDING,
+    ORG_INVITE_KEY_CHANGED,
 ];
 
 #[cfg(test)]
@@ -319,6 +327,10 @@ mod tests {
             // the removal succeeded and the rotation is owed, which is a different sentence from
             // any existing failure code and the only one that must not read as "try again".
             "org-rotation-pending",
+            // Added 2026-09-03 with TOFU on org invites. See `ORG_INVITE_KEY_CHANGED`: the invite
+            // was NOT sent, and unlike every other failure here the remedy is not "try again" —
+            // retrying is precisely what must not happen until a human has verified the key.
+            "org-invite-key-changed",
         ];
         assert_eq!(ALL, expected);
     }

@@ -250,7 +250,20 @@ export class WorkspaceTreeComponent {
   }
 
   protected readonly loading = this.workspace.loading;
-  protected readonly error = this.workspace.error;
+  /**
+   * The message this half of the forest should show, if any.
+   *
+   * Was always `workspace.error`, even on the SHARED instance — so a shared-workspace read that
+   * failed rendered as "Nothing shared with you yet". A user whose relay was unreachable was told
+   * their team had shared nothing. The own-workspace half is unchanged.
+   */
+  protected readonly error = computed(() =>
+    this.isOwnScope()
+      ? this.workspace.error()
+      : this.sharedWorkspace.loadFailed()
+        ? "Couldn't read what's shared with you. Showing the last known state."
+        : null,
+  );
   protected readonly workspaceEmpty = this.workspace.workspaceEmpty;
   protected readonly unfiledRecordings = this.workspace.unfiledRecordings;
   protected readonly unfiledExpanded = this.workspace.unfiledExpanded;

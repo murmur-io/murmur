@@ -194,7 +194,14 @@ pub fn build_vault_context_hybrid_visible(
     // Brain v2 L1.5 — temporal window (all hybrid legs apply it; query-time `now` anchor).
     let date_filter =
         crate::summarize::temporal::extract_date_filter(query, chrono::Utc::now().date_naive());
-    let mut hits = db.search_hybrid_visible(query, query_vec, 40, 0.0, unlocked, date_filter)?;
+    let mut hits = db.search_hybrid_visible(
+        query,
+        query_vec,
+        40,
+        crate::embed::KNN_SEARCH_COSINE_FLOOR,
+        unlocked,
+        date_filter,
+    )?;
 
     // Brain v2 L1.4 — the RERANKER seam (Ask-only): reorder the TOP-K fused candidates before
     // packing. The reranker sees ONLY already-gated hits (id + title/snippet — content the caller
@@ -269,7 +276,14 @@ pub fn build_meeting_listing_visible(
             .map(|h| h.meeting)
             .collect()
     } else {
-        db.search_hybrid_visible(query, query_vec, limit, 0.0, unlocked, date_filter)?
+        db.search_hybrid_visible(
+            query,
+            query_vec,
+            limit,
+            crate::embed::KNN_SEARCH_COSINE_FLOOR,
+            unlocked,
+            date_filter,
+        )?
             .into_iter()
             .map(|h| h.meeting)
             .collect()
@@ -310,7 +324,7 @@ fn pack_doc_chunks(
     let knn = if query_vec.is_empty() {
         Vec::new()
     } else {
-        db.search_doc_chunks_visible(query_vec, 20, 0.0, unlocked)?
+        db.search_doc_chunks_visible(query_vec, 20, crate::embed::KNN_SEARCH_COSINE_FLOOR, unlocked)?
     };
     let fts = db.search_doc_chunks_fts_visible(query, 20, unlocked)?;
     let mut hits = crate::embed::fuse_doc_hits(knn, fts);
@@ -1825,5 +1839,91 @@ mod tests {
             "pinned corpus must not contain the unlisted meeting"
         );
         assert_eq!(pinned_sources.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod knn_floor_tests {
+    /// A stub embedder must yield NO handle, so the Ask path gets no query vector rather than a
+    /// fake one.
+    ///
+    /// This is the half that actually mattered. `active_admitted_embedder` falls back to
+    /// `StubEmbedder`, a hash bag whose "similarity" carries no semantics, and the old code fed that
+    /// straight into the KNN leg. Combined with a `0.0` floor — which cannot reject anything — the
+    /// result was noise fused into the answer as if it were a semantic signal. Two bugs compounding:
+    /// a fake vector and a threshold unable to reject it.
+    ///
+    /// `active_persistence_embedder_if_available` returns `None` for a stub snapshot, so the vector
+    /// is empty, `search_hybrid_visible` treats the KNN leg as absent, and `score_fuse`
+    /// redistributes its weight to the legs that have something to say.
+    ///
+    /// NOTE on what this can and cannot assert. `embed_model_present()` is NOT the right predicate
+    /// here and using it was my first mistake: `active_embedder_snapshot` carries a `#[cfg(test)]`
+    /// guard that forces a stub unless `MURMUR_TEST_REAL_EMBED` is set, so a test build reports the
+    /// model absent even on a machine whose model directory is fully populated — deliberately, so
+    /// the suite never loads 470 MB of weights. The two therefore disagree BY DESIGN in test builds,
+    /// and a test that asserted they agree fails on exactly the machines that have the model. What
+    /// is deterministic, and what this pins, is the stub branch — the branch every user without the
+    /// model is on, and the one that was producing the noise.
+    #[test]
+    fn a_stub_embedder_yields_no_handle_rather_than_fake_vectors() {
+        if std::env::var_os("MURMUR_TEST_REAL_EMBED").is_some() {
+            // Opted into the real model: the handle must then exist, or Ask would silently lose its
+            // semantic leg on the machines that paid for it.
+            assert!(
+                crate::embed::active_persistence_embedder_if_available().is_some(),
+                "with the real embedder opted in, the real-only handle must be available"
+            );
+            return;
+        }
+        assert!(
+            crate::embed::active_persistence_embedder_if_available().is_none(),
+            "a stub snapshot must produce NO handle. If this returns a stub embedder, the Ask path \
+             embeds the question into hash noise and fuses it into the answer as if it meant \
+             something"
+        );
+    }
+
+    /// Every hybrid/doc search on the Ask path uses the REAL cosine floor, never a zero.
+    ///
+    /// A `0.0` floor admits every vector in the index, however unrelated — harmless when the vector
+    /// is meaningful, actively harmful when it is not.
+    ///
+    /// The first version of this test looked for the literal `", 0.0,"`. Review defeated it three
+    /// times in a row with entirely ordinary spellings — `0.0f32,`, `0.00,`, and a `let floor = 0.0;`
+    /// bound above the call — each leaving a real zero floor live and the test green. So it no longer
+    /// hunts for a spelling. It reads the argument in the position the floor occupies and requires it
+    /// to BE the named constant: anything else, however written, fails.
+    #[test]
+    fn the_ask_path_passes_the_named_cosine_floor_constant() {
+        // Only the PRODUCTION half of the file: this module names the calls too, and matching its
+        // own prose would make the scan report on itself.
+        let whole = include_str!("vault_context.rs");
+        let src = whole
+            .split_once("mod knn_floor_tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(whole);
+        for call in ["search_hybrid_visible", "search_doc_chunks_visible"] {
+            let mut found = 0usize;
+            for (i, line) in src.lines().enumerate() {
+                // Skip the doc comments and this test's own mentions of the call names.
+                if !line.contains(call) || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                found += 1;
+                let window: String = src.lines().skip(i).take(10).collect::<Vec<_>>().join(" ");
+                assert!(
+                    window.contains("KNN_SEARCH_COSINE_FLOOR"),
+                    "{call} at line {} does not pass `KNN_SEARCH_COSINE_FLOOR`. Whatever it passes \
+                     instead — a literal, a suffixed literal, or a local binding — is not the \
+                     reviewed threshold, and a zero there fuses unrelated vectors into the answer.",
+                    i + 1
+                );
+            }
+            assert!(
+                found > 0,
+                "no call to {call} found — the scan has gone vacuous, fix it before trusting it"
+            );
+        }
     }
 }
