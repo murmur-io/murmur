@@ -738,22 +738,42 @@ async fn probe_supported_codex_version_with_boundary(
         let mut cache = verified_codex_binary_cache()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Replace this key's own entry rather than the whole cache, so a concurrent verification of
-        // a DIFFERENT binary cannot evict one that is still in use.
-        if let Some(slot) = cache
-            .iter_mut()
-            .find(|entry| entry.identity == verified.identity && entry.boundary == verified.boundary)
-        {
-            *slot = verified.clone();
-        } else {
-            if cache.len() >= VERIFIED_CODEX_BINARY_CACHE_CAP {
-                // Oldest first. A cache that grew without bound would be the worse bug.
-                cache.remove(0);
-            }
-            cache.push(verified.clone());
-        }
+        remember_verified_binary(&mut cache, verified.clone());
     }
     Ok(verified)
+}
+
+/// Record a verified binary, replacing its own entry and evicting the oldest when full.
+///
+/// Split out of the probe so both rules can be tested on a LOCAL vector. The probe needs a real
+/// executable and the cache is process-global, so a test driving it through the probe shares state
+/// with every other test in the process and can only reach these branches indirectly — which is
+/// exactly why review found both of them untested (#658):
+///
+///   * eviction DIRECTION: swapping `remove(0)` for `pop()` passed, because no test ever filled the
+///     cache to `VERIFIED_CODEX_BINARY_CACHE_CAP` and the branch never ran;
+///   * the `boundary` half of the replacement key: deleting it passed all 47 module tests, because
+///     the boundary-scoping test probes twice and never a third time, so it cannot tell "a second
+///     entry was added" from "the second overwrote the first".
+///
+/// Both are silent: the first grows the cache without bound, the second lets an entry verified
+/// under the permissive test boundary satisfy a production probe.
+fn remember_verified_binary(cache: &mut Vec<VerifiedCodexBinary>, verified: VerifiedCodexBinary) {
+    // Replace this key's own entry rather than the whole cache, so a concurrent verification of a
+    // DIFFERENT binary cannot evict one that is still in use. The key is identity AND boundary:
+    // the same binary verified under a weaker boundary is NOT the same fact.
+    if let Some(slot) = cache
+        .iter_mut()
+        .find(|entry| entry.identity == verified.identity && entry.boundary == verified.boundary)
+    {
+        *slot = verified;
+        return;
+    }
+    if cache.len() >= VERIFIED_CODEX_BINARY_CACHE_CAP {
+        // Oldest first. A cache that grew without bound would be the worse bug.
+        cache.remove(0);
+    }
+    cache.push(verified);
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2484,6 +2504,124 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn cache_identity(path: &str) -> CodexBinaryIdentity {
+        CodexBinaryIdentity {
+            canonical_path: PathBuf::from(path),
+            len: 1,
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 1,
+            #[cfg(unix)]
+            modified_seconds: 1,
+            #[cfg(unix)]
+            modified_nanoseconds: 0,
+            #[cfg(unix)]
+            changed_seconds: 1,
+            #[cfg(unix)]
+            changed_nanoseconds: 0,
+            #[cfg(not(unix))]
+            modified_nanoseconds: 0,
+        }
+    }
+
+    fn cache_entry(path: &str, boundary: VersionProbeNetworkBoundary) -> VerifiedCodexBinary {
+        VerifiedCodexBinary {
+            identity: cache_identity(path),
+            boundary,
+            version: "0.146.0".into(),
+        }
+    }
+
+    /// A full cache evicts the OLDEST entry, not the newest.
+    ///
+    /// Review of #658 found this branch untested: swapping `remove(0)` for `pop()` passed, because
+    /// no test ever filled the cache to capacity so `len() >= CAP` never ran. The failure is
+    /// silent — evicting the newest means the entry just verified is thrown away and re-probed
+    /// every time, while the stale head is kept forever.
+    ///
+    /// Runs on a LOCAL vector: the real cache is process-global, so a test driving it through the
+    /// probe shares state with every other test in the process and cannot pin this deterministically.
+    ///
+    /// RED CONTROL (run 2026-09-03): `remove(0)` -> `pop()` fails this on the first assertion.
+    #[test]
+    fn a_full_cache_evicts_the_oldest_entry() {
+        let mut cache: Vec<VerifiedCodexBinary> = Vec::new();
+        for i in 0..VERIFIED_CODEX_BINARY_CACHE_CAP {
+            remember_verified_binary(
+                &mut cache,
+                cache_entry(
+                    &format!("/tmp/codex-{i}"),
+                    VersionProbeNetworkBoundary::InheritedTestSandbox,
+                ),
+            );
+        }
+        assert_eq!(cache.len(), VERIFIED_CODEX_BINARY_CACHE_CAP);
+
+        remember_verified_binary(
+            &mut cache,
+            cache_entry("/tmp/codex-new", VersionProbeNetworkBoundary::InheritedTestSandbox),
+        );
+
+        assert_eq!(cache.len(), VERIFIED_CODEX_BINARY_CACHE_CAP, "the cap must hold");
+        assert!(
+            !cache
+                .iter()
+                .any(|e| e.identity.canonical_path.as_path() == Path::new("/tmp/codex-0")),
+            "the OLDEST entry must be the one evicted"
+        );
+        assert!(
+            cache
+                .iter()
+                .any(|e| e.identity.canonical_path.as_path() == Path::new("/tmp/codex-new")),
+            "the entry just verified must survive — evicting it would re-probe forever"
+        );
+        assert!(
+            cache
+                .iter()
+                .any(|e| e.identity.canonical_path.as_path() == Path::new("/tmp/codex-1")),
+            "only ONE entry is evicted per insertion"
+        );
+    }
+
+    /// The replacement key is identity AND boundary — the same binary under a weaker boundary is
+    /// not the same fact.
+    ///
+    /// Review of #658 found that deleting the `boundary` term from that `find` passed all 47
+    /// module tests: the boundary-scoping test probes twice and never a third time, so it cannot
+    /// tell "a second entry was added" from "the second overwrote the first". The consequence is
+    /// not cosmetic — an entry verified under the permissive test boundary would satisfy a
+    /// PRODUCTION probe.
+    ///
+    /// RED CONTROL (run 2026-09-03): dropping `&& entry.boundary == verified.boundary` fails this
+    /// with one entry instead of two.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_same_binary_under_two_boundaries_is_two_entries() {
+        let mut cache: Vec<VerifiedCodexBinary> = Vec::new();
+        remember_verified_binary(
+            &mut cache,
+            cache_entry("/tmp/codex", VersionProbeNetworkBoundary::InheritedTestSandbox),
+        );
+        remember_verified_binary(
+            &mut cache,
+            cache_entry("/tmp/codex", VersionProbeNetworkBoundary::MacosSeatbelt),
+        );
+        assert_eq!(
+            cache.len(),
+            2,
+            "the same path verified under a DIFFERENT boundary is a different fact and must not \
+             replace the first — otherwise a test-boundary verification satisfies production"
+        );
+
+        // …and re-verifying one of them replaces only its own entry.
+        remember_verified_binary(
+            &mut cache,
+            cache_entry("/tmp/codex", VersionProbeNetworkBoundary::InheritedTestSandbox),
+        );
+        assert_eq!(cache.len(), 2, "re-verifying an existing key must not grow the cache");
+    }
+
     #[tokio::test]
     async fn version_probe_cache_is_scoped_to_the_network_boundary() {
         use std::os::unix::fs::PermissionsExt;
