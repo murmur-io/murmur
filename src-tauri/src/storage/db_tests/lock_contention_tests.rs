@@ -71,28 +71,33 @@ fn a_read_waiting_behind_a_long_write_is_measured_not_just_slow() {
     );
 }
 
-/// The uncontended path stays free: no clock read, and it does not land in the wait totals.
+/// The uncontended path is counted, and counted CHEAPLY — one atomic, no clock read.
 ///
-/// This is the half that keeps the instrumentation honest about its own cost — an accounting layer
+/// This is the half that keeps the instrumentation honest about its own cost: an accounting layer
 /// that charged every access would be a perf regression sold as a perf fix.
+///
+/// Asserts a DELTA of at least the acquisitions this test performs. The earlier version also
+/// asserted that the wait totals were "monotonic", which adversarial review showed to be
+/// tautological — those counters are only ever `fetch_add`/`fetch_max`ed and there is no `reset`
+/// anywhere in the crate, so that assertion was true by construction for any two ordered snapshots
+/// and could never fail. It is gone; a check that cannot fail is not a check, it is decoration that
+/// makes a test look stronger than it is.
+///
+/// RED CONTROL (run 2026-09-03, observed by the reviewer): making `record_immediate` a no-op fails
+/// this test — so the surviving assertion does carry signal.
 #[test]
 fn an_uncontended_read_costs_no_wait_accounting() {
+    const ACQUISITIONS: u64 = 50;
+
     let db = file_db("free");
-    let (_, _, total_before, max_before) = crate::storage::db::db_lock_stats().snapshot();
-    for _ in 0..50 {
+    let (_, uncontended_before, _, _) = crate::storage::db::db_lock_stats().snapshot();
+    for _ in 0..ACQUISITIONS {
         drop(db.lock());
     }
-    let (_, uncontended_after, total_after, max_after) =
-        crate::storage::db::db_lock_stats().snapshot();
+    let (_, uncontended_after, _, _) = crate::storage::db::db_lock_stats().snapshot();
     assert!(
-        uncontended_after > 0,
-        "uncontended acquisitions must be counted"
-    );
-    // Other tests in this process may contend concurrently, so assert these 50 added nothing of
-    // their own rather than that the totals are frozen.
-    assert_eq!(
-        (total_after >= total_before, max_after >= max_before),
-        (true, true),
-        "wait totals are monotonic"
+        uncontended_after - uncontended_before >= ACQUISITIONS,
+        "{ACQUISITIONS} uncontended acquisitions must be counted, delta was {}",
+        uncontended_after - uncontended_before
     );
 }
