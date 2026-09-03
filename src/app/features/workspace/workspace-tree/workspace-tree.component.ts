@@ -58,6 +58,7 @@ import {
   WorkspaceManageSheetComponent,
   type WorkspaceManageMode,
 } from "../workspace-manage-sheet/workspace-manage-sheet.component";
+import { containerNoun } from "../../../core/hierarchy-vocabulary";
 
 /** A flattened tree line, so one `@for` renders the whole forest. */
 export interface TreeLine {
@@ -1190,11 +1191,8 @@ export class WorkspaceTreeComponent {
     }
   }
 
-  protected containerNoun(
-    container: Pick<ContainerNode, "level">,
-  ): "space" | "folder" {
-    return container.level === "project" ? "space" : "folder";
-  }
+  /** The ONE user-facing noun for this level — see `core/hierarchy-vocabulary.ts`. */
+  protected readonly containerNoun = containerNoun;
 
   protected canCreateNote(container: ContainerNode): boolean {
     return this.canCreateIn(container);

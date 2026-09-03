@@ -25,13 +25,14 @@ import type {
 } from "../../../core/models";
 import { MurSelectComponent } from "../../../design-system/select/select.component";
 import { SharedWorkspaceService } from "../../../services/shared-workspace.service";
+import { containerNoun } from "../../../core/hierarchy-vocabulary";
 
 /** The local container this sheet is publishing. */
 export interface ContainerShareTarget {
   /** The local `folders.id`. */
   id: string;
   name: string;
-  /** `"project"` renders as "Workspace"; anything else as "Folder". */
+  /** `"project"` renders as "Workspace"; anything else as "folder" (`containerNoun`). */
   level: "project" | "folder";
 }
 
@@ -107,10 +108,8 @@ export class ContainerShareSheetComponent {
     return total > 0 ? Math.round((this.progressDone() / total) * 100) : 0;
   });
 
-  /** "Workspace" or "Folder" — the word the user sees for this container. */
-  readonly noun = computed(() =>
-    this.target().level === "project" ? "Workspace" : "folder",
-  );
+  /** The word the user sees for this level — the ONE source is `core/hierarchy-vocabulary.ts`. */
+  readonly noun = computed(() => containerNoun(this.target()));
 
   /** The container's existing share in the CHOSEN org, if any. */
   readonly existingShare = computed<ContainerShareStatus | null>(() => {

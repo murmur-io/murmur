@@ -1,6 +1,6 @@
 {
   "_comment": "Transitional debt only. This number must never grow. Entries are removed by rewriting the copy, never by adding to the allowlist without a reason.",
-  "count": 165,
+  "count": 160,
   "files": {
     "src/app/features/analytics/analytics/analytics.component.html": 1,
     "src/app/features/analytics/egress-ledger/egress-ledger.component.html": 9,

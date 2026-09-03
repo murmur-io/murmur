@@ -84,6 +84,11 @@
       "file": "src/app/features/settings/settings/settings.component.ts",
       "term": "\\bDEK\\b|\\bKEK\\b|\\bCK\\b",
       "reason": "Hidden search synonym, never rendered. No key MATERIAL is ever shown; this is only a term someone might search for."
+    },
+    {
+      "file": "src/app/services/note-attachment.service.ts",
+      "term": "\\bcontainers?\\b",
+      "reason": "Ordinary English, not the hierarchy: an image's decoded dimensions are compared against its CONTAINER FORMAT. The banned sense is the code's word for 'a Workspace or a folder'; here the user is better off with the precise term, and rewriting it to 'Workspace or folder' would say something false."
     }
   ]
 }
