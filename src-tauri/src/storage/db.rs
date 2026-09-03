@@ -4630,12 +4630,22 @@ impl Db {
         // id to match, e.g. a stale finding's `see [[superseding note]]`; a seal anywhere
         // invalidates the pass's visibility snapshot). Resolved rows were blanked on resolve.
         Self::purge_all_pending_audit_findings_tx(&tx)?;
-        // Ask history v1 is global-derived because current citations are not a complete typed
-        // provenance log — so a conversation is revoked whenever a folder it could have drawn on
-        // loses content. Scoped to the affected meetings' folders; unfiled meetings have no folder
-        // to name and keep the atomic global sweep.
-        let ask_scope = Self::ask_scope_for_meetings_tx(&tx, meeting_ids)?;
-        Self::purge_ask_conversations_for_scope_tx(&tx, ask_scope.as_ref())?;
+        // GLOBAL on purpose, and this is the one place in this file where that is not laziness.
+        //
+        // This helper is reached from `seal_moved_note`, which runs AFTER
+        // `move_meeting_with_attachments_sealed` has already committed
+        // `UPDATE meetings SET folder_id = <destination>`. Deriving a scope from `meetings.folder_id`
+        // here therefore reads the folder the meeting has just been moved INTO, never the one it
+        // came FROM — so a conversation that depended on the source folder survived a move into a
+        // locked folder and went on paraphrasing content the user had just put behind the biometric
+        // gate. Scoping this call site was an ACTIVE LEAK, caught in review before it shipped.
+        //
+        // Nothing is lost by staying global: `finish_folder_lock_after_seal` follows this with an
+        // unconditional `purge_all_ask_conversations` four lines later, so the scope was inert on
+        // the lock path anyway. "I cannot name the scope" is the honest answer whenever an earlier
+        // step in the same operation may have moved the content — see
+        // `purge_ask_conversations_for_scope_tx`.
+        Self::purge_all_ask_conversations_tx(&tx)?;
         // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose SRC OR DST is a
         // just-sealed meeting in this SAME seal tx — a link names a neighbour (its title/existence
         // reveals a possibly-sealed item), so it must not survive at rest for a sealed endpoint.
@@ -6097,8 +6107,12 @@ impl Db {
         // may cite third-party titles no document id can match). Findings are cheap re-derivable
         // rows — the next pass re-stages anything still true (never content loss).
         Self::purge_all_pending_audit_findings_tx(&tx)?;
-        let ask_scope = Self::ask_scope_for_documents_tx(&tx, document_ids)?;
-        Self::purge_ask_conversations_for_scope_tx(&tx, ask_scope.as_ref())?;
+        // GLOBAL, for the same reason as `purge_chunks_for_meetings` above: this is a seal-side
+        // helper, and a future document-move path reusing it the way `seal_moved_note` reuses that
+        // one would re-derive its scope from an already-reassigned `folder_id`. The equivalent
+        // note-move path (`move_note_with_attachments_sealed`) deliberately calls the global sweep
+        // directly today; keeping this one global stops the two from disagreeing.
+        Self::purge_all_ask_conversations_tx(&tx)?;
         tx.commit().map_err(map_err)?;
         Ok(())
     }

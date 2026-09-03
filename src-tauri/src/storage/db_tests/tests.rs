@@ -16945,3 +16945,58 @@ fn deleting_an_unfiled_meeting_still_revokes_everything() {
         "an unfiled meeting names no folder, so the fail-closed global sweep must still run"
     );
 }
+
+/// The seal-side chunk purge stays GLOBAL, and that is a decision, not an omission.
+///
+/// `purge_chunks_for_meetings` is reached from `seal_moved_note`, which runs AFTER
+/// `move_meeting_with_attachments_sealed` has already committed
+/// `UPDATE meetings SET folder_id = <destination>`. Any scope derived from `meetings.folder_id` at
+/// that point names the folder the meeting moved INTO, never the one it came FROM — so a
+/// conversation depending on the SOURCE folder survives, and goes on paraphrasing content the user
+/// has just put behind the biometric gate. Scoping this call site was an active leak; review caught
+/// it before it shipped.
+///
+/// This test pins the DECISION at the layer the decision lives in. It does not drive the move path
+/// end to end — that needs the command layer and an unlocked folder key — so it would not catch a
+/// regression introduced by re-scoping from inside `seal_moved_note` itself. What it does catch is
+/// somebody scoping THIS helper again, which is exactly how the leak was introduced.
+#[test]
+fn the_seal_side_chunk_purge_stays_global_because_the_folder_may_already_have_moved() {
+    use crate::storage::models::AskConversationScope;
+
+    let db = mem_db();
+    seed_folder(&db, "f-source", "Source");
+    seed_folder(&db, "f-elsewhere", "Elsewhere");
+
+    let mut meeting = sample_meeting("m-moved", "2026-09-03T09:00:00Z");
+    // Stands in for the post-move state: the row already names the destination, so a scope derived
+    // here could never mention `f-source`.
+    meeting.folder_id = Some("f-elsewhere".to_string());
+    db.insert_meeting(&meeting).unwrap();
+
+    for folder in ["f-source", "f-elsewhere"] {
+        db.persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            "a question",
+            "an answer",
+            &[],
+            &[],
+            &[],
+            &[folder.to_string()],
+            "2026-09-03T09:01:00Z",
+        )
+        .unwrap();
+    }
+
+    db.purge_chunks_for_meetings(&["m-moved".to_string()])
+        .unwrap();
+
+    assert!(
+        db.list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+            .unwrap()
+            .is_empty(),
+        "the seal-side purge must revoke EVERY conversation, including the one that depends on the \
+         folder this meeting came from — that folder is no longer readable from the meeting row"
+    );
+}
