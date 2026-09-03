@@ -870,10 +870,13 @@
 {
   <span class="k">"mcpServers"</span>: {
     <span class="k">"murmur"</span>: {
-      <span class="k">"url"</span>: <span class="s">"http://127.0.0.1:8765"</span>
+      <span class="k">"type"</span>: <span class="s">"http"</span>,
+      <span class="k">"url"</span>: <span class="s">"http://127.0.0.1:8765"</span>,
+      <span class="k">"headers"</span>: { <span class="k">"Authorization"</span>: <span class="s">"Bearer &lt;your-token&gt;"</span> }
     }
   }
 }</pre>
+            <p>The bearer token is required by default. Murmur shows the finished block, with your own token already in it, in <b>Settings → Privacy &amp; Integrations</b> — copy it from there rather than retyping this one.</p>
             <h2 id="apple-reminders">Apple Reminders</h2>
             <p>Action items extracted from a meeting note can push straight into Apple Reminders, so follow-ups don't have to live only inside Murmur.</p>
             <h2 id="feed-it-more">Feed it more than meetings</h2>

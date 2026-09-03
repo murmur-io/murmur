@@ -37,8 +37,10 @@ Keep that token to yourself — it's the key to your local server.
 ### 2. Add it to Claude Code
 
 Paste the block into your Claude Code MCP configuration and restart Claude. Your agent now has
-nine read-only tools for searching and retrieving your meetings, notes, entity dossiers, open
-commitments, and typed note-folder properties — all computed on-device.
+twenty read-only tools covering your meetings and transcripts, imported documents and their
+outlines, semantic and located search, open commitments, entity dossiers and the entity list, note
+folders, your Spaces hierarchy, boards, shared tasks, and your Shared Brain — all computed
+on-device.
 
 ### 3. Install the skills
 

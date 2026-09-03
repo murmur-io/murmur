@@ -10,7 +10,7 @@
 ## 1. The Architecture (always-local core + optional cloud + the single seam)
 
 ### The always-local core (today, unchanged)
-Everything runs in one macOS Tauri process, single-user, on-device. Audio capture → on-device Whisper transcription → provider-agnostic AI summary → atomic Markdown writes into the user's Obsidian vault. State lives in **one SQLite file** (`<app-data>/MeetNotes/meetnotes.sqlite`, opened once in `state.rs::AppState::init`) plus the vault `.md` files on disk. Secrets (today: one Anthropic key) live in the **macOS Keychain** (`secrets/keychain.rs`, service `com.meetnotes.app`). A **localhost-only MCP server** (`mcp.rs`, `127.0.0.1:8765`, no auth, read-only) exposes meetings to the user's own Claude Desktop/Code. The only network egress today is the optional Anthropic API call (already PII-scrubbed by the `RedactingProvider` decorator) and the one-time Whisper model download.
+Everything runs in one macOS Tauri process, single-user, on-device. Audio capture → on-device Whisper transcription → provider-agnostic AI summary → atomic Markdown writes into the user's Obsidian vault. State lives in **one SQLite file** (`<app-data>/MeetNotes/meetnotes.sqlite`, opened once in `state.rs::AppState::init`) plus the vault `.md` files on disk. Secrets (today: one Anthropic key) live in the **macOS Keychain** (`secrets/keychain.rs`, service `com.meetnotes.app`). A **localhost-only MCP server** (`mcp.rs`, `127.0.0.1:8765`, bearer-token-required by default, read-only) exposes meetings to the user's own Claude Desktop/Code. The only network egress today is the optional Anthropic API call (already PII-scrubbed by the `RedactingProvider` decorator) and the one-time Whisper model download.
 
 This is already ~6 of the 7 Ink & Switch local-first ideals. The two gaps — *"not trapped on one device"* and *"security/privacy by default"* — are exactly what the optional cloud layer + at-rest encryption fill.
 
@@ -43,7 +43,7 @@ Three coupled-but-independently-toggleable capabilities, each attaching at an ex
  export::write_note() ───────┴─ vault .md (plaintext, Obsidian owns) ──▶ share?   │  upload rendered blob,
    (always local)               (the honest dent — Murmur can't OS-lock these)    │  ACL/expiry/revoke link
                                                  │                                 │
- mcp.rs (127.0.0.1:8765, no auth, read-only) ── re-host handle_rpc ─── auth+ACL ─▶ │  hosted multi-tenant MCP
+ mcp.rs (127.0.0.1:8765, bearer token, read-only) ── re-host handle_rpc ─── auth+ACL ─▶ │  hosted multi-tenant MCP
    (Seam C)                                      │  (RFC 9728/8414/7591/8707)      │  (same tool schema)
 ```
 
@@ -117,7 +117,7 @@ One key hierarchy, copied from Obsidian/Bitwarden/1Password/Standard Notes:
 - **Enterprise:** OIDC (who the user is) federated to the customer IdP + OAuth 2.1 (what tools they reach) + **per-tenant SCIM** (each tenant its own bearer token + `/Users`+`/Groups`) + RFC 8707 audience-binding so a stolen token can't replay cross-tenant.
 
 ### Local MCP ↔ future Hosted MCP — **same tool schema, different transport + scoping**
-`mcp.rs::handle_rpc(db_path, body) -> Option<Value>` is already transport-decoupled (takes/returns strings/JSON). The hosted MCP **reuses the exact tool schema and `handle_rpc` verbatim**; only two things change, both server-side: (1) the bind address (the single `format!("127.0.0.1:{MCP_PORT}")` at `mcp.rs:24`), and (2) an **auth + ACL pre-filter wrapper** before `handle_tool_call` opens the DB (today there is *no auth* — fine for loopback, a hard requirement once hosted). The desktop app keeps the loopback server running; a teammate adds the hosted node as a *second* MCP node (`claude mcp add --transport http murmur-team https://mcp.<tenant>.murmur.cloud/mcp`). Same tools, scoped per-tenant, ACL-filtered.
+`mcp.rs::handle_rpc(db_path, body) -> Option<Value>` is already transport-decoupled (takes/returns strings/JSON). The hosted MCP **reuses the exact tool schema and `handle_rpc` verbatim**; only two things change, both server-side: (1) the bind address (the single `format!("127.0.0.1:{MCP_PORT}")` at `mcp.rs:24`), and (2) an **auth + ACL pre-filter wrapper** before `handle_tool_call` opens the DB (the loopback server now requires a bearer token by default, but it has no per-tenant ACL — that is the part hosting has to add). The desktop app keeps the loopback server running; a teammate adds the hosted node as a *second* MCP node (`claude mcp add --transport http murmur-team https://mcp.<tenant>.murmur.cloud/mcp`). Same tools, scoped per-tenant, ACL-filtered.
 
 ---
 
