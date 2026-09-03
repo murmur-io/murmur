@@ -167,11 +167,13 @@ pub(crate) fn reminder_runtime_probe_requested() -> bool {
 pub(crate) fn prepare_reminder_runtime_probe_environment() {
     #[cfg(debug_assertions)]
     if reminder_runtime_probe_requested() {
-        if std::env::var_os("MURMUR_DEV_KEK").is_none() {
+        if std::env::var_os(crate::secrets::keychain::DEV_KEK_ENV).is_none() {
             // SAFETY: `lib::run` calls this at process entry, before Tauri or any app worker starts.
+            // Name and value both come from the hatch's own module, so this writer cannot drift
+            // from the test fixture or from the reader.
             std::env::set_var(
-                "MURMUR_DEV_KEK",
-                "1111111111111111111111111111111111111111111111111111111111111111",
+                crate::secrets::keychain::DEV_KEK_ENV,
+                crate::secrets::keychain::dev_kek_hatch_value(),
             );
         }
         runtime_probe::prepare_process_environment();
