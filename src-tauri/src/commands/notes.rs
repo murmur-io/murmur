@@ -384,11 +384,14 @@ fn get_note_under_lifecycle_authorized(state: &AppState, id: &str) -> Result<Not
 /// one note-folder. Filtered IN THE QUERY by `visibility_clause` — a sealed-not-unlocked note is
 /// ABSENT (its title never leaks), not per-row masked.
 #[tauri::command]
-pub fn list_notes(
-    state: State<'_, AppState>,
+pub async fn list_notes(
+    app: AppHandle,
     folder_id: Option<String>,
 ) -> Result<Vec<NoteSummary>, AppError> {
-    list_notes_inner(state.inner(), folder_id.as_deref())
+    offload_read(app, move |state| {
+        list_notes_inner(state, folder_id.as_deref())
+    })
+    .await
 }
 
 /// Inner of [`list_notes`] taking `&AppState` (unit-testable gate).
@@ -1073,11 +1076,14 @@ pub(crate) fn set_note_folder_schema_inner(
 /// row) via [`Db::list_notes_visible_typed`], which is built on the gated `list_notes_visible`.
 /// `InvalidArg` when `folder_id` is not a note-folder.
 #[tauri::command]
-pub fn list_notes_typed(
-    state: State<'_, AppState>,
+pub async fn list_notes_typed(
+    app: AppHandle,
     folder_id: String,
 ) -> Result<Vec<TypedNoteRow>, AppError> {
-    list_notes_typed_inner(state.inner(), &folder_id)
+    offload_read(app, move |state| {
+        list_notes_typed_inner(state, &folder_id)
+    })
+    .await
 }
 
 /// Inner of [`list_notes_typed`] taking `&AppState` (unit-testable gate).

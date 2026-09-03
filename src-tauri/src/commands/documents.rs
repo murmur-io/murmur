@@ -388,11 +388,14 @@ fn ingest_into_folder(
 /// folder returns an EMPTY list (masked — never surface even a document name behind the lock),
 /// exactly like the masked detail DTO drops note/segments.
 #[tauri::command]
-pub fn list_documents(
-    state: State<'_, AppState>,
+pub async fn list_documents(
+    app: AppHandle,
     folder_id: String,
 ) -> Result<Vec<DocumentInfo>, AppError> {
-    list_documents_inner(state.inner(), &folder_id)
+    offload_read(app, move |state| {
+        list_documents_inner(state, &folder_id)
+    })
+    .await
 }
 
 /// Inner of [`list_documents`] taking `&AppState` (unit-testable gate).

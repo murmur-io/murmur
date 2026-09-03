@@ -25,9 +25,12 @@ const ENTITY_NEIGHBOR_LIMIT: i64 = 12;
 /// and pushes it through the visibility predicate, so sealed-and-not-unlocked meetings contribute
 /// nothing — the graph can never disagree with Library/MCP about what's visible.
 #[tauri::command]
-pub fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError> {
-    let unlocked = unlocked_snapshot(state.inner())?;
-    state.db.build_graph(&unlocked)
+pub async fn get_graph(app: AppHandle) -> Result<GraphData, AppError> {
+    offload_read(app, |state| {
+        let unlocked = unlocked_snapshot(state)?;
+        state.db.build_graph(&unlocked)
+    })
+    .await
 }
 
 /// The FULL-BRAIN graph (Brain v3 PR-4): a SEPARATE, additive read that unifies entities + VISIBLE
@@ -38,14 +41,17 @@ pub fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError> {
 /// defaults to all-off; `includeSuggested` admits un-accepted (`status='suggested'`) semantic links.
 /// Pure read: no writes, no new storage. `get_graph` is untouched + byte-compatible for its FE.
 #[tauri::command]
-pub fn get_full_graph(
-    state: State<'_, AppState>,
+pub async fn get_full_graph(
+    app: AppHandle,
     opts: Option<FullGraphOpts>,
 ) -> Result<FullGraphData, AppError> {
-    let unlocked = unlocked_snapshot(state.inner())?;
-    state
-        .db
-        .build_full_graph(&unlocked, opts.unwrap_or_default())
+    offload_read(app, move |state| {
+        let unlocked = unlocked_snapshot(state)?;
+        state
+            .db
+            .build_full_graph(&unlocked, opts.unwrap_or_default())
+    })
+    .await
 }
 
 /// `/people` personal CRM: one card per VISIBLE Person entity, rolled up over the SAME gated

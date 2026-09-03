@@ -46,9 +46,12 @@ const ORGANIZE_GUIDANCE_CHARS: usize = 800;
 /// `count_notes_per_folder` gates their counts to zero): a user has to be able to see the container
 /// in order to unlock it.
 #[tauri::command]
-pub fn list_workspace_tree(state: State<'_, AppState>) -> Result<Vec<ContainerNode>, AppError> {
-    let unlocked = unlocked_snapshot(state.inner())?;
-    workspace_tree_inner(&state.db, &unlocked)
+pub async fn list_workspace_tree(app: AppHandle) -> Result<Vec<ContainerNode>, AppError> {
+    offload_read(app, |state| {
+        let unlocked = unlocked_snapshot(state)?;
+        workspace_tree_inner(&state.db, &unlocked)
+    })
+    .await
 }
 
 /// Inner of [`list_workspace_tree`], taking the pieces directly so the tree assembly — the gate
