@@ -32,6 +32,7 @@ import { FoldersService } from "../../../services/folders.service";
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import { NotesService } from "../../../services/notes.service";
 import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
+import { DateFormatService } from "../../../core/date-format.service";
 
 /**
  * A conversation turn as rendered on the Ask page. It mirrors {@link ChatTurn}
@@ -102,6 +103,8 @@ const STARTERS: readonly string[] = [
   styleUrl: "./ask.component.scss",
 })
 export class AskComponent implements OnInit {
+  private readonly dates = inject(DateFormatService);
+
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly destroyRef = inject(DestroyRef);
@@ -674,15 +677,8 @@ export class AskComponent implements OnInit {
   }
 
   /** Presentational only: render a source timestamp as a friendly local date. */
+  /** Formatted through {@link DateFormatService} — the one place a date becomes user-visible text. */
   formatDate(startedAt: string): string {
-    const d = new Date(startedAt);
-    if (Number.isNaN(d.getTime())) {
-      return startedAt;
-    }
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
+    return this.dates.day(startedAt);
   }
 }
