@@ -435,3 +435,42 @@ test("an item inside a shared container is not marked twice", async ({ page }) =
   await expect(kickoff).toBeVisible();
   await expect(kickoff.getByRole("img", { name: /Shared to/ })).toHaveCount(0);
 });
+
+/// A failed shared-workspace read must SAY so, not render as "nothing shared with you".
+///
+/// Every read in `SharedWorkspaceService.load` swallowed its rejection into `null`/`[]`, so an
+/// unreachable relay produced an empty workspace — indistinguishable from a team that has shared
+/// nothing. The user was, in effect, told something false, with no retry offered because nothing
+/// indicated there was anything to retry.
+///
+/// The control is the second half: with the same fixtures resolving normally, the banner must be
+/// ABSENT. Without that, a component that always showed the message would pass the first assertion
+/// and be worse than what it replaced.
+test("an unreachable shared workspace shows an error, not an empty one", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {
+      list_shared_workspace: () => {
+        throw new Error("relay unreachable");
+      },
+    },
+    {
+      list_workspace_tree: LOCAL_FOREST,
+      list_container_share_status: CONTAINER_SHARES,
+    },
+  );
+  await page.goto("/");
+  await expect(
+    page.getByRole("navigation", { name: "Primary navigation" }),
+  ).toBeVisible();
+
+  await expect(page.getByText(/Couldn't read what's shared with you/)).toBeVisible();
+  await expect(page.getByText("Nothing shared with you yet")).toHaveCount(0);
+});
+
+test("a healthy shared workspace shows no error banner", async ({ page }) => {
+  await openSidebar(page);
+  await expect(page.getByText(/Couldn't read what's shared with you/)).toHaveCount(0);
+});

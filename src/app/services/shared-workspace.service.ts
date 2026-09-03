@@ -42,6 +42,7 @@ export class SharedWorkspaceService {
   private readonly _containerShares = signal<ContainerShareStatus[]>([]);
   private readonly _shareTargets = signal<OrgShareTargetRow[]>([]);
   private readonly _loading = signal(false);
+  private readonly _loadFailed = signal(false);
 
   /** Received SPACES — each renders as its own top-level sidebar row. */
   readonly spaces = this._spaces.asReadonly();
@@ -57,6 +58,19 @@ export class SharedWorkspaceService {
   readonly shareTargets = this._shareTargets.asReadonly();
   /** True while a (re)load is in flight. A hint, never a render gate. */
   readonly loading = this._loading.asReadonly();
+  /**
+   * The last load could not read the shared workspace.
+   *
+   * Every read here swallowed its error into `null`/`[]`, so a failure rendered as an EMPTY
+   * workspace — indistinguishable from "nothing is shared with you". Somebody whose relay was
+   * unreachable was told, in effect, that their team had shared nothing, and there was no retry
+   * because there was nothing to retry from.
+   *
+   * Kept separate from the data signals on purpose: the last-known rows stay on screen while this
+   * is true, so a failed refresh degrades to "possibly stale" rather than blanking what the user
+   * was already reading.
+   */
+  readonly loadFailed = this._loadFailed.asReadonly();
 
   /** Nothing shared in either direction — the sidebar renders no shared rows. */
   readonly isEmpty = computed(() => {
@@ -148,19 +162,34 @@ export class SharedWorkspaceService {
     const seq = ++this.loadSeq;
     this._loading.set(true);
     try {
-      const [workspace, shares, targets] = await Promise.all([
-        this.ipc.listSharedWorkspace().catch(() => null),
-        this.ipc.listContainerShareStatus().catch(() => [] as ContainerShareStatus[]),
-        this.ipc.listOrgShareTargets().catch(() => [] as OrgShareTargetRow[]),
+      // `allSettled`, not `all`: one unreachable read must not discard the two that succeeded.
+      // What changes is that a rejection is now RECORDED rather than silently becoming an empty
+      // list — the difference between "nothing is shared with you" and "we could not find out".
+      const [workspace, shares, targets] = await Promise.allSettled([
+        this.ipc.listSharedWorkspace(),
+        this.ipc.listContainerShareStatus(),
+        this.ipc.listOrgShareTargets(),
       ]);
+      const failed =
+        workspace.status === "rejected" ||
+        shares.status === "rejected" ||
+        targets.status === "rejected";
       if (seq !== this.loadSeq) {
         return;
       }
-      if (workspace) {
-        this.applyWorkspace(workspace);
+      this._loadFailed.set(failed);
+      // Each leg applies only if it actually resolved. A rejected leg leaves its previous value
+      // alone rather than clearing it, so a partial failure never erases rows the user can still
+      // legitimately see.
+      if (workspace.status === "fulfilled" && workspace.value) {
+        this.applyWorkspace(workspace.value);
       }
-      this._containerShares.set(shares);
-      this._shareTargets.set(targets);
+      if (shares.status === "fulfilled") {
+        this._containerShares.set(shares.value);
+      }
+      if (targets.status === "fulfilled") {
+        this._shareTargets.set(targets.value);
+      }
     } finally {
       if (seq === this.loadSeq) {
         this._loading.set(false);
