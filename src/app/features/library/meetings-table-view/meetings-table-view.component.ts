@@ -1,10 +1,4 @@
-import {
-  ChangeDetectionStrategy,
-  Component,
-  computed,
-  input,
-  output,
-} from "@angular/core";
+import { ChangeDetectionStrategy, Component, computed, inject, input, output } from "@angular/core";
 import { MurTableComponent } from "../../../design-system/table/table.component";
 import { MurTableColumnComponent } from "../../../design-system/table/table-column.component";
 import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
@@ -15,6 +9,7 @@ import {
 } from "../../../design-system/meeting-status";
 import type { Meeting } from "../../../core/models";
 import type { ViewRow } from "../../../services/view-engine";
+import { DateFormatService } from "../../../core/date-format.service";
 
 /** A {@link ViewRow} plus its pre-derived status-pill presentation. */
 export interface DecoratedViewRow extends ViewRow {
@@ -67,6 +62,8 @@ const COLUMN_META: Record<
   styleUrl: "./meetings-table-view.component.scss",
 })
 export class MeetingsTableViewComponent {
+  private readonly dates = inject(DateFormatService);
+
   /** Filtered+sorted rows from the ViewEngine (each carries a masked-or-real Meeting). */
   readonly rows = input.required<ViewRow[]>();
   /** The visible column field-ids, in order, from the active ViewConfig. */
@@ -120,18 +117,9 @@ export class MeetingsTableViewComponent {
     this.openMeeting.emit({ event, meeting });
   }
 
+  /** Formatted through {@link DateFormatService} — the one place a date becomes user-visible text. */
   formatDate(startedAt: string): string {
-    const d = new Date(startedAt);
-    if (Number.isNaN(d.getTime())) {
-      return startedAt;
-    }
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    return this.dates.day(startedAt);
   }
 
   formatDuration(durationS: number): string {
