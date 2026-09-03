@@ -600,7 +600,12 @@
 
         let missing: Vec<&String> = registered
             .iter()
-            .filter(|name| !skill.contains(&format!("`{name}`")))
+            // `name(` — the invocation-example shape every real catalog entry uses — rather than
+            // a bare `name`. Review removed one tool's whole entry, left a stray cross-reference to
+            // it in another entry's prose, and the bare-name check accepted that. The file's own
+            // convention already cross-references tools by name inside other entries, so a bare
+            // mention genuinely cannot distinguish "documented" from "alluded to".
+            .filter(|name| !skill.contains(&format!("`{name}(")))
             .collect();
         assert!(
             missing.is_empty(),
@@ -629,22 +634,28 @@
             .parent()
             .expect("repo root");
 
-        /// Pull out the one documented block that configures the MCP server, so the assertions
-        /// below cannot be satisfied by text somewhere else in the file. Markdown fences and the
-        /// landing page's `<pre>` are both bounded by their own delimiters; we take the block that
-        /// mentions `mcpServers` and nothing else.
-        fn mcp_block<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+        /// Every documented block that configures the MCP server. Markdown fences and the landing
+        /// page's `<pre>` are both bounded by their own delimiters.
+        ///
+        /// Returns ALL of them rather than the first, because first-match-wins was a bypass:
+        /// review broke the real snippet and put a satisfying decoy block EARLIER in the same file,
+        /// and the check went green on the historical bug. The caller therefore refuses ambiguity
+        /// instead of guessing which block the reader will copy.
+        fn mcp_blocks<'a>(text: &'a str, open: &str, close: &str) -> Vec<&'a str> {
+            let mut found = Vec::new();
             let mut rest = text;
             while let Some(start) = rest.find(open) {
                 let after = &rest[start + open.len()..];
-                let end = after.find(close)?;
+                let Some(end) = after.find(close) else {
+                    break;
+                };
                 let block = &after[..end];
                 if block.contains("mcpServers") {
-                    return Some(block);
+                    found.push(block);
                 }
                 rest = &after[end + close.len()..];
             }
-            None
+            found
         }
 
         for (relative, open, close, needles) in [
@@ -670,9 +681,17 @@
             let path = repo.join(relative);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            let block = mcp_block(&text, open, close).unwrap_or_else(|| {
-                panic!("{relative} no longer contains a documented `mcpServers` block at all")
-            });
+            let blocks = mcp_blocks(&text, open, close);
+            assert_eq!(
+                blocks.len(),
+                1,
+                "{relative} should document exactly ONE `mcpServers` block; found {}. With more \
+                 than one there is no way to tell which the reader copies, and a satisfying decoy \
+                 would let a broken real snippet pass. With none, the documentation this test \
+                 exists to police is gone.",
+                blocks.len()
+            );
+            let block = blocks[0];
             for needle in needles {
                 assert!(
                     block.contains(needle),
