@@ -14491,6 +14491,11 @@ mod org_rotation_tests;
 #[path = "tests/container_share_tests.rs"]
 mod container_share_tests;
 
+// ── The ONE debug KEK the whole test process runs under (see the module doc for why) ─────────────
+#[cfg(test)]
+#[path = "tests/dev_kek_fixture.rs"]
+mod dev_kek_fixture;
+
 // ── BLK-1 lifecycle-race + BLK-2 move-into-locked + BLK-3/BLK-4 config tests ──────────────────────
 #[cfg(test)]
 #[path = "tests/lifecycle_tests.rs"]

@@ -3419,7 +3419,7 @@ mod smart_audit_command_tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::sync::{Condvar, Mutex, Once};
+    use std::sync::{Condvar, Mutex};
     use std::time::Duration;
 
     use serde_json::{json, Value};
@@ -3431,11 +3431,8 @@ mod smart_audit_command_tests {
     use crate::storage::{AttachmentOwner, Db, NewAttachment};
 
     const TEST_DB_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const TEST_DEV_KEK: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-    static TEST_KEK_ENV: Once = Once::new();
-
     fn ensure_test_dev_kek() {
-        TEST_KEK_ENV.call_once(|| std::env::set_var("MURMUR_DEV_KEK", TEST_DEV_KEK));
+        crate::commands::dev_kek_fixture::ensure_dev_kek();
     }
 
     fn test_state(tag: &str, reasoner: Arc<dyn LocalReasoner>) -> Arc<AppState> {
