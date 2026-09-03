@@ -44,7 +44,9 @@ export class UpdateService {
    */
   async checkOnStartup(): Promise<void> {
     try {
-      const info = await this.ipc.checkForUpdate();
+      // `manual: false` — the backend refuses this outright when the user has turned automatic
+      // checks off, so the decision is not the frontend's to make or to route around.
+      const info = await this.ipc.checkForUpdate(false);
       this._latest.set(info);
       if (info.updateAvailable) {
         this._status.set("available");
@@ -65,7 +67,8 @@ export class UpdateService {
   async checkManually(): Promise<void> {
     this._status.set("checking");
     try {
-      const info = await this.ipc.checkForUpdate();
+      // `manual: true` — pressing the button IS the consent, so this runs whatever the flag says.
+      const info = await this.ipc.checkForUpdate(true);
       this._latest.set(info);
       if (info.updateAvailable) {
         this._status.set("available");

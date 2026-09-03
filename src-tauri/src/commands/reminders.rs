@@ -396,7 +396,10 @@ void (async () => {
 /// initialization script can race during a real WebView boot. Blocking at the IPC boundary keeps
 /// the no-egress proof deterministic without changing release behavior.
 #[tauri::command(rename = "check_for_update")]
-pub async fn check_for_update_guarded() -> Result<crate::update::UpdateInfo, AppError> {
+pub async fn check_for_update_guarded(
+    state: tauri::State<'_, crate::state::AppState>,
+    manual: bool,
+) -> Result<crate::update::UpdateInfo, AppError> {
     #[cfg(debug_assertions)]
     if reminder_runtime_probe_requested() {
         return Err(AppError::Unavailable(
@@ -404,7 +407,7 @@ pub async fn check_for_update_guarded() -> Result<crate::update::UpdateInfo, App
         ));
     }
 
-    crate::update::check_for_update().await
+    crate::update::check_for_update_inner(state.inner(), manual).await
 }
 
 #[derive(Debug, serde::Deserialize)]

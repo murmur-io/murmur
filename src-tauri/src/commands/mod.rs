@@ -826,6 +826,15 @@ pub struct AppConfigDto {
     /// off; now defaults ON like its Stage-E siblings (BLK-3).
     #[serde(default = "default_true")]
     pub mcp_require_token: bool,
+    /// `Option` on purpose, and NOT the bare `bool` its neighbour uses.
+    ///
+    /// `mcp_require_token` can default to `true` on omission because for a security requirement
+    /// `true` is the SAFE direction. Here `true` means "call home", so defaulting an omitted field
+    /// to it is the UNSAFE direction: a partial save would silently re-enable a network call the
+    /// user had turned off. `None` therefore means "the client said nothing", and `dto_to_config`
+    /// preserves the live value — the same shape `diarize_others` and `ground_summary` use.
+    #[serde(default)]
+    pub update_check_enabled: Option<bool>,
     /// Stage E: default true (matches AppConfig::default) when the FE omits it on an older payload.
     #[serde(default = "default_true")]
     pub lock_require_biometric: bool,
@@ -7002,6 +7011,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         ground_summary: Some(c.ground_summary),
         glossary: Some(c.glossary.clone()),
         mcp_require_token: c.mcp_require_token,
+        update_check_enabled: Some(c.update_check_enabled),
         lock_require_biometric: c.lock_require_biometric,
         relock_on_screenshare: c.relock_on_screenshare,
         cloud_egress_consented: c.cloud_egress_consented,
@@ -7333,6 +7343,9 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // while an explicit empty string intentionally clears it.
         glossary: d.glossary.unwrap_or_else(|| current.glossary.clone()),
         mcp_require_token: d.mcp_require_token,
+        update_check_enabled: d
+            .update_check_enabled
+            .unwrap_or(current.update_check_enabled),
         lock_require_biometric: d.lock_require_biometric,
         relock_on_screenshare: d.relock_on_screenshare,
         // BLK-4: consent is NEVER set from the DTO. Preserve the live value; only the dedicated
