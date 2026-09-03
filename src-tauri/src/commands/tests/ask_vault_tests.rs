@@ -1608,3 +1608,58 @@ fn ask_produces_no_query_vector_without_a_real_embedder() {
         "semantic search off must not embed anything"
     );
 }
+
+/// And with a real embedder, Ask must actually USE it.
+///
+/// The sibling test above only asserts the no-model branch, and review showed why that is not
+/// enough on its own: a body of `Vec::new()` — ignoring the flag and the embedder entirely — passed
+/// it, because under the suite's forced stub snapshot empty is also the CORRECT answer. That mutant
+/// would silently disable semantic search for every user who HAS the model, and Ask would quietly
+/// stop using their notes.
+///
+/// This drives the injectable seam with a deterministic fake standing in for a real embedder, so
+/// the two states are finally distinguishable without 470 MB of weights on disk.
+#[test]
+fn ask_uses_a_real_embedder_when_one_is_available() {
+    /// Returns a recognisable constant vector — enough to tell "called through" from "returned
+    /// empty", which is the only distinction under test.
+    struct FakeRealEmbedder;
+    impl crate::embed::Embedder for FakeRealEmbedder {
+        fn dim(&self) -> usize {
+            crate::embed::EMBED_DIM
+        }
+        fn embed(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.25_f32; crate::embed::EMBED_DIM])
+                .collect())
+        }
+    }
+
+    let vector = crate::commands::ask_commands::ask_query_vector_with(
+        "what did we decide",
+        true,
+        Some(Box::new(FakeRealEmbedder)),
+    );
+    assert_eq!(
+        vector.len(),
+        crate::embed::EMBED_DIM,
+        "with a real embedder available Ask must return ITS vector — an empty one here means the \
+         semantic leg was dropped for a user who has the model"
+    );
+    assert!(
+        vector.iter().all(|v| (*v - 0.25).abs() < 1e-6),
+        "and it must be the embedder's OWN output, not something manufactured"
+    );
+
+    // The flag still wins: semantics off means nothing is embedded, model or not.
+    assert!(
+        crate::commands::ask_commands::ask_query_vector_with(
+            "what did we decide",
+            false,
+            Some(Box::new(FakeRealEmbedder)),
+        )
+        .is_empty(),
+        "semantic search off must not embed, even with an embedder in hand"
+    );
+}

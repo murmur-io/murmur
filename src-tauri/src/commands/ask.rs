@@ -292,16 +292,37 @@ pub(crate) fn remove_duplicate_dashboard_question(history: &mut Vec<ChatTurn>, q
 /// returns `None` for a stub snapshot, and `search_hybrid_visible` short-circuits on an empty
 /// vector, so the leg drops out and `score_fuse` redistributes its weight to the legs that have
 /// something to say.
-///
-/// Extracted as a function on review's finding: with the logic inline in two places, reverting
-/// either one to the buggy call left the whole suite green — there was nothing a test could hold on
-/// to. Errors are swallowed here on purpose: a failure to embed is the same situation as no model,
-/// and Ask degrading to keyword search beats Ask refusing to answer.
 pub(crate) fn ask_query_vector(question: &str, semantic_enabled: bool) -> Vec<f32> {
+    ask_query_vector_with(
+        question,
+        semantic_enabled,
+        crate::embed::active_persistence_embedder_if_available(),
+    )
+}
+
+/// As [`ask_query_vector`], with the embedder handed in.
+///
+/// The seam exists because resolving the embedder internally made the function untestable in the
+/// direction that matters. Review proved it: a body of `Vec::new()` — ignoring both the flag and the
+/// embedder — passed the test, because the suite only ever runs under the `#[cfg(test)]`-forced
+/// stub, where empty is also the CORRECT answer. That mutant would silently disable semantic search
+/// for every user who has the model, and nothing would have caught it.
+///
+/// With the handle injected, a test can pass a real one and assert the vector actually comes back,
+/// which distinguishes "correctly calls through" from "always returns empty" without needing 470 MB
+/// of weights on disk.
+///
+/// Errors are swallowed on purpose: a failure to embed is the same situation as no model, and Ask
+/// degrading to keyword search beats Ask refusing to answer.
+pub(crate) fn ask_query_vector_with(
+    question: &str,
+    semantic_enabled: bool,
+    embedder: Option<Box<dyn crate::embed::Embedder>>,
+) -> Vec<f32> {
     if !semantic_enabled {
         return Vec::new();
     }
-    crate::embed::active_persistence_embedder_if_available()
+    embedder
         .and_then(|embedder| {
             // QUERY side: the e5 `query:` prefix (asymmetric with the `passage:` index side).
             embedder
