@@ -16,6 +16,7 @@ import type {
   OrgStatus,
 } from "../../../../core/models";
 import { ErrorCopyService } from "../../../../core/copy/error-copy.service";
+import { DateFormatService } from "../../../../core/date-format.service";
 
 /**
  * Settings → Organization section (Shared Brain v1, MULTI-ORG).
@@ -51,6 +52,8 @@ import { ErrorCopyService } from "../../../../core/copy/error-copy.service";
   styleUrl: "./settings-organization-section.component.scss",
 })
 export class SettingsOrganizationSectionComponent {
+  private readonly dates = inject(DateFormatService);
+
   private readonly ipc = inject(IpcService);
   private readonly toast = inject(ToastService);
   private readonly errorCopy = inject(ErrorCopyService);
@@ -526,15 +529,8 @@ export class SettingsOrganizationSectionComponent {
   }
 
   /** Presentational: an ISO timestamp → a friendly local date. */
+  /** Formatted through {@link DateFormatService} — the one place a date becomes user-visible text. */
   formatDate(iso: string): string {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) {
-      return iso;
-    }
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
+    return this.dates.day(iso);
   }
 }

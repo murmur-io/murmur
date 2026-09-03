@@ -42,6 +42,7 @@ import { ToastService } from "../../../services/toast.service";
 import { MeetingsViewSwitcherComponent } from "../meetings-view-switcher/meetings-view-switcher.component";
 import { MeetingsTableViewComponent } from "../meetings-table-view/meetings-table-view.component";
 import { matchedInLabel } from "../../../core/copy/labels";
+import { DateFormatService } from "../../../core/date-format.service";
 
 /** Debounce window for search-as-you-type — quick enough to feel instant. */
 const SEARCH_DEBOUNCE_MS = 180;
@@ -149,6 +150,8 @@ export interface OrgMeetingListItem {
   styleUrl: "./library.component.scss",
 })
 export class LibraryComponent implements OnInit {
+  private readonly dates = inject(DateFormatService);
+
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
   private readonly folders = inject(FoldersService);
@@ -493,7 +496,13 @@ export class LibraryComponent implements OnInit {
    * Built from {@link displayedMeetings}, which already applies the folder/tag
    * precedence. Only recordings can be masked (folder-sealed).
    */
-  readonly listItems = computed<MeetingsListItem[]>(() =>
+  /** The windowed view the template renders. */
+  readonly listItems = computed<MeetingsListItem[]>(() => {
+    const all = this.allListItems();
+    return this.expandedList() ? all : all.slice(0, this.RENDER_CAP);
+  });
+
+  private readonly allListItems = computed<MeetingsListItem[]>(() =>
     this.displayedMeetings()
       .map<MeetingsListItem>((meeting) => ({
         kind: "meeting",
@@ -684,6 +693,32 @@ export class LibraryComponent implements OnInit {
    * meetings carrying the tag, and hits outside it are dropped. "All" (null tag)
    * passes every hit through untouched.
    */
+  /**
+   * How many rows the list renders before "Show all".
+   *
+   * `list_meetings` already caps its read at 200, so this is not about the fetch — it is about the
+   * DOM. Every row carries links, badges and a date, so a few hundred of them is thousands of nodes
+   * that zoneless change detection walks on every pass, and the cost lands on scrolling and typing
+   * rather than on load. Same shape and the same reason as `audio-panel`'s transcript window, which
+   * is where this number came from.
+   */
+  private readonly RENDER_CAP = 80;
+
+  /** True while the list is windowed — drives the "Show all" affordance. */
+  readonly listCapped = computed(
+    () => !this.expandedList() && this.allListItems().length > this.RENDER_CAP,
+  );
+
+  /** Total rows behind the window, so the affordance can say how many are hidden. */
+  readonly totalListCount = computed(() => this.allListItems().length);
+
+  private readonly expandedList = signal(false);
+
+  /** Drop the window for this list (the user asked to see everything). */
+  showAllList(): void {
+    this.expandedList.set(true);
+  }
+
   readonly displayedResults = computed<SearchRow[]>(() => {
     const hits = this.results();
     let narrowed = hits;
@@ -1106,18 +1141,9 @@ export class LibraryComponent implements OnInit {
   }
 
   /** Presentational only: render the stored timestamp as a friendly local date. */
+  /** Formatted through {@link DateFormatService} — the one place a date becomes user-visible text. */
   formatDate(startedAt: string): string {
-    const d = new Date(startedAt);
-    if (Number.isNaN(d.getTime())) {
-      return startedAt;
-    }
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    return this.dates.day(startedAt);
   }
 
   /** Presentational only: seconds → compact "Hh Mm" / "Mm Ss" / "Ss" duration. */

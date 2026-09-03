@@ -9,6 +9,7 @@ import { RouterLink } from "@angular/router";
 import { IpcService } from "../../../core/ipc.service";
 import { TopicThreadsStore } from "../../../services/topic-threads-store.service";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { DateFormatService } from "../../../core/date-format.service";
 
 /**
  * "Topic threads" — cross-meeting topic clusters surfaced on the Analytics
@@ -34,6 +35,8 @@ import { ErrorCopyService } from "../../../core/copy/error-copy.service";
   styleUrl: "./topic-threads.component.scss",
 })
 export class TopicThreadsComponent implements OnInit {
+  private readonly dates = inject(DateFormatService);
+
   private readonly ipc = inject(IpcService);
   private readonly store = inject(TopicThreadsStore);
   private readonly errorCopy = inject(ErrorCopyService);
@@ -87,16 +90,9 @@ export class TopicThreadsComponent implements OnInit {
   }
 
   /** Presentational only: render a stored timestamp as a friendly local date. */
+  /** Formatted through {@link DateFormatService} — the one place a date becomes user-visible text. */
   formatDate(startedAt: string): string {
-    const d = new Date(startedAt);
-    if (Number.isNaN(d.getTime())) {
-      return startedAt;
-    }
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
+    return this.dates.day(startedAt);
   }
 
   /** Presentational only: seconds offset → "m:ss" mention stamp. */
