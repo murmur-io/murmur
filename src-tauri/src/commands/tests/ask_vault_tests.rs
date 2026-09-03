@@ -1575,3 +1575,36 @@ fn ask_tool_event_is_distinct() {
         crate::events::EVENT_CHAT_TOOL
     );
 }
+
+/// Ask must never search with a vector it did not really compute.
+///
+/// This is the half of the fix that had NO coverage, and review proved it the hard way: it reverted
+/// `commands/ask.rs` alone to the pre-fix `active_admitted_embedder()` calls — restoring the exact
+/// bug, where a missing model means the question is embedded into `StubEmbedder`'s hash noise and
+/// fused into the answer at full weight — and the entire suite stayed green. Nothing could tell the
+/// two states apart.
+///
+/// It could not, because the logic lived inline in two call sites with nothing to call. It is now
+/// `ask_query_vector`, and this drives it directly.
+///
+/// The suite runs with a stub snapshot forced (`#[cfg(test)]` in `active_embedder_snapshot`, so no
+/// test ever loads 470 MB of weights), which is exactly the no-model condition users hit — so the
+/// assertion is that an EMPTY vector comes back. Empty is the honest answer: `search_hybrid_visible`
+/// short-circuits on it and `score_fuse` redistributes the KNN weight to the legs that have
+/// something to say. A non-empty vector here is hash noise wearing a semantic costume.
+#[test]
+fn ask_produces_no_query_vector_without_a_real_embedder() {
+    let with_semantics = crate::commands::ask_commands::ask_query_vector("what did we decide", true);
+    assert!(
+        with_semantics.is_empty(),
+        "a stub snapshot must yield NO vector — got {} dimensions of hash noise, which the fusion \
+         would then weight as if it meant something",
+        with_semantics.len()
+    );
+
+    // And with semantic search switched off there is nothing to compute either way.
+    assert!(
+        crate::commands::ask_commands::ask_query_vector("what did we decide", false).is_empty(),
+        "semantic search off must not embed anything"
+    );
+}

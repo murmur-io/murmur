@@ -1884,48 +1884,46 @@ mod knn_floor_tests {
         );
     }
 
-    /// Every hybrid/doc search on the Ask path uses the REAL cosine floor, never `0.0`.
+    /// Every hybrid/doc search on the Ask path uses the REAL cosine floor, never a zero.
     ///
-    /// `0.0` admits every vector in the index, however unrelated. That is harmless when the vector
-    /// is meaningful and actively harmful when it is not: without the embedding model installed the
-    /// old code fell back to `StubEmbedder`, a hash bag whose "similarity" carries no semantics, and
-    /// a floor of `0.0` then fused that noise into the answer as if it were a real leg. Two bugs
-    /// compounding — a fake vector and a threshold that could not reject it.
+    /// A `0.0` floor admits every vector in the index, however unrelated — harmless when the vector
+    /// is meaningful, actively harmful when it is not.
     ///
-    /// The floor is only half the fix; the other half is that `commands::ask` now uses a real-only
-    /// embedder handle, so with no model the vector is EMPTY and the KNN leg drops out entirely
-    /// rather than being filtered. This test pins the half that lives in this file, by reading the
-    /// source rather than by driving a search — a behavioural test would need the real 384-dim model
-    /// present, which CI does not have, and would silently pass on the stub.
+    /// The first version of this test looked for the literal `", 0.0,"`. Review defeated it three
+    /// times in a row with entirely ordinary spellings — `0.0f32,`, `0.00,`, and a `let floor = 0.0;`
+    /// bound above the call — each leaving a real zero floor live and the test green. So it no longer
+    /// hunts for a spelling. It reads the argument in the position the floor occupies and requires it
+    /// to BE the named constant: anything else, however written, fails.
     #[test]
-    fn the_ask_path_never_searches_with_a_zero_cosine_floor() {
-        let src = include_str!("vault_context.rs");
-        for (call, needle) in [
-            ("search_hybrid_visible", "search_hybrid_visible"),
-            ("search_doc_chunks_visible", "search_doc_chunks_visible"),
-        ] {
+    fn the_ask_path_passes_the_named_cosine_floor_constant() {
+        // Only the PRODUCTION half of the file: this module names the calls too, and matching its
+        // own prose would make the scan report on itself.
+        let whole = include_str!("vault_context.rs");
+        let src = whole
+            .split_once("mod knn_floor_tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(whole);
+        for call in ["search_hybrid_visible", "search_doc_chunks_visible"] {
+            let mut found = 0usize;
             for (i, line) in src.lines().enumerate() {
-                if !line.contains(needle) {
+                // Skip the doc comments and this test's own mentions of the call names.
+                if !line.contains(call) || line.trim_start().starts_with("//") {
                     continue;
                 }
-                // The floor may sit on the call line or a few lines below it once rustfmt splits a
-                // long call across lines.
-                // Match the argument in BOTH shapes rustfmt produces: inline (`, 0.0,`) and, once
-                // the call is split across lines, as a line that is nothing but `0.0,`. The first
-                // version of this test only knew the inline form, so reverting the floor — which
-                // rustfmt then reformatted onto its own line — left it green. A guard whose needle
-                // depends on formatting is not a guard.
-                let window: Vec<&str> = src.lines().skip(i).take(8).collect();
-                let joined = window.join(" ");
-                let lone_zero = window.iter().any(|l| l.trim() == "0.0,");
+                found += 1;
+                let window: String = src.lines().skip(i).take(10).collect::<Vec<_>>().join(" ");
                 assert!(
-                    !joined.contains(", 0.0,") && !lone_zero,
-                    "{call} at line {} passes a 0.0 cosine floor — that admits every vector in the \
-                     index, which is exactly how stub-embedder noise reached the answer. Use \
-                     `crate::embed::KNN_SEARCH_COSINE_FLOOR`.",
+                    window.contains("KNN_SEARCH_COSINE_FLOOR"),
+                    "{call} at line {} does not pass `KNN_SEARCH_COSINE_FLOOR`. Whatever it passes \
+                     instead — a literal, a suffixed literal, or a local binding — is not the \
+                     reviewed threshold, and a zero there fuses unrelated vectors into the answer.",
                     i + 1
                 );
             }
+            assert!(
+                found > 0,
+                "no call to {call} found — the scan has gone vacuous, fix it before trusting it"
+            );
         }
     }
 }
