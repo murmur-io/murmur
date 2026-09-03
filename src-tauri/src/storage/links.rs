@@ -170,6 +170,24 @@ fn link_endpoint_sealed_at_rest_tx(
     }
 }
 
+/// One `links` row, verbatim, for a trash snapshot.
+///
+/// Deliberately its own type rather than a reuse of a query DTO: this is an AT-REST format that
+/// ships inside a user's trash entry, so it must stay stable independently of anything the UI or
+/// IPC layer decides to rename. Snake_case for the same reason the snapshot payloads are.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LinkRowSnapshot {
+    pub src_kind: String,
+    pub src_id: String,
+    pub dst_kind: String,
+    pub dst_id: String,
+    pub edge_type: String,
+    pub score: f64,
+    pub created_by: String,
+    pub status: String,
+    pub created_at: i64,
+}
+
 impl Db {
     /// Brain v3 PR-3 — idempotent LINK-ENGINE schema: the `links` table records DERIVED, content-
     /// revealing relations between `meeting|note|document` rows. Three edge kinds:
@@ -885,6 +903,141 @@ impl Db {
     // is a DERIVED, content-revealing relation, so: PURGED on seal (`purge_links_tx`), RE-DERIVED on
     // unlock, and read with BOTH endpoints visibility-gated (`links_for_visible`). SQL only — the
     // pure edge math (canonicalization, kNN selection) lives in `crate::links`.
+
+    /// Every link row touching `meeting_id` on EITHER side, for a trash snapshot.
+    ///
+    /// Deleting a meeting purges its links outright (`purge_links_tx` with `preserve_decisions=false`,
+    /// because the endpoint is gone), so unlike the cascade-driven tables there is nothing left to
+    /// find afterwards. The snapshot is the only copy, and it has to carry both directions: a link
+    /// naming this meeting as its DESTINATION is somebody else's edge into it, and losing that is
+    /// what makes a restored meeting look connected to nothing.
+    pub fn link_rows_for_meeting(&self, meeting_id: &str) -> Result<Vec<LinkRowSnapshot>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status,
+                        created_at
+                   FROM links
+                  WHERE (src_kind = 'meeting' AND src_id = ?1)
+                     OR (dst_kind = 'meeting' AND dst_id = ?1)
+                  ORDER BY src_kind, src_id, dst_kind, dst_id, edge_type",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| {
+                Ok(LinkRowSnapshot {
+                    src_kind: r.get(0)?,
+                    src_id: r.get(1)?,
+                    dst_kind: r.get(2)?,
+                    dst_id: r.get(3)?,
+                    edge_type: r.get(4)?,
+                    score: r.get(5)?,
+                    created_by: r.get(6)?,
+                    status: r.get(7)?,
+                    created_at: r.get(8)?,
+                })
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    /// Is the far endpoint of a snapshotted row visible right now?
+    ///
+    /// "Far" is whichever side is not the meeting being restored — and a row may name it on either
+    /// side, which is the whole reason the snapshot carries both directions. An endpoint kind this
+    /// does not know how to check is treated as NOT visible: refusing to restore an edge is a
+    /// smaller mistake than restoring one that points somewhere sealed.
+    fn endpoints_visible(&self, row: &LinkRowSnapshot, unlocked: &HashSet<String>) -> Result<bool> {
+        for (kind, id) in [
+            (row.src_kind.as_str(), row.src_id.as_str()),
+            (row.dst_kind.as_str(), row.dst_id.as_str()),
+        ] {
+            let visible = match kind {
+                "meeting" => self.meeting_is_visible(id, unlocked)?,
+                "document" => self.document_is_visible(id, unlocked)?,
+                _ => false,
+            };
+            if !visible {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Is this snapshotted row one the USER decided on, rather than one the app derived?
+    ///
+    /// Mirrors `LINK_DECISION_KEEP`, which is what a seal already preserves across a lock of either
+    /// endpoint: a dismissal, an accepted suggestion, or a hand-drawn link. Those carry only ids and
+    /// an edge type — no titles, no plaintext — and every reader gates both endpoints live, which is
+    /// why keeping them is safe. Derived rows have no such standing.
+    fn is_user_decision(row: &LinkRowSnapshot) -> bool {
+        row.status == "dismissed" || row.created_by == "accepted" || row.edge_type == "manual"
+    }
+
+    /// Re-insert snapshotted link rows.
+    ///
+    /// `INSERT OR IGNORE` rather than the usual upsert: a restore must not overwrite a decision the
+    /// user has made since the delete. If an identical edge was re-derived and then dismissed while
+    /// the meeting sat in the trash, the dismissal wins — resurrecting it would undo a choice the
+    /// user made after the fact.
+    ///
+    /// A DERIVED row whose far endpoint is no longer visible is dropped. Lock-security review found
+    /// the gap: `purge_links_tx` strips derived edges when a folder seals, but a meeting sitting in
+    /// the trash is invisible to that pass — so a plain restore would resurrect a `wikilink`,
+    /// `companion` or suggested `semantic` edge pointing at a neighbour that has been sealed
+    /// meanwhile, which the ordinary lifecycle would have removed. Every reader re-gates both
+    /// endpoints live, so such a row is inert rather than a leak, but "inert" is a property of
+    /// today's readers and not something to lean on: the row should not exist. The outbound
+    /// `wikilink` leg self-heals through the re-index that follows a restore; the inbound leg and
+    /// the companion/semantic rows do not, which is what this filter is for.
+    ///
+    /// User decisions are kept regardless — exactly as a seal keeps them.
+    pub fn restore_link_rows(
+        &self,
+        rows: &[LinkRowSnapshot],
+        unlocked: &HashSet<String>,
+    ) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        // Decided BEFORE the connection lock: the visibility helpers take it themselves, and this
+        // one holds it for the whole insert transaction.
+        let mut keep: Vec<&LinkRowSnapshot> = Vec::with_capacity(rows.len());
+        for row in rows {
+            if Self::is_user_decision(row) || self.endpoints_visible(row, unlocked)? {
+                keep.push(row);
+            }
+        }
+
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let mut restored = 0usize;
+        for row in keep {
+            restored += tx
+                .execute(
+                    "INSERT OR IGNORE INTO links
+                       (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status,
+                        created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        row.src_kind,
+                        row.src_id,
+                        row.dst_kind,
+                        row.dst_id,
+                        row.edge_type,
+                        row.score,
+                        row.created_by,
+                        row.status,
+                        row.created_at
+                    ],
+                )
+                .map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(restored)
+    }
 
     /// Upsert ONE edge (idempotent on the UNIQUE key). For an UNDIRECTED (semantic) edge the caller
     /// MUST have canonicalized endpoints (`src<dst`) so A~B and B~A collapse to one row. On a
