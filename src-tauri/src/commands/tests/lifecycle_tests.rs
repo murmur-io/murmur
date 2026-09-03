@@ -15699,6 +15699,31 @@
         );
     }
 
+    /// The toggle must SHOW what is actually stored, not a constant.
+    ///
+    /// Its sibling test covers the inbound direction only: it strips the key before deserializing,
+    /// so it never looks at what `config_to_dto` put there. Review demonstrated the consequence by
+    /// hardcoding `Some(true)` on the way out — all five update-check tests stayed green.
+    ///
+    /// The enforcement gate reads `AppConfig` directly rather than through the DTO, so a regression
+    /// here would not re-enable the network call. It would do something subtler and arguably worse:
+    /// show a user who turned the check OFF a switch that says ON, while the check stays off. A
+    /// privacy control that misreports its own state is not a control.
+    #[test]
+    fn the_config_the_ui_reads_reports_the_stored_update_flag() {
+        for stored in [false, true] {
+            let cfg = crate::settings::config::AppConfig {
+                update_check_enabled: stored,
+                ..crate::settings::config::AppConfig::default()
+            };
+            assert_eq!(
+                config_to_dto(&cfg).update_check_enabled,
+                Some(stored),
+                "the DTO must carry the stored value, not a constant"
+            );
+        }
+    }
+
     /// A save that omits the field must NOT re-enable a check the user turned off.
     ///
     /// This is the test review wrote to disprove the doc comment I had written, and it was right:
