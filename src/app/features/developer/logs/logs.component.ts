@@ -367,6 +367,22 @@ export class LogsComponent implements OnInit {
   }
 
   /**
+   * Write a shareable diagnostics bundle and reveal it, so a bug report can carry the app version,
+   * the OS, the models on disk and BOTH log generations instead of a screenshot of one screen.
+   *
+   * Carries no meeting content: the backend assembles it from sources that are non-PII by contract.
+   */
+  async exportBundle(): Promise<void> {
+    try {
+      await this.ipc.exportDiagnosticsBundle();
+      await this.ipc.revealAppLog();
+      this.toast.success("Diagnostics bundle saved next to the logs");
+    } catch {
+      this.toast.danger("Couldn’t write the diagnostics bundle.");
+    }
+  }
+
+  /**
    * Empty the CURRENT session's file. Offered only on `current` — the previous
    * generation is the evidence this view exists to preserve.
    */

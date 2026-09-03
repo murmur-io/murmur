@@ -252,6 +252,7 @@ pub fn run() {
             // Developer mode — the on-device log reader (Settings → Developer → Logs).
             commands::read_app_log,
             commands::clear_app_log,
+            commands::export_diagnostics_bundle,
             commands::reveal_app_log,
             // Brain v2 L5 — scheduled briefs (schedule CRUD + propose-accept runs).
             commands::list_brief_schedules,

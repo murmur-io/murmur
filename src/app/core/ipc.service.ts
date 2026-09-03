@@ -469,6 +469,18 @@ export class IpcService {
     return invoke<void>("clear_app_log");
   }
 
+  /**
+   * Write a shareable diagnostics bundle and return its absolute path.
+   *
+   * App version, OS, the models present on disk (names and sizes only) and both log generations,
+   * as one plain-text file to attach to a bug report. Carries no note, transcript, title or
+   * attendee: the backend assembles it from sources that are non-PII by contract rather than
+   * filtering afterwards.
+   */
+  exportDiagnosticsBundle(): Promise<string> {
+    return invoke<string>("export_diagnostics_bundle");
+  }
+
   /** Reveal the log folder in Finder (to attach the raw file to a report). */
   revealAppLog(): Promise<void> {
     return invoke<void>("reveal_app_log");
