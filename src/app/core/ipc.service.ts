@@ -3440,8 +3440,8 @@ export class IpcService {
    * command REJECTS on network failure / rate-limit, so a thrown error means
    * "couldn't check" (never treat it as "up to date").
    */
-  checkForUpdate(): Promise<UpdateInfo> {
-    return invoke<UpdateInfo>("check_for_update");
+  checkForUpdate(manual: boolean): Promise<UpdateInfo> {
+    return invoke<UpdateInfo>("check_for_update", { manual });
   }
 
   /** Static product identity (name / version / description / repository) for About. */
