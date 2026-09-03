@@ -1230,12 +1230,25 @@ fn show_fatal_init_dialog(handle: tauri::AppHandle, err: &crate::error::AppError
 
     const TITLE: &str = "Murmur can't open your library";
 
-    let (body, log_reason) = match err {
+    let (body, log_reason): (String, &str) = match err {
+        // `Secrets` carries guidance the user has to ACT on — which key to restore, and from where.
+        // Every other arm here is a hardcoded body, so before this the crafted message reached the
+        // log and nothing else: the one place a locked-out person needs it was the one place it did
+        // not appear. `AppError` messages on this path are content-free by construction (no note
+        // text, no paths, no key material), so showing this one is safe.
+        AppError::Secrets(detail) => (
+            format!(
+                "Murmur couldn't unlock its encrypted database.\n\n{detail}\n\nYour notes have \
+                 NOT been changed or deleted."
+            ),
+            "database key unavailable — refused to replace it",
+        ),
         AppError::KeychainDenied(_) => (
             "macOS didn't grant access to your keychain, so Murmur couldn't unlock its encrypted \
              database.\n\nYour notes are safe and have not been changed. Please reopen Murmur and \
              choose \"Always Allow\" when macOS asks for keychain access. If this keeps happening, \
-             contact support.",
+             contact support."
+                .to_string(),
             "keychain access denied or unavailable",
         ),
         AppError::Locked(_) => (
@@ -1245,14 +1258,16 @@ fn show_fatal_init_dialog(handle: tauri::AppHandle, err: &crate::error::AppError
              content, and audio files have NOT been changed or deleted. Murmur may have recorded a \
              recovery marker. For authenticated recovery, reopen Murmur v1.0.1 (or the dedicated \
              recovery build), use Touch ID to unlock the affected folder, then relaunch this Murmur \
-             build.",
+             build."
+                .to_string(),
             "unfinished legacy recording recovery is locked or ambiguous",
         ),
         _ => (
             "Murmur couldn't unlock its encrypted database. This can happen if the database key \
              doesn't match the data on this Mac (for example after restoring from a backup or \
              another computer) or if the file is damaged.\n\nYour notes have NOT been changed or \
-             deleted. Please reopen Murmur, and if this keeps happening, contact support.",
+             deleted. Please reopen Murmur, and if this keeps happening, contact support."
+                .to_string(),
             "database could not be opened (key mismatch / corruption)",
         ),
     };
@@ -1269,7 +1284,6 @@ fn show_fatal_init_dialog(handle: tauri::AppHandle, err: &crate::error::AppError
     // blocking_show() MUST run off the main thread — it dispatches the native dialog to the main
     // run loop and blocks the caller, so calling it on the main thread would deadlock. Spawn a
     // worker that shows the modal, then exits cleanly (code 1) once the user clicks OK.
-    let body = body.to_string();
     std::thread::spawn(move || {
         handle
             .dialog()

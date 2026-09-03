@@ -703,12 +703,13 @@ impl AppState {
     /// `<app-data>/<app_dir_name()>/meetnotes.sqlite`, creating the directory if absent.
     /// The folder is `MeetNotes` for release and `MeetNotes-dev` for dev/debug ([`app_dir_name`]).
     fn db_path() -> Result<PathBuf> {
-        let base = dirs::data_dir()
+        let path = db_file_path()
             .ok_or_else(|| AppError::Storage("could not resolve app-data directory".into()))?;
-        let dir = base.join(app_dir_name());
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| AppError::Storage(format!("create app-data dir: {e}")))?;
-        Ok(dir.join(DB_FILE))
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| AppError::Storage(format!("create app-data dir: {e}")))?;
+        }
+        Ok(path)
     }
 }
 
@@ -879,6 +880,42 @@ fn assert_locked_audio_at_rest(path: Option<&str>, stream: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Would minting a fresh DEK orphan an existing database?
+///
+/// True when `path` is a file that is NOT plaintext SQLite — i.e. an already-SQLCipher-encrypted
+/// database, whose only key is the DEK we are about to replace. A plaintext file is deliberately
+/// NOT a refusal: that is the pre-encryption shape, and `storage::migration` encrypts it with the
+/// newly-minted key on purpose.
+///
+/// Split from [`encrypted_db_exists`] so the decision is testable without reaching for the real
+/// app-data directory.
+pub(crate) fn minting_would_orphan_db(path: &std::path::Path) -> bool {
+    path.is_file() && !is_plaintext_sqlite_file(path)
+}
+
+/// Is there already an encrypted database in the app-data directory?
+///
+/// Read-only on purpose: unlike `Db::db_path` this never creates the directory, because it runs on
+/// the pre-mint path where creating anything would be a side effect of asking a question.
+pub(crate) fn encrypted_db_exists() -> bool {
+    // No resolvable app-data directory means no database to orphan. The permissive answer is the
+    // right one: a fresh install on a machine this improbable still deserves to work, and there is
+    // provably nothing to lose.
+    db_file_path().is_some_and(|p| minting_would_orphan_db(&p))
+}
+
+/// Where the database lives — the SINGLE construction of that path.
+///
+/// `Db::db_path` and [`encrypted_db_exists`] both go through here on purpose. Review pointed out
+/// that the guard's own composition had no test: a wrong constant, a missing `app_dir_name()`, or a
+/// stray early return in it would leave the guard permanently inert while the whole suite stayed
+/// green, because the decision logic it wraps is tested and it is not. Rather than test for that
+/// drift, this removes the possibility of it — there is now one place to get the path wrong, and
+/// the opener would fail loudly with it.
+pub(crate) fn db_file_path() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join(app_dir_name()).join(DB_FILE))
 }
 
 /// Does `path` start with the plaintext-SQLite magic ("SQLite format 3\0")? A SQLCipher-encrypted
@@ -1585,5 +1622,61 @@ mod tests {
             let RecordingStopResult { meeting_id } = result.unwrap();
             assert_eq!(meeting_id, "meeting-42");
         }
+    }
+}
+
+#[cfg(test)]
+mod dek_mint_guard_tests {
+    use super::minting_would_orphan_db;
+
+    /// The three cases the mint decision has to tell apart — and getting any of them wrong is a
+    /// different disaster.
+    ///
+    /// An ENCRYPTED database must refuse: minting there replaces the only key its contents have,
+    /// which is silent, total, unrecoverable loss of every meeting. A PLAINTEXT database must NOT
+    /// refuse: that is the pre-encryption shape and `storage::migration` encrypts it with the newly
+    /// minted key on purpose, so refusing would brick every upgrading install. And NO file must not
+    /// refuse: that is a fresh install, where refusing would mean the app never starts at all.
+    ///
+    /// A single "does the file exist" check would conflate the first two; a single "is it missing"
+    /// check would conflate the last two. That is why this asserts each separately rather than
+    /// asserting one predicate twice.
+    #[test]
+    fn only_an_encrypted_database_refuses_the_mint() {
+        let dir = std::env::temp_dir().join(format!("murmur-dek-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let missing = dir.join("absent.sqlite");
+        assert!(
+            !minting_would_orphan_db(&missing),
+            "a fresh install has no database — refusing here would stop the app from ever starting"
+        );
+
+        let plaintext = dir.join("plain.sqlite");
+        std::fs::write(&plaintext, b"SQLite format 3\0and then some payload").unwrap();
+        assert!(
+            !minting_would_orphan_db(&plaintext),
+            "a plaintext database is the pre-encryption shape; migration encrypts it WITH the new \
+             key, so refusing would brick every upgrading install"
+        );
+
+        let encrypted = dir.join("encrypted.sqlite");
+        // A SQLCipher file opens with random salt, so the plaintext magic is absent.
+        std::fs::write(&encrypted, b"\x9f\x2c\x7e\x01random salt then ciphertext").unwrap();
+        assert!(
+            minting_would_orphan_db(&encrypted),
+            "an encrypted database's ONLY key is the DEK about to be replaced — minting here is \
+             silent, total, unrecoverable loss"
+        );
+
+        // A directory is not a database, however it is named.
+        let dir_named_like_a_db = dir.join("looks-like.sqlite");
+        std::fs::create_dir_all(&dir_named_like_a_db).unwrap();
+        assert!(
+            !minting_would_orphan_db(&dir_named_like_a_db),
+            "a directory is not a file to orphan"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
