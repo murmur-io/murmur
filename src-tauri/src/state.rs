@@ -703,12 +703,13 @@ impl AppState {
     /// `<app-data>/<app_dir_name()>/meetnotes.sqlite`, creating the directory if absent.
     /// The folder is `MeetNotes` for release and `MeetNotes-dev` for dev/debug ([`app_dir_name`]).
     fn db_path() -> Result<PathBuf> {
-        let base = dirs::data_dir()
+        let path = db_file_path()
             .ok_or_else(|| AppError::Storage("could not resolve app-data directory".into()))?;
-        let dir = base.join(app_dir_name());
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| AppError::Storage(format!("create app-data dir: {e}")))?;
-        Ok(dir.join(DB_FILE))
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| AppError::Storage(format!("create app-data dir: {e}")))?;
+        }
+        Ok(path)
     }
 }
 
@@ -899,13 +900,22 @@ pub(crate) fn minting_would_orphan_db(path: &std::path::Path) -> bool {
 /// Read-only on purpose: unlike `Db::db_path` this never creates the directory, because it runs on
 /// the pre-mint path where creating anything would be a side effect of asking a question.
 pub(crate) fn encrypted_db_exists() -> bool {
-    let Some(base) = dirs::data_dir() else {
-        // No resolvable app-data directory means no database to orphan. Returning false here is the
-        // permissive answer, and it is the right one: a fresh install on a machine this improbable
-        // still deserves to work, and there is provably nothing to lose.
-        return false;
-    };
-    minting_would_orphan_db(&base.join(app_dir_name()).join(DB_FILE))
+    // No resolvable app-data directory means no database to orphan. The permissive answer is the
+    // right one: a fresh install on a machine this improbable still deserves to work, and there is
+    // provably nothing to lose.
+    db_file_path().is_some_and(|p| minting_would_orphan_db(&p))
+}
+
+/// Where the database lives — the SINGLE construction of that path.
+///
+/// `Db::db_path` and [`encrypted_db_exists`] both go through here on purpose. Review pointed out
+/// that the guard's own composition had no test: a wrong constant, a missing `app_dir_name()`, or a
+/// stray early return in it would leave the guard permanently inert while the whole suite stayed
+/// green, because the decision logic it wraps is tested and it is not. Rather than test for that
+/// drift, this removes the possibility of it — there is now one place to get the path wrong, and
+/// the opener would fail loudly with it.
+pub(crate) fn db_file_path() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join(app_dir_name()).join(DB_FILE))
 }
 
 /// Does `path` start with the plaintext-SQLite magic ("SQLite format 3\0")? A SQLCipher-encrypted
