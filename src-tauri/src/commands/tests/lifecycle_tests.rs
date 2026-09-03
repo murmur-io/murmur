@@ -30533,10 +30533,13 @@
             let (mut put, _) = accept_with_timeout(&listener);
             // `read_http_request` rather than a bare `read`, for the two reasons its own comment
             // gives. `accept_with_timeout` polls a NONBLOCKING listener and the accepted stream can
-            // inherit that mode, so a raw `read().unwrap()` panics on `WouldBlock` the moment the
-            // request has not landed yet — which is precisely how this test failed on CI for #647
-            // and passed on the re-run. And a single `read` returns whatever bytes have arrived, so
-            // asserting `starts_with` on it is a second race even once the socket blocks properly.
+            // inherit that mode, so a raw `read().unwrap()` panics on `WouldBlock` before the
+            // request has landed. That is not a theory: CI run 33550375752 — the `murmur` trunk run
+            // for the #647 merge, not one of its PR runs — died here with
+            // `Os { code: 35, kind: WouldBlock }`. Reproduced locally at roughly 8 in 300 sequential
+            // runs of the pre-fix code, and 0 in 600 after it. And a single `read` returns whatever
+            // bytes have arrived, so asserting `starts_with` on it is a second race even once the
+            // socket blocks properly.
             let request = read_http_request(&mut put);
             assert!(String::from_utf8_lossy(&request).starts_with(&format!(
                 "PUT /v1/orgs/{STABLE_ORG_ID}/documents/{doc_for_server}"
