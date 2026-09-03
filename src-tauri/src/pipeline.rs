@@ -641,6 +641,54 @@ enum MasterPointerKind {
 }
 
 /// Persist a managed master pointer and reconcile SQLite's ambiguous-error window. A confirmed
+/// The segments a decode window OWNS, renumbered contiguously.
+///
+/// Each window emits only what ENDS before the next window begins; the next window has the
+/// boundary in full and emits it instead. That does two jobs at once: a word straddling the
+/// boundary is decoded by the window that can actually see all of it, AND the result is
+/// deduplicated BY CONSTRUCTION — there is no window in which the same span is emitted twice, so
+/// no text or timestamp matching is needed and none can go wrong. Matching would have been the
+/// obvious approach and the fragile one: two decodes of the same audio do not have to agree on
+/// either the wording or the exact boundaries, which is precisely why they were worth overlapping.
+///
+/// The final window has no successor, so it keeps its tail.
+///
+/// Split out of [`transcribe_raw_windows`] because that function needs a loaded whisper model and
+/// cannot run in a unit test, while this rule — the part that can silently drop or duplicate a
+/// user's words — can.
+pub(crate) fn own_window_segments(
+    segments: Vec<crate::transcribe::types::Segment>,
+    boundary_s: f64,
+    is_last: bool,
+    next_idx: &mut i64,
+) -> Vec<crate::transcribe::types::Segment> {
+    let mut owned = Vec::with_capacity(segments.len());
+    for mut segment in segments {
+        if !is_last && segment.end_s > boundary_s {
+            continue;
+        }
+        segment.idx = *next_idx;
+        *next_idx += 1;
+        owned.push(segment);
+    }
+    owned
+}
+
+/// Length of one decode window, in seconds.
+const DECODE_WINDOW_S: usize = 120;
+
+/// How much each decode window overlaps the previous one.
+///
+/// Windows used to be read back-to-back, so a word spoken across the 120 s boundary was cut in
+/// half and each half was decoded WITHOUT the other's context — the boundary word came out
+/// mangled or missing, silently, once every two minutes of every long recording.
+///
+/// Five seconds is chosen to comfortably exceed a spoken sentence rather than a word: whisper's
+/// own segmentation works on utterances, so an overlap shorter than an utterance can still split
+/// one. The cost is bounded and small — 5 s re-decoded per 115 s of audio is ~4% more decode work,
+/// and it buys back a defect that was destroying content rather than merely slowing things down.
+const DECODE_OVERLAP_S: usize = 5;
+
 /// absent/different pointer authorizes exact deletion of only the just-published inode; an
 /// unreadable DB preserves both the managed file and the ARCHIVED generation for recovery.
 fn persist_master_pointer_or_reconcile(
@@ -1139,12 +1187,15 @@ fn transcribe_raw_windows(
     vad_path: Option<&Path>,
     normalize: bool,
 ) -> Result<Vec<crate::transcribe::types::Segment>> {
-    const WINDOW_FRAMES: usize = 120 * audio::TARGET_RATE_HZ as usize;
+    const WINDOW_FRAMES: usize = DECODE_WINDOW_S * audio::TARGET_RATE_HZ as usize;
+    const OVERLAP_FRAMES: usize = DECODE_OVERLAP_S * audio::TARGET_RATE_HZ as usize;
+    const STRIDE_FRAMES: u64 = (WINDOW_FRAMES - OVERLAP_FRAMES) as u64;
     let mut source = RawF32LeSource::open(path, audio::TARGET_RATE_HZ)?;
     let mut all = Vec::new();
     let mut offset = 0u64;
     let mut next_idx = 0i64;
     let mut vad = vad_path.and_then(|model| crate::transcribe::vad::VadSegmenter::load(model).ok());
+    let mut pinned_language: Option<String> = language.map(str::to_string);
     while offset < source.frames() {
         let mut window = source.read_frames(offset, WINDOW_FRAMES)?;
         if window.is_empty() {
@@ -1154,15 +1205,30 @@ fn transcribe_raw_windows(
             audio::normalize_for_asr(&mut window);
         }
         let offset_s = offset as f64 / audio::TARGET_RATE_HZ as f64;
-        let mut segments = transcribe_stream(transcriber, vad.as_mut(), &window, language)?;
+        // Carry the pinned language ACROSS outer windows too, or each 120 s window would start
+        // detection over and the flip this prevents would simply move up a level.
+        let (mut segments, detected) =
+            transcribe_stream(transcriber, vad.as_mut(), &window, pinned_language.as_deref())?;
+        if pinned_language.is_none() {
+            pinned_language = detected;
+        }
         for segment in &mut segments {
-            segment.idx = next_idx;
             segment.start_s += offset_s;
             segment.end_s += offset_s;
-            next_idx += 1;
         }
-        all.extend(segments);
-        offset += window.len() as u64;
+        let next_offset = offset + STRIDE_FRAMES;
+        let is_last = next_offset >= source.frames() || window.len() < WINDOW_FRAMES;
+        let boundary_s = next_offset as f64 / audio::TARGET_RATE_HZ as f64;
+        all.extend(own_window_segments(
+            segments,
+            boundary_s,
+            is_last,
+            &mut next_idx,
+        ));
+        if is_last {
+            break;
+        }
+        offset = next_offset;
     }
     Ok(all)
 }
@@ -1347,7 +1413,7 @@ fn transcribe_stream(
     vad: Option<&mut crate::transcribe::vad::VadSegmenter>,
     samples_16k: &[f32],
     lang: Option<&str>,
-) -> Result<Vec<crate::transcribe::types::Segment>> {
+) -> Result<(Vec<crate::transcribe::types::Segment>, Option<String>)> {
     use crate::transcribe::TranscribeQuality;
 
     let regions: Vec<(usize, usize)> = match vad {
@@ -1366,14 +1432,28 @@ fn transcribe_stream(
 
     let mut out: Vec<crate::transcribe::types::Segment> = Vec::new();
     let mut idx: i64 = 0;
+    // Language is DETECTED ONCE and then pinned for the rest of the stream.
+    //
+    // Every decode window used to auto-detect independently, and a decode window is far shorter
+    // than the recording — so one meeting could be decoded as Polish, then English, then Polish
+    // again, purely on which words happened to fall in a window. Whisper's own detection is
+    // weakest exactly where windows are quietest, which is where a wrong guess does most damage.
+    // The first region's answer is the one taken from the whole recording's speaker, so it is the
+    // one to trust for the rest of it.
+    //
+    // An explicit user setting always wins: `lang` non-None means detection never runs at all.
+    let mut pinned: Option<String> = lang.map(str::to_string);
     for (start, end) in regions {
         for (win_start, win_end) in decode_windows(start, end, window_len) {
             let offset_s = win_start as f64 / crate::audio::TARGET_RATE_HZ as f64;
             let tx = transcriber.transcribe_with(
                 &samples_16k[win_start..win_end],
-                lang,
+                pinned.as_deref(),
                 TranscribeQuality::Accurate,
             )?;
+            if pinned.is_none() {
+                pinned = tx.language.clone();
+            }
             for mut seg in tx.segments {
                 seg.idx = idx;
                 seg.start_s += offset_s;
@@ -1383,7 +1463,7 @@ fn transcribe_stream(
             }
         }
     }
-    Ok(out)
+    Ok((out, pinned))
 }
 
 /// Split a `[start, end)` sample range into fixed-length decode windows of at most `window_len`
@@ -1792,7 +1872,7 @@ async fn run_inner(
         // FRESH decode (context reset across long gaps; never decode through silence). Live captions
         // + voice trigger keep the Fast greedy profile for latency — see transcribe::whisper.
         let mic_segments =
-            transcribe_stream(&transcriber, vad.as_mut(), &mic_16k, lang_owned.as_deref())?;
+            transcribe_stream(&transcriber, vad.as_mut(), &mic_16k, lang_owned.as_deref())?.0;
 
         let mut streams = vec![StreamInput {
             segments: mic_segments,
@@ -1806,7 +1886,7 @@ async fn run_inner(
 
         if let (Some(sys), Some(sys_started)) = (sys_16k, system_started_at) {
             let mut sys_segments =
-                transcribe_stream(&transcriber, vad.as_mut(), &sys, lang_owned.as_deref())?;
+                transcribe_stream(&transcriber, vad.as_mut(), &sys, lang_owned.as_deref())?.0;
 
             // ASR is done for both streams — free Whisper (+ VAD, also unused from here on) BEFORE
             // loading the diarizer, so the two heavy ML runtimes are never resident together.
@@ -3407,6 +3487,85 @@ fn should_auto_index(semantic_enabled: bool, embed_model_present: bool) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── decode-window overlap + stitching (T19) ────────────────────────────────────────────────
+    /// A word spoken ACROSS a window boundary is emitted once, by the window that heard all of it.
+    ///
+    /// Windows used to be read back-to-back, so such a word was cut in half and each half decoded
+    /// without the other's context — mangled or missing, silently, once every two minutes of every
+    /// long recording. With a 5 s overlap both windows see it, and the ownership rule decides.
+    ///
+    /// RED CONTROL (run 2026-09-03): drop the `end_s > boundary_s` skip and the straddling word
+    /// appears TWICE — once truncated from the earlier window, once whole from the later one.
+    #[test]
+    fn a_word_across_a_window_boundary_is_emitted_once_by_the_window_that_heard_it_whole() {
+        let mut idx = 0i64;
+        // Window 1 covers [0, 120) and the next window starts at 115.
+        let first = own_window_segments(
+            vec![
+                seg(-1, 10.0, 12.0, None, "well inside"),
+                seg(-1, 116.0, 117.0, None, "inside the overlap"),
+                seg(-1, 119.5, 120.0, None, "strad"), // truncated at the window edge
+            ],
+            115.0,
+            false,
+            &mut idx,
+        );
+        // Window 2 covers [115, 235) and is the last one.
+        let second = own_window_segments(
+            vec![
+                seg(-1, 116.0, 117.0, None, "inside the overlap"),
+                seg(-1, 119.5, 120.5, None, "straddling"), // whole, because this window heard all of it
+                seg(-1, 130.0, 131.0, None, "after"),
+            ],
+            230.0,
+            true,
+            &mut idx,
+        );
+
+        let texts: Vec<&str> = first
+            .iter()
+            .chain(second.iter())
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "well inside",
+                "inside the overlap",
+                "straddling",
+                "after"
+            ],
+            "the straddling word must appear ONCE and in its whole form, and the overlap must not \
+             duplicate the segment both windows heard"
+        );
+        assert!(
+            !texts.contains(&"strad"),
+            "the truncated half must never reach the transcript"
+        );
+        let idxs: Vec<i64> = first.iter().chain(second.iter()).map(|s| s.idx).collect();
+        assert_eq!(idxs, vec![0, 1, 2, 3], "indices stay contiguous across windows");
+    }
+
+    /// The LAST window keeps its tail — it has no successor to hand the boundary to.
+    ///
+    /// Without this the final seconds of every recording would be silently dropped, which is the
+    /// mirror-image bug of the one this overlap fixes and a far worse one.
+    #[test]
+    fn the_final_window_keeps_everything_it_heard() {
+        let mut idx = 0i64;
+        let tail = own_window_segments(
+            vec![
+                seg(-1, 200.0, 201.0, None, "second to last"),
+                seg(-1, 233.0, 234.9, None, "the very last words"),
+            ],
+            230.0,
+            true,
+            &mut idx,
+        );
+        assert_eq!(tail.len(), 2, "the last window has no successor and drops nothing");
+        assert_eq!(tail[1].text, "the very last words");
+    }
 
     // ── whisper decode windowing (P1 whisper-batch-cap) ────────────────────────────────────────
     /// A long region is tiled into ≤window_len windows that fully cover it with no gaps/overlaps, so

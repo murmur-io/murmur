@@ -220,7 +220,11 @@ test("a LOCKED folder shows the lock gate and hides the Saved Views bar", async 
     .click();
 
   await expect(page).toHaveURL(/\/container\/nf2$/);
-  await expect(page.getByText("This container is locked")).toBeVisible();
+  // "folder", not "container": the code's word for "a Workspace or a folder" used to leak into
+  // this state, where it named nothing the user ever created. `core/hierarchy-vocabulary.ts`
+  // is the one source now — and this assertion failing on the rename is what proved the old
+  // word really was on screen rather than only in the source.
+  await expect(page.getByText("This folder is locked")).toBeVisible();
   // No view controls and no counts: the backend refuses to describe a sealed container, and
   // "0" would be a claim about contents nobody is entitled to read.
   await expect(page.locator("app-notes-view-switcher")).toHaveCount(0);

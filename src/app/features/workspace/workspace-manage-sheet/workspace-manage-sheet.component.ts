@@ -11,6 +11,7 @@ import {
 } from "@angular/core";
 
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
+import type { ContainerNoun } from "../../../core/hierarchy-vocabulary";
 
 export type WorkspaceManageMode = "rename" | "delete";
 
@@ -27,7 +28,15 @@ export class WorkspaceManageSheetComponent {
 
   readonly mode = input.required<WorkspaceManageMode>();
   readonly name = input.required<string>();
-  readonly noun = input.required<"space" | "folder">();
+  /**
+   * The DISPLAY word, from `core/hierarchy-vocabulary.ts` — not a kind or a level.
+   *
+   * This used to be typed `"space" | "folder"`, which is the code's vocabulary; the sheet then
+   * told the user it was deleting a "space" while the sheet that created the same thing called
+   * it a Workspace. `ContainerNoun` keeps the two vocabularies from drifting again: a domain
+   * identifier no longer typechecks where a sentence is being written.
+   */
+  readonly noun = input.required<ContainerNoun>();
   readonly busy = input(false);
   readonly error = input<string | null>(null);
   readonly renamed = output<string>();

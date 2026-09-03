@@ -102,7 +102,11 @@ fn body_of(file: &str, name: &str) -> String {
     panic!("{file}: `{name}` has no closing brace");
 }
 
-const ACQUIRE: &str = "org_share_mutation_lock";
+/// Every acquisition now goes through the ONE helper (see
+/// `nothing_takes_the_org_mutex_except_the_one_helper`), so that call — not the field name — is
+/// what these oracles look for. Matching the field would silently stop finding anything the moment
+/// the door was renamed, which is how a source oracle goes quietly vacuous.
+const ACQUIRE: &str = "lock_org_mutation(";
 
 /// `unlock_folder` must not hold the org mutex across the Touch ID sheet.
 ///
@@ -268,5 +272,53 @@ fn unlock_folder_revalidates_the_visibility_snapshot_after_taking_the_org_mutex(
         acquire < require,
         "the re-validation must happen AFTER the mutex is held (acquire {acquire}, require \
          {require}), or it can be invalidated again before the restore"
+    );
+}
+
+/// Every acquisition of the org mutex goes through `AppState::lock_org_mutation`.
+///
+/// The debug re-entrancy guard lives in that one helper, and a guard that covers SOME call sites
+/// covers none of the ones that matter: the deadlock it exists for was reached three levels deep,
+/// through a callee nobody was thinking about (`reconcile_container_shares` ->
+/// `reconcile_one_container_root` -> `share_to_org_placed_notifying`). One raw `.lock()` anywhere
+/// is a hole in exactly the place a future author will not be looking.
+///
+/// `state.rs` is the sole exemption — it is where the helper takes the real lock.
+///
+/// RED CONTROL (run 2026-09-03): rewriting any single call site back to
+/// `state.org_share_mutation_lock.lock().await` fails this test naming that file and line.
+#[test]
+fn nothing_takes_the_org_mutex_except_the_one_helper() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut raw = Vec::new();
+    let mut stack = vec![src.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}")) {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !(name.ends_with(".rs") || name.ends_with(".inc")) || name == "state.rs" {
+                continue;
+            }
+            let text = strip_comments(&std::fs::read_to_string(&path).unwrap_or_default());
+            for (i, line) in text.lines().enumerate() {
+                // Skip STRING LITERALS: this test's own assertion message names both the field
+                // and `.lock()`, and so does prose in error copy. A check that flags itself is a
+                // check nobody will keep.
+                let code = line.split('"').step_by(2).collect::<String>();
+                if code.contains("org_share_mutation_lock") && code.contains(".lock()") {
+                    let rel = path.strip_prefix(&src).unwrap_or(&path).display().to_string();
+                    raw.push(format!("{rel}:{}", i + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        raw.is_empty(),
+        "these take `org_share_mutation_lock` directly instead of `lock_org_mutation()`, so the \
+         debug re-entrancy guard cannot see them: {raw:?}"
     );
 }

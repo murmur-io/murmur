@@ -887,7 +887,7 @@ pub async fn apply_workspace_organization(
     state: State<'_, AppState>,
     moves: Vec<WorkspaceOrganizeMove>,
 ) -> Result<WorkspaceOrganizeApplyResult, AppError> {
-    let _share_mutation = state.org_share_mutation_lock.lock().await;
+    let _share_mutation = state.lock_org_mutation().await;
     apply_workspace_organization_inner(&state.db, moves, |item_id, target_id| {
         file_recording_command_body(&app, state.inner(), item_id, Some(target_id))
     })

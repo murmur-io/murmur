@@ -34,6 +34,17 @@ export interface RecordingStatus {
   recording: boolean;
   meetingId: string | null;
   startedAt: string | null;
+  /**
+   * Whether SYSTEM audio capture is positively live. `null` when idle, or when this recording
+   * never asked for it — absent is not the same as broken.
+   *
+   * The helper is a separate process and can die mid-recording. Until this existed the mic kept
+   * recording and the timer kept counting while the far side of the call went missing from the
+   * transcript, discovered after a meeting nobody can repeat.
+   */
+  systemCaptureAlive: boolean | null;
+  /** Why it is not live, in words the user can act on. `null` while healthy. */
+  systemCaptureNote: string | null;
 }
 
 /**

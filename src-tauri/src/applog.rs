@@ -46,7 +46,21 @@ pub const DEFAULT_ENTRIES: usize = 1_000;
 const TAIL_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// How long a log is kept. Past this, entries are DELETED — see the module doc.
-pub const RETENTION_HOURS: i64 = 24;
+///
+/// Seven days, not one. A user reporting "it did the thing again last week" was asking about a log
+/// that had already been pruned, which made the whole surface unable to answer the question it
+/// exists for. The window is bounded in the OTHER dimension by [`MAX_LOG_BYTES`], so extending it
+/// cannot turn diagnosability into unbounded disk use.
+pub const RETENTION_HOURS: i64 = 24 * 7;
+
+/// Ceiling on the CURRENT log file. Past this, the oldest entries are dropped even when they are
+/// still inside the retention window.
+///
+/// Time alone is the wrong bound for a log: a quiet week costs nothing while a crash loop can write
+/// gigabytes in an hour, and the second case is exactly when a full disk hurts most. 16 MB holds a
+/// long, chatty session — `TAIL_SCAN_BYTES` reads only the last 4 MB anyway — and is small enough
+/// that a runaway writer is capped within one prune tick.
+pub const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
 
 /// How often the background pruner runs. Hourly is far finer than the 24 h window it enforces, so
 /// an aged-out log is gone within an hour of expiring, and the tick costs nothing noticeable (a
@@ -231,7 +245,14 @@ fn prune_file_head(path: &Path, cutoff: DateTime<Utc>) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(()),
         Err(e) => return Err(AppError::Storage(format!("read log for prune: {e}"))),
     };
-    let keep_from = first_retained_offset(&text, cutoff);
+    let mut keep_from = first_retained_offset(&text, cutoff);
+    // Size ceiling, applied AFTER the time cutoff: whatever survived the window may still be too
+    // big. Drop whole entries from the head — never a byte offset into one, which would leave a
+    // truncated first line and a continuation with no entry above it.
+    if (text.len() - keep_from) as u64 > MAX_LOG_BYTES {
+        let overflow = (text.len() - keep_from) as u64 - MAX_LOG_BYTES;
+        keep_from = first_entry_offset_past(&text, keep_from, overflow as usize);
+    }
     if keep_from == 0 {
         return Ok(()); // nothing has expired — the common case, and it writes nothing.
     }
@@ -247,6 +268,24 @@ fn prune_file_head(path: &Path, cutoff: DateTime<Utc>) -> Result<()> {
     file.flush()
         .map_err(|e| AppError::Storage(format!("flush log: {e}")))?;
     Ok(())
+}
+
+/// First entry boundary at or after `from + at_least` bytes.
+///
+/// Used by the size cap to drop WHOLE entries: starting the retained region mid-entry would leave a
+/// half line at the top and orphan its continuation lines, which is exactly the shape
+/// [`first_retained_offset`] documents as unacceptable for the time cutoff. Returns `text.len()`
+/// when no boundary is far enough, i.e. the file becomes empty rather than partially valid.
+fn first_entry_offset_past(text: &str, from: usize, at_least: usize) -> usize {
+    let target = from + at_least;
+    let mut offset = from;
+    for line in text[from..].split_inclusive('\n') {
+        if offset >= target && !line.starts_with(char::is_whitespace) {
+            return offset;
+        }
+        offset += line.len();
+    }
+    text.len()
 }
 
 /// Byte offset of the first entry to KEEP.
@@ -590,7 +629,7 @@ mod tests {
     #[test]
     fn nothing_expired_means_nothing_is_rewritten() {
         let now = Utc::now();
-        let text = line_at(now, 1, "fresh") + &line_at(now, 23, "still inside the window");
+        let text = line_at(now, 1, "fresh") + &line_at(now, RETENTION_HOURS - 1, "still inside the window");
         assert_eq!(
             first_retained_offset(&text, cutoff(now)),
             0,
@@ -601,8 +640,8 @@ mod tests {
     #[test]
     fn the_expired_head_is_dropped_and_the_rest_kept() {
         let now = Utc::now();
-        let old = line_at(now, 30, "yesterday's noise");
-        let older = line_at(now, 48, "two days ago");
+        let old = line_at(now, RETENTION_HOURS + 6, "past the window");
+        let older = line_at(now, RETENTION_HOURS * 2, "long past it");
         let fresh = line_at(now, 2, "keep me");
         let text = format!("{older}{old}{fresh}");
         let offset = first_retained_offset(&text, cutoff(now));
@@ -612,14 +651,14 @@ mod tests {
     #[test]
     fn an_entirely_expired_file_retains_nothing() {
         let now = Utc::now();
-        let text = line_at(now, 25, "just past the window") + &line_at(now, 90, "ancient");
+        let text = line_at(now, RETENTION_HOURS + 1, "just past the window") + &line_at(now, RETENTION_HOURS * 3, "ancient");
         assert_eq!(first_retained_offset(&text, cutoff(now)), text.len());
     }
 
     #[test]
     fn a_continuation_line_expires_with_the_entry_it_belongs_to() {
         let now = Utc::now();
-        let expired_panic = line_at(now, 40, "thread panicked");
+        let expired_panic = line_at(now, RETENTION_HOURS + 16, "thread panicked");
         let text = format!("{expired_panic}stack frame one\nstack frame two\n{}", line_at(now, 1, "fresh"));
         let offset = first_retained_offset(&text, cutoff(now));
         let kept = &text[offset..];
@@ -637,11 +676,59 @@ mod tests {
         let now = Utc::now();
         let text = format!(
             "{}9999-99-99T99:99:99.000000Z  INFO murmur: malformed\n{}",
-            line_at(now, 40, "expired"),
+            line_at(now, RETENTION_HOURS + 16, "expired"),
             line_at(now, 1, "fresh"),
         );
         let offset = first_retained_offset(&text, cutoff(now));
         assert!(text[offset..].contains("malformed"));
+    }
+
+    /// The size ceiling drops WHOLE entries from the head, even when they are still in-window.
+    ///
+    /// Time alone is the wrong bound for a log: a quiet week costs nothing while a crash loop can
+    /// write gigabytes in an hour, and that is exactly when a full disk hurts most. Every line here
+    /// is one minute old — comfortably inside retention — so only the byte ceiling can trim it, and
+    /// the assertions pin the two things that make the trim safe rather than merely small: the
+    /// NEWEST entry survives, and the retained region starts on an entry header, never mid-entry
+    /// with an orphaned continuation above it.
+    ///
+    /// RED CONTROL (run 2026-09-03): deleting the `MAX_LOG_BYTES` branch in `prune_file_head` fails
+    /// this on the size assertion while every other applog test stays green.
+    #[test]
+    fn the_size_ceiling_drops_whole_entries_even_when_they_are_still_in_window() {
+        let now = Utc::now();
+        let filler = "x".repeat(4_000);
+        let mut text = String::new();
+        // Comfortably over the ceiling, all of it fresh.
+        let entries = (MAX_LOG_BYTES as usize / 4_000) + 64;
+        for i in 0..entries {
+            text.push_str(&line_at(now, 1, &format!("entry {i} {filler}")));
+            text.push_str("  a continuation line for entry ");
+            text.push_str(&i.to_string());
+            text.push('\n');
+        }
+        let dir = temp_log_dir("size-cap");
+        let current = dir.join(LOG_FILE);
+        std::fs::write(&current, &text).unwrap();
+
+        prune_dir(&dir, now).unwrap();
+
+        let kept = std::fs::read_to_string(&current).unwrap();
+        assert!(
+            kept.len() as u64 <= MAX_LOG_BYTES,
+            "the ceiling must actually bind: kept {} bytes, cap {MAX_LOG_BYTES}",
+            kept.len()
+        );
+        assert!(
+            kept.contains(&format!("entry {}", entries - 1)),
+            "the NEWEST entry must survive — trimming from the wrong end would delete exactly what \
+             the log is read for"
+        );
+        assert!(
+            !kept.starts_with("  a continuation"),
+            "the retained region must start on an entry header, never on a continuation line whose \
+             entry was trimmed away"
+        );
     }
 
     #[test]
@@ -652,13 +739,17 @@ mod tests {
         let previous = dir.join(PREV_LOG_FILE);
         std::fs::write(
             &current,
-            line_at(now, 30, "expired") + &line_at(now, 1, "live"),
+            line_at(now, RETENTION_HOURS + 6, "expired") + &line_at(now, 1, "live"),
         )
         .unwrap();
-        std::fs::write(&previous, line_at(now, 30, "last session")).unwrap();
+        std::fs::write(&previous, line_at(now, RETENTION_HOURS + 6, "last session")).unwrap();
         // The previous file is judged by its mtime, so age it explicitly rather than trusting the
         // clock of the machine running the test.
-        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        // Relative to the window, not a fixed 48 h: a hardcoded age silently stops testing
+        // anything the moment RETENTION_HOURS grows past it, which is exactly what happened
+        // when the window went from 1 day to 7.
+        let stale = std::time::SystemTime::now()
+            - std::time::Duration::from_secs((RETENTION_HOURS as u64 + 6) * 3600);
         std::fs::File::options()
             .write(true)
             .open(&previous)

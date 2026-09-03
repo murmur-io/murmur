@@ -164,7 +164,7 @@
               <mur-icon [icon]="target.container.level === 'project' ? 'spaces' : 'folder'" />
               <span>
                 <strong>{{ target.label }}</strong>
-                <small>{{ target.container.level === "project" ? "Workspace" : "Folder" }}</small>
+                <small>{{ containerNounLeading(target.container) }}</small>
               </span>
               @if (selectedTargetId() === target.container.id) {
                 <span class="selected-mark" aria-hidden="true">✓</span>

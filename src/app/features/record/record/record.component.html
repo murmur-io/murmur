@@ -334,6 +334,17 @@
     </div>
   }
 
+  <!-- System audio died mid-recording. Not an error — the recording is still running and still
+       being saved — but the far side of the call is no longer in it, and the user can only act on
+       that WHILE the meeting is still happening. Silence here is what made this discoverable only
+       afterwards, on a meeting nobody can repeat. -->
+  @if (store.systemCaptureNote(); as note) {
+    <div class="banner" role="status">
+      <span class="banner-icon" aria-hidden="true">◑</span>
+      <span>{{ note }}</span>
+    </div>
+  }
+
   @if (store.error(); as err) {
     @if (needsCloudConsent()) {
       <div class="banner is-accent cloud-consent" role="alert">

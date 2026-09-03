@@ -333,7 +333,7 @@ test("audits the complete sidebar at tall and short viewports", async ({
       testInfo,
       `workspace-sidebar-${viewport.name}-overflow-menu`,
     );
-    await expectMenuItemAtHitPoint(page, "Rename space");
+    await expectMenuItemAtHitPoint(page, "Rename Workspace");
     await page.keyboard.press("Escape");
     await expect(overflowMenu).toHaveCount(0);
     await expect(overflowTrigger).toBeFocused();
@@ -370,13 +370,13 @@ test("keeps the single contextual container menu above following tree rows", asy
       .getByRole("menuitem", { name: "Create folder here" })
       .locator("mur-icon"),
   ).toHaveAttribute("data-icon", "folder-add");
-  await expectMenuItemAtHitPoint(page, "Rename space");
+  await expectMenuItemAtHitPoint(page, "Rename Workspace");
   await expect(page.getByText("Workspace actions", { exact: true })).toBeVisible();
   await expect(
-    page.getByRole("menuitem", { name: "Rename space" }).locator("mur-icon"),
+    page.getByRole("menuitem", { name: "Rename Workspace" }).locator("mur-icon"),
   ).toHaveAttribute("data-icon", "rename");
   await expect(
-    page.getByRole("menuitem", { name: "Delete space" }).locator("mur-icon"),
+    page.getByRole("menuitem", { name: "Delete Workspace" }).locator("mur-icon"),
   ).toHaveAttribute("data-icon", "trash");
 
   await page.keyboard.press("Escape");
@@ -495,8 +495,8 @@ test("rename and delete use explicit contextual confirmation instead of native p
   await page.goto("/");
 
   await page.getByRole("button", { name: "Actions for Acme" }).click();
-  await page.getByRole("menuitem", { name: "Rename space" }).click();
-  const rename = page.getByRole("dialog", { name: "Rename space Acme" });
+  await page.getByRole("menuitem", { name: "Rename Workspace" }).click();
+  const rename = page.getByRole("dialog", { name: "Rename Workspace Acme" });
   await expect(rename).toBeVisible();
   await rename.getByLabel("Name").fill("Acme Studio");
   await rename.getByRole("button", { name: "Rename", exact: true }).click();
@@ -509,15 +509,15 @@ test("rename and delete use explicit contextual confirmation instead of native p
     .toEqual([{ folderId: "p-acme", newName: "Acme Studio" }]);
 
   await page.getByRole("button", { name: "Actions for Acme" }).click();
-  await page.getByRole("menuitem", { name: "Delete space" }).click();
-  const remove = page.getByRole("dialog", { name: "Delete space Acme" });
+  await page.getByRole("menuitem", { name: "Delete Workspace" }).click();
+  const remove = page.getByRole("dialog", { name: "Delete Workspace Acme" });
   await expect(remove).toContainText("Its items are kept and moved out");
   expect(
     await page.evaluate(
       () => (window as unknown as { __deletes?: unknown[] }).__deletes ?? [],
     ),
   ).toEqual([]);
-  await remove.getByRole("button", { name: "Delete space" }).click();
+  await remove.getByRole("button", { name: "Delete Workspace" }).click();
   await expect
     .poll(() =>
       page.evaluate(

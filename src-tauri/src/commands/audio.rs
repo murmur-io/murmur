@@ -36,6 +36,17 @@ pub struct RecordingStatus {
     /// The in-progress meeting's `started_at` (RFC3339), so the FE anchors its elapsed timer to the
     /// real start instead of an epoch-sized value. `None` when idle or the row can't be read.
     pub started_at: Option<String>,
+    /// Whether SYSTEM audio capture is positively live right now (`None` when idle, or when this
+    /// recording never asked for it).
+    ///
+    /// The helper can die mid-recording — it is a separate process — and until now nothing told the
+    /// user. The mic keeps recording, the timer keeps counting, and the far side of the call is
+    /// simply missing from the transcript, discovered after the meeting is over and unrepeatable.
+    /// The backend already watches this every 100 ms to decide whether to un-mute the mic
+    /// (`audio::system::mic_must_be_restored`); this surfaces the same fact.
+    pub system_capture_alive: Option<bool>,
+    /// Why system capture is not live, when it is not. Plain words, no PII, `None` while healthy.
+    pub system_capture_note: Option<String>,
 }
 
 /// One stored voiceprint surfaced to a management view (opt-in voice biometrics). NEVER carries the
@@ -140,7 +151,34 @@ pub fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatus, A
     } else {
         None
     };
-    Ok(recording_status_dto(&state.db, recording, meeting_id))
+    // Ask the SAME predicate the 100 ms watchdog uses, so the UI and the mic-restore decision can
+    // never disagree about whether the helper is alive.
+    let system_capture = if recording {
+        let mut recorder = state
+            .recorder
+            .lock()
+            .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
+        recorder.as_mut().and_then(|r| {
+            r.system.as_mut().map(|sys| {
+                if sys.can_cover_muted_mic() {
+                    (true, None)
+                } else {
+                    (
+                        false,
+                        Some("System audio stopped — only your microphone is being recorded.".into()),
+                    )
+                }
+            })
+        })
+    } else {
+        None
+    };
+    Ok(recording_status_dto(
+        &state.db,
+        recording,
+        meeting_id,
+        system_capture,
+    ))
 }
 
 /// Assemble the [`RecordingStatus`] DTO from the recorder-presence flag + the in-progress meeting id,
@@ -152,22 +190,31 @@ pub(crate) fn recording_status_dto(
     db: &crate::storage::Db,
     recording: bool,
     meeting_id: Option<String>,
+    system_capture: Option<(bool, Option<String>)>,
 ) -> RecordingStatus {
     if !recording {
         return RecordingStatus {
             recording: false,
             meeting_id: None,
             started_at: None,
+            system_capture_alive: None,
+            system_capture_note: None,
         };
     }
     let started_at = meeting_id
         .as_deref()
         .and_then(|id| db.get_meeting(id).ok().flatten())
         .map(|m| m.started_at);
+    let (system_capture_alive, system_capture_note) = match system_capture {
+        Some((alive, note)) => (Some(alive), note),
+        None => (None, None),
+    };
     RecordingStatus {
         recording: true,
         meeting_id,
         started_at,
+        system_capture_alive,
+        system_capture_note,
     }
 }
 

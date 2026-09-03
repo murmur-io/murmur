@@ -42,11 +42,28 @@ pub(crate) enum StartupRefusal {
     GuardUnavailable,
 }
 
+/// The single-instance lock file, scoped to the dev/release split.
+///
+/// Dev and release keep deliberately separate databases and app-support directories
+/// (`state::app_dir_name`), but this lock used ONE fixed filename for both — so a debug build and
+/// an installed release refused to run at the same time, each reporting the other as "already
+/// running", even though they share no state at all.
+///
+/// The DIRECTORY stays `com.meetnotes.app` and the RELEASE FILENAME is unchanged. That is
+/// deliberate: putting the discriminator in a subdirectory would move the release path too, and
+/// during an upgrade an already-running old instance would hold the old path while the new binary
+/// took the new one — briefly admitting two live instances, which is the single thing this file
+/// exists to prevent. Only the dev build gets a different name.
 fn lock_path() -> Result<PathBuf> {
     let base = dirs::data_dir().ok_or_else(|| {
         AppError::Unavailable("could not resolve the single-instance coordination directory".into())
     })?;
-    Ok(base.join("com.meetnotes.app").join("murmur.instance.lock"))
+    let name = if crate::state::app_dir_name() == "MeetNotes" {
+        "murmur.instance.lock"
+    } else {
+        "murmur-dev.instance.lock"
+    };
+    Ok(base.join("com.meetnotes.app").join(name))
 }
 
 pub(crate) fn acquire() -> Result<AcquireResult> {

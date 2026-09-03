@@ -17,7 +17,7 @@
          holds. Saying "empty" here would be a claim about contents nobody is
          entitled to read. -->
     <div class="state-card">
-      <p><strong>This container is locked</strong></p>
+      <p><strong>This {{ noun() }} is locked</strong></p>
       <p>Unlock it to see what it holds.</p>
     </div>
   } @else if (error(); as message) {
@@ -27,7 +27,7 @@
   } @else if (isEmpty() && loading()) {
     <p class="state">Loading…</p>
   } @else if (isEmpty()) {
-    <p class="state">This container is empty.</p>
+    <p class="state">This {{ noun() }} is empty.</p>
   } @else {
     @for (page of pages(); track page.kind) {
       @if (page.total > 0) {
@@ -60,5 +60,5 @@
 } @else if (loading()) {
   <p class="state">Loading…</p>
 } @else {
-  <p class="state">That container was not found.</p>
+  <p class="state">That {{ noun() }} was not found.</p>
 }

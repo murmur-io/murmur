@@ -619,7 +619,7 @@ pub async fn move_note_doc(
     id: String,
     folder_id: String,
 ) -> Result<(), AppError> {
-    let _share_mutation = state.org_share_mutation_lock.lock().await;
+    let _share_mutation = state.lock_org_mutation().await;
     let target_locked = state
         .db
         .folder_by_id(&folder_id)?
@@ -853,7 +853,7 @@ async fn delete_note_inner_notifying(
             "unlock this folder to delete a note",
         )));
     }
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     state.db.begin_org_source_closure("document", id)?;
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact note
     // BEFORE the local row disappears, so the background org-sync tick can never re-pull a still-live
@@ -1243,7 +1243,7 @@ pub async fn delete_note_folder(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), AppError> {
-    let _share_mutation = state.org_share_mutation_lock.lock().await;
+    let _share_mutation = state.lock_org_mutation().await;
     if state.db.note_folder_by_id(&id)?.is_none() {
         return Err(AppError::InvalidArg(format!("no note folder {id}")));
     }
@@ -1261,7 +1261,7 @@ pub async fn move_note_folder(
     id: String,
     parent_id: Option<String>,
 ) -> Result<(), AppError> {
-    let _share_mutation = state.org_share_mutation_lock.lock().await;
+    let _share_mutation = state.lock_org_mutation().await;
     move_note_folder_inner(state.inner(), &id, parent_id.as_deref())
 }
 

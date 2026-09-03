@@ -155,6 +155,36 @@ export class RecorderStore {
     { initialValue: 0 },
   );
 
+  /**
+   * Why system audio is not being captured right now, or `null` while it is fine.
+   *
+   * Polled every 5 s WHILE RECORDING only — the same sanctioned `toObservable` + `interval` +
+   * `toSignal` shape as `level`, so the subscription's lifecycle is the framework's, not ours.
+   * Five seconds, not 100 ms: this answers "has the helper died", which is a once-per-recording
+   * event, and a tighter poll would spend IPC on a question whose answer almost never changes.
+   *
+   * The backend derives it from the SAME predicate its 100 ms mic-restore watchdog uses, so the
+   * warning cannot disagree with the decision to un-mute.
+   */
+  readonly systemCaptureNote = toSignal(
+    toObservable(this.isRecording).pipe(
+      switchMap((rec) =>
+        rec
+          ? interval(5000).pipe(
+              startWith(0),
+              switchMap(() =>
+                from(this.ipc.recordingStatus()).pipe(
+                  map((st) => st?.systemCaptureNote ?? null),
+                  catchError(() => of(null)),
+                ),
+              ),
+            )
+          : of(null),
+      ),
+    ),
+    { initialValue: null as string | null },
+  );
+
   /** Epoch ms when the current recording started — drives the elapsed timer. */
   private _recStartMs = 0;
 

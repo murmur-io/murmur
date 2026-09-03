@@ -12,6 +12,7 @@ import { map } from "rxjs";
 
 import type { ContainerNode, ItemKind, ItemRow } from "../../../core/models";
 import { WorkspaceService } from "../workspace.service";
+import { containerNoun } from "../../../core/hierarchy-vocabulary";
 
 /** The kinds a container can hold, in render order. */
 const KINDS: readonly ItemKind[] = ["meeting", "note", "task", "dashboard"];
@@ -61,6 +62,19 @@ export class ContainerViewComponent {
   private readonly workspace = inject(WorkspaceService);
 
   private readonly _container = signal<ContainerNode | null>(null);
+
+  /**
+   * The word the user reads for this thing.
+   *
+   * These states used to say "container" — the CODE's word for "either a Workspace or a folder",
+   * which no other surface shows and which names nothing the user ever created. Falls back to
+   * "folder" only before the node has loaded, where the sentence has to say something and the
+   * narrower word is the safer guess.
+   */
+  protected readonly noun = computed(() => {
+    const c = this._container();
+    return c ? containerNoun(c) : "folder";
+  });
   private readonly _pages = signal<KindPage[]>([]);
   private readonly _loading = signal(false);
   private readonly _error = signal<string | null>(null);

@@ -7388,7 +7388,7 @@
             |_ck: &[u8; 32], _blob: &[u8], _aad: &[u8]| -> Result<Vec<u8>, AppError> {
                 Ok(b"not the attachment plaintext".to_vec())
             };
-        let _org_mutation = block_on(state.org_share_mutation_lock.lock());
+        let _org_mutation = block_on(state.lock_org_mutation());
         let error = persist_converted_companion_under_snapshot_with_attachment_verifier(
             &state,
             MEETING,
@@ -8368,7 +8368,7 @@
 
         // Keep cleanup queued before its authoritative recheck. The editor wins while cleanup is
         // waiting, so the recheck must return false without touching the remote-share journal.
-        let mutation = block_on(state.org_share_mutation_lock.lock());
+        let mutation = block_on(state.lock_org_mutation());
         let cleanup_state = state.clone();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let cleanup = std::thread::spawn(move || {
@@ -22860,6 +22860,41 @@
     // `Recorder` needs mic hardware (can't be built headless), so we test the pure DTO builder that
     // the command delegates to.
 
+    /// A dead system-audio helper must be VISIBLE in the status, with a reason.
+    ///
+    /// The helper is a separate process and can die mid-recording. The mic keeps recording and
+    /// the timer keeps counting, so the far side of the call simply goes missing from the
+    /// transcript — discovered after a meeting nobody can repeat. The backend already watches
+    /// this every 100 ms to decide whether to un-mute the mic; before this it never said so.
+    ///
+    /// Asserts the HEALTHY case too: a status that always warned would pass the first
+    /// assertion and be worse than saying nothing.
+    #[test]
+    fn recording_status_surfaces_a_dead_system_audio_helper() {
+        let state = build_state("system-capture-status");
+        let dead = recording_status_dto(
+            &state.db,
+            true,
+            Some("live-1".to_string()),
+            Some((false, Some("System audio stopped — only your microphone is being recorded.".into()))),
+        );
+        assert_eq!(dead.system_capture_alive, Some(false));
+        assert!(
+            dead.system_capture_note
+                .as_deref()
+                .is_some_and(|n| n.contains("microphone")),
+            "a dead helper must explain itself in words the user can act on"
+        );
+        let live = recording_status_dto(&state.db, true, Some("live-1".to_string()), Some((true, None)));
+        assert_eq!(live.system_capture_alive, Some(true));
+        assert!(
+            live.system_capture_note.is_none(),
+            "a healthy capture must carry no warning — otherwise the warning means nothing"
+        );
+        let idle = recording_status_dto(&state.db, false, None, None);
+        assert_eq!(idle.system_capture_alive, None);
+    }
+
     #[test]
     fn recording_status_reports_idle_when_not_recording() {
         let state = build_state("recstatus-idle");
@@ -22878,7 +22913,7 @@
                 folder_id: None,
             })
             .unwrap();
-        let st = recording_status_dto(&state.db, false, Some("ghost".to_string()));
+        let st = recording_status_dto(&state.db, false, Some("ghost".to_string()), None);
         assert!(!st.recording);
         assert_eq!(st.meeting_id, None);
         assert_eq!(st.started_at, None);
@@ -22900,7 +22935,7 @@
                 folder_id: None,
             })
             .unwrap();
-        let st = recording_status_dto(&state.db, true, Some("live-1".to_string()));
+        let st = recording_status_dto(&state.db, true, Some("live-1".to_string()), None);
         assert!(st.recording);
         assert_eq!(st.meeting_id.as_deref(), Some("live-1"));
         // The FE anchors its elapsed timer to THIS, not an epoch-sized value.
@@ -22912,7 +22947,7 @@
         // Recording is true but the row can't be read → still report recording, just drop the anchor
         // (the FE falls back to "now"); the status read must never fail on a best-effort lookup.
         let state = build_state("recstatus-norow");
-        let st = recording_status_dto(&state.db, true, Some("no-such-meeting".to_string()));
+        let st = recording_status_dto(&state.db, true, Some("no-such-meeting".to_string()), None);
         assert!(st.recording);
         assert_eq!(st.meeting_id.as_deref(), Some("no-such-meeting"));
         assert_eq!(st.started_at, None);

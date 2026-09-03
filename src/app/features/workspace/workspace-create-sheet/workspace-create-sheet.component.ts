@@ -15,6 +15,7 @@ import {
 
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import type { WorkspaceDestination } from "../workspace-destination";
+import { containerNounLeading } from "../../../core/hierarchy-vocabulary";
 
 export type WorkspaceCreateKind = "space" | "note" | "folder" | "dashboard";
 
@@ -46,6 +47,9 @@ export interface WorkspaceCreateRequest {
   styleUrl: "./workspace-create-sheet.component.scss",
 })
 export class WorkspaceCreateSheetComponent {
+  /** The ONE user-facing noun for this level — see `core/hierarchy-vocabulary.ts`. */
+  protected readonly containerNounLeading = containerNounLeading;
+
   private readonly injector = inject(Injector);
 
   readonly targets = input.required<readonly WorkspaceDestination[]>();

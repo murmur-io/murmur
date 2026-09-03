@@ -41,6 +41,14 @@
           type="button"
           class="menu-item"
           role="menuitem"
+          (click)="exportBundle()"
+        >
+          <span>Save diagnostics bundle</span>
+        </button>
+        <button
+          type="button"
+          class="menu-item"
+          role="menuitem"
           (click)="chooseCopy()"
         >
           <span>Copy</span>
