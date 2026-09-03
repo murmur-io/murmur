@@ -249,7 +249,20 @@ export class WorkspaceTreeComponent {
     void this.router.navigate(["/notes"]);
   }
 
-  protected readonly loading = this.workspace.loading;
+  /**
+   * Scope-aware, exactly like {@link error}.
+   *
+   * This component renders BOTH halves of the tree — the user's own workspace and the shared one —
+   * and `loading` used to read `WorkspaceService.loading` in both. `SharedWorkspaceService.loading`
+   * was never referenced anywhere in the component, so while a shared fetch was still in flight the
+   * shared section fell through to its empty state and told the user "Nothing shared with you yet"
+   * about content that was still arriving. Wrong content, not just a missing spinner — and the
+   * spinner half of the same 2026-07-12 "reload flash" contract the template comment above
+   * `sectionEmpty() && loading()` already spells out for cached rows.
+   */
+  protected readonly loading = computed(() =>
+    this.isOwnScope() ? this.workspace.loading() : this.sharedWorkspace.loading(),
+  );
   /**
    * The message this half of the forest should show, if any.
    *
