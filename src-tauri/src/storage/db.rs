@@ -381,6 +381,65 @@ pub struct Db {
     conn: Mutex<Connection>,
 }
 
+/// Wait accounting for the ONE `Mutex<Connection>` every DB access funnels through.
+///
+/// The whole app shares a single SQLCipher connection, so a long write (a delete cascade, an org
+/// sync) serialises every concurrent read behind it. Before this existed the cost was unobservable:
+/// nothing recorded how long anyone waited, so "the app freezes while X runs" could only ever be
+/// argued from feel. These counters make the before/after a NUMBER — and they are the reason a
+/// contention claim in this repo can be measured instead of asserted.
+///
+/// Non-PII by construction: counts and microseconds only, never a statement, table, or row.
+#[derive(Debug, Default)]
+pub(crate) struct DbLockStats {
+    contended: std::sync::atomic::AtomicU64,
+    uncontended: std::sync::atomic::AtomicU64,
+    total_wait_us: std::sync::atomic::AtomicU64,
+    max_wait_us: std::sync::atomic::AtomicU64,
+}
+
+impl DbLockStats {
+    fn record_wait(&self, waited: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let us = waited.as_micros().min(u64::MAX as u128) as u64;
+        self.contended.fetch_add(1, Relaxed);
+        self.total_wait_us.fetch_add(us, Relaxed);
+        self.max_wait_us.fetch_max(us, Relaxed);
+    }
+
+    fn record_immediate(&self) {
+        self.uncontended
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `(contended, uncontended, total_wait_us, max_wait_us)`.
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.contended.load(Relaxed),
+            self.uncontended.load(Relaxed),
+            self.total_wait_us.load(Relaxed),
+            self.max_wait_us.load(Relaxed),
+        )
+    }
+}
+
+/// Process-global because the counters describe the ONE shared connection, not a `Db` value.
+///
+/// Deliberately NO reset: `cargo test --lib` runs the suite in ONE process, so a reset would race
+/// every other test's DB work and the failure would be invisible under `cargo nextest` (a process
+/// per test) — which is what CI runs. Assert on a BEFORE/AFTER delta instead; that is correct under
+/// both runners.
+pub(crate) fn db_lock_stats() -> &'static DbLockStats {
+    static STATS: OnceLock<DbLockStats> = OnceLock::new();
+    STATS.get_or_init(DbLockStats::default)
+}
+
+/// A wait at least this long is worth a line in the log: it is long enough for a person to see the
+/// UI stop responding.
+const SLOW_DB_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+
 impl Db {
     /// Opens the encrypted DB (fetching the SQLCipher key from the Keychain) + runs migrations.
     /// This is the path used by the MCP server thread too — it transparently keys the handle.
@@ -2950,7 +3009,40 @@ impl Db {
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         // A poisoned lock means a prior writer panicked mid-statement; recover the
         // guard so the DB stays usable rather than cascading the panic.
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        //
+        // `try_lock` first so the overwhelmingly common uncontended case pays NOTHING: no clock
+        // read, no atomic beyond one counter. Only a genuine wait is timed, which is also the only
+        // case worth measuring.
+        match self.conn.try_lock() {
+            Ok(guard) => {
+                db_lock_stats().record_immediate();
+                return guard;
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                db_lock_stats().record_immediate();
+                return poisoned.into_inner();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let started = std::time::Instant::now();
+        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let waited = started.elapsed();
+        db_lock_stats().record_wait(waited);
+        if waited >= SLOW_DB_LOCK_WAIT {
+            // One slow wait is noise; the running totals are what say whether this is a pattern —
+            // which is the whole reason the counters are not test-only.
+            // IDs, stages, counts and durations only — never a statement or a row (rust-tauri §8).
+            let (contended, _uncontended, total_wait_us, max_wait_us) = db_lock_stats().snapshot();
+            tracing::warn!(
+                target: "db",
+                wait_ms = waited.as_millis() as u64,
+                contended_total = contended,
+                total_wait_ms = total_wait_us / 1_000,
+                max_wait_ms = max_wait_us / 1_000,
+                "waited for the shared SQLite connection",
+            );
+        }
+        guard
     }
 
     /// B12: fold the WAL back into the main DB and TRUNCATE the `-wal` sidecar. Called on relock-all
@@ -9830,6 +9922,10 @@ mod tests;
 #[cfg(test)]
 #[path = "db_tests/lock_tests.rs"]
 mod lock_tests;
+
+#[cfg(test)]
+#[path = "db_tests/lock_contention_tests.rs"]
+mod lock_contention_tests;
 
 #[cfg(test)]
 #[path = "db_tests/graph_tests.rs"]

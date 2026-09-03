@@ -100,14 +100,14 @@ pub(crate) fn brain_overview_inner(state: &AppState) -> Result<BrainOverview, Ap
 
 /// Full-text-ish search across meeting titles, transcripts, and notes (Library search).
 #[tauri::command]
-pub fn search_meetings(
-    state: State<'_, AppState>,
-    query: String,
-) -> Result<Vec<SearchHit>, AppError> {
-    // BLK-2b: search only VISIBLE meetings (open/unlocked folders) so a sealed-and-not-unlocked
-    // meeting's title/transcript/note never surfaces in a hit — independent of at-rest blanking.
-    let unlocked = unlocked_snapshot(state.inner())?;
-    state.db.search_visible(&query, 100, &unlocked)
+pub async fn search_meetings(app: AppHandle, query: String) -> Result<Vec<SearchHit>, AppError> {
+    offload_read(app, move |state| {
+        // BLK-2b: search only VISIBLE meetings (open/unlocked folders) so a sealed-and-not-unlocked
+        // meeting's title/transcript/note never surfaces in a hit — independent of at-rest blanking.
+        let unlocked = unlocked_snapshot(state)?;
+        state.db.search_visible(&query, 100, &unlocked)
+    })
+    .await
 }
 
 /// Best-effort detection of a running meeting app (Zoom / Teams / Webex) to offer a
@@ -185,9 +185,12 @@ pub(crate) fn list_meetings_by_tag_inner(
 /// meetings are MASKED at the backend before the DTO crosses IPC (see [`mask_locked_meetings`]) —
 /// the Library lock gate is enforced in code here, never trusted to the FE.
 #[tauri::command]
-pub fn list_meetings(state: State<'_, AppState>) -> Result<Vec<Meeting>, AppError> {
-    let meetings = state.db.list_meetings(200)?;
-    mask_locked_meetings(state.inner(), meetings)
+pub async fn list_meetings(app: AppHandle) -> Result<Vec<Meeting>, AppError> {
+    offload_read(app, |state| {
+        let meetings = state.db.list_meetings(200)?;
+        mask_locked_meetings(state, meetings)
+    })
+    .await
 }
 
 /// Rename a speaker across a meeting's cached timeline (e.g. "User 1" → "Sarah"). Persists to
@@ -477,11 +480,14 @@ pub fn get_timeline(
 /// gate). The `segments: Vec::new()` shape is byte-identical to the masked/locked DTO
 /// (`super::masked_detail`) that every consumer already tolerates — no new DTO fork.
 #[tauri::command]
-pub fn get_meeting_detail(
-    state: State<'_, AppState>,
+pub async fn get_meeting_detail(
+    app: AppHandle,
     meeting_id: String,
 ) -> Result<Option<MeetingDetailDto>, AppError> {
-    get_meeting_detail_inner(state.inner(), &meeting_id)
+    offload_read(app, move |state| {
+        get_meeting_detail_inner(state, &meeting_id)
+    })
+    .await
 }
 
 pub(crate) fn get_meeting_detail_inner(
@@ -559,11 +565,14 @@ pub(crate) fn get_meeting_detail_inner(
 /// takes `&AppState` (the pervasive command-vs-`_inner` shape in this file — `set_focus_meeting`,
 /// `brain_overview`, `rename_speaker`, …) so the read gate is unit-testable without a Tauri `State`.
 #[tauri::command]
-pub fn get_meeting_segments(
-    state: State<'_, AppState>,
+pub async fn get_meeting_segments(
+    app: AppHandle,
     meeting_id: String,
 ) -> Result<Vec<Segment>, AppError> {
-    get_meeting_segments_inner(state.inner(), &meeting_id)
+    offload_read(app, move |state| {
+        get_meeting_segments_inner(state, &meeting_id)
+    })
+    .await
 }
 
 /// Phase 0.5 READ-GATE (mirrors `get_meeting_detail` / `get_timeline`): a sealed-and-NOT-session-
