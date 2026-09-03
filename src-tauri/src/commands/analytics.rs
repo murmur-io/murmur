@@ -27,9 +27,12 @@ use super::*;
 /// gate as `brain_overview`/`list_meetings`), so the Analytics tab can never reveal the size or
 /// activity pattern of content the user has deliberately locked.
 #[tauri::command]
-pub fn get_analytics(state: State<'_, AppState>) -> Result<Analytics, AppError> {
-    let unlocked = unlocked_snapshot(state.inner())?;
-    state.db.analytics(&unlocked)
+pub async fn get_analytics(app: AppHandle) -> Result<Analytics, AppError> {
+    offload_read(app, |state| {
+        let unlocked = unlocked_snapshot(state)?;
+        state.db.analytics(&unlocked)
+    })
+    .await
 }
 
 /// Per-model token-usage roll-up for `EgressLedger.byModel`.

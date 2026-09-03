@@ -10899,6 +10899,41 @@ pub(crate) fn lifecycle_guard(state: &AppState) -> std::sync::MutexGuard<'_, ()>
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Run a blocking DB read on a blocking worker instead of the main thread.
+///
+/// WHY (2026-09-03 audit S1). Tauri runs a synchronous `#[tauri::command]` ON THE MAIN THREAD, and
+/// every DB access in this app funnels through one `Mutex<Connection>`. So a listing read issued
+/// while a long write holds that mutex — a delete cascade, an org sync — does not merely wait: it
+/// parks the UI thread for the whole wait, and the window stops responding. 240 of 355 commands
+/// were synchronous.
+///
+/// The conversion deliberately moves the EXISTING body verbatim, gate and all, rather than
+/// re-deriving the gate for an async world. That matters: `get_meeting_detail_inner` holds
+/// [`lifecycle_guard`] across its gate-then-read so a concurrent relock cannot land in between, and
+/// an "optimistic" rewrite (snapshot the seal epoch, read, re-check) would quietly downgrade that
+/// mutual exclusion to detect-and-refuse. Here the closure takes the same `&AppState` and takes the
+/// same guard — only the THREAD changes, so the lock model is untouched by construction.
+///
+/// Taking the state from an owned [`AppHandle`] inside the closure is what makes that possible: a
+/// `State<'_, AppState>` borrows from the invocation and cannot cross into a `'static` task, while
+/// `AppHandle` is `Send + 'static` and hands out the same managed state. Already the idiom for this
+/// repo's background work (`lib.rs`, `audit.rs`).
+///
+/// The guard is still never held across an `await` — it is taken and dropped entirely inside the
+/// synchronous closure.
+pub(crate) async fn offload_read<T, F>(app: AppHandle, work: F) -> Result<T, AppError>
+where
+    F: FnOnce(&AppState) -> Result<T, AppError> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        work(&state)
+    })
+    .await
+    .map_err(|e| AppError::Other(anyhow::anyhow!("read task failed to join: {e}")))?
+}
+
 /// RAII ownership for one from-disk salvage. The set entry is installed while holding the lock
 /// lifecycle guard, so a key-changing folder operation can never slip between the salvage's
 /// registration and its folder/CK snapshot. Drop removes only the opaque meeting id; the
@@ -14446,6 +14481,10 @@ pub(crate) fn session_server_user_id(state: &AppState) -> Result<String, AppErro
 #[cfg(test)]
 #[path = "tests/lock_read_gate_tests.rs"]
 mod lock_read_gate_tests;
+
+#[cfg(test)]
+#[path = "tests/main_thread_offload_tests.rs"]
+mod main_thread_offload_tests;
 
 // ── Workspace hierarchy read surface: the container forest, its per-kind groups, and the gate ─────
 #[cfg(test)]

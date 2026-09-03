@@ -24,6 +24,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Response, AppHandle, State};
 
+use crate::commands::offload_read;
 use crate::error::AppError;
 use crate::links::LinkKind;
 use crate::state::AppState;
@@ -368,8 +369,8 @@ fn iso_to_epoch_secs(iso: &str) -> Option<i64> {
 /// names the thing whether or not a single tile is readable — so a board whose container is sealed
 /// and not session-unlocked comes back masked.
 #[tauri::command]
-pub fn list_dashboards(state: State<'_, AppState>) -> Result<Vec<DashboardSummaryDto>, AppError> {
-    list_dashboards_inner(state.inner())
+pub async fn list_dashboards(app: AppHandle) -> Result<Vec<DashboardSummaryDto>, AppError> {
+    offload_read(app, list_dashboards_inner).await
 }
 
 /// Body of [`list_dashboards`], taking `&AppState`.
@@ -836,11 +837,14 @@ pub(crate) fn move_dashboard_to_container_inner(
 
 /// One board with every tile resolved through the gated readers.
 #[tauri::command]
-pub fn get_dashboard(state: State<'_, AppState>, id: String) -> Result<Response, AppError> {
-    let payload = get_dashboard_inner(state.inner(), &id)?;
-    serde_json::to_string(&payload)
-        .map(Response::new)
-        .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()))
+pub async fn get_dashboard(app: AppHandle, id: String) -> Result<Response, AppError> {
+    offload_read(app, move |state| {
+        let payload = get_dashboard_inner(state, &id)?;
+        serde_json::to_string(&payload)
+            .map(Response::new)
+            .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()))
+    })
+    .await
 }
 
 /// Body of [`get_dashboard`], returning the DTO rather than its serialization.
