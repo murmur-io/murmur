@@ -1,18 +1,16 @@
 use super::*;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use crate::settings::AppConfig;
 use crate::storage::{AttachmentOwner, Db, Folder, Meeting, MeetingStatus, NoteRecord};
 use zeroize::Zeroizing;
 
 const DB_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const DEV_KEK: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-static KEK_ENV: Once = Once::new();
 
 fn build_state(tag: &str, vault: Option<&std::path::Path>) -> AppState {
-    KEK_ENV.call_once(|| std::env::set_var("MURMUR_DEV_KEK", DEV_KEK));
+    crate::commands::dev_kek_fixture::ensure_dev_kek();
     let db_path =
         crate::storage::db::unique_temp_path(&format!("murmur-attachments-{tag}"), "sqlite");
     let _ = std::fs::remove_file(&db_path);

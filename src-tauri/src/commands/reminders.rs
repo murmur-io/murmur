@@ -167,11 +167,13 @@ pub(crate) fn reminder_runtime_probe_requested() -> bool {
 pub(crate) fn prepare_reminder_runtime_probe_environment() {
     #[cfg(debug_assertions)]
     if reminder_runtime_probe_requested() {
-        if std::env::var_os("MURMUR_DEV_KEK").is_none() {
+        if std::env::var_os(crate::secrets::keychain::DEV_KEK_ENV).is_none() {
             // SAFETY: `lib::run` calls this at process entry, before Tauri or any app worker starts.
+            // Name and value both come from the hatch's own module, so this writer cannot drift
+            // from the test fixture or from the reader.
             std::env::set_var(
-                "MURMUR_DEV_KEK",
-                "1111111111111111111111111111111111111111111111111111111111111111",
+                crate::secrets::keychain::DEV_KEK_ENV,
+                crate::secrets::keychain::dev_kek_hatch_value(),
             );
         }
         runtime_probe::prepare_process_environment();
@@ -3419,7 +3421,7 @@ mod smart_audit_command_tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::sync::{Condvar, Mutex, Once};
+    use std::sync::{Condvar, Mutex};
     use std::time::Duration;
 
     use serde_json::{json, Value};
@@ -3431,11 +3433,8 @@ mod smart_audit_command_tests {
     use crate::storage::{AttachmentOwner, Db, NewAttachment};
 
     const TEST_DB_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const TEST_DEV_KEK: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-    static TEST_KEK_ENV: Once = Once::new();
-
     fn ensure_test_dev_kek() {
-        TEST_KEK_ENV.call_once(|| std::env::set_var("MURMUR_DEV_KEK", TEST_DEV_KEK));
+        crate::commands::dev_kek_fixture::ensure_dev_kek();
     }
 
     fn test_state(tag: &str, reasoner: Arc<dyn LocalReasoner>) -> Arc<AppState> {
