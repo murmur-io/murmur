@@ -219,6 +219,7 @@ export interface AppConfigDto {
    */
   /** Require a bearer token on every MCP method (E3). Default true. */
   mcpRequireToken: boolean;
+  updateCheckEnabled: boolean;
   /** Require biometric (Touch ID) before unlocking a sealed folder. Default true. */
   lockRequireBiometric: boolean;
   /** Auto-relock + zeroize the cached KEK when screen sharing starts. Default true. */

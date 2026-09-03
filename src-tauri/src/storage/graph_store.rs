@@ -79,6 +79,75 @@ impl Db {
         Ok(resolved)
     }
 
+    /// This meeting's entity mentions, for a trash snapshot: `(entity_id, created_at)` pairs.
+    ///
+    /// These cascade off `meetings` on delete, so after the delete there is nothing to read. Their
+    /// loss is what makes a restored meeting vanish from every person's and project's timeline while
+    /// the meeting itself looks fine — the entity is still there, the meeting is still there, and
+    /// the edge between them is silently gone.
+    pub fn entity_mentions_for_meeting(&self, meeting_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT entity_id, created_at FROM entity_mentions
+                  WHERE meeting_id = ?1 ORDER BY entity_id",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    /// Re-insert snapshotted mentions, preserving their ORIGINAL `created_at`.
+    ///
+    /// `add_mention` stamps "now", which would be wrong here: these mentions were made when the
+    /// meeting happened, and the graph orders timelines by that stamp. A restore that re-dated them
+    /// would put an old meeting at the top of every entity's history.
+    ///
+    /// A mention whose entity has since been deleted is skipped rather than failing the restore —
+    /// the FK would refuse it, and losing one edge is better than refusing to bring the meeting
+    /// back at all.
+    pub fn restore_entity_mentions(
+        &self,
+        meeting_id: &str,
+        mentions: &[(String, String)],
+    ) -> Result<usize> {
+        if mentions.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let mut restored = 0usize;
+        for (entity_id, created_at) in mentions {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM entities WHERE id = ?1",
+                    rusqlite::params![entity_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(map_err)?
+                .unwrap_or(false);
+            if !exists {
+                continue;
+            }
+            restored += tx
+                .execute(
+                    "INSERT OR IGNORE INTO entity_mentions (entity_id, meeting_id, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![entity_id, meeting_id, created_at],
+                )
+                .map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(restored)
+    }
+
     /// Record that `entity_id` was mentioned in `meeting_id`. Idempotent via the PK
     /// `(entity_id, meeting_id)` — re-summarize / re-extract never double-counts.
     pub fn add_mention(&self, entity_id: &str, meeting_id: &str) -> Result<()> {

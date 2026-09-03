@@ -594,3 +594,137 @@ fn attachment_hex_codec_round_trips_and_rejects_malformed_input() {
     assert!(hex_decode("zz").is_none(), "non-hex digit is refused");
     assert!(hex_decode("00ff0g").is_none(), "a late bad digit is refused");
 }
+
+/// Trash → restore must bring back the graph edges too, not just the recording.
+///
+/// Before this, the snapshot carried the row, its segments, notes, timeline and tags — everything
+/// that renders the meeting itself — and nothing that connects it to anything. Deleting a meeting
+/// purges its links outright (`preserve_decisions=false`, because the endpoint is gone) and cascades
+/// away its `entity_mentions`, so restore produced a meeting that looked perfectly intact and had
+/// silently forgotten every person it mentioned and every note it was linked to. Re-indexing does
+/// not bring those back: it rebuilds what can be INFERRED from text, so a manual link somebody drew
+/// by hand, or an inbound edge from another note, is gone for good.
+///
+/// The assertions deliberately cover BOTH link directions. An inbound edge is somebody else's link
+/// into this meeting, and losing only that would leave the meeting looking connected while the rest
+/// of the vault had forgotten it.
+#[test]
+fn restoring_a_meeting_brings_back_its_links_and_mentions() {
+    let state = build_state("trash-graph-restore");
+    open_folder(&state, "f1", "Work");
+    seed_meeting(&state, "m1", Some("f1"));
+    state
+        .db
+        .insert_note("n-other", "f1", "Other", "Other", "body", 1_760_000_000_000)
+        .expect("insert the note on the far side of the inbound edge");
+
+    let entity_id = state
+        .db
+        .upsert_entity("Anna", crate::storage::models::EntityKind::Person)
+        .expect("entity");
+    state.db.add_mention(&entity_id, "m1").expect("mention");
+
+    // One edge OUT of the meeting and one INTO it.
+    state
+        .db
+        .upsert_manual_link("meeting", "m1", "document", "n-other")
+        .expect("outbound manual link");
+    state
+        .db
+        .upsert_manual_link("document", "n-other", "meeting", "m1")
+        .expect("inbound manual link");
+
+    let links_before = state.db.link_rows_for_meeting("m1").unwrap();
+    let mentions_before = state.db.entity_mentions_for_meeting("m1").unwrap();
+    assert_eq!(links_before.len(), 2, "one edge each way");
+    assert_eq!(mentions_before.len(), 1, "one mention");
+
+    block_on(delete_meeting_inner(&state, "m1")).expect("delete to trash");
+    assert!(
+        state.db.link_rows_for_meeting("m1").unwrap().is_empty(),
+        "precondition: the delete really does purge the edges — otherwise this test proves nothing"
+    );
+
+    let entries = state.db.list_trash_entries().unwrap();
+    block_on(restore_trash_item_inner(&state, &entries[0].id)).expect("restore");
+
+    let links_after = state.db.link_rows_for_meeting("m1").unwrap();
+    let mentions_after = state.db.entity_mentions_for_meeting("m1").unwrap();
+    assert_eq!(
+        links_after, links_before,
+        "every edge comes back, in both directions, byte-for-byte"
+    );
+    assert_eq!(
+        mentions_after, mentions_before,
+        "and the mention keeps its ORIGINAL created_at — re-dating it would move an old meeting to \
+         the top of the entity's timeline"
+    );
+}
+
+/// A DERIVED edge to a neighbour sealed since the delete must not come back; a user's own must.
+///
+/// `purge_links_tx` strips derived edges when a folder seals, but a meeting sitting in the trash is
+/// invisible to that pass — so a plain verbatim restore resurrects a `wikilink`/`companion`/
+/// suggested `semantic` edge pointing at something that has been sealed meanwhile, which the
+/// ordinary lifecycle would have removed. Lock-security review traced that such a row is INERT today
+/// (every reader re-gates both endpoints live) — but inertness is a property of today's readers, and
+/// the row still should not exist.
+///
+/// The manual edge is the control, and it is the half that makes this test mean something: it proves
+/// the filter is discriminating between derived and decided rather than simply dropping edges to
+/// sealed folders. A seal already preserves user decisions (`LINK_DECISION_KEEP`); a restore must
+/// not be stricter than a seal.
+#[test]
+fn restore_drops_derived_edges_to_a_since_sealed_neighbour_but_keeps_the_users_own() {
+    let state = build_state("trash-derived-sealed");
+    open_folder(&state, "f1", "Work");
+    open_folder(&state, "f2", "Later-sealed");
+    seed_meeting(&state, "m1", Some("f1"));
+    state
+        .db
+        .insert_note("n-far", "f2", "Far", "Far", "body", 1_760_000_000_000)
+        .expect("note in the folder that will be sealed");
+
+    state
+        .db
+        .upsert_manual_link("meeting", "m1", "document", "n-far")
+        .expect("the user's own link");
+    {
+        let mut conn = state.db.lock();
+        let tx = conn.transaction().unwrap();
+        crate::storage::Db::upsert_link_tx(
+            &tx, "meeting", "m1", "document", "n-far", "semantic", 0.9, "auto", "active",
+            1_760_000_000_000,
+        )
+        .expect("a derived suggestion between the same pair");
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        state.db.link_rows_for_meeting("m1").unwrap().len(),
+        2,
+        "one decided edge and one derived one"
+    );
+
+    block_on(delete_meeting_inner(&state, "m1")).expect("delete to trash");
+
+    // The far side seals while the meeting sits in the trash, and stays NOT session-unlocked.
+    state
+        .db
+        .set_folder_locked_for_test("f2", true)
+        .expect("seal the neighbour's folder");
+
+    let entries = state.db.list_trash_entries().unwrap();
+    block_on(restore_trash_item_inner(&state, &entries[0].id)).expect("restore");
+
+    let after = state.db.link_rows_for_meeting("m1").unwrap();
+    let kinds: Vec<&str> = after.iter().map(|r| r.edge_type.as_str()).collect();
+    assert!(
+        kinds.contains(&"manual"),
+        "the user's own link survives, exactly as a seal preserves it. Got {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"semantic"),
+        "the DERIVED edge must not be resurrected into a folder that sealed meanwhile — the \
+         ordinary lifecycle would have purged it. Got {kinds:?}"
+    );
+}
