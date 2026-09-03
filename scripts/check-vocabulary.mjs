@@ -51,6 +51,20 @@ const BANNED = [
   ["prefix cache|KV cache", "(drop it)"],
   ["\\bRAG\\b", "search"],
   ["reranker", "result ordering"],
+  // The hierarchy's CODE word. A user never made a "container" — they made a Workspace or a
+  // folder — and it leaked into three of `container-view`'s own empty and error states while
+  // every other surface said something else. `core/hierarchy-vocabulary.ts` is the one source.
+  //
+  // Deliberately NOT banning "space": it is ordinary English used correctly elsewhere ("Free up
+  // space"), and banning it would train people to ignore this list. What stops "space" being used
+  // as a HIERARCHY noun is the `ContainerNoun` type — a domain identifier no longer typechecks
+  // where a sentence is written, which is a guard a word list cannot provide.
+  // FE ONLY, for now. `core/hierarchy-vocabulary.ts` made the frontend consistent, but the
+  // BACKEND still says "container" in 69 `AppError` bodies that reach the user as toasts
+  // ("unlock this container before moving a dashboard into it"). Those live in files another PR
+  // is currently rewriting, and silently widening the baseline to admit them would be the exact
+  // rubber stamp this gate exists to prevent — so they are a recorded task, not a hidden pass.
+  ["\\bcontainers?\\b", "Workspace or folder", ["fe"]],
 ];
 
 /** Files whose strings a user can actually read. */
@@ -85,7 +99,12 @@ function visibleText(file, source) {
     // prose comment ("doesn't") opens a bogus string literal that swallows the next few
     // hundred characters of code, and the whole comment then reads as user-facing copy.
     while ((m = re.exec(text))) {
-      const value = m[2];
+      // An interpolated expression is CODE, not copy: in `Created a folder in ${container.name}`
+      // the user reads "Created a folder in Projects" — `container` is a variable name that
+      // happens to sit inside a string. Leaving these in made every hierarchy term look like it
+      // leaked into 80 sentences it never reached, which is precisely the noise this function's
+      // own comment warns teaches people to ignore the tool.
+      const value = m[2].replace(/\$\{[^}]*\}/g, " ");
       // Prose, not an identifier / path / css class / event name.
       if (!/\s/.test(value)) continue;
       if (/^[./#@]/.test(value)) continue;
@@ -100,6 +119,16 @@ function visibleText(file, source) {
       /^\s(?:aria-label|title|placeholder|alt|matTooltip)=/.test(m) ? m : " ",
     );
     text = text.replace(/<!--[\s\S]*?-->/g, " ");
+    // Angular control flow and interpolation EXPRESSIONS are code. A user reading
+    // `{{ container.name }}` sees "Projects"; `@if (node(); as container)` they never see at all.
+    // Left in, they made every hierarchy term look like it leaked into dozens of sentences it
+    // never reached — the same false-positive class the `.ts` branch already strips for `${…}`.
+    text = text.replace(/\{\{[\s\S]*?\}\}/g, " ");
+    text = text.replace(/@(?:if|else if|for|switch|case|defer|placeholder|loading|empty)\s*\([^)]*\)/g, " ");
+    // Element NAMES are never copy — `<app-container-share-sheet>` is a selector. The attribute
+    // pass above deliberately keeps aria-label/title/placeholder/alt, so whole tags cannot simply
+    // be stripped; the tag NAME can.
+    text = text.replace(/<\/?[a-zA-Z][\w-]*/g, " ");
   }
   if (file.endsWith(".rs")) {
     // Only strings that can REACH a user: AppError bodies and role/map display fields.
@@ -123,7 +152,9 @@ function scan() {
       const text = visibleText(file, source);
       if (!text.trim()) continue;
       const lines = text.split("\n");
-      for (const [term, replacement] of BANNED) {
+      for (const [term, replacement, kinds] of BANNED) {
+        // A term may name a surface it applies to; the default is every surface.
+        if (kinds && !kinds.includes(kind)) continue;
         const re = new RegExp(term, "i");
         lines.forEach((line, i) => {
           if (re.test(line)) {
