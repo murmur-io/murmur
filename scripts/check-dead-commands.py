@@ -38,14 +38,65 @@ import re
 import sys
 import tempfile
 
-# `invoke` optionally carries a type argument (`invoke<OrgTask[]>(…)`), so skip anything up to the
-# call paren — type arguments never contain one — then take the first string literal.
-INVOKE = re.compile(r"""invoke[^(]*\(\s*["']([a-z0-9_]+)["']""")
-# The attribute, any further attributes stacked under it, then the fn name.
+# An `invoke` call site: the word, an optional type argument, then the paren. The type argument is
+# bounded so the scan cannot leap over an unrelated statement to a later call — an unbounded
+# `[^(]*` will happily cross an entire import line and read the wrong name.
+INVOKE_SITE = re.compile(r"""\binvoke\b\s*(?:<[^;{}()]*>)?\s*\(""")
+# …whose first argument must be a plain string literal for the name to be readable at all.
+INVOKE_NAME = re.compile(r"""\s*["']([a-z0-9_]+)["']""")
+# The attribute, then anything that may legally sit between it and the fn — further attributes,
+# doc comments, ordinary comments, blank lines — then the fn name. The gap matters: a `///` between
+# the attribute and `pub fn` used to drop the whole definition out of the rename map, which turned a
+# LIVE renamed command into a reported orphan (found in review, 2026-09-03).
+_GAP = r"""(?:\s|\#\[[^\]]*\]|///[^\n]*|//![^\n]*|//[^\n]*|/\*.*?\*/)*"""
 COMMAND = re.compile(
-    r"""\#\[tauri::command(?:\(([^)]*)\))?\]((?:\s*\#\[[^\]]*\])*)\s*pub\s+(?:async\s+)?fn\s+([a-z0-9_]+)"""
+    r"""\#\[tauri::command(?:\(([^)]*)\))?\]""" + _GAP + r"""pub\s+(?:async\s+)?fn\s+([a-z0-9_]+)""",
+    re.S,
 )
 RENAME = re.compile(r"""rename\s*=\s*"([^"]+)\"""")
+# A reason has to actually say something; "x" satisfies "non-empty" and explains nothing.
+MIN_REASON = 15
+
+
+def strip_comments(source: str) -> str:
+    """Blank out // and /* */ comments, respecting string and template literals.
+
+    Without this, a comment that merely CONTAINS `invoke("name")` — a JSDoc `@example`, a rationale
+    note — silences a real orphan. Blanking rather than deleting keeps every byte offset, so any
+    position reported later still points at the right place.
+    """
+    out = list(source)
+    i, n = 0, len(source)
+    while i < n:
+        ch = source[i]
+        if ch in "\"'`":
+            quote, i = ch, i + 1
+            while i < n:
+                if source[i] == "\\":
+                    i += 2
+                    continue
+                if source[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and source[i + 1] == "/":
+            while i < n and source[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and source[i + 1] == "*":
+            while i < n and not (source[i] == "*" and i + 1 < n and source[i + 1] == "/"):
+                if source[i] != "\n":
+                    out[i] = " "
+                i += 1
+            for _ in range(2):
+                if i < n:
+                    out[i] = " "
+                    i += 1
+            continue
+        i += 1
+    return "".join(out)
 
 
 def registered(lib_rs: str) -> list[str]:
@@ -80,18 +131,33 @@ def wire_names(rust_root: str) -> dict[str, str]:
     """fn name -> the name the FE must invoke (the `rename` when present)."""
     names: dict[str, str] = {}
     for path in walk(rust_root, (".rs", ".inc")):
-        for attr, _stacked, fn in COMMAND.findall(read(path)):
+        for attr, fn in COMMAND.findall(read(path)):
             hit = RENAME.search(attr or "")
             names[fn] = hit.group(1) if hit else fn
     return names
 
 
-def invoked(fe_root: str) -> set[str]:
-    return {
-        name
-        for path in walk(fe_root, (".ts", ".html"))
-        for name in INVOKE.findall(read(path))
-    }
+def invoked(fe_root: str) -> tuple[set[str], list[str]]:
+    """Names passed to an `invoke(…)`, plus call sites whose name this cannot read.
+
+    An unreadable name — a constant, a template literal, a computed string — is REPORTED rather
+    than ignored. Ignoring it would silently mark a live command dead, and guessing is worse: the
+    checker says what it cannot see and asks for a literal, which is also what the one-method-per-
+    command rule already wants.
+    """
+    names: set[str] = set()
+    unreadable: list[str] = []
+    for path in walk(fe_root, (".ts", ".html")):
+        source = strip_comments(read(path))
+        for site in INVOKE_SITE.finditer(source):
+            tail = source[site.end() : site.end() + 80]
+            hit = INVOKE_NAME.match(tail)
+            if hit:
+                names.add(hit.group(1))
+            else:
+                line = source.count("\n", 0, site.start()) + 1
+                unreadable.append(f"{path}:{line}")
+    return names, unreadable
 
 
 def allowlist(path: str) -> tuple[dict[str, str], list[str]]:
@@ -100,6 +166,7 @@ def allowlist(path: str) -> tuple[dict[str, str], list[str]]:
     errors: list[str] = []
     if not os.path.exists(path):
         return entries, errors
+    seen: dict[str, int] = {}
     for lineno, raw in enumerate(read(path).splitlines(), 1):
         line = raw.split("#", 1)[0].strip() if raw.lstrip().startswith("#") else raw.strip()
         if not line:
@@ -109,6 +176,19 @@ def allowlist(path: str) -> tuple[dict[str, str], list[str]]:
         if not sep or not reason:
             errors.append(f"{path}:{lineno}: needs `name: reason` — an entry with no reason is a rubber stamp")
             continue
+        if len(reason) < MIN_REASON:
+            errors.append(
+                f"{path}:{lineno}: `{name}`'s reason is {len(reason)} characters — say what the plan "
+                f"is (at least {MIN_REASON}), or the ledger records nothing a reviewer can act on"
+            )
+            continue
+        if name in seen:
+            errors.append(
+                f"{path}:{lineno}: `{name}` is already listed on line {seen[name]} — a duplicate "
+                f"silently overrides the earlier reason, which is how a copy-paste mistake hides"
+            )
+            continue
+        seen[name] = lineno
         entries[name] = reason
     return entries, errors
 
@@ -117,8 +197,13 @@ def check(repo: str) -> list[str]:
     lib_rs = os.path.join(repo, "src-tauri", "src", "lib.rs")
     allow_path = os.path.join(repo, "scripts", "dead-commands-allowlist.txt")
     names = wire_names(os.path.join(repo, "src-tauri", "src"))
-    used = invoked(os.path.join(repo, "src"))
+    used, unreadable = invoked(os.path.join(repo, "src"))
     allowed, errors = allowlist(allow_path)
+    for site in unreadable:
+        errors.append(
+            f"{site}: invoke() is called with a name this checker cannot read (not a plain string "
+            f"literal). Pass the command name as a literal so the registry stays checkable."
+        )
 
     reg = registered(lib_rs)
     wire_of = {fn: names.get(fn, fn) for fn in reg}
@@ -156,14 +241,28 @@ pub fn live_one() {}
 #[tauri::command(rename = "wire_name")]
 pub async fn renamed_one() {}
 
+// Regression (review, 2026-09-03): a doc comment BETWEEN the attribute and `pub fn` used to drop
+// this definition out of the rename map, reporting a LIVE command as dead.
+#[tauri::command(rename  =  "documented_wire")]
+/// Doc comment sitting between the attribute and the signature.
+#[allow(clippy::needless_pass_by_value)]
+pub async fn documented_rename() {}
+
 #[tauri::command]
 pub fn orphan_one() {}
 '''
 FIXTURE_FE = '''
 // A comment naming "orphan_one" must not make it look used.
+/* A block comment containing a literal call: invoke("orphan_one") — still not a call. */
+const url = "https://example.invalid/not//a/comment";
 const a = await invoke<void>("live_one");
 const b = await invoke<number>("wire_name", { x: 1 });
+const d = await invoke<Record<string, number>>("documented_wire");
 const c = await invoke<void>("get_orphan_one");  // substring decoy
+'''
+FIXTURE_FE_DYNAMIC = '''
+const NAME = "live_one";
+const a = await invoke<void>(NAME);
 '''
 
 
@@ -185,6 +284,11 @@ def self_test() -> int:
             failures.append(f"expected exactly one finding naming orphan_one, got: {errors}")
         if any("renamed_one" in e for e in errors):
             failures.append("renamed_one is reachable as its wire name and must not be reported")
+        if any("documented_rename" in e for e in errors):
+            failures.append(
+                "documented_rename carries a doc comment between the attribute and the signature; "
+                "its rename must still be honoured or a live command gets reported dead"
+            )
         if any("live_one" in e for e in errors):
             failures.append("live_one is invoked directly and must not be reported")
 
@@ -200,16 +304,43 @@ def self_test() -> int:
             failures.append(f"a reasoned allowlist entry must silence the finding, got: {check(root)}")
         # And a stale entry (naming a command that IS invoked) must be reported.
         with open(allow, "w") as fh:
-            fh.write("orphan_one: ok\nlive_one: stale\n")
+            fh.write("orphan_one: backend-complete, UI pending\nlive_one: stale entry, wired since\n")
         if not any("`live_one` is invoked from the FE now" in e for e in check(root)):
             failures.append("a stale allowlist entry must be reported")
+
+        # A reason has to say something. "x" is non-empty and explains nothing.
+        with open(allow, "w") as fh:
+            fh.write("orphan_one: x\n")
+        if not any("characters" in e for e in check(root)):
+            failures.append("a one-character reason must be rejected as substanceless")
+
+        # A duplicate silently overrode the earlier reason before this check existed.
+        with open(allow, "w") as fh:
+            fh.write("orphan_one: backend-complete, UI pending\norphan_one: pasted twice by mistake\n")
+        if not any("already listed on line" in e for e in check(root)):
+            failures.append("a duplicate allowlist key must be reported")
+
+        # A name the checker cannot read must be an ERROR, never a silent pass: ignoring it marks a
+        # live command dead, and guessing is worse.
+        with open(allow, "w") as fh:
+            fh.write("orphan_one: backend-complete, UI pending\n")
+        with open(os.path.join(root, "src", "dynamic.ts"), "w") as fh:
+            fh.write(FIXTURE_FE_DYNAMIC)
+        dynamic = check(root)
+        if not any("cannot read" in e for e in dynamic):
+            failures.append("an invoke() whose name is not a literal must be reported, not ignored")
+        os.remove(os.path.join(root, "src", "dynamic.ts"))
+        if check(root):
+            failures.append("removing the dynamic call site must return the repo to clean")
 
         for f in failures:
             print(f"self-test FAIL: {f}", file=sys.stderr)
         if failures:
             return 1
-        print("check-dead-commands self-test: 5 checks passed (orphan detected, rename honoured, "
-              "decoy+comment ignored, reasonless entry rejected, stale entry reported)")
+        print("check-dead-commands self-test: 9 checks passed (orphan detected, rename honoured "
+              "incl. a doc comment between attribute and signature, line+block comment and "
+              "substring decoys ignored, reasonless / substanceless / duplicate entries rejected, "
+              "stale entry reported, unreadable invoke name reported)")
         return 0
 
 
