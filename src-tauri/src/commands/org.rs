@@ -3559,17 +3559,51 @@ pub(crate) async fn org_invite_member_inner(
     let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
 
-    // Resolve the new member's account id (server-side email lookup).
-    let added = client
-        .org_add_member(&access_token, &org.org_id, &email)
-        .await?;
-
-    // Look up the member's published identity key to wrap the OCK to them.
+    // Look up and VERIFY the key BEFORE adding the member.
+    //
+    // The order matters, on review's finding. Adding first left a refused invite with an active
+    // member row server-side, and the relay counts every active member toward a rotation's coverage
+    // regardless of whether they hold a grant — so a refused invitee silently blocked every future
+    // rotation until removed, and re-drove the rotation path against the very key just refused.
+    // Verifying first means a refusal leaves no server-side trace at all.
     let lookup = client.lookup_key(&access_token, &email).await?;
     let key = lookup
         .key
         .filter(|_| lookup.registered)
         .ok_or_else(|| AppError::InvalidArg("that address is not a registered account".into()))?;
+
+    // TOFU on the invitee's key, BEFORE the OCK is wrapped to it.
+    //
+    // `lookup_key` answers with whatever the relay says the address's key is. Without this check a
+    // relay that substitutes `pk_enc` between the lookup and the wrap receives the org content key
+    // wrapped to a key it holds — the exact substitution the mode-B share path already refuses
+    // (`share_note_with_account`). This path skipped it, so the org's whole shared brain was one
+    // dishonest lookup away from a stranger.
+    //
+    // First contact PINS. A change REFUSES and sends nothing: a changed key is either a legitimate
+    // re-key or an attack, and the two are indistinguishable from here, so the only honest move is
+    // to stop and ask the human to re-verify out of band.
+    let member_fp_pre = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+    match crate::commands::tofu_check(&state.db, &key.user_id, &member_fp_pre)? {
+        crate::commands::TofuState::Changed => {
+            return Err(AppError::Auth(crate::errcode::tag(
+                crate::errcode::ORG_INVITE_KEY_CHANGED,
+                "this person's key changed since you last invited them — re-verify the safety words \
+                 with them out of band, then invite again",
+            )));
+        }
+        _ => state.db.pin_contact(
+            &key.user_id,
+            Some(&email),
+            &member_fp_pre,
+            &chrono::Utc::now().to_rfc3339(),
+        )?,
+    }
+
+    // Only now does the member row exist server-side.
+    let added = client
+        .org_add_member(&access_token, &org.org_id, &email)
+        .await?;
 
     let generation = org.generation;
     let ock = acquire_org_ock(state, &org.org_id, generation).await?;
@@ -3796,6 +3830,36 @@ pub(crate) async fn rotate_org_generation(
                 )));
             };
             let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+            // SAME gate as the invite path, and for a sharper reason: without it, gating the invite
+            // alone was FALSE ASSURANCE. A refused invite still leaves the member row active
+            // server-side, the relay's coverage check counts every active member regardless of
+            // whether they hold a grant, so the next ordinary removal schedules a rotation that
+            // re-drives this very branch — cache misses, ungated lookup fires, and the brand-new OCK
+            // is wrapped to the same substituted key the invite had just refused. The attack simply
+            // arrived one admin action later.
+            //
+            // The cached branch above needs no check because a cached key is one this device already
+            // TOFU-verified. This branch is the cold-cache case: a second Mac, a reinstall, or an org
+            // whose members predate the key cache — all of which land here.
+            //
+            // Refusing keeps the rotation OWED rather than granting to an unverified key. The debt is
+            // journalled and retried, so a legitimate re-key resolves once a human has verified it,
+            // while a substitution never silently completes.
+            match crate::commands::tofu_check(&state.db, &member.user_id, &fp)? {
+                crate::commands::TofuState::Changed => {
+                    return Err(AppError::Auth(crate::errcode::tag(
+                        crate::errcode::ORG_INVITE_KEY_CHANGED,
+                        "a remaining member's key changed since you last verified it — re-verify the \
+                         safety words with them out of band before this rotation can complete",
+                    )));
+                }
+                _ => state.db.pin_contact(
+                    &member.user_id,
+                    Some(email),
+                    &fp,
+                    &chrono::Utc::now().to_rfc3339(),
+                )?,
+            }
             state.db.upsert_org_member_key(
                 &org.org_id,
                 &member.user_id,
