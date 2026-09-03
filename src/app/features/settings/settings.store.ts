@@ -41,6 +41,7 @@ import type {
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { NOTE_ASSIST_NEW_ACTION_IDS } from "../notes/note-brain-popover/note-assist-catalog";
 import { ErrorCopyService } from "../../core/copy/error-copy.service";
+import { subscribeUntilDestroyed } from "../../core/subscribe-until-destroyed";
 
 /**
  * The provider-backed connection ids — the ones `list_models` serves a
@@ -341,6 +342,12 @@ export class SettingsStore {
     // change still sitting in the 500ms debounce window instead of dropping
     // it (adversarial-verify finding: toggle → ⌘N within 500ms lost the edit).
     this.destroyRef.onDestroy(() => {
+      // The "Copied" flash timers live here, not in their click handlers. Registering an
+      // `onDestroy` per click accumulated one callback per copy for the lifetime of this store —
+      // each clearing the same single handle. One registration, cleared once, is the shape
+      // `toast.service.ts` established for tracked timers (angular-zoneless §5).
+      if (this.copyResetTimer) clearTimeout(this.copyResetTimer);
+      if (this.mcpCopyResetTimer) clearTimeout(this.mcpCopyResetTimer);
       if (this.autoSavePending && this.autoSaveReady && this.form.dirty) {
         this.autoSavePending = false;
         try {
@@ -1839,22 +1846,25 @@ export class SettingsStore {
    */
   private async subscribeModelDownload(): Promise<void> {
     try {
-      this.unlistenModelDownload = await this.ipc.onModelDownload((p) => {
-        // EVENT_MODEL_DOWNLOAD is shared by the whisper AND parakeet downloads; route the
-        // progress to whichever this component started (only one runs at a time).
-        if (this.downloadingModel()) {
-          if (p.total && p.total > 0) {
-            this._modelDownloadFrac.set(Math.min(1, p.downloaded / p.total));
-          }
-          if (p.done) this._modelDownloadFrac.set(1);
-        } else if (this.downloadingParakeet()) {
-          if (p.total && p.total > 0) {
-            this._parakeetDownloadFrac.set(Math.min(1, p.downloaded / p.total));
-          }
-          if (p.done) this._parakeetDownloadFrac.set(1);
-        }
-      });
-      this.destroyRef.onDestroy(() => this.unlistenModelDownload?.());
+      this.unlistenModelDownload = await subscribeUntilDestroyed(
+        this.destroyRef,
+        () =>
+      this.ipc.onModelDownload((p) => {
+            // EVENT_MODEL_DOWNLOAD is shared by the whisper AND parakeet downloads; route the
+            // progress to whichever this component started (only one runs at a time).
+            if (this.downloadingModel()) {
+              if (p.total && p.total > 0) {
+                this._modelDownloadFrac.set(Math.min(1, p.downloaded / p.total));
+              }
+              if (p.done) this._modelDownloadFrac.set(1);
+            } else if (this.downloadingParakeet()) {
+              if (p.total && p.total > 0) {
+                this._parakeetDownloadFrac.set(Math.min(1, p.downloaded / p.total));
+              }
+              if (p.done) this._parakeetDownloadFrac.set(1);
+            }
+          }),
+      );
     } catch {
       // No model-download stream available — progress stays inert.
     }
@@ -1867,20 +1877,23 @@ export class SettingsStore {
    */
   private async subscribeBrainDownload(): Promise<void> {
     try {
-      this.unlistenBrainDownload = await this.ipc.onBrainDownload((p) => {
-        // The backend emits one download at a time and the component already
-        // tracks which model it started (brainDownloadingId), so every progress
-        // event applies to it. (Download errors surface via the command promise.)
-        if (this.brainDownloadingId() === null) return;
-        if (p.total && p.total > 0) {
-          this._brainDownloadFrac.set(Math.min(1, p.downloaded / p.total));
-        }
-        if (p.done) {
-          this._brainDownloadingId.set(null);
-          void this.refreshBrainModels();
-        }
-      });
-      this.destroyRef.onDestroy(() => this.unlistenBrainDownload?.());
+      this.unlistenBrainDownload = await subscribeUntilDestroyed(
+        this.destroyRef,
+        () =>
+      this.ipc.onBrainDownload((p) => {
+            // The backend emits one download at a time and the component already
+            // tracks which model it started (brainDownloadingId), so every progress
+            // event applies to it. (Download errors surface via the command promise.)
+            if (this.brainDownloadingId() === null) return;
+            if (p.total && p.total > 0) {
+              this._brainDownloadFrac.set(Math.min(1, p.downloaded / p.total));
+            }
+            if (p.done) {
+              this._brainDownloadingId.set(null);
+              void this.refreshBrainModels();
+            }
+          }),
+      );
     } catch {
       // No brain-download stream available — progress stays inert; downloads
       // still resolve via the command promise.
@@ -2274,26 +2287,28 @@ export class SettingsStore {
    */
   private async subscribeSemanticStreams(): Promise<void> {
     try {
-      this.unlistenEmbedDownload = await this.ipc.onEmbedDownload((p) => {
-        // Per-file progress: blend the completed files + the current file's fraction
-        // across the whole set so the single bar advances smoothly.
-        if (p.fileCount > 0) {
-          const cur = p.total && p.total > 0 ? p.downloaded / p.total : 0;
-          this._embedDownloadFrac.set(
-            Math.min(1, (p.fileIndex + cur) / p.fileCount),
-          );
-        }
-        if (p.done) this._embedDownloadFrac.set(1);
-      });
-      this.unlistenReindex = await this.ipc.onReindex((p) => {
-        if (p.total > 0) {
-          this._reindexFrac.set(Math.min(1, p.done / p.total));
-        }
-      });
-      this.destroyRef.onDestroy(() => {
-        this.unlistenEmbedDownload?.();
-        this.unlistenReindex?.();
-      });
+      this.unlistenEmbedDownload = await subscribeUntilDestroyed(
+        this.destroyRef,
+        () =>
+      this.ipc.onEmbedDownload((p) => {
+            // Per-file progress: blend the completed files + the current file's fraction
+            // across the whole set so the single bar advances smoothly.
+            if (p.fileCount > 0) {
+              const cur = p.total && p.total > 0 ? p.downloaded / p.total : 0;
+              this._embedDownloadFrac.set(
+                Math.min(1, (p.fileIndex + cur) / p.fileCount),
+              );
+            }
+            if (p.done) this._embedDownloadFrac.set(1);
+          }),
+      );
+      this.unlistenReindex = await subscribeUntilDestroyed(this.destroyRef, () =>
+        this.ipc.onReindex((p) => {
+          if (p.total > 0) {
+            this._reindexFrac.set(Math.min(1, p.done / p.total));
+          }
+        }),
+      );
     } catch {
       // No stream available — progress bars stay inert; commands still resolve.
     }
@@ -2324,18 +2339,21 @@ export class SettingsStore {
    */
   private async subscribeNerDownload(): Promise<void> {
     try {
-      this.unlistenNerDownload = await this.ipc.onNerDownload((p) => {
-        // Per-file progress: blend the completed files + the current file's
-        // fraction across the whole set so the single bar advances smoothly.
-        if (p.fileCount > 0) {
-          const cur = p.total && p.total > 0 ? p.downloaded / p.total : 0;
-          this._nerDownloadFrac.set(
-            Math.min(1, (p.fileIndex + cur) / p.fileCount),
-          );
-        }
-        if (p.done) this._nerDownloadFrac.set(1);
-      });
-      this.destroyRef.onDestroy(() => this.unlistenNerDownload?.());
+      this.unlistenNerDownload = await subscribeUntilDestroyed(
+        this.destroyRef,
+        () =>
+      this.ipc.onNerDownload((p) => {
+            // Per-file progress: blend the completed files + the current file's
+            // fraction across the whole set so the single bar advances smoothly.
+            if (p.fileCount > 0) {
+              const cur = p.total && p.total > 0 ? p.downloaded / p.total : 0;
+              this._nerDownloadFrac.set(
+                Math.min(1, (p.fileIndex + cur) / p.fileCount),
+              );
+            }
+            if (p.done) this._nerDownloadFrac.set(1);
+          }),
+      );
     } catch {
       // No stream available — progress bar stays inert; the command still resolves.
     }
@@ -2999,9 +3017,6 @@ export class SettingsStore {
       this._urlCopied.set(true);
       if (this.copyResetTimer) clearTimeout(this.copyResetTimer);
       this.copyResetTimer = setTimeout(() => this._urlCopied.set(false), 1600);
-      this.destroyRef.onDestroy(() => {
-        if (this.copyResetTimer) clearTimeout(this.copyResetTimer);
-      });
     } catch {
       // Clipboard unavailable — the URL stays visible and selectable as a fallback.
     }
@@ -3029,9 +3044,6 @@ export class SettingsStore {
         () => this._configCopied.set(false),
         1600,
       );
-      this.destroyRef.onDestroy(() => {
-        if (this.mcpCopyResetTimer) clearTimeout(this.mcpCopyResetTimer);
-      });
     } catch {
       // Clipboard unavailable — the config stays visible and selectable as a fallback.
     }

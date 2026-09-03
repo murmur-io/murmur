@@ -103,10 +103,25 @@ export class PeopleComponent {
     },
   );
 
+  /**
+   * Monotonic fetch id, so an out-of-order response cannot overwrite a newer one.
+   *
+   * `_refetchOnLock` re-runs on every folders-tree change — a session unlock, a relock, a
+   * screen-share-triggered relock-all — so two fetches can be in flight at once, and nothing
+   * guarantees they resolve in the order they started. Without this guard the LATER-started fetch
+   * could land first and be overwritten by the older one, which for a visibility refetch is not a
+   * cosmetic race: it can put sealed people back on screen after a relock, from a response that was
+   * already stale when it arrived. `entity-detail.component.ts` keys the same discipline on the
+   * entity id; there is no such identity here, so the sequence number is the identity.
+   */
+  private fetchSeq = 0;
+
   private async fetch(): Promise<void> {
+    const seq = ++this.fetchSeq;
     this.error.set(null);
     try {
       const { people: rows, totalVisiblePeople } = await this.ipc.listPeople();
+      if (seq !== this.fetchSeq) return;
       this.people.set(rows);
       this.totalVisiblePeople.set(totalVisiblePeople);
       // If the selected person is no longer visible (e.g. their folder re-sealed),
@@ -116,11 +131,14 @@ export class PeopleComponent {
         this.selectedId.set(null);
       }
     } catch (e) {
+      if (seq !== this.fetchSeq) return;
       this.people.set([]);
       this.totalVisiblePeople.set(0);
       this.error.set(this.errorCopy.humanize(e));
     } finally {
-      this.loading.set(false);
+      // Only the newest fetch may clear the spinner; an older one finishing later must not
+      // announce "done" while the current request is still running.
+      if (seq === this.fetchSeq) this.loading.set(false);
     }
   }
 
