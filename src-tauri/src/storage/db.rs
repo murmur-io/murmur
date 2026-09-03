@@ -439,7 +439,6 @@ pub(crate) fn db_lock_stats() -> &'static DbLockStats {
 /// UI stop responding.
 const SLOW_DB_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
-
 impl Db {
     /// Opens the encrypted DB (fetching the SQLCipher key from the Keychain) + runs migrations.
     /// This is the path used by the MCP server thread too — it transparently keys the handle.
