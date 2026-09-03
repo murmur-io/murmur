@@ -822,7 +822,8 @@ pub async fn unlock_folder(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    // NOTE: `org_share_mutation_lock` is acquired LATER, just before the restore — see the comment
+    // at that acquisition. Taking it here held it across the Touch ID sheet.
     // v0.3.2 — the master KEK is a BIOMETRIC-GATED keychain item. Reading it makes macOS present the
     // Touch ID / passcode sheet directly (with our reason string) and hand back the key — THAT single
     // sheet IS the unlock auth, so there is no separate app-side authentication step (which would
@@ -965,6 +966,21 @@ pub async fn unlock_folder(
             .try_into()
             .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
     );
+
+    // Serialize against org mutation/revoke from HERE, not from the top of the command.
+    //
+    // This lock guards one thing in this function: `clear_org_folder_closure` at the end, which
+    // lifts the org barrier for this folder. Everything before this point is a read plus the
+    // biometric KEK release — and that release BLOCKS ON A HUMAN. Acquiring the lock at the top of
+    // the command therefore held a process-wide org mutex across the Touch ID sheet, for as long as
+    // the user took to answer (or not answer) it: org sync, share dispatch and revoke all stalled
+    // behind a dialog. It is taken here instead, immediately before the first mutation, so the
+    // barrier it exists for is unchanged while the unbounded human wait is outside it.
+    //
+    // The lock-state race this does NOT need to cover is covered elsewhere: the restore below takes
+    // `lifecycle_guard` for its whole synchronous body, which is what serializes against a
+    // concurrent `lock_folder` / `relock_all_inner`.
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
 
     // The rest of the restore (decrypt every note/segment/timeline blob, materialize the session
     // WAV, re-embed the folder's meetings) is synchronous CPU/AES/Candle-Metal work that used to

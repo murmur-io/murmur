@@ -9522,21 +9522,39 @@ pub const ORG_SYNC_TICK_SECS: u64 = 60;
 /// production callers so productive visibility reductions can emit the history invalidation while
 /// the lifecycle guard is still held.
 pub(crate) async fn org_background_sync_tick(state: &AppState, app: Option<AppHandle>) -> bool {
-    let _mutation = state.org_share_mutation_lock.lock().await;
+    // The org mutex is taken PER PHASE below, not once around the whole tick.
+    //
+    // This tick runs four phases and every one of them makes network round trips. Holding
+    // `org_share_mutation_lock` across all four meant a user action that needs it — sharing,
+    // revoking, "sync now" — waited behind up to four consecutive HTTP timeouts on a tick that
+    // fires every 60 s. Per phase, the worst case is one.
+    //
+    // Safe because per-phase acquisition is, for EVERY phase, at least as strong as that phase's
+    // existing manual path: `org_sweep_pending` and `org_sync_now` are commands that already take
+    // this lock around exactly one phase, and `sync_container_shares` /
+    // `org_reconcile_memberships_notifying` already run their phase with no acquisition at all. So
+    // this introduces no interleaving the app does not already perform. The `policy.is_current()`
+    // checks between phases already assumed the tick is interruptible at these boundaries.
     let policy = OrgWorkPolicy::background(crate::perf::background_epoch());
     if !policy.is_current() {
         return false;
     }
     // Reconcile membership FIRST so a newly-invited org is present (and synced this same tick) and a
     // departed org is dropped before we pull its feed. Best-effort — a failure never blocks the sync.
-    if let Err(e) = org_reconcile_memberships_with_policy(state, policy, app.as_ref()).await {
-        tracing::warn!(target: "org", error = %brief_err(&e), "org membership reconcile tick failed");
+    {
+        let _mutation = state.org_share_mutation_lock.lock().await;
+        if let Err(e) = org_reconcile_memberships_with_policy(state, policy, app.as_ref()).await {
+            tracing::warn!(target: "org", error = %brief_err(&e), "org membership reconcile tick failed");
+        }
     }
     if !policy.is_current() {
         return false;
     }
-    if let Err(e) = org_sweep_pending_with_policy(state, policy, app.as_ref()).await {
-        tracing::warn!(target: "org", error = %e, "org outbound sweep tick failed");
+    {
+        let _mutation = state.org_share_mutation_lock.lock().await;
+        if let Err(e) = org_sweep_pending_with_policy(state, policy, app.as_ref()).await {
+            tracing::warn!(target: "org", error = %e, "org outbound sweep tick failed");
+        }
     }
     if !policy.is_current() {
         return false;
@@ -9544,19 +9562,25 @@ pub(crate) async fn org_background_sync_tick(state: &AppState, app: Option<AppHa
     // Keep every shared container in step with the local tree. Best-effort for the same reason the
     // outbound sweep is: a container that cannot reconcile right now is retried next tick, and must
     // never stop the feed pull that follows.
-    if let Err(e) =
-        crate::commands::org_containers::reconcile_container_shares(state, app.as_ref()).await
     {
-        tracing::warn!(target: "org", error = %brief_err(&e), "container share reconcile tick failed");
+        let _mutation = state.org_share_mutation_lock.lock().await;
+        if let Err(e) =
+            crate::commands::org_containers::reconcile_container_shares(state, app.as_ref()).await
+        {
+            tracing::warn!(target: "org", error = %brief_err(&e), "container share reconcile tick failed");
+        }
     }
     if !policy.is_current() {
         return false;
     }
-    let report = match org_sync_now_inner_with_policy(state, policy, app.clone()).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(target: "org", error = %e, "org feed sync tick failed");
-            return false;
+    let report = {
+        let _mutation = state.org_share_mutation_lock.lock().await;
+        match org_sync_now_inner_with_policy(state, policy, app.clone()).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(target: "org", error = %e, "org feed sync tick failed");
+                return false;
+            }
         }
     };
     let live_changed = report.ingested > 0 || report.tombstoned > 0;
