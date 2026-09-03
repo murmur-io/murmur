@@ -20,6 +20,7 @@ import { MurProgressComponent } from "../../../design-system/progress/progress.c
 import { MurSelectComponent } from "../../../design-system/select/select.component";
 import { ModelPowerComponent } from "../../settings/sections/settings-transcription-section/model-power/model-power.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { subscribeUntilDestroyed } from "../../../core/subscribe-until-destroyed";
 
 /** The wizard steps, in order. Drives the dot indicator + progress copy. */
 type Step = "welcome" | "model" | "provider" | "brain" | "vault" | "done";
@@ -291,14 +292,17 @@ export class OnboardingComponent implements OnInit {
   async ngOnInit(): Promise<void> {
     // Whisper model-download progress stream (best-effort; drives the progress bar).
     try {
-      this.unlistenModelDownload = await this.ipc.onModelDownload((p) => {
-        if (!this.downloading()) return;
-        if (p.total && p.total > 0) {
-          this.downloadFrac.set(Math.min(1, p.downloaded / p.total));
-        }
-        if (p.done) this.downloadFrac.set(1);
-      });
-      this.destroyRef.onDestroy(() => this.unlistenModelDownload?.());
+      this.unlistenModelDownload = await subscribeUntilDestroyed(
+        this.destroyRef,
+        () =>
+          this.ipc.onModelDownload((p) => {
+            if (!this.downloading()) return;
+            if (p.total && p.total > 0) {
+              this.downloadFrac.set(Math.min(1, p.downloaded / p.total));
+            }
+            if (p.done) this.downloadFrac.set(1);
+          }),
+      );
     } catch {
       // No model-download stream — progress stays inert; the download still resolves.
     }
