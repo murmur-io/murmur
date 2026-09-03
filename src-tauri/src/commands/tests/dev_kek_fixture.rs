@@ -71,11 +71,13 @@ pub(crate) fn ensure_dev_kek() {
 /// and the next appeared — `.rs`-only filtering, then `src/`-only rooting, then a rogue file inside
 /// `target/`, which never leaves the crate at all and defeats the exclusions below.
 ///
-/// So the scan is NOT a fence and no version of it will be. It covers the directories where source
-/// realistically lives, which is where an accidental second writer — a revert, a cherry-pick, a
-/// copied setup block — actually lands. A file placed in `target/`, `gen/`, `binaries/` or a dot
-/// directory and pulled in with `#[path]` is not caught, and closing that would mean walking
-/// gigabytes on every run to defend against something nobody does by accident.
+/// So the scan is NOT a fence and no version of it will be — a `#[path]` pointing outside the crate
+/// is unreachable by any walker. What it does cover is now wider than "where source lives", because
+/// review MEASURED the objection I had raised instead of accepting it: walking `target/` (8.1 GB,
+/// 21,957 files) with an extension filter costs 0.055-0.068s, the same order as this guard already
+/// costs, since the price is directory entries rather than bytes never read. Build output is
+/// therefore walked, source-only. `binaries/` stays out for the opposite reason — false positives
+/// from embedded strings in bundled Mach-O helpers, which an extension filter would skip regardless.
 ///
 /// The ACTUAL guard is the runtime assertion in [`ensure_dev_kek`]: it compares the live value and
 /// therefore catches any writer, however it spells the call and wherever it lives, as soon as one
@@ -89,8 +91,9 @@ pub(crate) fn ensure_dev_kek() {
 ///
 /// - A name assembled at compile time (`concat!("MURMUR", "_DEV_KEK")`). Defending against this
 ///   means parsing, which is the approach that already failed.
-/// - Anything under an excluded directory (`target/`, `gen/`, `binaries/`, dotfiles), reachable
-///   with `#[path]`. Excluded for cost and artifact noise, as above.
+/// - A NON-`.rs` file placed specifically inside `target/` or `gen/`, or anything under
+///   `binaries/` or a dot directory. Two unusual choices stacked, where the hole this replaced
+///   needed none.
 /// - A second `set_var` inside a file that is ALREADY on the list. Trust here is file-grained, not
 ///   call-site-grained, so an allowlisted file is immune for its whole length — and `keychain.rs`,
 ///   the one place a careless KEK-adjacent `set_var` is most likely to be added, is exactly that
@@ -105,8 +108,8 @@ pub(crate) fn ensure_dev_kek() {
 /// This module itself is not on the list, and does not need to be: it reaches the hatch through
 /// `DEV_KEK_ENV` like every other caller should, and builds its search needle in pieces so it
 /// cannot match its own source.
-/// Directories the scan does not enter. See the module doc: cost and artifact noise, not safety.
-const EXCLUDED_DIRS: &[&str] = &["target", "gen", "binaries"];
+/// Build output: walked, but only `.rs` files are read there. See the module doc.
+const SOURCE_ONLY_DIRS: &[&str] = &["target", "gen"];
 
 const FILES_THAT_MAY_NAME_THE_HATCH: &[&str] = &[
     // Owns the hatch: declares its name and value, and reads it.
@@ -133,7 +136,7 @@ fn only_the_fixture_and_the_hatch_owner_may_name_the_dev_kek() {
     // corrupted key. A scanner whose blind spot is reachable by a normal language feature is worse
     // than no scanner, because it is trusted. Bytes rather than `read_to_string`, so a non-UTF-8
     // file is skipped over rather than panicking the guard.
-    fn walk(dir: &Path, needle: &str, out: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, needle: &str, out: &mut Vec<PathBuf>, source_only: bool) {
         for entry in std::fs::read_dir(dir).expect("read src dir") {
             let path = entry.expect("dir entry").path();
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -142,11 +145,25 @@ fn only_the_fixture_and_the_hatch_owner_may_name_the_dev_kek() {
             // embedded strings would be read and lossily decoded on every run. See the module doc —
             // a `#[path]` into any of these defeats the scan, and that is a known limit rather than
             // an oversight.
-            if EXCLUDED_DIRS.contains(&name.as_str()) || name.starts_with('.') {
+            // `binaries` stays out entirely: it holds bundled Mach-O helpers whose embedded
+            // strings would be read and lossily decoded on every run, so the risk there is a
+            // FALSE POSITIVE, not cost, and an extension filter would skip them anyway.
+            if name == "binaries" || name.starts_with('.') {
                 continue;
             }
+            // Build output IS walked, just source-only. Review measured the alternative rather
+            // than arguing it: 8.1 GB, 21,957 files, 1,519 directories → 0.055-0.068s, the same
+            // order as this guard already costs, because the price is directory entries and not
+            // the bytes an extension filter never reads. My earlier claim that covering `target`
+            // would hurt the loop was simply wrong.
+            let source_only = source_only || SOURCE_ONLY_DIRS.contains(&name.as_str());
             if path.is_dir() {
-                walk(&path, needle, out);
+                walk(&path, needle, out, source_only);
+            } else if source_only && path.extension().is_none_or(|e| e != "rs") {
+                // Inside build output we read only Rust sources. Residual, stated plainly: a
+                // non-`.rs` file hidden specifically in `target`/`gen` stays invisible. That needs
+                // two unusual choices stacked, where the round-5 hole needed none.
+                continue;
             } else {
                 // A read failure is NOT "no match". Collapsing those two is the exact shape that
                 // cost a reviewer 19 of 20 hits in an unrelated sweep this same week, and it is
@@ -170,7 +187,7 @@ fn only_the_fixture_and_the_hatch_owner_may_name_the_dev_kek() {
     }
 
     let mut found = Vec::new();
-    walk(&src, needle, &mut found);
+    walk(&src, needle, &mut found, false);
     let found: std::collections::BTreeSet<String> = found
         .iter()
         .map(|p| {

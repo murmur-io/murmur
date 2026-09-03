@@ -199,6 +199,18 @@ pub fn master_kek_with_policy(reason: &str, allow_mint: bool) -> Result<[u8; 32]
     // ID and no Keychain access at all. NEVER compiled into release.
     #[cfg(debug_assertions)]
     if let Ok(dev) = std::env::var(DEV_KEK_ENV) {
+        // Checked HERE, at the moment the key is actually used, not only where the test fixture
+        // installs it. The fixture's own assertion covers the gap between one test's setup and the
+        // next; this covers the gap between a test's setup and its own crypto, which is the window
+        // that actually decides whether that test decrypts with the right key. Compiled out of
+        // both the dev binary and release.
+        #[cfg(test)]
+        debug_assert_eq!(
+            dev,
+            dev_kek_hatch_value(),
+            "the debug KEK changed between fixture setup and this read — something else in this \
+             process installed a different {DEV_KEK_ENV}"
+        );
         if let Some(k) = hex_to_key32(&dev) {
             return Ok(k);
         }
