@@ -173,3 +173,100 @@ fn the_org_background_tick_never_holds_the_mutex_across_a_network_phase() {
         acquisitions.len()
     );
 }
+
+/// Positions in `body` where an `org_share_mutation_lock` guard is still IN SCOPE.
+///
+/// Models the guard's lifetime rather than its mere presence: an acquisition at brace depth `d`
+/// lives until the block at depth `d` closes. Returns every byte offset at which at least one guard
+/// is held.
+fn guard_is_held_at(body: &str) -> Vec<(usize, bool)> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut depth = 0usize;
+    let mut open_guards: Vec<usize> = Vec::new();
+    let mut marks = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                open_guards.retain(|d| *d <= depth);
+            }
+            _ => {
+                if body[i..].starts_with(ACQUIRE) {
+                    open_guards.push(depth);
+                }
+            }
+        }
+        marks.push((i, !open_guards.is_empty()));
+        i += 1;
+    }
+    marks
+}
+
+/// The container-reconcile phase must NOT run under `org_share_mutation_lock`.
+///
+/// `reconcile_container_shares` -> `reconcile_one_container_root` -> `share_to_org_placed_notifying`,
+/// whose FIRST statement acquires this same mutex. `tokio::sync::Mutex` is not reentrant, so holding
+/// it across this phase makes the task await a second acquisition of a mutex it already holds: it
+/// never returns, the guard is never dropped, and every later org operation blocks for the rest of
+/// the process. There is no timeout around the tick, so it does not recover.
+///
+/// This is why the FE's own "sync now" (`sync_container_shares`) calls the same function with no
+/// lock — the serialization lives inside `share_to_org_placed_notifying`.
+///
+/// RED CONTROL (run 2026-09-03): wrapping the call in `{ let _m = …lock().await; … }` — the shape
+/// this PR shipped before review — fails this test.
+#[test]
+fn the_container_reconcile_phase_does_not_run_under_the_org_mutex() {
+    let body = body_of("org.rs", "org_background_sync_tick");
+    let call = body
+        .find("reconcile_container_shares(")
+        .expect("the tick no longer reconciles container shares — update this oracle deliberately");
+    let held = guard_is_held_at(&body);
+    let (_, holding) = held[call];
+    assert!(
+        !holding,
+        "`reconcile_container_shares` is called while `{ACQUIRE}` is held. Its callee \
+         `share_to_org_placed_notifying` acquires the same non-reentrant mutex as its first \
+         statement, so this deadlocks permanently and takes every later org operation with it."
+    );
+}
+
+/// `unlock_folder` must RE-VALIDATE after taking the mutex, not merely serialize the write.
+///
+/// Its `folder`, `folder.locked` refusal, `preflight_unlock_subtree` and `folder_wrapped_key` are
+/// all read before any lock is held, with an unbounded Touch ID wait in between. A `lock_folder`
+/// landing in that window takes its already-locked idempotent branch, bumps the seal epoch and
+/// returns Ok — the user sees a successful "Lock". Without the re-check the unlock then resumes on
+/// stale reads and restores plaintext, silently undoing it.
+///
+/// RED CONTROL (run 2026-09-03): deleting the
+/// `require_current_content_visibility_snapshot` call fails this test.
+#[test]
+fn unlock_folder_revalidates_the_visibility_snapshot_after_taking_the_org_mutex() {
+    let body = body_of("lock.rs", "unlock_folder");
+    let capture = body
+        .find("capture_content_visibility_snapshot")
+        .expect("unlock_folder no longer captures a visibility snapshot");
+    let first_read = body
+        .find("folder_by_id")
+        .expect("unlock_folder no longer reads the folder — this oracle is stale");
+    let acquire = body.find(ACQUIRE).expect("no org mutex acquisition");
+    let require = body
+        .find("require_current_content_visibility_snapshot")
+        .expect(
+            "unlock_folder takes the org mutex late but never re-validates: a `lock_folder` that \
+             ran during the Touch ID sheet would be silently undone",
+        );
+    assert!(
+        capture < first_read,
+        "the snapshot must be captured BEFORE the reads it protects (capture {capture}, read \
+         {first_read})"
+    );
+    assert!(
+        acquire < require,
+        "the re-validation must happen AFTER the mutex is held (acquire {acquire}, require \
+         {require}), or it can be invalidated again before the restore"
+    );
+}

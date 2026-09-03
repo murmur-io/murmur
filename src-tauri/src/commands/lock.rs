@@ -824,6 +824,12 @@ pub async fn unlock_folder(
 ) -> Result<FolderNode, AppError> {
     // NOTE: `org_share_mutation_lock` is acquired LATER, just before the restore — see the comment
     // at that acquisition. Taking it here held it across the Touch ID sheet.
+    //
+    // Capture the content-authorization generation FIRST, before any read below is trusted. Moving
+    // the lock later widens the window in which a concurrent `lock_folder` can run, and this
+    // snapshot is what makes that window safe rather than merely narrow — see the re-validation at
+    // the acquisition point.
+    let visibility = capture_content_visibility_snapshot(state.inner());
     // v0.3.2 — the master KEK is a BIOMETRIC-GATED keychain item. Reading it makes macOS present the
     // Touch ID / passcode sheet directly (with our reason string) and hand back the key — THAT single
     // sheet IS the unlock auth, so there is no separate app-side authentication step (which would
@@ -981,6 +987,20 @@ pub async fn unlock_folder(
     // `lifecycle_guard` for its whole synchronous body, which is what serializes against a
     // concurrent `lock_folder` / `relock_all_inner`.
     let _org_mutation = state.org_share_mutation_lock.lock().await;
+
+    // RE-VALIDATE: everything above — `folder`, the `folder.locked` refusal,
+    // `preflight_unlock_subtree`, `folder_wrapped_key` — was read BEFORE this lock was held, with an
+    // unbounded human wait in between. Serializing the write is not enough; the DECISION has to be
+    // fresh too.
+    //
+    // Concretely (found in review, 2026-09-03): while the Touch ID sheet is up, a `lock_folder` for
+    // this folder or an ancestor is no longer blocked. It takes the already-locked idempotent branch,
+    // bumps the seal epoch, and returns Ok — the user sees a successful "Lock". Without this check
+    // the unlock then resumes on its stale reads, decrypts plaintext back and re-adds the folder to
+    // the session unlock set, silently undoing that Lock: the UI says sealed and the bytes say
+    // otherwise. The old top-of-function acquisition prevented this only by accident, because it
+    // forced the racing `lock_folder` to queue behind the entire unlock.
+    require_current_content_visibility_snapshot(state.inner(), visibility)?;
 
     // The rest of the restore (decrypt every note/segment/timeline blob, materialize the session
     // WAV, re-embed the folder's meetings) is synchronous CPU/AES/Candle-Metal work that used to

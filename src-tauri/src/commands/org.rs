@@ -9562,13 +9562,25 @@ pub(crate) async fn org_background_sync_tick(state: &AppState, app: Option<AppHa
     // Keep every shared container in step with the local tree. Best-effort for the same reason the
     // outbound sweep is: a container that cannot reconcile right now is retried next tick, and must
     // never stop the feed pull that follows.
+    // NO acquisition around this phase — taking it here DEADLOCKS.
+    //
+    // `reconcile_container_shares` -> `reconcile_one_container_root` -> `share_to_org_placed_notifying`,
+    // whose FIRST statement is `org_share_mutation_lock.lock().await`. `tokio::sync::Mutex` is not
+    // reentrant, so a caller that already holds the guard awaits a second acquisition of the same
+    // mutex on the same task and never returns — the guard is never dropped either, so the mutex is
+    // held for the rest of the process and every later org command, `unlock_folder` included, blocks
+    // forever. The tick has no timeout around it, so this does not recover.
+    //
+    // This is why `sync_container_shares` (the FE's explicit "sync now") takes NO lock before calling
+    // the same function: the serialization is already inside `share_to_org_placed_notifying`. The
+    // pre-2026-09-03 tick held one lock from its top across all four phases and so had exactly the
+    // same latent deadlock; per-phase acquisition did not introduce it, but it does not excuse it,
+    // and my "per phase is at least as strong as the manual path" argument was wrong HERE — for this
+    // phase the manual path is lock-free because it must be.
+    if let Err(e) =
+        crate::commands::org_containers::reconcile_container_shares(state, app.as_ref()).await
     {
-        let _mutation = state.org_share_mutation_lock.lock().await;
-        if let Err(e) =
-            crate::commands::org_containers::reconcile_container_shares(state, app.as_ref()).await
-        {
-            tracing::warn!(target: "org", error = %brief_err(&e), "container share reconcile tick failed");
-        }
+        tracing::warn!(target: "org", error = %brief_err(&e), "container share reconcile tick failed");
     }
     if !policy.is_current() {
         return false;
