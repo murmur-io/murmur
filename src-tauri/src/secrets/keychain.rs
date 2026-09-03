@@ -150,6 +150,26 @@ pub fn get_or_create_db_dek() -> Result<String> {
 /// PLAIN item (see [`resolve_kek`]). This KEK never touches SQLCipher; it only
 /// wraps/unwraps content keys via [`crate::crypto`].
 ///
+/// The debug KEK hatch: its environment-variable name, and the one value every in-repo writer
+/// installs.
+///
+/// Both live here, next to the code that READS the hatch, so the writers cannot drift from the
+/// reader or from each other. There are exactly two writers — the harness runtime probe in
+/// `commands::reminders` and the test fixture in `commands::tests::dev_kek_fixture` — and before
+/// this constant existed each hand-typed its own 64-character literal. They happened to agree,
+/// which is not the same as being unable to disagree.
+///
+/// Never compiled into a release build.
+#[cfg(debug_assertions)]
+pub(crate) const DEV_KEK_ENV: &str = "MURMUR_DEV_KEK";
+
+/// The fixed hatch key. Built rather than written out: a literal 64-hex string in a diff is the
+/// shape the repo's secret scanner exists to catch, and this must not LOOK like a real KEK.
+#[cfg(debug_assertions)]
+pub(crate) fn dev_kek_hatch_value() -> String {
+    "1".repeat(64)
+}
+
 /// Uses [`KEK_DEFAULT_REASON`] on the Touch ID sheet. Call
 /// [`get_or_create_master_kek_with_reason`] to override the prompt text per call-site.
 ///
@@ -178,7 +198,19 @@ pub fn master_kek_with_policy(reason: &str, allow_mint: bool) -> Result<[u8; 32]
     // and the lock KEK can be fixed independently in tests/dev. Returns FIRST so dev needs no Touch
     // ID and no Keychain access at all. NEVER compiled into release.
     #[cfg(debug_assertions)]
-    if let Ok(dev) = std::env::var("MURMUR_DEV_KEK") {
+    if let Ok(dev) = std::env::var(DEV_KEK_ENV) {
+        // Checked HERE, at the moment the key is actually used, not only where the test fixture
+        // installs it. The fixture's own assertion covers the gap between one test's setup and the
+        // next; this covers the gap between a test's setup and its own crypto, which is the window
+        // that actually decides whether that test decrypts with the right key. Compiled out of
+        // both the dev binary and release.
+        #[cfg(test)]
+        debug_assert_eq!(
+            dev,
+            dev_kek_hatch_value(),
+            "the debug KEK changed between fixture setup and this read — something else in this \
+             process installed a different {DEV_KEK_ENV}"
+        );
         if let Some(k) = hex_to_key32(&dev) {
             return Ok(k);
         }
@@ -272,7 +304,7 @@ fn collect_master_kek_candidates(
     // Dev hatch first (mirrors the resolution order).
     #[cfg(debug_assertions)]
     if let Some(dev_result) =
-        dev_kek_candidates(std::env::var("MURMUR_DEV_KEK").ok().as_deref(), strict)
+        dev_kek_candidates(std::env::var(DEV_KEK_ENV).ok().as_deref(), strict)
     {
         // The debug hatch is an explicit isolated key universe. Touching
         // biometric/plain login-Keychain generations as well would make

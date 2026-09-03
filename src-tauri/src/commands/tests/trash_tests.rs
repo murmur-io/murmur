@@ -16,7 +16,7 @@
 use super::*;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use crate::settings::AppConfig;
 use crate::storage::{Db, Folder, Meeting, MeetingStatus, NoteRecord};
@@ -29,14 +29,8 @@ fn db_key() -> String {
     "0123456789abcdef".repeat(4)
 }
 
-fn dev_kek() -> String {
-    "2".repeat(64)
-}
-
-static KEK_ENV: Once = Once::new();
-
 fn build_state(tag: &str) -> AppState {
-    KEK_ENV.call_once(|| std::env::set_var("MURMUR_DEV_KEK", dev_kek()));
+    crate::commands::dev_kek_fixture::ensure_dev_kek();
     let db_path = crate::storage::db::unique_temp_path(&format!("murmur-trash-{tag}"), "sqlite");
     let _ = std::fs::remove_file(&db_path);
     let db = Db::open_with_key(&db_path, &db_key()).expect("open trash test db");

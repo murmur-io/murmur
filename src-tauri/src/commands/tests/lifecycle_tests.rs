@@ -4,13 +4,10 @@
     use crate::transcribe::types::Segment;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, Once};
+    use std::sync::{Arc, Mutex};
 
     // A fixed at-rest DB key (NOT the Keychain) — same shape the config tests use.
     const DB_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    // A fixed dev master KEK so lock/unlock/remove use a deterministic key WITHOUT the Keychain or a
-    // Touch ID prompt (the `MURMUR_DEV_KEK` debug-only escape hatch in `secrets::keychain`).
-    const DEV_KEK: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const STABLE_ORG_ID: &str = "11111111-1111-4111-8111-111111111111";
     const STABLE_DOC_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
@@ -70,10 +67,9 @@
         request
     }
 
-    static KEK_ENV: Once = Once::new();
     fn ensure_dev_kek() {
         // Set once, before any thread reads it, so the concurrent readers only ever READ env.
-        KEK_ENV.call_once(|| std::env::set_var("MURMUR_DEV_KEK", DEV_KEK));
+        crate::commands::dev_kek_fixture::ensure_dev_kek();
     }
 
     fn tmp_db_path(tag: &str) -> std::path::PathBuf {
