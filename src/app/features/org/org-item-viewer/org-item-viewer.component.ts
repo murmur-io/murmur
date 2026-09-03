@@ -24,6 +24,7 @@ import { ConnectionsComponent } from "../../../shared/connections/connections.co
 import { NoteChatComponent } from "../../notes/note-chat/note-chat.component";
 import { ToastService } from "../../../services/toast.service";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { DateFormatService } from "../../../core/date-format.service";
 
 const STABLE_UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -88,6 +89,8 @@ function stableLinkIdOf(item: OrgItemDetail | null): string | null {
   styleUrl: "./org-item-viewer.component.scss",
 })
 export class OrgItemViewerComponent {
+  private readonly dates = inject(DateFormatService);
+
   private readonly ipc = inject(IpcService);
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
@@ -654,15 +657,8 @@ export class OrgItemViewerComponent {
   }
 
   /** Presentational: an ISO timestamp → a friendly local date. */
+  /** Formatted through {@link DateFormatService} — the one place a date becomes user-visible text. */
   formatDate(iso: string): string {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) {
-      return iso;
-    }
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
+    return this.dates.day(iso);
   }
 }
