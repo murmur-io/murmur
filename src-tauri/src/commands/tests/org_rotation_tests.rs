@@ -855,3 +855,86 @@ async fn the_rotation_targets_the_relay_s_generation_not_the_stale_local_one() {
     );
     assert_eq!(state.db.get_org_state(ORG).unwrap().unwrap().generation, 4);
 }
+
+/// A rotation must REFUSE when a looked-up member's key changed since it was pinned — and must
+/// send nothing at all when it does.
+///
+/// Gating the invite alone was false assurance, and this is the branch that made it so. A refused
+/// invitee stays an active member server-side, the relay counts every active member toward a
+/// rotation's coverage regardless of whether they hold a grant, so the next ordinary removal
+/// schedules a rotation that re-drives THIS loop — where a cache miss sends the ungated lookup back
+/// to the same dishonest relay, and the brand-new OCK gets wrapped to the very key the invite just
+/// refused. The attack completed one admin action later.
+///
+/// Lock-security review traced the gate as correct but noted nothing would fail if a refactor moved
+/// it. That is the gap this closes.
+///
+/// The two assertions carry different weight. Refusing is the visible half; sending nothing is the
+/// security property. `rotate_org_generation` builds every grant into a local vec and posts once
+/// after the loop, so an early return drops the partial work — but that is a property of the
+/// current shape, not a law, and it is exactly what a future refactor could break silently.
+#[tokio::test]
+async fn a_rotation_refuses_and_sends_nothing_when_a_members_key_changed() {
+    let relay = RotationRelay::start(roster(), published_keys());
+    let state = AppState::for_tests(fresh_db("rotate-tofu-changed"));
+    wire_state(&state, &relay);
+    seed_cached_member_key(&state);
+
+    // The looked-up member was pinned earlier with a DIFFERENT key than the relay now publishes.
+    // Seed 9 vs the roster's seed 4: same person, a key this device has never agreed to.
+    let stale = member_identity(9, "lookedup@example.com");
+    state
+        .db
+        .pin_contact(
+            STAYS_LOOKED_UP_UID,
+            Some("lookedup@example.com"),
+            &crate::e2ee::key_fingerprint(&stale.pk_enc, &stale.pk_sig),
+            "2026-09-01T00:00:00Z",
+        )
+        .unwrap();
+
+    let err = org_remove_member_inner(&state, ORG.into(), REMOVED_UID.into())
+        .await
+        .expect_err("a changed key must stop the rotation");
+    // The REMOVAL succeeds and the rotation debt is journalled — `org_remove_member_inner`
+    // deliberately converts any rotation failure into `ORG_ROTATION_PENDING`, because the member is
+    // already gone and the retry is what eventually completes it. So the surfaced code is the
+    // pending one, not the TOFU one; what this test pins is that the rotation itself sent nothing.
+    assert!(
+        matches!(err, AppError::Unavailable(ref m) if m.contains(crate::errcode::ORG_ROTATION_PENDING)),
+        "removal succeeds and the debt is recorded, got: {err:?}"
+    );
+    assert!(
+        state
+            .db
+            .list_org_rotations_pending()
+            .unwrap()
+            .contains(&ORG.to_string()),
+        "the rotation must stay OWED so a retry can complete it once the key is verified"
+    );
+
+    let log = relay.log();
+    assert!(
+        log.granted.is_empty(),
+        "NO grant may be posted after the refusal — a grant here hands the new org key to whoever \
+         supplied the substituted public key. Got {:?}",
+        log.granted
+    );
+    assert!(
+        log.bump_body.is_none(),
+        "and the generation must not be committed: a bumped generation nobody holds a key for \
+         strands the whole org"
+    );
+
+    // The pin still names the key this device agreed to — a refusal must never re-pin.
+    assert_eq!(
+        state
+            .db
+            .get_pinned_contact(STAYS_LOOKED_UP_UID)
+            .unwrap()
+            .unwrap()
+            .1,
+        crate::e2ee::key_fingerprint(&stale.pk_enc, &stale.pk_sig),
+        "the refusal must leave the original pin intact"
+    );
+}
