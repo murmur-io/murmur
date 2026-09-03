@@ -353,9 +353,16 @@ pub(crate) fn ask_vault_agentic_attempt(
     // contributes no line; a listing failure degrades to the legacy prompt (never an error).
     let jit_listing = if config.ask_jit_retrieval {
         let query_vec = if config.semantic_search_enabled {
-            crate::embed::active_admitted_embedder()
-                .embed_query(std::slice::from_ref(&question.to_string()))
-                .ok()
+            // REAL embedder only. `active_admitted_embedder` falls back to `StubEmbedder` — a hash
+            // bag whose "similarity" is noise — when the model is not installed, and that noise was
+            // then fused into the answer as if it were a semantic signal. An empty vector is the
+            // honest input: `search_hybrid_visible` treats the KNN leg as absent and `score_fuse`
+            // redistributes its weight across the legs that actually have something to say.
+            crate::embed::active_persistence_embedder_if_available()
+                .and_then(|e| {
+                    e.embed_query(std::slice::from_ref(&question.to_string()))
+                        .ok()
+                })
                 .and_then(|v| v.into_iter().next())
                 .unwrap_or_default()
         } else {
@@ -565,13 +572,17 @@ pub(crate) fn build_ask_vault_floor_prompt(
         };
         (corpus, sources)
     } else if config.semantic_search_enabled {
-        let embedder = crate::embed::active_admitted_embedder();
         // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).
-        let query_vec = embedder
-            .embed_query(std::slice::from_ref(&question.to_string()))?
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        // Real embedder only, for the same reason as the sibling path above — without the model the
+        // vector is empty and the KNN leg drops out rather than contributing hash noise.
+        let query_vec = match crate::embed::active_persistence_embedder_if_available() {
+            Some(embedder) => embedder
+                .embed_query(std::slice::from_ref(&question.to_string()))?
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
         crate::summarize::vault_context::build_vault_context_hybrid_visible(
             db, question, &ask_conn, &query_vec, unlocked, reranker,
         )?

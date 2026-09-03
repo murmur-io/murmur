@@ -194,7 +194,14 @@ pub fn build_vault_context_hybrid_visible(
     // Brain v2 L1.5 — temporal window (all hybrid legs apply it; query-time `now` anchor).
     let date_filter =
         crate::summarize::temporal::extract_date_filter(query, chrono::Utc::now().date_naive());
-    let mut hits = db.search_hybrid_visible(query, query_vec, 40, 0.0, unlocked, date_filter)?;
+    let mut hits = db.search_hybrid_visible(
+        query,
+        query_vec,
+        40,
+        crate::embed::KNN_SEARCH_COSINE_FLOOR,
+        unlocked,
+        date_filter,
+    )?;
 
     // Brain v2 L1.4 — the RERANKER seam (Ask-only): reorder the TOP-K fused candidates before
     // packing. The reranker sees ONLY already-gated hits (id + title/snippet — content the caller
@@ -269,7 +276,14 @@ pub fn build_meeting_listing_visible(
             .map(|h| h.meeting)
             .collect()
     } else {
-        db.search_hybrid_visible(query, query_vec, limit, 0.0, unlocked, date_filter)?
+        db.search_hybrid_visible(
+            query,
+            query_vec,
+            limit,
+            crate::embed::KNN_SEARCH_COSINE_FLOOR,
+            unlocked,
+            date_filter,
+        )?
             .into_iter()
             .map(|h| h.meeting)
             .collect()
@@ -310,7 +324,7 @@ fn pack_doc_chunks(
     let knn = if query_vec.is_empty() {
         Vec::new()
     } else {
-        db.search_doc_chunks_visible(query_vec, 20, 0.0, unlocked)?
+        db.search_doc_chunks_visible(query_vec, 20, crate::embed::KNN_SEARCH_COSINE_FLOOR, unlocked)?
     };
     let fts = db.search_doc_chunks_fts_visible(query, 20, unlocked)?;
     let mut hits = crate::embed::fuse_doc_hits(knn, fts);
@@ -1825,5 +1839,93 @@ mod tests {
             "pinned corpus must not contain the unlisted meeting"
         );
         assert_eq!(pinned_sources.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod knn_floor_tests {
+    /// A stub embedder must yield NO handle, so the Ask path gets no query vector rather than a
+    /// fake one.
+    ///
+    /// This is the half that actually mattered. `active_admitted_embedder` falls back to
+    /// `StubEmbedder`, a hash bag whose "similarity" carries no semantics, and the old code fed that
+    /// straight into the KNN leg. Combined with a `0.0` floor — which cannot reject anything — the
+    /// result was noise fused into the answer as if it were a semantic signal. Two bugs compounding:
+    /// a fake vector and a threshold unable to reject it.
+    ///
+    /// `active_persistence_embedder_if_available` returns `None` for a stub snapshot, so the vector
+    /// is empty, `search_hybrid_visible` treats the KNN leg as absent, and `score_fuse`
+    /// redistributes its weight to the legs that have something to say.
+    ///
+    /// NOTE on what this can and cannot assert. `embed_model_present()` is NOT the right predicate
+    /// here and using it was my first mistake: `active_embedder_snapshot` carries a `#[cfg(test)]`
+    /// guard that forces a stub unless `MURMUR_TEST_REAL_EMBED` is set, so a test build reports the
+    /// model absent even on a machine whose model directory is fully populated — deliberately, so
+    /// the suite never loads 470 MB of weights. The two therefore disagree BY DESIGN in test builds,
+    /// and a test that asserted they agree fails on exactly the machines that have the model. What
+    /// is deterministic, and what this pins, is the stub branch — the branch every user without the
+    /// model is on, and the one that was producing the noise.
+    #[test]
+    fn a_stub_embedder_yields_no_handle_rather_than_fake_vectors() {
+        if std::env::var_os("MURMUR_TEST_REAL_EMBED").is_some() {
+            // Opted into the real model: the handle must then exist, or Ask would silently lose its
+            // semantic leg on the machines that paid for it.
+            assert!(
+                crate::embed::active_persistence_embedder_if_available().is_some(),
+                "with the real embedder opted in, the real-only handle must be available"
+            );
+            return;
+        }
+        assert!(
+            crate::embed::active_persistence_embedder_if_available().is_none(),
+            "a stub snapshot must produce NO handle. If this returns a stub embedder, the Ask path \
+             embeds the question into hash noise and fuses it into the answer as if it meant \
+             something"
+        );
+    }
+
+    /// Every hybrid/doc search on the Ask path uses the REAL cosine floor, never `0.0`.
+    ///
+    /// `0.0` admits every vector in the index, however unrelated. That is harmless when the vector
+    /// is meaningful and actively harmful when it is not: without the embedding model installed the
+    /// old code fell back to `StubEmbedder`, a hash bag whose "similarity" carries no semantics, and
+    /// a floor of `0.0` then fused that noise into the answer as if it were a real leg. Two bugs
+    /// compounding — a fake vector and a threshold that could not reject it.
+    ///
+    /// The floor is only half the fix; the other half is that `commands::ask` now uses a real-only
+    /// embedder handle, so with no model the vector is EMPTY and the KNN leg drops out entirely
+    /// rather than being filtered. This test pins the half that lives in this file, by reading the
+    /// source rather than by driving a search — a behavioural test would need the real 384-dim model
+    /// present, which CI does not have, and would silently pass on the stub.
+    #[test]
+    fn the_ask_path_never_searches_with_a_zero_cosine_floor() {
+        let src = include_str!("vault_context.rs");
+        for (call, needle) in [
+            ("search_hybrid_visible", "search_hybrid_visible"),
+            ("search_doc_chunks_visible", "search_doc_chunks_visible"),
+        ] {
+            for (i, line) in src.lines().enumerate() {
+                if !line.contains(needle) {
+                    continue;
+                }
+                // The floor may sit on the call line or a few lines below it once rustfmt splits a
+                // long call across lines.
+                // Match the argument in BOTH shapes rustfmt produces: inline (`, 0.0,`) and, once
+                // the call is split across lines, as a line that is nothing but `0.0,`. The first
+                // version of this test only knew the inline form, so reverting the floor — which
+                // rustfmt then reformatted onto its own line — left it green. A guard whose needle
+                // depends on formatting is not a guard.
+                let window: Vec<&str> = src.lines().skip(i).take(8).collect();
+                let joined = window.join(" ");
+                let lone_zero = window.iter().any(|l| l.trim() == "0.0,");
+                assert!(
+                    !joined.contains(", 0.0,") && !lone_zero,
+                    "{call} at line {} passes a 0.0 cosine floor — that admits every vector in the \
+                     index, which is exactly how stub-embedder noise reached the answer. Use \
+                     `crate::embed::KNN_SEARCH_COSINE_FLOOR`.",
+                    i + 1
+                );
+            }
+        }
     }
 }
