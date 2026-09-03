@@ -494,7 +494,7 @@ async fn delete_document_inner_notifying(
             "task sources must be deleted through the task lifecycle".into(),
         ));
     }
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     state.db.begin_org_source_closure("document", id)?;
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact source
     // BEFORE the local row disappears, so the background org-sync tick can never re-pull a still-live

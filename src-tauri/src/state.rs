@@ -389,6 +389,139 @@ pub struct AppState {
     pub heavy_inference: Arc<tokio::sync::Semaphore>,
 }
 
+/// Debug-only bookkeeping that turns a SELF-REENTRANT acquisition of
+/// [`AppState::org_share_mutation_lock`] into a loud panic instead of a silent, permanent hang.
+///
+/// WHY (found 2026-09-03, on trunk). `org_background_sync_tick` held the mutex across
+/// `reconcile_container_shares`, whose callee `share_to_org_placed_notifying` acquires the SAME
+/// mutex as its first statement. `tokio::sync::Mutex` is not reentrant, so the task awaited a lock
+/// it already held: it never returned, its guard was never dropped, and every later org operation —
+/// sharing, revoking, `unlock_folder` — blocked for the rest of the process. The symptom was
+/// SILENCE. No error, no failing test, no log line; org sync simply stopped forever.
+///
+/// Nothing could have caught it. A green suite proves nothing about a deadlock that needs one
+/// specific call path, and a source-level oracle only sees the site it was written for. This sees
+/// the class: any path, any depth, any future author.
+///
+/// Debug-only on purpose. In release the check would cost a lock and a set lookup on every
+/// acquisition to defend against a bug that, once found, is fixed in the code — and a panic is the
+/// wrong response to ship to a user regardless.
+#[cfg(debug_assertions)]
+mod org_mutex_reentrancy {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    /// One id per in-flight holder. A tokio task id where there is one, else the OS thread id —
+    /// `run_heavy`'s blocking closures have no task id, and they hold this lock too.
+    fn holder_id() -> u64 {
+        match tokio::task::try_id() {
+            // `Id` has no numeric accessor, and its Display is the number.
+            Some(id) => id.to_string().parse().unwrap_or(u64::MAX),
+            None => {
+                let t = std::thread::current().id();
+                // Thread ids are opaque too; hash them into the same space. A collision between a
+                // thread and a task id would only ever cause a FALSE panic in a debug build, which
+                // is loud and immediately investigable — never a missed deadlock.
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                t.hash(&mut h);
+                h.finish() | (1 << 63)
+            }
+        }
+    }
+
+    fn holders() -> &'static Mutex<HashSet<u64>> {
+        static HOLDERS: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+        HOLDERS.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    pub(super) fn enter() {
+        let id = holder_id();
+        let mut set = holders()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            set.insert(id),
+            "org_share_mutation_lock acquired re-entrantly by the same task/thread. \
+             tokio::sync::Mutex is not reentrant: this would hang forever and hold the mutex for \
+             the rest of the process, stopping every org operation with no error. Take the lock \
+             around the durable commit only, or let the callee that already takes it do so."
+        );
+    }
+
+    pub(super) fn leave() {
+        let id = holder_id();
+        let mut set = holders()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.remove(&id);
+    }
+}
+
+/// The ONLY way to take [`AppState::org_share_mutation_lock`].
+///
+/// Routing every acquisition through one place is what makes the debug re-entrancy check possible
+/// at all — a check that only covers some call sites covers none of the ones that matter, since the
+/// deadlock this exists for was reached three levels deep through a callee nobody was thinking
+/// about. `commands/tests/org_mutex_scope_tests.rs` fails the build if a raw `.lock()` reappears.
+pub struct OrgMutationGuard<'a> {
+    _inner: tokio::sync::MutexGuard<'a, ()>,
+    /// Whether this guard registered itself with the re-entrancy bookkeeping, so only guards that
+    /// entered ever leave. A bounded acquisition never enters, and must not remove an id the
+    /// unbounded holder on the same thread put there.
+    #[cfg(debug_assertions)]
+    checked: bool,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for OrgMutationGuard<'_> {
+    fn drop(&mut self) {
+        if self.checked {
+            org_mutex_reentrancy::leave();
+        }
+    }
+}
+
+impl AppState {
+    /// Acquire the org mutation lock, waiting indefinitely. See [`OrgMutationGuard`].
+    ///
+    /// This is the door the re-entrancy check guards, because this is the one that can HANG: an
+    /// unbounded wait for a lock the caller already holds never returns and never releases.
+    pub(crate) async fn lock_org_mutation(&self) -> OrgMutationGuard<'_> {
+        #[cfg(debug_assertions)]
+        org_mutex_reentrancy::enter();
+        OrgMutationGuard {
+            _inner: self.org_share_mutation_lock.lock().await,
+            #[cfg(debug_assertions)]
+            checked: true,
+        }
+    }
+
+    /// Acquire it, or give up after `wait`.
+    ///
+    /// DELIBERATELY NOT re-entrancy-checked, and the distinction is the whole point: a BOUNDED
+    /// attempt cannot deadlock. If the caller already holds the lock the timeout simply elapses and
+    /// the caller is told the resource is busy — which is a correct, recoverable outcome, and one
+    /// the suite asserts on purpose in
+    /// `org_diagnosability_tests::a_held_share_mutation_lock_yields_busy_rather_than_hanging`.
+    ///
+    /// Panicking there would have been the guard mistaking "an attempt designed to be refused" for
+    /// "a hang", which is exactly the false positive that gets a check deleted rather than fixed.
+    pub(crate) async fn lock_org_mutation_within(
+        &self,
+        wait: std::time::Duration,
+    ) -> Option<OrgMutationGuard<'_>> {
+        tokio::time::timeout(wait, self.org_share_mutation_lock.lock())
+            .await
+            .ok()
+            .map(|inner| OrgMutationGuard {
+                _inner: inner,
+                #[cfg(debug_assertions)]
+                checked: false,
+            })
+    }
+}
+
 type ContentDispatchValidator = dyn Fn(&AppState) -> Result<()> + Send + Sync + 'static;
 
 /// An owned authorization capability for a model/provider dispatch that derives from visible

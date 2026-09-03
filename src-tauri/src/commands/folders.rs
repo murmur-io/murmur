@@ -677,7 +677,7 @@ pub async fn delete_folder(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), AppError> {
-    let _share_mutation = state.org_share_mutation_lock.lock().await;
+    let _share_mutation = state.lock_org_mutation().await;
     delete_folder_inner(state.inner(), folder_id)?;
     emit_ask_history_invalidated_fail_closed(&app);
     Ok(())

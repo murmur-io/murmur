@@ -1391,7 +1391,7 @@ pub async fn start_recording(
     // Same lock order as the lock/share commands. The first check above makes invalid starts
     // side-effect-free; this authoritative check closes reparent/lock/closure races after the long
     // model-quiescence awaits and stays held through the canonical meeting insert.
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     let _recording_lifecycle = state
         .lifecycle
         .lock()
@@ -3731,7 +3731,7 @@ async fn convert_meeting_to_note_inner_with(
     // Canonical order shared by every note move/share mutation: org mutation first, then the short
     // non-reentrant lock lifecycle interval inside persistence. Provider work has already finished,
     // so neither mutex is held across inference/network awaits.
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     persist_converted_companion_under_snapshot(
         state,
         &meeting_id,
@@ -4055,7 +4055,7 @@ async fn delete_companion_note_if_empty_inner_notifying(
     if !companion_body_is_empty(&row.text) {
         return Ok(false);
     }
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     // The first snapshot was taken before waiting for the async mutation authority. Re-establish
     // emptiness under lifecycle immediately before installing the durable close barrier: an editor
     // that won the wait must keep both its content and its shares.
@@ -4557,7 +4557,7 @@ async fn delete_meeting_inner_notifying(
             ));
         }
     }
-    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let _org_mutation = state.lock_org_mutation().await;
     state.db.begin_org_source_closure("meeting", meeting_id)?;
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact meeting
     // BEFORE the local rows disappear, so the background org-sync tick can never re-pull a still-live
@@ -9959,7 +9959,7 @@ async fn move_note_under_org_share_mutation_lock<T>(
     state: &AppState,
     operation: impl FnOnce(&AppState) -> Result<T, AppError>,
 ) -> Result<T, AppError> {
-    let _share_mutation = state.org_share_mutation_lock.lock().await;
+    let _share_mutation = state.lock_org_mutation().await;
     operation(state)
 }
 
