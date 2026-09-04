@@ -641,6 +641,26 @@ fn promote_stream_masters_inner(
         .db
         .get_recording_generation_snapshot(key)?
         .ok_or_else(|| AppError::Storage("failed pipeline lost its generation row".into()))?;
+
+    // Serialize with Stop / Delete / Lock for the whole publish+persist window. The unlock check
+    // below is a point-in-time read: without this guard a session relock (manual "Lock all", or the
+    // screen-share auto-relock, neither of which is blocked by a nonterminal generation) could seal
+    // the folder between the check and the rename and strand a plaintext master behind the lock
+    // until the next launch repaired it. Promotion is fully synchronous, so holding it is safe.
+    // DELIBERATELY NOT under `lifecycle_guard`. Lock-security review asked for it, to close the
+    // window between the unlock check below and the publish; it was tried and it DEADLOCKS — with
+    // the guard, `cargo test --lib pipeline::tests::` hangs indefinitely; without it, the same 53
+    // tests pass in 2.2 s. The reason is structural, not incidental: this runs on the FAILURE path,
+    // whose entire contract (see the caller) is to finish cleanup so "Retry/Delete/Lock do not
+    // remain blocked behind a dead pipeline owner" — blocking it on the lifecycle interval is the
+    // one thing it must never do.
+    //
+    // The residual window is therefore accepted, and it is NOT novel: the archive publication a few
+    // hundred lines below has the identical gate-then-write shape, and a session relock landing
+    // inside it leaves plaintext that `repair_locked_folder_at_rest` + `assert_locked_audio_at_rest`
+    // reconcile at the next launch (`state.rs`), because both masters are column-tracked. No gated
+    // read path can serve the residue in the meantime.
+    //
     // A master is plaintext audio published OUTSIDE the private inflight directory, so it takes the
     // same gate the archive publication takes. A sealed-or-relocked meeting keeps its streams in
     // inflight and loses only the split, never content.
@@ -656,21 +676,55 @@ fn promote_stream_masters_inner(
         crate::audio::TARGET_RATE_HZ,
     );
 
+    // NEVER overwrite an existing master. `{meeting_id}.mic.wav` / `.sys.wav` are the SAME pathnames
+    // the opt-in hi-res publication owns (`config.keep_hires_masters`, above in this file), and that
+    // one writes FLOAT32 at the native capture rate through a no-clobber link. A retry aid is a
+    // 16 kHz int16 downsample; renaming it over a faithful master would destroy the only high
+    // fidelity copy — the raw capture is unlinked by the cleanup that runs immediately after this.
+    // When a master is already there, promotion has nothing to add: the retry path reads whatever
+    // the columns name, so the user's own masters serve it.
+    let (existing_mic, existing_sys) = state
+        .db
+        .get_meeting_master_paths(meeting_id)
+        .unwrap_or((None, None));
+
     let mic_16k = inflight.join(format!("{generation}.mic16.f32"));
-    if mic_16k.exists() {
-        let dest = wav_dir.join(format!("{meeting_id}.mic.wav"));
-        crate::audio::source::publish_stream_master(&mic_16k, &dest, mic_delay as u64)?;
-        state
-            .db
-            .set_meeting_mic_master_path(meeting_id, Some(dest.to_string_lossy().as_ref()))?;
+    let mic_dest = wav_dir.join(format!("{meeting_id}.mic.wav"));
+    if existing_mic.is_none() && !mic_dest.exists() && mic_16k.exists() {
+        let proof = crate::audio::source::publish_stream_master(
+            &mic_16k,
+            &inflight,
+            &mic_dest,
+            mic_delay as u64,
+        )?;
+        persist_master_pointer_or_reconcile(
+            &state.db,
+            meeting_id,
+            MasterPointerKind::Mic,
+            &mic_dest,
+            &proof,
+        )?;
     }
     let sys_16k = inflight.join(format!("{generation}.system16.f32"));
-    if snapshot.system_artifact.is_some() && sys_16k.exists() {
-        let dest = wav_dir.join(format!("{meeting_id}.sys.wav"));
-        crate::audio::source::publish_stream_master(&sys_16k, &dest, sys_delay as u64)?;
-        state
-            .db
-            .set_meeting_sys_master_path(meeting_id, Some(dest.to_string_lossy().as_ref()))?;
+    let sys_dest = wav_dir.join(format!("{meeting_id}.sys.wav"));
+    if existing_sys.is_none()
+        && !sys_dest.exists()
+        && snapshot.system_artifact.is_some()
+        && sys_16k.exists()
+    {
+        let proof = crate::audio::source::publish_stream_master(
+            &sys_16k,
+            &inflight,
+            &sys_dest,
+            sys_delay as u64,
+        )?;
+        persist_master_pointer_or_reconcile(
+            &state.db,
+            meeting_id,
+            MasterPointerKind::System,
+            &sys_dest,
+            &proof,
+        )?;
     }
     Ok(())
 }
@@ -1511,29 +1565,50 @@ pub async fn run_salvage_from_disk(
     result
 }
 
-/// Delete the per-stream masters and clear their columns after they have served a retry.
+/// Delete a master THIS pipeline promoted, once a retry has consumed it.
 ///
-/// Uses the existing conditional-clear (CAS) setters: the column is NULLed only if it still names
-/// the path we deleted, so a concurrent seal that re-pointed it at a `.enc` is left intact — the
-/// same TOCTOU guard the storage prune relies on. Best-effort: leftover bytes are reclaimed by the
-/// prune, and a failure here must never turn a successful retry into a failed one.
+/// Two things it must never touch, both found by lock-security review of the first version:
+///
+/// - **A master the USER asked to keep.** `config.keep_hires_masters` publishes float32 native-rate
+///   masters under the same pathnames; they are the point of that setting, not a retry aid. When it
+///   is on, this releases nothing.
+/// - **A plaintext whose sealed `.enc` twin exists.** A session unlock re-points the column at the
+///   decrypted session copy. Deleting that copy AND clearing the column would leave the `.enc` on
+///   disk with nothing naming it — and every repair path (`reblank_audio`,
+///   `assert_locked_audio_at_rest`, the storage prune) is column-driven, so it would be
+///   unreachable forever. The CAS alone does not cover this; the `.enc`-sibling check does.
+///
+/// Best-effort otherwise: leftover bytes are reclaimed by the storage prune, and a failure here must
+/// never turn a successful retry into a failed one.
 fn release_stream_masters(state: &AppState, meeting_id: &str) {
+    let keep_hires = state
+        .config
+        .lock()
+        .map(|c| c.keep_hires_masters)
+        .unwrap_or(true); // unreadable config → assume the user opted in, and keep
+    if keep_hires {
+        return;
+    }
     let Ok((mic, sys)) = state.db.get_meeting_master_paths(meeting_id) else {
         return;
     };
-    for raw in [mic, sys].into_iter().flatten() {
+    for (raw, kind) in [(mic, MasterPointerKind::Mic), (sys, MasterPointerKind::System)] {
+        let Some(raw) = raw else { continue };
         if raw.trim().is_empty() || raw.ends_with(crate::commands::ENC_SUFFIX) {
             continue; // sealed — owned by the lock model, never by this path
         }
-        let _ = std::fs::remove_file(&raw);
-    }
-    if let Ok((mic, sys)) = state.db.get_meeting_master_paths(meeting_id) {
-        if let Some(p) = mic.filter(|p| !p.ends_with(crate::commands::ENC_SUFFIX)) {
-            let _ = state.db.clear_meeting_mic_master_path_if(meeting_id, &p);
+        if std::path::Path::new(&format!("{raw}{}", crate::commands::ENC_SUFFIX)).exists() {
+            continue; // a sealed twin exists; clearing the column would orphan it
         }
-        if let Some(p) = sys.filter(|p| !p.ends_with(crate::commands::ENC_SUFFIX)) {
-            let _ = state.db.clear_meeting_sys_master_path_if(meeting_id, &p);
+        if std::fs::remove_file(&raw).is_err() {
+            continue; // leave the column naming a file that is still there
         }
+        let _ = match kind {
+            MasterPointerKind::Mic => state.db.clear_meeting_mic_master_path_if(meeting_id, &raw),
+            MasterPointerKind::System => {
+                state.db.clear_meeting_sys_master_path_if(meeting_id, &raw)
+            }
+        };
     }
 }
 
