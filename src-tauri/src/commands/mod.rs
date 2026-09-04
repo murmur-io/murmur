@@ -6059,6 +6059,27 @@ pub async fn ask_vault(
     .await
 }
 
+// NOTE FOR THE NEXT INSERTION HERE: anchor on the DOC-COMMENT start of the function below, never
+// on its `pub fn` line — an attribute sits above it and inserting between the two silently steals
+// it. `cargo test` stays green either way; only `clippy --tests` sees it.
+/// Does this Ask need the deterministic FLOOR inputs (a resolved corpus assembled here) rather than
+/// the plain vault-wide path?
+///
+/// Lifted out of the `if` it used to be so the exact expression can be unit-tested. It regressed
+/// once already: the container scope was missing from it, which made the whole feature unreachable —
+/// picking a Space and nothing else left every other flag false, so the request fell through to a
+/// vault-wide search with the scope silently dropped. That is the same failure the board id had
+/// before it, recorded in the comment below. Nothing in the suite could see it, because every test
+/// called the layer underneath.
+fn floor_inputs_required(
+    has_pinned_sources: bool,
+    has_pinned_org: bool,
+    has_board: bool,
+    has_scope: bool,
+) -> bool {
+    has_pinned_sources || has_pinned_org || has_board || has_scope
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ask_vault_inner(
     app: &AppHandle,
@@ -6127,11 +6148,12 @@ pub(crate) async fn ask_vault_inner(
     // feature unreachable: picking a Space and nothing else left all three of the others `None`, so
     // the request fell through to the vault-wide path with the scope silently dropped — the exact
     // failure the board-id comment below records, reintroduced for containers.
-    if pinned_sources.is_some()
-        || pinned_org.is_some()
-        || board_id.is_some()
-        || scope_folders.is_some()
-    {
+    if floor_inputs_required(
+        pinned_sources.is_some(),
+        pinned_org.is_some(),
+        board_id.is_some(),
+        scope_folders.is_some(),
+    ) {
         // Snapshot AND resolve under ONE guard, exactly as `get_dashboard` does. Sharing
         // the caller's snapshot is not enough on its own: it prevents a second, later
         // snapshot but does not serialize against a relock landing between the snapshot

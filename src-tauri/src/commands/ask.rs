@@ -632,6 +632,11 @@ pub(crate) fn build_ask_vault_floor_prompt(
     } else {
         // SEARCH path. With a scope set, anything the user ALSO pinned is packed first so it cannot
         // be lost by routing here, and the scoped search fills what is left of the one budget.
+        //
+        // DELIBERATE EXCEPTION to "scoped means scoped": a pinned source brings its capped active
+        // neighbours with it, and those can sit outside the scope. That is the user's own explicit
+        // pin, so it is correct — but it means a scope is not a hard egress boundary once pins are
+        // also set. Every neighbour is still visibility-gated and content-source-filtered.
         let (mut corpus, mut sources) = if scope.is_some() {
             let budget = crate::summarize::vault_context::budget_for(&ask_conn);
             let mut pinned_corpus = String::new();
@@ -683,8 +688,19 @@ pub(crate) fn build_ask_vault_floor_prompt(
         // to the FE unchanged and rendered with `track s.origin?.orgItemId ?? s.meetingId`, so a
         // duplicate is a duplicate Angular track key (NG0955) — a rendering fault, not just noise.
         // The PINNED entry is kept: it is the one the user asked for by name.
+        // Dedupe on the SAME expression the FE tracks by — `origin.orgItemId ?? meetingId` — not on
+        // `meeting_id` alone. They are identical today only because `VaultSource.origin` is `None`
+        // at every construction site; the day the org-origin chip is wired, deduping on the meeting
+        // would start DROPPING a distinct org source, which is the opposite failure from the
+        // duplicate this fixes. Matching the track key is immune to that and costs nothing now.
+        let key = |s: &crate::storage::models::VaultSource| -> (Option<String>, String) {
+            (
+                s.origin.as_ref().and_then(|o| o.org_item_id.clone()),
+                s.meeting_id.clone(),
+            )
+        };
         for source in found_sources {
-            if !sources.iter().any(|s| s.meeting_id == source.meeting_id) {
+            if !sources.iter().any(|s| key(s) == key(&source)) {
                 sources.push(source);
             }
         }

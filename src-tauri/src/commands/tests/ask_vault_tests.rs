@@ -1759,7 +1759,11 @@ fn a_container_scope_bounds_the_corpus_on_the_default_semantic_path() {
     seed_note(&db, "m-out", "Atlas Outside", "atlas lives outside", None);
 
     // The DEFAULT: semantic search on. With an empty `vec_chunks` the KNN leg contributes nothing,
-    // so this exercises the hybrid builder's FTS + graph legs AND both of its fallbacks.
+    // so this exercises the hybrid builder's FTS + graph legs and its "recent meetings" fallback.
+    // It does NOT reach the L1.5 temporal fallback: that needs `extract_date_filter` to return a
+    // range, which no query here carries. The temporal fix is code-verified and primitive-tested,
+    // not covered end to end — said plainly, because an oracle that overstates its reach is how the
+    // inert version of this feature passed 8/8.
     let cfg = AppConfig::default();
     assert!(cfg.semantic_search_enabled, "the shipped default is semantic ON");
     let unlocked = HashSet::new();
@@ -1778,15 +1782,23 @@ fn a_container_scope_bounds_the_corpus_on_the_default_semantic_path() {
 
     // A question that matches NOTHING inside the scope must not fall back to the vault. This is the
     // branch that packed the 30 most recent meetings from everywhere.
-    let no_match = build_ask_vault_floor_prompt(
-        &db, &cfg, &unlocked, "zzzz-nothing-matches", &[], "", None, None, None, Some(&scope),
-    )
-    .unwrap();
-    if let AskFloorPrompt::Ready { sources, .. } = no_match {
-        let ids: Vec<&str> = sources.iter().map(|s| s.meeting_id.as_str()).collect();
+    // A temporal question with no lexical match: this one DOES carry a date range, so it reaches
+    // the L1.5 in-window fallback as well as the recent-meetings one.
+    for q in ["zzzz-nothing-matches", "what did we discuss last week"] {
+        let no_match = build_ask_vault_floor_prompt(
+            &db, &cfg, &unlocked, q, &[], "", None, None, None, Some(&scope),
+        )
+        .unwrap();
+        let ids: Vec<String> = match no_match {
+            AskFloorPrompt::Ready { sources, .. } => {
+                sources.iter().map(|s| s.meeting_id.clone()).collect()
+            }
+            // Empty is the ideal outcome, and it trivially contains nothing out of scope.
+            AskFloorPrompt::Empty(_) => Vec::new(),
+        };
         assert!(
-            !ids.contains(&"m-out"),
-            "the no-match fallback must stay inside the scope, got {ids:?}",
+            !ids.iter().any(|id| id == "m-out"),
+            "no-match fallback for {q:?} must stay inside the scope, got {ids:?}",
         );
     }
 }
@@ -1834,4 +1846,27 @@ fn a_meeting_pinned_inside_its_own_scope_is_not_listed_twice() {
     };
     let hits = sources.iter().filter(|s| s.meeting_id == "m-in").count();
     assert_eq!(hits, 1, "pinned AND found inside the scope ⇒ one entry, got {sources:?}");
+}
+
+
+/// The BRANCH CONDITION, which had no oracle at all.
+///
+/// The scope reaching a query depends on two independent things: this predicate admitting it, and
+/// `build_ask_vault_floor_prompt` routing it to the search path. The end-to-end test covers the
+/// second. Dropping `has_scope` from the first would leave that test — and all 3700 others — green
+/// while the feature went inert again, which is exactly how it shipped inert the first time.
+#[test]
+fn a_scope_alone_requires_the_floor_inputs() {
+    use crate::commands::floor_inputs_required;
+
+    assert!(
+        floor_inputs_required(false, false, false, true),
+        "a container scope ALONE must take the floor path — this is the regression",
+    );
+    // The three that were already there, unchanged.
+    assert!(floor_inputs_required(true, false, false, false));
+    assert!(floor_inputs_required(false, true, false, false));
+    assert!(floor_inputs_required(false, false, true, false));
+    // And nothing at all is still the plain vault-wide path.
+    assert!(!floor_inputs_required(false, false, false, false));
 }
