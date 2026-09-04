@@ -16795,10 +16795,22 @@
         let archive = dir.join("m.wav");
         let mic = dir.join("m.mic.wav");
         let sys = dir.join("m.sys.wav");
-        // The archive is the SUM (0.5 everywhere); the masters keep the sides apart.
+        // The archive is the SUM (0.5 everywhere); the masters keep the sides apart. The masters are
+        // written by the REAL producer, so they carry the promoted shape the retry path requires —
+        // a hand-rolled fixture would define a shape rather than exercise the one that ships.
         crate::audio::write_wav_f32(&archive, &[0.5, 0.5, 0.5, 0.5], 16_000, 1).unwrap();
-        crate::audio::write_wav_f32(&mic, &[1.0, 1.0, 1.0, 1.0], 16_000, 1).unwrap();
-        crate::audio::write_wav_f32(&sys, &[0.0, 0.0, 0.0, 0.0], 16_000, 1).unwrap();
+        let mic_raw = dir.join("mic.f32");
+        let sys_raw = dir.join("sys.f32");
+        let mut mic_bytes = Vec::new();
+        let mut sys_bytes = Vec::new();
+        for _ in 0..4 {
+            mic_bytes.extend_from_slice(&1.0f32.to_le_bytes());
+            sys_bytes.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        std::fs::write(&mic_raw, &mic_bytes).unwrap();
+        std::fs::write(&sys_raw, &sys_bytes).unwrap();
+        crate::audio::source::publish_stream_master(&mic_raw, &dir, "g1", &mic, 0).unwrap();
+        crate::audio::source::publish_stream_master(&sys_raw, &dir, "g1", &sys, 0).unwrap();
 
         let mid = uuid::Uuid::new_v4().to_string();
         seed_meeting(&state.db, &mid, "# err", None);
@@ -16850,6 +16862,17 @@
         assert!(
             crate::pipeline::readable_stream_masters(&state, &mid).is_none(),
             "a missing mic master falls back to the archive",
+        );
+
+        // And the case lock-security review found: a user's HI-RES master (native-rate float32) is
+        // NOT usable here. It carries no front padding, and the merge hands both streams one
+        // `Instant` on the assumption that they do — accepting it would shift `Others` away from
+        // `Me` by the system start offset and silently produce a wrong transcript, for exactly the
+        // users who kept the faithful audio. It must degrade to the archive instead.
+        crate::audio::write_wav_f32(&mic, &[1.0, 1.0, 1.0, 1.0], 48_000, 1).unwrap();
+        assert!(
+            crate::pipeline::readable_stream_masters(&state, &mid).is_none(),
+            "an unpadded hi-res master must fall back to the archive, not be merged as if padded",
         );
 
         let _ = std::fs::remove_dir_all(&dir);

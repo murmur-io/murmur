@@ -642,25 +642,17 @@ fn promote_stream_masters_inner(
         .get_recording_generation_snapshot(key)?
         .ok_or_else(|| AppError::Storage("failed pipeline lost its generation row".into()))?;
 
-    // Serialize with Stop / Delete / Lock for the whole publish+persist window. The unlock check
-    // below is a point-in-time read: without this guard a session relock (manual "Lock all", or the
-    // screen-share auto-relock, neither of which is blocked by a nonterminal generation) could seal
-    // the folder between the check and the rename and strand a plaintext master behind the lock
-    // until the next launch repaired it. Promotion is fully synchronous, so holding it is safe.
-    // DELIBERATELY NOT under `lifecycle_guard`. Lock-security review asked for it, to close the
-    // window between the unlock check below and the publish; it was tried and it DEADLOCKS — with
-    // the guard, `cargo test --lib pipeline::tests::` hangs indefinitely; without it, the same 53
-    // tests pass in 2.2 s. The reason is structural, not incidental: this runs on the FAILURE path,
-    // whose entire contract (see the caller) is to finish cleanup so "Retry/Delete/Lock do not
-    // remain blocked behind a dead pipeline owner" — blocking it on the lifecycle interval is the
-    // one thing it must never do.
+    // Serialize the whole publish+persist window with Stop / Delete / Lock. The unlock check below
+    // is a point-in-time read; without this guard a session relock (manual "Lock all", or the
+    // screen-share auto-relock — neither is blocked by a nonterminal generation) could seal the
+    // folder between the check and the publish and strand a plaintext master behind the lock until
+    // the next launch repaired it. Promotion is fully synchronous, so nothing is awaited under it.
     //
-    // The residual window is therefore accepted, and it is NOT novel: the archive publication a few
-    // hundred lines below has the identical gate-then-write shape, and a session relock landing
-    // inside it leaves plaintext that `repair_locked_folder_at_rest` + `assert_locked_audio_at_rest`
-    // reconcile at the next launch (`state.rs`), because both masters are column-tracked. No gated
-    // read path can serve the residue in the meantime.
-    //
+    // An earlier revision of this function claimed the guard DEADLOCKS and left it out. That claim
+    // was wrong: the hang came from leftover test binaries of runs killed by a harness timeout, not
+    // from this lock. Measured from a clean process state, `cargo test --lib` is 3648 passed / 0
+    // failed WITH the guard held here.
+    let _lifecycle = crate::commands::lifecycle_guard(state);
     // A master is plaintext audio published OUTSIDE the private inflight directory, so it takes the
     // same gate the archive publication takes. A sealed-or-relocked meeting keeps its streams in
     // inflight and loses only the split, never content.
@@ -694,6 +686,7 @@ fn promote_stream_masters_inner(
         let proof = crate::audio::source::publish_stream_master(
             &mic_16k,
             &inflight,
+            generation,
             &mic_dest,
             mic_delay as u64,
         )?;
@@ -715,6 +708,7 @@ fn promote_stream_masters_inner(
         let proof = crate::audio::source::publish_stream_master(
             &sys_16k,
             &inflight,
+            generation,
             &sys_dest,
             sys_delay as u64,
         )?;
@@ -1567,16 +1561,26 @@ pub async fn run_salvage_from_disk(
 
 /// Delete a master THIS pipeline promoted, once a retry has consumed it.
 ///
-/// Two things it must never touch, both found by lock-security review of the first version:
+/// **Provenance, not a live setting.** The first version asked
+/// `config.keep_hires_masters` — a global question about *now* — which lock-security review broke:
+/// a user who publishes float32 masters, hits a pipeline failure, then turns the setting off while
+/// investigating, and finally clicks Retry, had their only faithful capture deleted. The setting is
+/// live (`state.config`), so it does not describe who wrote the file. The WAV's SHAPE does: a
+/// promoted master is 16 kHz int16 by construction, a hi-res master is native-rate float32.
+/// `has_promoted_master_shape` is therefore the authorization, and `keep_hires_masters` stays only
+/// as an outer belt.
 ///
-/// - **A master the USER asked to keep.** `config.keep_hires_masters` publishes float32 native-rate
-///   masters under the same pathnames; they are the point of that setting, not a retry aid. When it
-///   is on, this releases nothing.
-/// - **A plaintext whose sealed `.enc` twin exists.** A session unlock re-points the column at the
-///   decrypted session copy. Deleting that copy AND clearing the column would leave the `.enc` on
-///   disk with nothing naming it — and every repair path (`reblank_audio`,
-///   `assert_locked_audio_at_rest`, the storage prune) is column-driven, so it would be
-///   unreachable forever. The CAS alone does not cover this; the `.enc`-sibling check does.
+/// Three more things it must not do, all found by that review:
+/// - touch a **sealed** master (`.enc`): that is the lock model's, never this path's;
+/// - delete a plaintext whose sealed `.enc` twin exists: a session unlock re-points the column at
+///   the decrypted copy, and deleting it while clearing the column would orphan the `.enc` where no
+///   column-driven repair could ever find it again. The probe FAILS CLOSED — a stat error keeps the
+///   file, because the cost of a wrong `false` here is permanent;
+/// - run at all for a **locked** folder: the remove-then-clear pair is not atomic, and a process
+///   death between them leaves a locked meeting naming a plaintext that no longer exists and has no
+///   `.enc`, which `repair_locked_audio_at_rest` reports as unrecoverable and which takes the next
+///   launch down its graceful cannot-start path. For a locked folder the master is the lock model's
+///   and the prune's to manage.
 ///
 /// Best-effort otherwise: leftover bytes are reclaimed by the storage prune, and a failure here must
 /// never turn a successful retry into a failed one.
@@ -1589,6 +1593,10 @@ fn release_stream_masters(state: &AppState, meeting_id: &str) {
     if keep_hires {
         return;
     }
+    // A locked folder's at-rest audio is owned by the lock model; never interleave with it.
+    if !matches!(crate::commands::meeting_is_unlocked(state, meeting_id), Ok(true)) {
+        return;
+    }
     let Ok((mic, sys)) = state.db.get_meeting_master_paths(meeting_id) else {
         return;
     };
@@ -1597,8 +1605,21 @@ fn release_stream_masters(state: &AppState, meeting_id: &str) {
         if raw.trim().is_empty() || raw.ends_with(crate::commands::ENC_SUFFIX) {
             continue; // sealed — owned by the lock model, never by this path
         }
-        if std::path::Path::new(&format!("{raw}{}", crate::commands::ENC_SUFFIX)).exists() {
-            continue; // a sealed twin exists; clearing the column would orphan it
+        // PROVENANCE gate: only a master with the promoted shape was written by this pipeline.
+        let promoted = WavMonoSource::open(std::path::Path::new(&raw))
+            .map(|s| s.has_promoted_master_shape())
+            .unwrap_or(false);
+        if !promoted {
+            continue; // native-rate / float32 → the user's hi-res master, not ours to delete
+        }
+        // Fail CLOSED on a stat error: keeping a file costs disk, orphaning an `.enc` costs content.
+        let sealed_twin = format!("{raw}{}", crate::commands::ENC_SUFFIX);
+        match crate::crypto::owned_regular_file_exists(
+            std::path::Path::new(&sealed_twin),
+            "probe sealed master twin before release",
+        ) {
+            Ok(false) => {}
+            _ => continue, // a sealed twin exists, or the probe failed — leave everything alone
         }
         if std::fs::remove_file(&raw).is_err() {
             continue; // leave the column naming a file that is still there
@@ -1637,7 +1658,16 @@ pub(crate) fn readable_stream_masters(
         }
         let path = std::path::PathBuf::from(raw);
         let ok = WavMonoSource::open(&path)
-            .map(|s| s.frames() > 0 && s.sample_rate() > 0)
+            .map(|s| {
+                // Only a PROMOTED master may be used here. The merge below hands both streams one
+                // `Instant` because a promoted master already carries the archive's front padding;
+                // the opt-in hi-res masters do NOT (they are verbatim copies of the capture), so
+                // accepting one would silently shift `Others` away from `Me` by exactly the system
+                // start offset — a wrong transcript rather than a failed retry, and it would hit
+                // precisely the users who kept the faithful audio. They fall back to the archive,
+                // which is what they got before this existed.
+                s.frames() > 0 && s.sample_rate() > 0 && s.has_promoted_master_shape()
+            })
             .unwrap_or(false);
         ok.then_some(path)
     };

@@ -786,6 +786,21 @@ pub(crate) struct WavMonoSource {
 }
 
 impl WavMonoSource {
+    /// True when this WAV has the shape a PROMOTED retry master is written with — 16 kHz, 16-bit
+    /// integer (see `publish_stream_master`). It is the PROVENANCE test that separates a retry aid
+    /// from a user's opt-in hi-res master, which is native-rate float32
+    /// (`stream_raw_to_float_wav`) or a byte copy of the system capture.
+    ///
+    /// Two things depend on telling them apart, and both are content-critical:
+    /// deleting a master after a retry (a hi-res one is the user's, never ours to remove) and
+    /// trusting that a master already carries the archive's front padding (only a promoted one
+    /// does — merging an unpadded master against a padded one silently shifts one speaker).
+    pub(crate) fn has_promoted_master_shape(&self) -> bool {
+        self.spec.sample_rate == crate::audio::TARGET_RATE_HZ
+            && self.spec.bits_per_sample == 16
+            && self.spec.sample_format == hound::SampleFormat::Int
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let file = open_existing_nofollow(path)?;
         let reader = hound::WavReader::new(file)
@@ -2676,6 +2691,7 @@ impl AtomicAudioPublisher {
 pub(crate) fn publish_stream_master(
     source_path: &Path,
     staging_dir: &Path,
+    generation_id: &str,
     final_path: &Path,
     delay_frames: u64,
 ) -> Result<VerifiedFile> {
@@ -2695,7 +2711,14 @@ pub(crate) fn publish_stream_master(
     // the asset-scoped audio directory that nothing sweeps: the crypto stage sweeper matches only
     // its own marker, the generation part-reaper scans only inflight, and the storage prune deletes
     // only paths a DB column names.
-    let temp = staging_dir.join(format!(".{stem}.{}.part", std::process::id()));
+    // Generation-scoped so the EXISTING staging reaper covers it: a crash during the write leaves a
+    // partial file that `tracked_generation_part_deletions` finds by generation-id prefix, instead of
+    // one only a same-pid rerun would clear.
+    let temp = staging_dir.join(format!(
+        ".{generation_id}.stream-master-{}-{}.part",
+        stem,
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&temp);
 
     {
@@ -2754,6 +2777,34 @@ pub(crate) fn publish_stream_master(
         let _ = std::fs::remove_file(&temp);
         AppError::Audio(format!("publish stream master without clobber: {e}"))
     })?;
+    // From here the destination EXISTS. Every failure below must remove it again: a published master
+    // with no DB column naming it is invisible to the seal, the crash reconciler and the storage
+    // prune (all column-driven) and would survive a folder lock as untracked plaintext.
+    match publish_stream_master_tail(&temp, final_path, &staged) {
+        Ok(published) => Ok(published),
+        Err(error) => {
+            // Exact deletion only: remove `final_path` if and only if it still names the inode we
+            // just published. Anything else is somebody else's file.
+            if let Ok(current) = verify_existing_file(final_path) {
+                if current.device() == staged.device() && current.inode() == staged.inode() {
+                    let _ = std::fs::remove_file(final_path);
+                    let _ = sync_parent_dir(final_path, "sync stream master directory");
+                }
+            }
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
+/// The post-link half of [`publish_stream_master`], split out so its caller can undo an incomplete
+/// publication. Proves the destination and the staging link name one inode with two owned paths,
+/// then drops the staging link.
+fn publish_stream_master_tail(
+    temp: &Path,
+    final_path: &Path,
+    staged: &VerifiedFile,
+) -> Result<VerifiedFile> {
     sync_parent_dir(final_path, "sync stream master directory")?;
     let published = verify_existing_file_with_nlink(final_path, 2)?;
     if published.device() != staged.device()
@@ -2768,7 +2819,7 @@ pub(crate) fn publish_stream_master(
     // Unlink the staging LINK, mirroring `AtomicAudioPublisher`: `VerifiedDeletion` is for a
     // single-link inode and this one now has two owned paths, so the proof is that BOTH paths name
     // the same inode with exactly two links before either is removed.
-    let staging_meta = std::fs::symlink_metadata(&temp)
+    let staging_meta = std::fs::symlink_metadata(temp)
         .map_err(|e| AppError::Audio(format!("inspect stream master staging link: {e}")))?;
     if staging_meta.dev() != published.device()
         || staging_meta.ino() != published.inode()
@@ -2778,9 +2829,9 @@ pub(crate) fn publish_stream_master(
             "stream master staging link does not name the published inode".into(),
         ));
     }
-    std::fs::remove_file(&temp)
+    std::fs::remove_file(temp)
         .map_err(|e| AppError::Audio(format!("remove stream master staging link: {e}")))?;
-    sync_parent_dir(&temp, "sync stream master staging directory")?;
+    sync_parent_dir(temp, "sync stream master staging directory")?;
     verify_existing_file(final_path)
 }
 
@@ -3813,7 +3864,7 @@ mod tests {
         std::fs::write(&raw, &bytes).unwrap();
 
         let dest = dir.join("m.mic.wav");
-        publish_stream_master(&raw, &dir, &dest, 3).unwrap();
+        publish_stream_master(&raw, &dir, "g1", &dest, 3).unwrap();
         let mut got = WavMonoSource::open(&dest).unwrap();
         assert_eq!(got.frames(), 7, "3 frames of padding + 4 of signal");
         let frames = got.read_frames(0, 7).unwrap();
@@ -3828,7 +3879,7 @@ mod tests {
 
         // Zero delay is the mic-leading case and must not pad at all.
         let dest0 = dir.join("m.sys.wav");
-        publish_stream_master(&raw, &dir, &dest0, 0).unwrap();
+        publish_stream_master(&raw, &dir, "g1", &dest0, 0).unwrap();
         assert_eq!(WavMonoSource::open(&dest0).unwrap().frames(), 4);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3847,7 +3898,7 @@ mod tests {
         let raw = dir.join("in.f32");
         std::fs::write(&raw, 0.5f32.to_le_bytes()).unwrap();
         let dest = dir.join("m.mic.wav");
-        publish_stream_master(&raw, &dir, &dest, 0).unwrap();
+        publish_stream_master(&raw, &dir, "g1", &dest, 0).unwrap();
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -3888,7 +3939,7 @@ mod tests {
         let before = std::fs::read(&dest).unwrap();
 
         assert!(
-            publish_stream_master(&raw, &dir, &dest, 0).is_err(),
+            publish_stream_master(&raw, &dir, "g1", &dest, 0).is_err(),
             "an occupied destination must be REFUSED, not replaced",
         );
         assert_eq!(
@@ -3896,6 +3947,61 @@ mod tests {
             before,
             "the pre-existing master survives byte-for-byte",
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PROVENANCE ORACLE — a promoted master and a user's hi-res master are distinguishable.
+    ///
+    /// Two content-critical decisions hang on this and nothing else: whether a successful retry may
+    /// DELETE a master (only one this pipeline wrote), and whether a retry may TRUST that a master
+    /// already carries the archive's front padding (only a promoted one does; merging an unpadded
+    /// master against a padded one silently shifts one speaker). Asking the live
+    /// `keep_hires_masters` setting instead — the first version — let a user destroy their only
+    /// faithful capture by toggling it off between the failure and the retry.
+    #[test]
+    fn a_promoted_master_is_distinguishable_from_a_hi_res_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-master-shape-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("in.f32");
+        let mut bytes = Vec::new();
+        for s in [0.5f32; 4] {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&raw, &bytes).unwrap();
+
+        let promoted = dir.join("m.mic.wav");
+        publish_stream_master(&raw, &dir, "g1", &promoted, 0).unwrap();
+        assert!(
+            WavMonoSource::open(&promoted)
+                .unwrap()
+                .has_promoted_master_shape(),
+            "16 kHz int16 is what promotion writes",
+        );
+
+        // A hi-res master: native capture rate, float32 — what `stream_raw_to_float_wav` produces.
+        let hires = dir.join("m.hires.wav");
+        crate::audio::write_wav_f32(&hires, &[0.5, 0.5, 0.5, 0.5], 48_000, 1).unwrap();
+        assert!(
+            !WavMonoSource::open(&hires)
+                .unwrap()
+                .has_promoted_master_shape(),
+            "a native-rate float32 master must never be mistaken for a retry aid",
+        );
+
+        // The rate alone is not enough: a float32 file AT 16 kHz is still not ours.
+        let f32_at_16k = dir.join("m.f32-16k.wav");
+        crate::audio::write_wav_f32(&f32_at_16k, &[0.5, 0.5], 16_000, 1).unwrap();
+        assert!(
+            !WavMonoSource::open(&f32_at_16k)
+                .unwrap()
+                .has_promoted_master_shape(),
+            "the sample FORMAT is part of the discriminator, not just the rate",
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3912,7 +4018,7 @@ mod tests {
         let raw = dir.join("in.f32");
         std::fs::write(&raw, b"").unwrap();
         let dest = dir.join("m.mic.wav");
-        assert!(publish_stream_master(&raw, &dir, &dest, 0).is_err());
+        assert!(publish_stream_master(&raw, &dir, "g1", &dest, 0).is_err());
         assert!(!dest.exists(), "nothing is published for an empty stream");
         let _ = std::fs::remove_dir_all(&dir);
     }
