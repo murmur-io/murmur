@@ -22,6 +22,48 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
+/// `seed_note` at an EXPLICIT `started_at`.
+///
+/// `seed_note` hardcodes a 2026-06-26 timestamp — fine for lexical tests, useless for temporal
+/// ones: `extract_date_filter` anchors on `Utc::now()`, so a fixed-date fixture falls into no
+/// natural-language window and the assertion that depends on it cannot fail. Review caught exactly
+/// that, and a first attempt at fixing it with a hardcoded days-ago offset STILL could not fail,
+/// because "last week" is the previous ISO week and its distance depends on today's weekday. The
+/// caller now computes the window with the real parser and seeds inside it.
+fn seed_note_at(
+    db: &Db,
+    id: &str,
+    title: &str,
+    markdown: &str,
+    folder: Option<&str>,
+    when: &str,
+) {
+    let when = when.to_string();
+    db.insert_meeting(&Meeting {
+        id: id.into(),
+        started_at: when.clone(),
+        ended_at: None,
+        title: Some(title.into()),
+        duration_s: 60,
+        audio_path: None,
+        status: MeetingStatus::Summarized,
+        folder_id: None,
+    })
+    .unwrap();
+    db.upsert_note(&NoteRecord {
+        meeting_id: id.into(),
+        provider_id: "claude_code".into(),
+        markdown: markdown.into(),
+        created_at: when,
+        exported_path: None,
+        model_requested: None,
+        model_served: None,
+        gateway_host: None,
+    })
+    .unwrap();
+    db.set_note_folder(id, folder).unwrap();
+}
+
 fn seed_note(db: &Db, id: &str, title: &str, markdown: &str, folder: Option<&str>) {
     db.insert_meeting(&Meeting {
         id: id.into(),
@@ -1759,11 +1801,9 @@ fn a_container_scope_bounds_the_corpus_on_the_default_semantic_path() {
     seed_note(&db, "m-out", "Atlas Outside", "atlas lives outside", None);
 
     // The DEFAULT: semantic search on. With an empty `vec_chunks` the KNN leg contributes nothing,
-    // so this exercises the hybrid builder's FTS + graph legs and its "recent meetings" fallback.
-    // It does NOT reach the L1.5 temporal fallback: that needs `extract_date_filter` to return a
-    // range, which no query here carries. The temporal fix is code-verified and primitive-tested,
-    // not covered end to end — said plainly, because an oracle that overstates its reach is how the
-    // inert version of this feature passed 8/8.
+    // so this exercises the hybrid builder's FTS + graph legs, its "recent meetings" fallback, and
+    // — via the temporal query below, against a meeting seeded relative to NOW — the L1.5 in-window
+    // fallback as well.
     let cfg = AppConfig::default();
     assert!(cfg.semantic_search_enabled, "the shipped default is semantic ON");
     let unlocked = HashSet::new();
@@ -1782,8 +1822,37 @@ fn a_container_scope_bounds_the_corpus_on_the_default_semantic_path() {
 
     // A question that matches NOTHING inside the scope must not fall back to the vault. This is the
     // branch that packed the 30 most recent meetings from everywhere.
-    // A temporal question with no lexical match: this one DOES carry a date range, so it reaches
-    // the L1.5 in-window fallback as well as the recent-meetings one.
+    // A temporal question with no lexical match reaches the L1.5 in-window fallback. For that
+    // assertion to be able to FAIL, something out of scope has to be IN the window — seeded
+    // relative to now, because `extract_date_filter` anchors on `Utc::now()` and a fixed-date
+    // fixture can never land in "last week".
+    // Compute the window the SAME way production does, then seed inside it. "last week" is the
+    // previous ISO week, so how many days back that is depends on today's weekday — a hardcoded
+    // offset lands in it only sometimes, and a test that only sometimes binds is one that never
+    // does when you need it. Anchoring on the real parser makes the meeting provably in-window.
+    let (from, _to) = crate::summarize::temporal::extract_date_filter(
+        "what did we discuss last week",
+        chrono::Utc::now().date_naive(),
+    )
+    .expect("\"last week\" must parse to a range");
+    let in_window = chrono::DateTime::parse_from_rfc3339(&from)
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| {
+            chrono::NaiveDate::parse_from_str(&from[..10], "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc()
+        })
+        + chrono::Duration::hours(36);
+    seed_note_at(
+        &db,
+        "m-recent-out",
+        "Recent Outside",
+        "unrelated words entirely",
+        None,
+        &in_window.to_rfc3339(),
+    );
     for q in ["zzzz-nothing-matches", "what did we discuss last week"] {
         let no_match = build_ask_vault_floor_prompt(
             &db, &cfg, &unlocked, q, &[], "", None, None, None, Some(&scope),
@@ -1797,7 +1866,7 @@ fn a_container_scope_bounds_the_corpus_on_the_default_semantic_path() {
             AskFloorPrompt::Empty(_) => Vec::new(),
         };
         assert!(
-            !ids.iter().any(|id| id == "m-out"),
+            !ids.iter().any(|id| id == "m-out" || id == "m-recent-out"),
             "no-match fallback for {q:?} must stay inside the scope, got {ids:?}",
         );
     }
