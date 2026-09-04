@@ -1357,3 +1357,263 @@ fn entity_detail_hidden_when_only_sealed() {
         "the (now visible) sealed meeting backlinks"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// CONTAINER SCOPE (folder-scoped Ask) — narrowing retrieval to one Space/folder subtree.
+//
+// The scope is a DIFFERENT mechanism from a container RELATION: a relation names a place and never
+// fans out, a scope says where to look and deliberately includes the subtree. These pin the four
+// properties that make the difference safe.
+// ---------------------------------------------------------------------------------------------
+
+fn seed_child_folder(db: &Db, id: &str, name: &str, parent: &str, path: &str) {
+    db.insert_folder(&Folder {
+        id: id.to_string(),
+        name: name.to_string(),
+        path: path.to_string(),
+        parent_id: Some(parent.to_string()),
+        locked: false,
+        created_at: "2026-09-04T00:00:00Z".to_string(),
+    })
+    .unwrap();
+}
+
+/// A scope covers the folder AND everything filed beneath it — that is what "search in this Space"
+/// means to a user, and it is the exact opposite of a container RELATION, which never fans out.
+#[test]
+fn a_container_scope_covers_the_whole_subtree() {
+    let db = file_db("scope-subtree");
+    seed_folder(&db, "f-root", "Product");
+    seed_child_folder(&db, "f-kid", "Roadmap", "f-root", "Product/Roadmap");
+    seed_child_folder(&db, "f-grand", "Q4", "f-kid", "Product/Roadmap/Q4");
+    seed_folder(&db, "f-other", "Personal");
+
+    let mut ids = db.folder_subtree_ids("f-root").unwrap();
+    ids.sort();
+    assert_eq!(ids, vec!["f-grand", "f-kid", "f-root"], "root + descendants");
+
+    // Scoping to a LEAF is just that leaf.
+    assert_eq!(db.folder_subtree_ids("f-grand").unwrap(), vec!["f-grand"]);
+    // A sibling tree is never dragged in by a shared name prefix.
+    assert_eq!(db.folder_subtree_ids("f-other").unwrap(), vec!["f-other"]);
+}
+
+/// A folder NAME is user text. If the subtree were resolved with SQL `LIKE`, a name containing `%`
+/// or `_` would silently widen the scope into folders the user never picked — `%` matches anything.
+/// This is why `folder_subtree_ids` compares in Rust.
+#[test]
+fn a_wildcard_in_a_folder_name_cannot_widen_the_scope() {
+    let db = file_db("scope-wildcards");
+    seed_folder(&db, "f-pct", "100%");
+    seed_child_folder(&db, "f-pct-kid", "Real", "f-pct", "100%/Real");
+    // A folder whose path a naive `LIKE '100%/%'` pattern would ALSO match.
+    seed_folder(&db, "f-decoy", "1000");
+    seed_child_folder(&db, "f-decoy-kid", "Decoy", "f-decoy", "1000/Decoy");
+
+    let mut ids = db.folder_subtree_ids("f-pct").unwrap();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["f-pct", "f-pct-kid"],
+        "the '%' is a literal character, not a wildcard",
+    );
+}
+
+/// An unknown folder id scopes to ITSELF, never to nothing. An empty set would read as "no scope"
+/// to `folder_scope_clause` and silently widen the answer to the whole vault — the one failure
+/// mode a scope must never have.
+#[test]
+fn an_unknown_scope_id_never_degrades_to_the_whole_vault() {
+    let db = file_db("scope-unknown");
+    seed_folder(&db, "f-real", "Real");
+    let ids = db.folder_subtree_ids("f-does-not-exist").unwrap();
+    assert_eq!(ids, vec!["f-does-not-exist"]);
+    assert!(!ids.is_empty(), "an empty set would mean 'unscoped'");
+}
+
+/// The scope NARROWS a search and can never widen it: a scoped query returns a subset of the
+/// unscoped one, and a locked folder inside the scope still contributes nothing — the visibility
+/// gate runs first and the scope only removes rows it already allowed.
+#[test]
+fn a_scope_narrows_search_and_never_bypasses_the_lock() {
+    let db = file_db("scope-narrows");
+    seed_folder(&db, "f-in", "Inside");
+    seed_folder(&db, "f-out", "Outside");
+    seed_note(&db, "m-in", "alpha budget inside", Some("f-in"));
+    seed_note(&db, "m-out", "alpha budget outside", Some("f-out"));
+
+    let open = std::collections::HashSet::new();
+    let all = db.search_visible("alpha", 20, &open).unwrap();
+    assert_eq!(all.len(), 2, "unscoped sees both");
+
+    let inside: Vec<String> = db
+        .search_visible_scoped("alpha", 20, &open, Some(&["f-in".to_string()]))
+        .unwrap()
+        .into_iter()
+        .map(|h| h.meeting.id)
+        .collect();
+    assert_eq!(inside, vec!["m-in"], "scoped sees only what is filed inside");
+
+    // Lock the scoped folder WITHOUT session-unlocking it: the scope must not become a way in.
+    db.set_folder_locked("f-in", true, None).unwrap();
+    let locked = db
+        .search_visible_scoped("alpha", 20, &open, Some(&["f-in".to_string()]))
+        .unwrap();
+    assert!(
+        locked.is_empty(),
+        "a scope ANDs with the lock gate; it can only remove rows, never reveal one",
+    );
+}
+
+/// A scope is a LIVE QUERY, not a snapshot of what was in the folder when it was chosen.
+///
+/// This is the property that makes a scope worth having over pinned sources: pin ten notes and the
+/// eleventh you write tomorrow is invisible until you pin it too. Scope a folder and tomorrow's
+/// note is simply in it. The same holds for a sub-folder created later, and in reverse for a note
+/// moved OUT — the scope follows the hierarchy as it is at question time, not as it was.
+///
+/// If anyone ever "optimises" this into a resolved id list cached per conversation, this test is
+/// what should stop them.
+#[test]
+fn a_scope_picks_up_items_added_after_it_was_chosen() {
+    let db = file_db("scope-live");
+    seed_folder(&db, "f-live", "Live");
+    seed_note(&db, "m-first", "alpha budget first", Some("f-live"));
+
+    let open = std::collections::HashSet::new();
+    let chosen = ["f-live".to_string()];
+    let ids = |db: &Db| -> Vec<String> {
+        // Exactly what production does per question: expand the chosen containers to their current
+        // subtree, THEN search. Recomputing here is the point — it is what makes the scope live.
+        let scope = db.folder_scope_ids(&chosen).unwrap();
+        let mut v: Vec<String> = db
+            .search_visible_scoped("alpha", 20, &open, Some(&scope))
+            .unwrap()
+            .into_iter()
+            .map(|h| h.meeting.id)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(ids(&db), vec!["m-first"]);
+
+    // A note written AFTER the scope was chosen — no re-selection, no refresh.
+    seed_note(&db, "m-later", "alpha budget later", Some("f-live"));
+    assert_eq!(
+        ids(&db),
+        vec!["m-first", "m-later"],
+        "a note added later is in scope without the user re-choosing it",
+    );
+
+    // A sub-folder created later, with content in it, is in scope too — the subtree is resolved
+    // per question, so the hierarchy can grow underneath a scope.
+    seed_child_folder(&db, "f-live-kid", "Deeper", "f-live", "Live/Deeper");
+    seed_note(&db, "m-deep", "alpha budget deeper", Some("f-live-kid"));
+    assert_eq!(
+        ids(&db),
+        vec!["m-deep", "m-first", "m-later"],
+        "a sub-folder created after the fact is inside the scope",
+    );
+
+    // And the converse: filed elsewhere ⇒ out of scope, even though it matches the query.
+    seed_folder(&db, "f-away", "Away");
+    seed_note(&db, "m-away", "alpha budget away", Some("f-away"));
+    assert_eq!(
+        ids(&db),
+        vec!["m-deep", "m-first", "m-later"],
+        "content outside the scoped subtree stays out",
+    );
+}
+
+/// THE FALLBACK MUST BE SCOPED TOO — the hole clippy found as "unused variable".
+///
+/// When a scoped question matches nothing, the corpus builder falls back to "recent meetings". If
+/// that fallback ignores the scope, the answer is drawn from the WHOLE vault while the UI still
+/// says the folder is scoped: a confidently wrong answer, which is worse than "nothing here".
+/// The same applies to the keyword path a user gets with semantic search switched off.
+#[test]
+fn the_recent_meetings_fallback_respects_the_scope() {
+    let db = file_db("scope-fallback");
+    seed_folder(&db, "f-scope", "Scoped");
+    seed_folder(&db, "f-elsewhere", "Elsewhere");
+    seed_note(&db, "m-inside", "gamma inside", Some("f-scope"));
+    seed_note(&db, "m-outside", "gamma outside", Some("f-elsewhere"));
+
+    let open = std::collections::HashSet::new();
+    let scope = db.folder_scope_ids(&["f-scope".to_string()]).unwrap();
+
+    // Unscoped, the listing sees both.
+    assert_eq!(db.list_meetings_visible(30, &open, None).unwrap().len(), 2);
+
+    // Scoped, it sees only what is filed inside — this is the branch a no-match question lands on.
+    let listed: Vec<String> = db
+        .list_meetings_visible(30, &open, Some(&scope))
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["m-inside"],
+        "a scoped question that matches nothing must not fall back to the whole vault",
+    );
+}
+
+/// Containers are OFFERED as pickable candidates, so a user can choose a place to scope to.
+///
+/// Without this leg the Ask composer would allow the `container` kind and never receive one — a
+/// control that looks enabled and does nothing. Every other `<mur-source-picker>` keeps the
+/// historical default kinds, so these rows are filtered out there rather than being offered as
+/// pinnable content, which they are not.
+#[test]
+fn containers_are_offered_as_pickable_candidates() {
+    let db = file_db("candidates-containers");
+    seed_folder(&db, "f-alpha", "Alpha Project");
+    seed_folder(&db, "f-beta", "Beta");
+    seed_note(&db, "m-x", "alpha content", Some("f-alpha"));
+
+    let open = std::collections::HashSet::new();
+    let (rows, _total) = db
+        .list_link_candidates_visible("Alpha", 20, 0, &open)
+        .unwrap();
+    let containers: Vec<(String, String)> = rows
+        .iter()
+        .filter(|r| r.kind == "container")
+        .map(|r| (r.id.clone(), r.title.clone()))
+        .collect();
+    assert_eq!(
+        containers,
+        vec![("f-alpha".to_string(), "Alpha Project".to_string())],
+        "the matching Space is offered, by name",
+    );
+
+    // A SEALED-and-not-unlocked folder disappears from the candidates entirely — name and all.
+    // The first version of this test asserted the opposite, on the reasoning that a folder name is
+    // already visible in the Related picker. That was wrong for THIS list: its contract, pinned by
+    // `list_link_candidates_hides_sealed_sources`, is that not even the pagination total may
+    // disclose a sealed match. A name IS a disclosure; searching "Alpha" must not confirm that a
+    // Space called that exists.
+    db.set_folder_locked("f-alpha", true, None).unwrap();
+    let (locked_rows, locked_total) = db
+        .list_link_candidates_visible("Alpha", 20, 0, &open)
+        .unwrap();
+    assert!(
+        !locked_rows.iter().any(|r| r.kind == "container"),
+        "a sealed folder is not offered as a candidate",
+    );
+    assert_eq!(
+        locked_total, 0,
+        "and the total must not disclose that a sealed match exists",
+    );
+
+    // Session-unlocked, it comes back — the gate is the session unlock set, not a permanent hide.
+    let unlocked: std::collections::HashSet<String> =
+        std::iter::once("f-alpha".to_string()).collect();
+    let (open_rows, _) = db
+        .list_link_candidates_visible("Alpha", 20, 0, &unlocked)
+        .unwrap();
+    assert!(
+        open_rows.iter().any(|r| r.kind == "container" && r.id == "f-alpha"),
+        "a session-unlocked folder is selectable again",
+    );
+}

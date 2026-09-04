@@ -22,6 +22,48 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
+/// `seed_note` at an EXPLICIT `started_at`.
+///
+/// `seed_note` hardcodes a 2026-06-26 timestamp — fine for lexical tests, useless for temporal
+/// ones: `extract_date_filter` anchors on `Utc::now()`, so a fixed-date fixture falls into no
+/// natural-language window and the assertion that depends on it cannot fail. Review caught exactly
+/// that, and a first attempt at fixing it with a hardcoded days-ago offset STILL could not fail,
+/// because "last week" is the previous ISO week and its distance depends on today's weekday. The
+/// caller now computes the window with the real parser and seeds inside it.
+fn seed_note_at(
+    db: &Db,
+    id: &str,
+    title: &str,
+    markdown: &str,
+    folder: Option<&str>,
+    when: &str,
+) {
+    let when = when.to_string();
+    db.insert_meeting(&Meeting {
+        id: id.into(),
+        started_at: when.clone(),
+        ended_at: None,
+        title: Some(title.into()),
+        duration_s: 60,
+        audio_path: None,
+        status: MeetingStatus::Summarized,
+        folder_id: None,
+    })
+    .unwrap();
+    db.upsert_note(&NoteRecord {
+        meeting_id: id.into(),
+        provider_id: "claude_code".into(),
+        markdown: markdown.into(),
+        created_at: when,
+        exported_path: None,
+        model_requested: None,
+        model_served: None,
+        gateway_host: None,
+    })
+    .unwrap();
+    db.set_note_folder(id, folder).unwrap();
+}
+
 fn seed_note(db: &Db, id: &str, title: &str, markdown: &str, folder: Option<&str>) {
     db.insert_meeting(&Meeting {
         id: id.into(),
@@ -369,6 +411,7 @@ fn ask_floor_prompt_matches_pre_change_implementation() {
         q,
         &cfg.provider_id,
         &unlocked,
+        None,
     )
     .unwrap();
     assert!(
@@ -378,7 +421,7 @@ fn ask_floor_prompt_matches_pre_change_implementation() {
     // Empty memory brief ⇒ the floor prompt must stay BYTE-IDENTICAL to the pre-memory build.
     let (want_system, want_user) = crate::summarize::vault_chat::build(&corpus, &history, q, "");
 
-    match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None, None, None)
+    match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None, None, None, None)
         .unwrap()
     {
         AskFloorPrompt::Ready {
@@ -411,7 +454,7 @@ fn ask_floor_prompt_matches_pre_change_implementation() {
 
     // The empty-vault early return keeps the EXACT pre-change canned answer.
     let empty = tmp_db();
-    match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None, None)
+    match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None, None, None)
         .unwrap()
     {
         AskFloorPrompt::Empty(r) => {
@@ -553,6 +596,7 @@ fn loopback_ollama_ask_paths_revalidate_visibility_before_provider_dispatch() {
     }];
     let prompt = build_ask_vault_floor_prompt(
         &db, &cfg, &unlocked, "atlas", &history, "", None, None, None,
+        None,
     )
     .unwrap();
     let AskFloorPrompt::Ready { system, user, .. } = prompt else {
@@ -582,6 +626,7 @@ fn loopback_ollama_ask_paths_revalidate_visibility_before_provider_dispatch() {
         "",
         None,
         &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
         None,
         None,
         floor_admission,
@@ -1662,4 +1707,235 @@ fn ask_uses_a_real_embedder_when_one_is_available() {
         .is_empty(),
         "semantic search off must not embed, even with an embedder in hand"
     );
+}
+
+/// THE WIRING, not the mechanism — a container scope must actually reach a query.
+///
+/// This is the test whose absence let the whole feature ship inert. The seven SQL-level oracles all
+/// exercised primitives (`folder_scope_ids`, `search_visible_scoped`, `list_meetings_visible`) and
+/// every one of them was green while `scope_folder_ids` could not reach a search leg at all: it was
+/// read only inside a branch gated on pinned sources / a pinned org item / a board id, and the
+/// pinned branch then skipped searching entirely. Picking a Space and nothing else — the FE's
+/// primary flow — dropped the scope silently and answered from the whole vault.
+///
+/// So this asserts through `build_ask_vault_floor_prompt`, the function production calls, with a
+/// scope and NOTHING else set.
+#[test]
+fn a_container_scope_alone_reaches_the_corpus_and_bounds_it() {
+    let db = tmp_db();
+    db.insert_folder(&crate::storage::models::Folder {
+        id: "f-in".into(),
+        name: "Inside".into(),
+        path: "Inside".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-09-04T00:00:00Z".into(),
+    })
+    .unwrap();
+    seed_note(&db, "m-in", "Atlas Inside", "atlas lives inside", Some("f-in"));
+    seed_note(&db, "m-out", "Atlas Outside", "atlas lives outside", None);
+
+    let cfg = AppConfig {
+        semantic_search_enabled: false,
+        ..AppConfig::default()
+    };
+    let unlocked = HashSet::new();
+    let scope = vec!["f-in".to_string()];
+
+    // Unscoped: both meetings are candidates.
+    let all = match build_ask_vault_floor_prompt(
+        &db, &cfg, &unlocked, "atlas", &[], "", None, None, None, None,
+    )
+    .unwrap()
+    {
+        AskFloorPrompt::Ready { sources, .. } => sources,
+        AskFloorPrompt::Empty(_) => panic!("a non-empty vault must yield Ready"),
+    };
+    assert_eq!(all.len(), 2, "unscoped sees both meetings");
+
+    // Scope ONLY — no pinned sources, no org item, no board. This is the case that was unreachable.
+    let scoped = match build_ask_vault_floor_prompt(
+        &db,
+        &cfg,
+        &unlocked,
+        "atlas",
+        &[],
+        "",
+        None,
+        None,
+        None,
+        Some(&scope),
+    )
+    .unwrap()
+    {
+        AskFloorPrompt::Ready { sources, .. } => sources,
+        AskFloorPrompt::Empty(_) => panic!("the scoped folder has matching content"),
+    };
+    let ids: Vec<&str> = scoped.iter().map(|s| s.meeting_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["m-in"],
+        "a scope on its own must bound the corpus, not be dropped",
+    );
+}
+
+/// The SAME assertion on the SHIPPED default path.
+///
+/// The test above pins `semantic_search_enabled: false` to exercise the keyword builder. Semantic
+/// search ships ON, so that left the hybrid builder — which carried two of the four unscoped
+/// paths review found (its "recent meetings" fallback and the L1.5 temporal fallback) — with no
+/// end-to-end coverage at all. This is its twin.
+#[test]
+fn a_container_scope_bounds_the_corpus_on_the_default_semantic_path() {
+    let db = tmp_db();
+    db.insert_folder(&crate::storage::models::Folder {
+        id: "f-in".into(),
+        name: "Inside".into(),
+        path: "Inside".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-09-04T00:00:00Z".into(),
+    })
+    .unwrap();
+    seed_note(&db, "m-in", "Atlas Inside", "atlas lives inside", Some("f-in"));
+    seed_note(&db, "m-out", "Atlas Outside", "atlas lives outside", None);
+
+    // The DEFAULT: semantic search on. With an empty `vec_chunks` the KNN leg contributes nothing,
+    // so this exercises the hybrid builder's FTS + graph legs, its "recent meetings" fallback, and
+    // — via the temporal query below, against a meeting seeded relative to NOW — the L1.5 in-window
+    // fallback as well.
+    let cfg = AppConfig::default();
+    assert!(cfg.semantic_search_enabled, "the shipped default is semantic ON");
+    let unlocked = HashSet::new();
+    let scope = vec!["f-in".to_string()];
+
+    let scoped = match build_ask_vault_floor_prompt(
+        &db, &cfg, &unlocked, "atlas", &[], "", None, None, None, Some(&scope),
+    )
+    .unwrap()
+    {
+        AskFloorPrompt::Ready { sources, .. } => sources,
+        AskFloorPrompt::Empty(_) => panic!("the scoped folder has matching content"),
+    };
+    let ids: Vec<&str> = scoped.iter().map(|s| s.meeting_id.as_str()).collect();
+    assert_eq!(ids, vec!["m-in"], "the hybrid path is scoped too");
+
+    // A question that matches NOTHING inside the scope must not fall back to the vault. This is the
+    // branch that packed the 30 most recent meetings from everywhere.
+    // A temporal question with no lexical match reaches the L1.5 in-window fallback. For that
+    // assertion to be able to FAIL, something out of scope has to be IN the window — seeded
+    // relative to now, because `extract_date_filter` anchors on `Utc::now()` and a fixed-date
+    // fixture can never land in "last week".
+    // Compute the window the SAME way production does, then seed inside it. "last week" is the
+    // previous ISO week, so how many days back that is depends on today's weekday — a hardcoded
+    // offset lands in it only sometimes, and a test that only sometimes binds is one that never
+    // does when you need it. Anchoring on the real parser makes the meeting provably in-window.
+    let (from, _to) = crate::summarize::temporal::extract_date_filter(
+        "what did we discuss last week",
+        chrono::Utc::now().date_naive(),
+    )
+    .expect("\"last week\" must parse to a range");
+    let in_window = chrono::DateTime::parse_from_rfc3339(&from)
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| {
+            chrono::NaiveDate::parse_from_str(&from[..10], "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc()
+        })
+        + chrono::Duration::hours(36);
+    seed_note_at(
+        &db,
+        "m-recent-out",
+        "Recent Outside",
+        "unrelated words entirely",
+        None,
+        &in_window.to_rfc3339(),
+    );
+    for q in ["zzzz-nothing-matches", "what did we discuss last week"] {
+        let no_match = build_ask_vault_floor_prompt(
+            &db, &cfg, &unlocked, q, &[], "", None, None, None, Some(&scope),
+        )
+        .unwrap();
+        let ids: Vec<String> = match no_match {
+            AskFloorPrompt::Ready { sources, .. } => {
+                sources.iter().map(|s| s.meeting_id.clone()).collect()
+            }
+            // Empty is the ideal outcome, and it trivially contains nothing out of scope.
+            AskFloorPrompt::Empty(_) => Vec::new(),
+        };
+        assert!(
+            !ids.iter().any(|id| id == "m-out" || id == "m-recent-out"),
+            "no-match fallback for {q:?} must stay inside the scope, got {ids:?}",
+        );
+    }
+}
+
+/// A meeting that is BOTH pinned and inside the scope appears ONCE.
+///
+/// The pinned+scope composition concatenates two source lists that were mutually exclusive before,
+/// so a repeat became possible for the first time. `AskVaultResult.sources` is rendered with
+/// `track s.origin?.orgItemId ?? s.meetingId`, and a duplicate track key is an Angular fault
+/// (NG0955), not merely a duplicate chip.
+#[test]
+fn a_meeting_pinned_inside_its_own_scope_is_not_listed_twice() {
+    use crate::storage::models::SourceRef;
+
+    let db = tmp_db();
+    db.insert_folder(&crate::storage::models::Folder {
+        id: "f-in".into(),
+        name: "Inside".into(),
+        path: "Inside".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-09-04T00:00:00Z".into(),
+    })
+    .unwrap();
+    seed_note(&db, "m-in", "Atlas Inside", "atlas lives inside", Some("f-in"));
+
+    let cfg = AppConfig {
+        semantic_search_enabled: false,
+        ..AppConfig::default()
+    };
+    let unlocked = HashSet::new();
+    let scope = vec!["f-in".to_string()];
+    let pinned = vec![SourceRef {
+        kind: crate::links::LinkKind::Meeting,
+        id: "m-in".into(),
+    }];
+
+    let sources = match build_ask_vault_floor_prompt(
+        &db, &cfg, &unlocked, "atlas", &[], "", None, Some(&pinned), None, Some(&scope),
+    )
+    .unwrap()
+    {
+        AskFloorPrompt::Ready { sources, .. } => sources,
+        AskFloorPrompt::Empty(_) => panic!("pinned + scoped content exists"),
+    };
+    let hits = sources.iter().filter(|s| s.meeting_id == "m-in").count();
+    assert_eq!(hits, 1, "pinned AND found inside the scope ⇒ one entry, got {sources:?}");
+}
+
+
+/// The BRANCH CONDITION, which had no oracle at all.
+///
+/// The scope reaching a query depends on two independent things: this predicate admitting it, and
+/// `build_ask_vault_floor_prompt` routing it to the search path. The end-to-end test covers the
+/// second. Dropping `has_scope` from the first would leave that test — and all 3700 others — green
+/// while the feature went inert again, which is exactly how it shipped inert the first time.
+#[test]
+fn a_scope_alone_requires_the_floor_inputs() {
+    use crate::commands::floor_inputs_required;
+
+    assert!(
+        floor_inputs_required(false, false, false, true),
+        "a container scope ALONE must take the floor path — this is the regression",
+    );
+    // The three that were already there, unchanged.
+    assert!(floor_inputs_required(true, false, false, false));
+    assert!(floor_inputs_required(false, true, false, false));
+    assert!(floor_inputs_required(false, false, true, false));
+    // And nothing at all is still the plain vault-wide path.
+    assert!(!floor_inputs_required(false, false, false, false));
 }

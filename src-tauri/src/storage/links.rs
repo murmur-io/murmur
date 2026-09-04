@@ -3211,7 +3211,7 @@ impl Db {
         //    take ids here; the centroid read is a separate stored-vector fetch.
         let cap = max_items.max(1) as i64;
         let mut ids: Vec<(crate::links::LinkKind, String)> = Vec::new();
-        for m in self.list_meetings_visible(cap, unlocked)? {
+        for m in self.list_meetings_visible(cap, unlocked, None)? {
             ids.push((crate::links::LinkKind::Meeting, m.id));
         }
         for (node_kind, id, _label, _ts) in self.full_graph_content_nodes(unlocked)? {

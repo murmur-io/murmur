@@ -477,7 +477,7 @@ fn mcp_visibility_filter() {
 
     // Before sealing both are visible.
     assert!(db
-        .list_meetings_visible(50, &empty)
+        .list_meetings_visible(50, &empty, None)
         .unwrap()
         .iter()
         .any(|m| m.id == "sealed1"));
@@ -485,7 +485,7 @@ fn mcp_visibility_filter() {
     // SEAL → the sealed note is invisible to MCP, the open one stays visible.
     seal_folder(&db, "secret", &kek);
     let visible_ids: HashSet<String> = db
-        .list_meetings_visible(50, &empty)
+        .list_meetings_visible(50, &empty, None)
         .unwrap()
         .into_iter()
         .map(|m| m.id)
@@ -517,7 +517,7 @@ fn mcp_visibility_filter() {
         .unwrap()
         .is_empty());
     let visible_after: HashSet<String> = db
-        .list_meetings_visible(50, &unlocked)
+        .list_meetings_visible(50, &unlocked, None)
         .unwrap()
         .into_iter()
         .map(|m| m.id)
@@ -560,7 +560,7 @@ fn unfiled_live_meeting_is_visible_until_canonical_locked_ownership_is_assigned(
         .unwrap()
         .is_some());
     assert!(db
-        .list_meetings_visible(50, &empty)
+        .list_meetings_visible(50, &empty, None)
         .unwrap()
         .iter()
         .any(|meeting| meeting.id == "live-root"));
@@ -594,7 +594,7 @@ fn unfiled_live_meeting_is_visible_until_canonical_locked_ownership_is_assigned(
         .unwrap()
         .is_none());
     assert!(!db
-        .list_meetings_visible(50, &empty)
+        .list_meetings_visible(50, &empty, None)
         .unwrap()
         .iter()
         .any(|meeting| meeting.id == "live-root"));

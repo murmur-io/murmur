@@ -2765,7 +2765,13 @@ export interface NoteAssistRequest {
  * note/meeting.
  */
 export interface NoteCitation {
-  kind: "meeting" | "note" | "person" | "entity" | "org";
+  /**
+   * `"container"` is a Space or folder, added when `list_link_candidates` gained a container leg so
+   * one can be picked as an Ask SCOPE. It is NOT a document: it is never a `[[` wikilink target and
+   * never pinned as content — the note-editor link picker filters it out, and only a
+   * `<mur-source-picker>` that opts into the `container` kind ever renders it.
+   */
+  kind: "meeting" | "note" | "person" | "entity" | "org" | "container";
   /**
    * For link-candidate `kind === "org"` rows this is the revision-stable
    * `orgId:docId` endpoint composite. Other citation surfaces may still carry a

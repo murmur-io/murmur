@@ -658,6 +658,9 @@ pub async fn ask_vault_persisted(
     ask_trace_id: Option<String>,
     explicit_sources: Option<Vec<SourceRef>>,
     dashboard_id: Option<String>,
+    // CONTAINER SCOPE (FE `scopeFolderIds`) — narrow retrieval to these Spaces/folders, subtree
+    // included, instead of pinning items. Empty/absent ⇒ the unchanged whole-vault behaviour.
+    scope_folder_ids: Option<Vec<String>>,
 ) -> Result<Response, AppError> {
     if !matches!(
         scope,
@@ -782,6 +785,7 @@ pub async fn ask_vault_persisted(
         ask_trace_id,
         explicit_sources,
         None,
+        scope_folder_ids,
         dashboard_id.clone(),
         Some(snapshot.clone()),
         dashboard_witness.clone(),

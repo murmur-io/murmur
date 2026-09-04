@@ -741,9 +741,9 @@ pub fn execute_tool(
             // search tool on a default install. `search_doc_chunks_fts_visible` applies the SAME
             // `visibility_clause` against `unlocked` as the meeting legs.
             let docs = db
-                .search_doc_chunks_fts_visible(q, 20, unlocked)
+                .search_doc_chunks_fts_visible(q, 20, unlocked, None)
                 .unwrap_or_default();
-            match db.search_visible_in_range(q, 20, unlocked, date_filter) {
+            match db.search_visible_in_range(q, 20, unlocked, date_filter, None) {
                 Ok(hits) if hits.is_empty() && docs.is_empty() => {
                     Ok(format!("No meetings or documents match \"{q}\"."))
                 }
@@ -771,10 +771,10 @@ pub fn execute_tool(
             // labelled as keyword matching so the model is never told a semantic search ran.
             if !config.semantic_search_enabled {
                 let hits = db
-                    .search_visible_in_range(q, 20, unlocked, date_filter)
+                    .search_visible_in_range(q, 20, unlocked, date_filter, None)
                     .map_err(|e| AppError::Storage(format!("search failed: {e}")))?;
                 let docs = db
-                    .search_doc_chunks_fts_visible(q, 20, unlocked)
+                    .search_doc_chunks_fts_visible(q, 20, unlocked, None)
                     .unwrap_or_default();
                 if hits.is_empty() && docs.is_empty() {
                     return Ok(format!(
@@ -794,10 +794,10 @@ pub fn execute_tool(
                 Ok(embedder) => embedder,
                 Err(_) => {
                     let hits = db
-                        .search_visible_in_range(q, 20, unlocked, date_filter)
+                        .search_visible_in_range(q, 20, unlocked, date_filter, None)
                         .map_err(|e| AppError::Storage(format!("search failed: {e}")))?;
                     let docs = db
-                        .search_doc_chunks_fts_visible(q, 20, unlocked)
+                        .search_doc_chunks_fts_visible(q, 20, unlocked, None)
                         .unwrap_or_default();
                     if hits.is_empty() && docs.is_empty() {
                         return Ok(format!(
@@ -828,10 +828,11 @@ pub fn execute_tool(
                     20,
                     crate::embed::KNN_SEARCH_COSINE_FLOOR,
                     unlocked,
+                    None,
                 )
                 .unwrap_or_default();
             let fts_docs = db
-                .search_doc_chunks_fts_visible(q, 20, unlocked)
+                .search_doc_chunks_fts_visible(q, 20, unlocked, None)
                 .unwrap_or_default();
             let mut docs = crate::embed::fuse_doc_hits(knn_docs, fts_docs);
             // Brain v3 audit Fix 1 — GATED, HIT-ALIGNED PARENT EXPANSION: a top-3 fused doc hit
@@ -859,6 +860,7 @@ pub fn execute_tool(
                 crate::embed::KNN_SEARCH_COSINE_FLOOR,
                 unlocked,
                 date_filter,
+                None, // the MCP search tool is vault-wide; scoping is an Ask-side choice
             ) {
                 Ok(hits) if hits.is_empty() && docs.is_empty() => {
                     Ok(format!("No meetings or documents match \"{q}\"."))

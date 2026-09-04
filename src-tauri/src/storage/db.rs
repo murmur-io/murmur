@@ -4614,7 +4614,7 @@ impl Db {
         const TOPIC_BACKFILL_BATCH: usize = 20;
         const TOPIC_BACKFILL_MAX_REEMBED_PER_RUN: usize = 50;
         let unlocked: HashSet<String> = HashSet::new();
-        let meetings = self.list_meetings_visible(100_000, &unlocked)?;
+        let meetings = self.list_meetings_visible(100_000, &unlocked, None)?;
         let mut indexed = 0usize;
         let mut reembedded = 0usize;
         'outer: for batch in meetings.chunks(TOPIC_BACKFILL_BATCH) {
@@ -4966,12 +4966,14 @@ impl Db {
         k: i64,
         min_cosine: f32,
         unlocked: &HashSet<String>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<SearchHit>> {
         if query_vec.is_empty() || k <= 0 {
             return Ok(Vec::new());
         }
         let conn = self.lock();
         let meeting_visible = meeting_visibility_clause("m", unlocked);
+        let scoped = folder_scope_clause("m", scope);
         // KNN is isolated to the vec0 table in a CTE (only a single MATCH+k constraint is allowed on
         // a vec0 query); visibility + meeting columns are joined OUTSIDE it.
         let sql = format!(
@@ -4988,7 +4990,7 @@ impl Db {
                FROM knn
                JOIN note_chunks nc ON nc.id = knn.chunk_id
                JOIN meetings m ON m.id = nc.meeting_id
-              WHERE {meeting_visible}
+              WHERE {meeting_visible}{scoped}
               ORDER BY knn.distance ASC, m.id ASC"
         );
         let blob = crate::embed::vec_to_blob(query_vec);
@@ -5100,7 +5102,7 @@ impl Db {
 
         // GATED KNN. Ask for k+1 because self is always the nearest hit; then drop self + truncate.
         // No S1 floor here (0.0) — related-meetings is behaviour-preserving; only the MCP search arms floor.
-        let mut hits = self.search_semantic_visible(&centroid, k + 1, 0.0, unlocked)?;
+        let mut hits = self.search_semantic_visible(&centroid, k + 1, 0.0, unlocked, None)?;
         hits.retain(|h| h.meeting.id != meeting_id);
         hits.truncate(k as usize);
         tracing::debug!(
@@ -5122,6 +5124,7 @@ impl Db {
         limit: i64,
         unlocked: &HashSet<String>,
         date_filter: Option<&(String, String)>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<(String, f64)>> {
         let q = query.trim();
         let Some(and_expr) = fts_match_query(q) else {
@@ -5130,6 +5133,7 @@ impl Db {
         let conn = self.lock();
         let meeting_visible = meeting_visibility_clause("m", unlocked);
         let date = date_clause(date_filter);
+        let scoped = folder_scope_clause("m", scope);
         let sql = format!(
             "WITH hits(meeting_id, rank) AS (
                  SELECT m.id, bm25(fts_meetings)
@@ -5158,7 +5162,7 @@ impl Db {
              SELECT m.id, r.rank
                FROM ranked r
                JOIN meetings m ON m.id = r.meeting_id
-              WHERE {meeting_visible}{date}
+              WHERE {meeting_visible}{date}{scoped}
               ORDER BY r.rank ASC, m.started_at DESC, m.id DESC
               LIMIT ?2"
         );
@@ -5204,6 +5208,7 @@ impl Db {
         min_cosine: f32,
         unlocked: &HashSet<String>,
         date_filter: Option<&(String, String)>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<(String, f64)>> {
         if query_vec.is_empty() || k <= 0 {
             return Ok(Vec::new());
@@ -5211,6 +5216,7 @@ impl Db {
         let conn = self.lock();
         let meeting_visible = meeting_visibility_clause("m", unlocked);
         let date = date_clause(date_filter);
+        let scoped = folder_scope_clause("m", scope);
         // Each vec0 table gets its own single-MATCH CTE (a vec0 query allows exactly one MATCH+k
         // constraint); the union + visibility + window join happen OUTSIDE the KNN CTEs.
         let sql = format!(
@@ -5235,7 +5241,7 @@ impl Db {
              SELECT m.id, b.distance
                FROM best b
                JOIN meetings m ON m.id = b.meeting_id
-              WHERE {meeting_visible}{date}
+              WHERE {meeting_visible}{date}{scoped}
               ORDER BY b.distance ASC, m.id ASC"
         );
         let blob = crate::embed::vec_to_blob(query_vec);
@@ -5280,6 +5286,7 @@ impl Db {
     /// the FTS and graph legs are NEVER floored. Sentinel `0.0` = no floor. When the floor empties
     /// the KNN leg on an irrelevant corpus, `score_fuse`'s empty-leg redistribution rescales the
     /// surviving FTS + graph legs, so an exact-word FTS hit still surfaces (recall safety).
+    #[allow(clippy::too_many_arguments)]
     pub fn search_hybrid_visible(
         &self,
         query: &str,
@@ -5288,6 +5295,7 @@ impl Db {
         min_cosine: f32,
         unlocked: &HashSet<String>,
         date_filter: Option<(String, String)>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<SearchHit>> {
         let range = date_filter.as_ref();
         let in_range = |m: &Meeting| -> bool {
@@ -5300,23 +5308,23 @@ impl Db {
         };
 
         // Snippet-bearing hit lists (each already gated); ordering comes from the scored legs.
-        let fts = self.search_visible_impl(query, limit, unlocked, range)?;
-        let semantic = self.search_semantic_visible(query_vec, limit, min_cosine, unlocked)?;
+        let fts = self.search_visible_impl(query, limit, unlocked, range, scope)?;
+        let semantic = self.search_semantic_visible(query_vec, limit, min_cosine, unlocked, scope)?;
 
         // GraphRAG-lite leg: resolve the query to known VISIBLE entities (deterministic, no LLM),
         // then gather their co-mention neighbourhood. Both the resolver and the neighbour reader
         // apply the same visibility predicate; the temporal window is applied here in Rust.
         let matched_entities = self.entities_matching_query(query, unlocked)?;
-        let mut graph = self.meetings_mentioning_entities_visible(&matched_entities, unlocked)?;
+        let mut graph = self.meetings_mentioning_entities_visible(&matched_entities, unlocked, scope)?;
         graph.retain(|m| in_range(m));
 
         // RAW-SCORED legs (L1.3). FTS: -bm25 higher-better over all four lexical sources. KNN:
         // raw distances over both vector tables. Graph: 1/rank of the neighbourhood ordering.
-        let mut fts_scored = self.fts_meeting_scores(query, limit, unlocked, range)?;
+        let mut fts_scored = self.fts_meeting_scores(query, limit, unlocked, range, scope)?;
         if fts_scored.is_empty() && range.is_some() {
             // Temporal fallback (L1.5): no lexical match inside the window ⇒ the window IS the
             // query — visible in-range meetings, newest-first, positionally scored.
-            let in_window = self.meetings_in_range_visible(range, limit, unlocked)?;
+            let in_window = self.meetings_in_range_visible(range, limit, unlocked, scope)?;
             fts_scored = in_window
                 .iter()
                 .enumerate()
@@ -5324,7 +5332,7 @@ impl Db {
                 .collect();
         }
         let knn_scored =
-            self.knn_meeting_distances(query_vec, limit, min_cosine, unlocked, range)?;
+            self.knn_meeting_distances(query_vec, limit, min_cosine, unlocked, range, scope)?;
         let graph_scored: Vec<(String, f64)> = graph
             .iter()
             .enumerate()
@@ -5415,6 +5423,7 @@ impl Db {
         date_filter: Option<&(String, String)>,
         limit: i64,
         unlocked: &HashSet<String>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<Meeting>> {
         let Some(range) = date_filter else {
             return Ok(Vec::new());
@@ -5422,11 +5431,12 @@ impl Db {
         let conn = self.lock();
         let meeting_visible = meeting_visibility_clause("m", unlocked);
         let date = date_clause(Some(range));
+        let scoped = folder_scope_clause("m", scope);
         let sql = format!(
             "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
                     m.folder_id
                FROM meetings m
-              WHERE {meeting_visible}{date}
+              WHERE {meeting_visible}{date}{scoped}
               ORDER BY m.started_at DESC, m.id DESC
               LIMIT ?1"
         );
@@ -6313,12 +6323,17 @@ impl Db {
         k: i64,
         min_cosine: f32,
         unlocked: &HashSet<String>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<DocChunkHit>> {
         if query_vec.is_empty() || k <= 0 {
             return Ok(Vec::new());
         }
         let conn = self.lock();
         let visible = visibility_clause("f", unlocked);
+        // Notes and DOCUMENTS are folder-anchored too, so a container scope must narrow them
+        // exactly as it narrows meetings — otherwise a scoped Ask still appends the whole vault's
+        // notes to a cloud-bound corpus.
+        let scoped = folder_scope_clause("d", scope);
         // KNN isolated to the vec0 table in a CTE; visibility + document columns joined OUTSIDE it.
         // The trailing `knn.distance` column feeds the S1 relevance floor (dropped below-floor).
         let sql = format!(
@@ -6333,7 +6348,7 @@ impl Db {
                JOIN doc_chunks dc ON dc.id = knn.chunk_id
                JOIN documents d ON d.id = dc.document_id
                JOIN folders f ON f.id = d.folder_id
-              WHERE d.kind IN ('note','document') AND {visible}
+              WHERE d.kind IN ('note','document') AND {visible}{scoped}
               ORDER BY knn.distance ASC, d.id ASC"
         );
         let blob = crate::embed::vec_to_blob(query_vec);
@@ -6375,6 +6390,7 @@ impl Db {
         query: &str,
         limit: i64,
         unlocked: &HashSet<String>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<DocChunkHit>> {
         if limit <= 0 {
             return Ok(Vec::new());
@@ -6385,6 +6401,10 @@ impl Db {
         };
         let conn = self.lock();
         let visible = visibility_clause("f", unlocked);
+        // Notes and DOCUMENTS are folder-anchored too, so a container scope must narrow them
+        // exactly as it narrows meetings — otherwise a scoped Ask still appends the whole vault's
+        // notes to a cloud-bound corpus.
+        let scoped = folder_scope_clause("d", scope);
         let sql = format!(
             "SELECT d.id, d.name, d.folder_id, dc.text, d.kind,
                     dc.id, dc.parent_id, dc.section_path, dc.page_no, dc.level
@@ -6393,7 +6413,7 @@ impl Db {
                JOIN documents d ON d.id = dc.document_id
                JOIN folders f ON f.id = d.folder_id
               WHERE fts_doc_chunks MATCH ?1
-                AND d.kind IN ('note','document') AND {visible}
+                AND d.kind IN ('note','document') AND {visible}{scoped}
               ORDER BY bm25(fts_doc_chunks) ASC, d.id ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
@@ -7165,7 +7185,7 @@ impl Db {
     ) -> Result<Vec<MeetingActionSummary>> {
         let mut out: Vec<MeetingActionSummary> = Vec::new();
         // GATE 1: only VISIBLE meetings. GATE 2: only the VISIBLE note (None for sealed-not-unlocked).
-        for m in self.list_meetings_visible(1000, unlocked)? {
+        for m in self.list_meetings_visible(1000, unlocked, None)? {
             let Some(note) = self.get_note_if_visible(&m.id, unlocked)? else {
                 continue; // sealed-and-not-unlocked → no row (aggregate posture).
             };
@@ -7712,7 +7732,23 @@ impl Db {
         limit: i64,
         unlocked: &HashSet<String>,
     ) -> Result<Vec<SearchHit>> {
-        self.search_visible_impl(query, limit, unlocked, None)
+        self.search_visible_impl(query, limit, unlocked, None, None)
+    }
+
+    /// [`Db::search_visible`] narrowed to a container SCOPE — the folder ids to search inside.
+    ///
+    /// `None` is byte-for-byte `search_visible`. A non-empty scope ANDs onto the SAME visibility
+    /// predicate rather than replacing it, so it can only ever remove rows the lock gate already
+    /// allowed: scoping into a locked-and-not-session-unlocked folder returns nothing, it does not
+    /// return its contents.
+    pub fn search_visible_scoped(
+        &self,
+        query: &str,
+        limit: i64,
+        unlocked: &HashSet<String>,
+        scope: Option<&[String]>,
+    ) -> Result<Vec<SearchHit>> {
+        self.search_visible_impl(query, limit, unlocked, None, scope)
     }
 
     /// Visibility-gated transcript FTS hits that retain their stored segment id.
@@ -7857,13 +7893,14 @@ impl Db {
         limit: i64,
         unlocked: &HashSet<String>,
         date_filter: Option<(String, String)>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<SearchHit>> {
-        let hits = self.search_visible_impl(query, limit, unlocked, date_filter.as_ref())?;
+        let hits = self.search_visible_impl(query, limit, unlocked, date_filter.as_ref(), scope)?;
         if !hits.is_empty() || date_filter.is_none() {
             return Ok(hits);
         }
         let range = date_filter.as_ref();
-        let meetings = self.meetings_in_range_visible(range, limit, unlocked)?;
+        let meetings = self.meetings_in_range_visible(range, limit, unlocked, scope)?;
         Ok(meetings
             .into_iter()
             .map(|m| {
@@ -7883,6 +7920,7 @@ impl Db {
         limit: i64,
         unlocked: &HashSet<String>,
         date_filter: Option<&(String, String)>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<SearchHit>> {
         let q = query.trim();
         let Some(and_expr) = fts_match_query(q) else {
@@ -7891,6 +7929,9 @@ impl Db {
         let conn = self.lock();
         let meeting_visible = meeting_visibility_clause("m", unlocked);
         let date = date_clause(date_filter);
+        // Container SCOPE, ANDed AFTER the visibility gate — it can only remove rows the gate
+        // already allowed, never add one.
+        let scoped = folder_scope_clause("m", scope);
         // FTS5/BM25 candidates (same UNION/MIN(bm25) ranking as `search`), THEN gated by exactly the
         // prior visibility predicate so a sealed-and-not-session-unlocked meeting is excluded: keep
         // a meeting iff it has NO note rows, OR it has at least one VISIBLE note row (folder
@@ -7924,7 +7965,7 @@ impl Db {
                     m.folder_id
                FROM ranked r
                JOIN meetings m ON m.id = r.meeting_id
-              WHERE {meeting_visible}{date}
+              WHERE {meeting_visible}{date}{scoped}
               ORDER BY r.rank ASC, m.started_at DESC, m.id DESC
               LIMIT ?2"
         );
@@ -8173,7 +8214,72 @@ impl Db {
                 });
             }
         }
-        Ok((out, note_count + meeting_count + document_count))
+        // CONTAINERS (Spaces/folders) — offered so a caller can pick a place to SCOPE a search to,
+        // never as pinned content. `LinkKind::Container` is deliberately not a content source, so a
+        // container that reaches a corpus packer would be a bug; the Ask composer routes it to
+        // `scopeFolderIds` instead, and every other `<mur-source-picker>` keeps the historical
+        // default kinds and therefore never sees these rows at all.
+        //
+        // Selectability reuses `picker_renderable_container` — the SAME predicate the Related
+        // hierarchy picker was reviewed against (no system paths, no roots, valid levels) — rather
+        // than a second, divergent notion of "a folder a user may choose".
+        //
+        // A SEALED-and-not-session-unlocked folder is NOT listed. An earlier revision listed it,
+        // reasoning that the Related hierarchy picker already shows folder names — but THIS list has
+        // a stricter contract, pinned by `list_link_candidates_hides_sealed_sources`: even the
+        // pagination TOTAL must not disclose that a matching sealed row exists. A name is a
+        // disclosure, and searching "Secret" must not confirm a folder called that. Nothing is lost:
+        // scoping to a folder the session cannot see would return no content anyway.
+        let container_where = format!(
+            "{} AND {} AND f.name LIKE :pat ESCAPE '\\'",
+            crate::storage::related_picker_store::picker_renderable_container("f"),
+            visibility_clause("f", unlocked)
+        );
+        let container_count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM folders f WHERE {container_where}"),
+                rusqlite::named_params! { ":pat": pat },
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        let consumed = note_count + meeting_count + document_count;
+        let container_offset = (offset - consumed).max(0);
+        let remaining = limit - out.len() as i64;
+        if remaining > 0 && container_offset < container_count {
+            let sql = format!(
+                "SELECT f.id, f.name
+                   FROM folders f
+                  WHERE {container_where}
+                  ORDER BY f.path ASC, f.id ASC
+                  LIMIT :limit OFFSET :offset"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::named_params! {
+                        ":pat": pat,
+                        ":limit": remaining,
+                        ":offset": container_offset,
+                    },
+                    |r: &Row<'_>| -> rusqlite::Result<(String, String)> {
+                        Ok((r.get(0)?, r.get(1)?))
+                    },
+                )
+                .map_err(map_err)?;
+            for r in rows {
+                let (id, name) = r.map_err(map_err)?;
+                out.push(NoteCitation {
+                    kind: "container".into(),
+                    id,
+                    title: name,
+                    snippet: String::new(),
+                });
+            }
+        }
+        Ok((
+            out,
+            note_count + meeting_count + document_count + container_count,
+        ))
     }
 
     // `get_note_if_visible` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
@@ -8341,7 +8447,7 @@ impl Db {
 
     /// OPEN-COMMITMENTS rollup (deterministic, no model): every OPEN (`- [ ]`) action item across
     /// the VISIBLE meetings, with its meeting context. DOUBLE-GATED — the meeting list is filtered
-    /// by `list_meetings_visible(unlocked)` and each note is re-fetched through
+    /// by `list_meetings_visible(unlocked, None, None)` and each note is re-fetched through
     /// `get_note_if_visible(unlocked)`, so a sealed-and-not-session-unlocked meeting contributes
     /// NOTHING (its note markdown is never read here). Checked-off (`- [x]`) items are dropped.
     /// `owner`, when Some, filters case-insensitively. Sorted by due date (None last), then recency.
@@ -8358,7 +8464,7 @@ impl Db {
             .filter(|o| !o.is_empty());
         let mut out: Vec<Commitment> = Vec::new();
         // GATE 1: only VISIBLE meetings. GATE 2: only the VISIBLE note (None for sealed-not-unlocked).
-        for m in self.list_meetings_visible(1000, unlocked)? {
+        for m in self.list_meetings_visible(1000, unlocked, None)? {
             let Some(note) = self.get_note_if_visible(&m.id, unlocked)? else {
                 continue;
             };
@@ -9389,6 +9495,39 @@ pub(crate) fn note_snippet(markdown: &str) -> String {
 /// app-generated ISO `YYYY-MM-DD` strings (from `summarize::temporal`) — compared
 /// lexicographically against the ISO-8601 `started_at` column — but single quotes are still
 /// escaped defensively (mirrors `visibility_clause`).
+/// SQL narrowing a meetings alias to a set of folder ids — the container SCOPE.
+///
+/// Returns a fragment that is APPENDED to an existing `WHERE`, never one that replaces it: every
+/// caller emits `WHERE {meeting_visible}{scope}`, so the lock gate always runs and the scope can
+/// only ever REMOVE rows the gate already allowed. A scope must not be able to widen anything.
+///
+/// `None` (or an empty set) yields the empty string, so an unscoped query is byte-for-byte the
+/// statement that shipped before scoping existed.
+///
+/// A meeting with no folder (`folder_id IS NULL` — Not classified) is outside every container and is
+/// therefore excluded by `IN`, which is the intended reading of "search inside this folder".
+///
+/// Ids are quoted the same way `visibility_clause` quotes the session unlock set, and THAT is what
+/// makes this safe — not their provenance. They are usually folder UUIDs read back from the
+/// database, but `folder_subtree_ids` returns an unknown id verbatim, so a value that reached the
+/// backend from the frontend can land here. Doubling `'` inside a `'…'` literal is complete for
+/// SQLite (it has no backslash escapes in string literals), so `x') OR 1=1 --` renders as one
+/// literal. Do not remove the quoting on the belief that these are always internal ids.
+///
+/// The folder NAME still never reaches this SQL, which is why `folder_subtree_ids` resolves the
+/// subtree in Rust rather than with a `LIKE` over paths.
+pub(crate) fn folder_scope_clause(alias: &str, scope: Option<&[String]>) -> String {
+    let Some(ids) = scope.filter(|ids| !ids.is_empty()) else {
+        return String::new();
+    };
+    let list = ids
+        .iter()
+        .map(|id| format!("'{}'", id.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" AND {alias}.folder_id IN ({list})")
+}
+
 fn date_clause(date_filter: Option<&(String, String)>) -> String {
     match date_filter {
         Some((from, to)) => format!(

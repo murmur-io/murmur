@@ -2173,12 +2173,19 @@ export class IpcService {
     explicitSources?: SourceRef[],
     pinnedOrgItemId?: string,
     dashboardId?: string,
+    scopeFolderIds?: string[],
   ): Promise<AskVaultResult> {
     return invoke<AskVaultResult>("ask_vault", {
       question,
       history,
       askThreadId,
       ...(explicitSources?.length ? { explicitSources } : {}),
+      // CONTAINER SCOPE — answer from what is filed under these Spaces/folders, subtree included.
+      // Distinct from `explicitSources`, which PINS specific items into the corpus: a scope narrows
+      // RETRIEVAL instead, so a folder holding a hundred notes costs what five cost, and a note
+      // added to the folder tomorrow is in scope without re-choosing anything. Empty ⇒ omitted, so
+      // "scope cleared" is the whole vault rather than a scope matching nothing.
+      ...(scopeFolderIds?.length ? { scopeFolderIds } : {}),
       // Org-item viewer: pin a read-only SHARED (org-feed) note into the Ask context server-side
       // (the local Brain never retrieves org content via search, so pinning is what grounds it).
       ...(pinnedOrgItemId ? { pinnedOrgItemId } : {}),
@@ -2224,6 +2231,7 @@ export class IpcService {
     explicitSources?: SourceRef[],
     askTraceId?: string,
     dashboardId?: string,
+    scopeFolderIds?: string[],
   ): Promise<AskConversationSendResult> {
     return invoke<AskConversationSendResult>("ask_vault_persisted", {
       scope,
@@ -2232,6 +2240,9 @@ export class IpcService {
       askTraceId,
       ...(explicitSources?.length ? { explicitSources } : {}),
       ...(dashboardId ? { dashboardId } : {}),
+      // Container scope — see `askVault`. Sent separately from `explicitSources` because a place
+      // is not a document: it narrows the search instead of being packed into the corpus.
+      ...(scopeFolderIds?.length ? { scopeFolderIds } : {}),
     });
   }
 

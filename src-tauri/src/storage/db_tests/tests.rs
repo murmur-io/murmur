@@ -8371,12 +8371,21 @@ fn list_link_candidates_hides_sealed_sources() {
     let (visible, visible_total) = db
         .list_link_candidates_visible("Secret", 10, 0, &unlocked)
         .unwrap();
+    // Three, not two: the folder itself is named "Secret", and once it is session-unlocked it is a
+    // legitimate CONTAINER candidate — something a user may scope a search to. It is offered as a
+    // place to look inside, never as pinnable content (`LinkKind::Container` is not a content
+    // source), and only a picker that opts into the `container` kind ever sees it.
     assert_eq!(
         visible.len(),
-        2,
-        "unlocking reveals both the note and the meeting"
+        3,
+        "unlocking reveals the note, the meeting, and the folder itself as a scope"
     );
-    assert_eq!(visible_total, 2);
+    assert_eq!(
+        visible.iter().filter(|r| r.kind == "container").count(),
+        1,
+        "exactly one of them is the container"
+    );
+    assert_eq!(visible_total, 3);
 }
 
 /// DOCUMENTS LEG (2026-07-20 link-documents): `list_link_candidates_visible` now surfaces
@@ -8491,9 +8500,12 @@ fn list_link_candidates_hides_sealed_documents() {
     let (visible, visible_total) = db
         .list_link_candidates_visible("Secret", 10, 0, &unlocked)
         .unwrap();
-    assert_eq!(visible.len(), 1, "unlocking reveals the document");
-    assert_eq!(visible[0].id, "d-secret");
-    assert_eq!(visible_total, 1);
+    // The document plus the now-unlocked folder named "Secret" — the latter as a SCOPE candidate,
+    // not as content. Sealed, neither appears at all (asserted above, including the total).
+    assert_eq!(visible.len(), 2, "unlocking reveals the document and the folder as a scope");
+    assert!(visible.iter().any(|r| r.id == "d-secret" && r.kind == "document"));
+    assert!(visible.iter().any(|r| r.id == "f-locked" && r.kind == "container"));
+    assert_eq!(visible_total, 2);
 }
 
 /// PAGINATION across the notes → meetings → documents seam: `offset` walks the ONE combined
@@ -10854,7 +10866,7 @@ fn vec_knn_orders_nearest_first() {
 
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_semantic_visible(&query, 3, 0.0, &nothing)
+        .search_semantic_visible(&query, 3, 0.0, &nothing, None)
         .unwrap();
     let order: Vec<&str> = hits.iter().map(|h| h.meeting.id.as_str()).collect();
     assert_eq!(
@@ -10885,7 +10897,7 @@ fn vec_semantic_search_is_gated_by_visibility() {
     // Empty unlock set → excluded.
     let nothing = std::collections::HashSet::new();
     let hidden = db
-        .search_semantic_visible(&query, 10, 0.0, &nothing)
+        .search_semantic_visible(&query, 10, 0.0, &nothing, None)
         .unwrap();
     assert!(
         !hidden.iter().any(|h| h.meeting.id == "sealed"),
@@ -10895,7 +10907,7 @@ fn vec_semantic_search_is_gated_by_visibility() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
     let shown = db
-        .search_semantic_visible(&query, 10, 0.0, &unlocked)
+        .search_semantic_visible(&query, 10, 0.0, &unlocked, None)
         .unwrap();
     assert!(
         shown.iter().any(|h| h.meeting.id == "sealed"),
@@ -10923,7 +10935,7 @@ fn vec_hybrid_search_is_gated_by_visibility() {
     // Empty unlock set → the sealed meeting is absent through the whole fused reader.
     let nothing = std::collections::HashSet::new();
     let hidden = db
-        .search_hybrid_visible("budget", &query_vec, 10, 0.0, &nothing, None)
+        .search_hybrid_visible("budget", &query_vec, 10, 0.0, &nothing, None, None)
         .unwrap();
     assert!(
         !hidden.iter().any(|h| h.meeting.id == "sealed"),
@@ -10934,7 +10946,7 @@ fn vec_hybrid_search_is_gated_by_visibility() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
     let shown = db
-        .search_hybrid_visible("budget", &query_vec, 10, 0.0, &unlocked, None)
+        .search_hybrid_visible("budget", &query_vec, 10, 0.0, &unlocked, None, None)
         .unwrap();
     assert!(
         shown.iter().any(|h| h.meeting.id == "sealed"),
@@ -11153,7 +11165,7 @@ fn expand_serves_the_hit_sections_own_parent_when_siblings_corroborate() {
     seed_two_section_doc(&db, "d1", "f1");
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("pistachio", 20, &nothing)
+        .search_doc_chunks_fts_visible("pistachio", 20, &nothing, None)
         .unwrap();
     assert_eq!(hits.len(), 1, "one document → one deduped hit");
     let h = &hits[0];
@@ -11193,7 +11205,7 @@ fn expand_requires_two_corroborating_sibling_leaves() {
     seed_two_section_doc(&db, "d1", "f1");
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("zloty", 20, &nothing)
+        .search_doc_chunks_fts_visible("zloty", 20, &nothing, None)
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].level, 0, "the single matching Beta leaf wins");
@@ -11234,7 +11246,7 @@ fn flat_doc_hit_keeps_its_leaf_no_expansion() {
         .unwrap();
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("zanzibar", 20, &nothing)
+        .search_doc_chunks_fts_visible("zanzibar", 20, &nothing, None)
         .unwrap();
     assert_eq!(hits.len(), 1, "a mid-file leaf must be keyword-reachable");
     assert!(
@@ -11264,7 +11276,7 @@ fn expand_doc_parents_is_gated_and_returns_section_text() {
     let nothing = std::collections::HashSet::new();
     // Open folder → the corroborated Beta hit expands to its section text.
     let hits = db
-        .search_doc_chunks_fts_visible("pistachio", 20, &nothing)
+        .search_doc_chunks_fts_visible("pistachio", 20, &nothing, None)
         .unwrap();
     assert_eq!(hits.len(), 1);
     let open = db.expand_doc_parents_visible(&hits, &nothing).unwrap();
@@ -11334,7 +11346,7 @@ fn doc_chunk_search_is_gated_by_visibility() {
     // Open folder → visible.
     let nothing = std::collections::HashSet::new();
     assert!(
-        db.search_doc_chunks_visible(&query, 10, 0.0, &nothing)
+        db.search_doc_chunks_visible(&query, 10, 0.0, &nothing, None)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -11344,7 +11356,7 @@ fn doc_chunk_search_is_gated_by_visibility() {
     // Seal the folder (chunk row deliberately survives) → INVISIBLE with empty unlock set.
     db.set_folder_locked("f-locked", true, None).unwrap();
     let hidden = db
-        .search_doc_chunks_visible(&query, 10, 0.0, &nothing)
+        .search_doc_chunks_visible(&query, 10, 0.0, &nothing, None)
         .unwrap();
     assert!(
         !hidden.iter().any(|h| h.document_id == "d1"),
@@ -11355,7 +11367,7 @@ fn doc_chunk_search_is_gated_by_visibility() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
     let shown = db
-        .search_doc_chunks_visible(&query, 10, 0.0, &unlocked)
+        .search_doc_chunks_visible(&query, 10, 0.0, &unlocked, None)
         .unwrap();
     assert!(
         shown.iter().any(|h| h.document_id == "d1"),
@@ -11394,7 +11406,7 @@ fn index_document_chunks_none_embedder_chunks_no_vectors_fts_finds() {
 
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("pistachio", 10, &nothing)
+        .search_doc_chunks_fts_visible("pistachio", 10, &nothing, None)
         .unwrap();
     assert!(
         hits.iter()
@@ -11403,7 +11415,7 @@ fn index_document_chunks_none_embedder_chunks_no_vectors_fts_finds() {
     );
     // Punctuation-only query defuses to no hits (never an FTS syntax error).
     assert!(db
-        .search_doc_chunks_fts_visible("?!*(", 10, &nothing)
+        .search_doc_chunks_fts_visible("?!*(", 10, &nothing, None)
         .unwrap()
         .is_empty());
 }
@@ -11428,7 +11440,7 @@ fn index_document_chunks_reflow_is_noop_on_clean_md() {
     db.index_document_chunks("d1", None).unwrap();
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("pistachio", 10, &nothing)
+        .search_doc_chunks_fts_visible("pistachio", 10, &nothing, None)
         .unwrap();
     assert!(
         hits.iter()
@@ -11544,7 +11556,7 @@ fn index_document_chunks_reflow_defragments_letter_spaced_pdf_text() {
 
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("Frontend", 10, &nothing)
+        .search_doc_chunks_fts_visible("Frontend", 10, &nothing, None)
         .unwrap();
     assert!(
         hits.iter().any(|h| h.document_id == "d1"),
@@ -11607,7 +11619,7 @@ fn index_document_chunks_contact_digest_makes_phone_retrievable_by_nl_query() {
 
     let nothing = std::collections::HashSet::new();
     for q in ["numer telefonu", "phone number", "telefon"] {
-        let hits = db.search_doc_chunks_fts_visible(q, 10, &nothing).unwrap();
+        let hits = db.search_doc_chunks_fts_visible(q, 10, &nothing, None).unwrap();
         assert!(
             hits.iter().any(|h| h.document_id == "d-cv"),
             "query {q:?} must retrieve the CV via the contact digest: {hits:?}"
@@ -11619,7 +11631,7 @@ fn index_document_chunks_contact_digest_makes_phone_retrievable_by_nl_query() {
     }
     // The digest also carries the number itself (spaced + bare), so a digit query lands too.
     let by_number = db
-        .search_doc_chunks_fts_visible("786 327 907", 10, &nothing)
+        .search_doc_chunks_fts_visible("786 327 907", 10, &nothing, None)
         .unwrap();
     assert!(
         by_number.iter().any(|h| h.document_id == "d-cv"),
@@ -11749,7 +11761,7 @@ fn doc_chunk_fts_search_is_gated_by_visibility() {
 
     let nothing = std::collections::HashSet::new();
     assert!(
-        db.search_doc_chunks_fts_visible("launch", 10, &nothing)
+        db.search_doc_chunks_fts_visible("launch", 10, &nothing, None)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -11759,7 +11771,7 @@ fn doc_chunk_fts_search_is_gated_by_visibility() {
     // Seal the folder (chunk row deliberately survives) → INVISIBLE with empty unlock set.
     db.set_folder_locked("f-locked", true, None).unwrap();
     assert!(
-        !db.search_doc_chunks_fts_visible("launch", 10, &nothing)
+        !db.search_doc_chunks_fts_visible("launch", 10, &nothing, None)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -11770,7 +11782,7 @@ fn doc_chunk_fts_search_is_gated_by_visibility() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
     assert!(
-        db.search_doc_chunks_fts_visible("launch", 10, &unlocked)
+        db.search_doc_chunks_fts_visible("launch", 10, &unlocked, None)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -11817,7 +11829,7 @@ fn doc_fts_tokens_purged_with_chunks_and_restored_on_reindex() {
     );
     let nothing = std::collections::HashSet::new();
     assert!(db
-        .search_doc_chunks_fts_visible("unicornfeather", 10, &nothing)
+        .search_doc_chunks_fts_visible("unicornfeather", 10, &nothing, None)
         .unwrap()
         .is_empty());
 
@@ -11847,7 +11859,7 @@ fn doc_fts_matches_polish_diacritics_folded() {
     let nothing = std::collections::HashSet::new();
     for q in ["budzet", "jazn", "gesla"] {
         assert!(
-            db.search_doc_chunks_fts_visible(q, 10, &nothing)
+            db.search_doc_chunks_fts_visible(q, 10, &nothing, None)
                 .unwrap()
                 .iter()
                 .any(|h| h.document_id == "d1"),
@@ -11855,7 +11867,7 @@ fn doc_fts_matches_polish_diacritics_folded() {
         );
     }
     assert!(
-        db.search_doc_chunks_fts_visible("gęślą", 10, &nothing)
+        db.search_doc_chunks_fts_visible("gęślą", 10, &nothing, None)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -14781,7 +14793,7 @@ fn transcript_chunks_are_gated_by_visibility_semantic() {
     let query = one_hot(0);
     let nothing = std::collections::HashSet::new();
     let hidden = db
-        .search_semantic_visible(&query, 10, 0.0, &nothing)
+        .search_semantic_visible(&query, 10, 0.0, &nothing, None)
         .unwrap();
     assert!(
         !hidden.iter().any(|h| h.meeting.id == "sealed"),
@@ -14791,7 +14803,7 @@ fn transcript_chunks_are_gated_by_visibility_semantic() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
     let shown = db
-        .search_semantic_visible(&query, 10, 0.0, &unlocked)
+        .search_semantic_visible(&query, 10, 0.0, &unlocked, None)
         .unwrap();
     assert!(
         shown.iter().any(|h| h.meeting.id == "sealed"),
@@ -14833,7 +14845,7 @@ fn transcript_chunks_are_gated_by_visibility_hybrid() {
     let query_vec = one_hot(0);
     let nothing = std::collections::HashSet::new();
     let hidden = db
-        .search_hybrid_visible("merger", &query_vec, 10, 0.0, &nothing, None)
+        .search_hybrid_visible("merger", &query_vec, 10, 0.0, &nothing, None, None)
         .unwrap();
     assert!(
         !hidden.iter().any(|h| h.meeting.id == "sealed"),
@@ -14842,7 +14854,7 @@ fn transcript_chunks_are_gated_by_visibility_hybrid() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
     let shown = db
-        .search_hybrid_visible("merger", &query_vec, 10, 0.0, &unlocked, None)
+        .search_hybrid_visible("merger", &query_vec, 10, 0.0, &unlocked, None, None)
         .unwrap();
     assert!(
         shown.iter().any(|h| h.meeting.id == "sealed"),
@@ -14907,14 +14919,14 @@ fn transcript_chunks_purged_on_seal() {
     let query = one_hot(0);
     let nothing = std::collections::HashSet::new();
     assert!(
-        !db.search_semantic_visible(&query, 10, 0.0, &nothing)
+        !db.search_semantic_visible(&query, 10, 0.0, &nothing, None)
             .unwrap()
             .iter()
             .any(|h| h.meeting.id == "m1"),
         "sealed meeting must not surface via semantic search after purge"
     );
     assert!(
-        !db.search_hybrid_visible("marketing", &query, 10, 0.0, &nothing, None)
+        !db.search_hybrid_visible("marketing", &query, 10, 0.0, &nothing, None, None)
             .unwrap()
             .iter()
             .any(|h| h.meeting.id == "m1"),
@@ -14987,7 +14999,7 @@ fn vec_hybrid_fuses_fts_and_vector() {
 
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_hybrid_visible("alpha", &query, 10, 0.0, &nothing, None)
+        .search_hybrid_visible("alpha", &query, 10, 0.0, &nothing, None, None)
         .unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.meeting.id.as_str()).collect();
     // One hit per meeting (dedup).
@@ -15046,14 +15058,14 @@ fn graph_leg_surfaces_co_mentioned_meeting_fts_and_vector_miss() {
     );
     // ... and absent from vector (no chunk at all → empty KNN).
     assert!(
-        db.search_semantic_visible(&empty_vec, 10, 0.0, &nothing)
+        db.search_semantic_visible(&empty_vec, 10, 0.0, &nothing, None)
             .unwrap()
             .is_empty(),
         "vector must miss B"
     );
     // The query names entity Atlas → graph leg pulls in its neighbour B.
     let hits = db
-        .search_hybrid_visible("atlas status", &empty_vec, 10, 0.0, &nothing, None)
+        .search_hybrid_visible("atlas status", &empty_vec, 10, 0.0, &nothing, None, None)
         .unwrap();
     assert!(
         hits.iter().any(|h| h.meeting.id == "B"),
@@ -15087,7 +15099,7 @@ fn graph_expansion_respects_lock_gate() {
     let empty = std::collections::HashSet::new();
     // Neighbour reader: B (sealed) excluded, A (open) kept.
     let nbrs = db
-        .meetings_mentioning_entities_visible(std::slice::from_ref(&atlas), &empty)
+        .meetings_mentioning_entities_visible(std::slice::from_ref(&atlas), &empty, None)
         .unwrap();
     assert!(nbrs.iter().any(|m| m.id == "A"), "open neighbour A present");
     assert!(
@@ -15106,7 +15118,7 @@ fn graph_expansion_respects_lock_gate() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-secret".to_string());
     let nbrs_u = db
-        .meetings_mentioning_entities_visible(&[atlas], &unlocked)
+        .meetings_mentioning_entities_visible(&[atlas], &unlocked, None)
         .unwrap();
     assert!(
         nbrs_u.iter().any(|m| m.id == "B"),
@@ -15153,7 +15165,7 @@ fn no_entity_match_leaves_hybrid_identical_to_two_leg_fusion() {
     // Expected = RRF over EXACTLY the two legs.
     let fts = db.search_visible("budget planning", 10, &nothing).unwrap();
     let sem = db
-        .search_semantic_visible(&query, 10, 0.0, &nothing)
+        .search_semantic_visible(&query, 10, 0.0, &nothing, None)
         .unwrap();
     let fts_ids: Vec<String> = fts.iter().map(|h| h.meeting.id.clone()).collect();
     let sem_ids: Vec<String> = sem.iter().map(|h| h.meeting.id.clone()).collect();
@@ -15163,7 +15175,7 @@ fn no_entity_match_leaves_hybrid_identical_to_two_leg_fusion() {
         .collect();
 
     let got: Vec<String> = db
-        .search_hybrid_visible("budget planning", &query, 10, 0.0, &nothing, None)
+        .search_hybrid_visible("budget planning", &query, 10, 0.0, &nothing, None, None)
         .unwrap()
         .into_iter()
         .map(|h| h.meeting.id)
@@ -15200,7 +15212,7 @@ fn three_leg_rrf_ranks_multi_leg_first_and_dedups() {
 
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_hybrid_visible("atlas budget", &query, 10, 0.0, &nothing, None)
+        .search_hybrid_visible("atlas budget", &query, 10, 0.0, &nothing, None, None)
         .unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.meeting.id.as_str()).collect();
     // Dedup: each meeting once.
@@ -15616,7 +15628,7 @@ fn hybrid_date_filter_excludes_out_of_window_lexical_match() {
 
     // RED baseline (no filter): BOTH lexical matches surface.
     let unfiltered = db
-        .search_hybrid_visible("budżet", &[], 10, 0.0, &nothing, None)
+        .search_hybrid_visible("budżet", &[], 10, 0.0, &nothing, None, None)
         .unwrap();
     assert!(unfiltered.iter().any(|h| h.meeting.id == "m-in"));
     assert!(
@@ -15627,7 +15639,7 @@ fn hybrid_date_filter_excludes_out_of_window_lexical_match() {
     // GREEN: the "last week of the 2026-06-29 anchor" window excludes m-out on EVERY leg.
     let window = Some(("2026-06-22".to_string(), "2026-06-29".to_string()));
     let filtered = db
-        .search_hybrid_visible("budżet", &[], 10, 0.0, &nothing, window)
+        .search_hybrid_visible("budżet", &[], 10, 0.0, &nothing, window, None)
         .unwrap();
     assert!(
         filtered.iter().any(|h| h.meeting.id == "m-in"),
@@ -15656,7 +15668,7 @@ fn search_visible_in_range_falls_back_to_temporal_window() {
     let window = Some(("2026-06-22".to_string(), "2026-06-29".to_string()));
     // No token of this query appears in any note ⇒ pure window fallback.
     let hits = db
-        .search_visible_in_range("what did we discuss", 10, &nothing, window)
+        .search_visible_in_range("what did we discuss", 10, &nothing, window, None)
         .unwrap();
     assert_eq!(
         hits.len(),
@@ -15668,7 +15680,7 @@ fn search_visible_in_range_falls_back_to_temporal_window() {
 
     // Without a window the same no-match query returns nothing (unchanged FTS behavior).
     let none = db
-        .search_visible_in_range("what did we discuss", 10, &nothing, None)
+        .search_visible_in_range("what did we discuss", 10, &nothing, None, None)
         .unwrap();
     assert!(
         none.is_empty(),
@@ -16343,7 +16355,7 @@ fn s1_floor_drops_orthogonal_semantic_neighbour() {
 
     // No floor (0.0) → BOTH returned.
     let all = db
-        .search_semantic_visible(&query, 10, 0.0, &nothing)
+        .search_semantic_visible(&query, 10, 0.0, &nothing, None)
         .unwrap();
     let ids: Vec<&str> = all.iter().map(|h| h.meeting.id.as_str()).collect();
     assert!(
@@ -16353,7 +16365,7 @@ fn s1_floor_drops_orthogonal_semantic_neighbour() {
 
     // Floor 0.75 → only the near (cos 1.0) survives.
     let floored = db
-        .search_semantic_visible(&query, 10, 0.75, &nothing)
+        .search_semantic_visible(&query, 10, 0.75, &nothing, None)
         .unwrap();
     let fids: Vec<&str> = floored.iter().map(|h| h.meeting.id.as_str()).collect();
     assert_eq!(
@@ -16379,7 +16391,7 @@ fn s1_floor_drops_orthogonal_doc_chunk() {
     let query = one_hot(0);
 
     let all = db
-        .search_doc_chunks_visible(&query, 10, 0.0, &nothing)
+        .search_doc_chunks_visible(&query, 10, 0.0, &nothing, None)
         .unwrap();
     let ids: Vec<&str> = all.iter().map(|h| h.document_id.as_str()).collect();
     assert!(
@@ -16388,7 +16400,7 @@ fn s1_floor_drops_orthogonal_doc_chunk() {
     );
 
     let floored = db
-        .search_doc_chunks_visible(&query, 10, 0.75, &nothing)
+        .search_doc_chunks_visible(&query, 10, 0.75, &nothing, None)
         .unwrap();
     let fids: Vec<&str> = floored.iter().map(|h| h.document_id.as_str()).collect();
     assert_eq!(
@@ -16444,7 +16456,7 @@ fn s1_floor_keeps_fts_hit_when_vector_leg_floored_empty() {
 
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_hybrid_visible("budget", &one_hot(0), 10, 0.75, &nothing, None)
+        .search_hybrid_visible("budget", &one_hot(0), 10, 0.75, &nothing, None, None)
         .unwrap();
     assert!(
         hits.iter().any(|h| h.meeting.id == "m-budget"),
@@ -16485,7 +16497,7 @@ fn s2_and_to_or_fallback_recovers_multiword_miss_docs() {
     db.index_document_chunks("d1", None).unwrap();
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("etykieta parcel", 10, &nothing)
+        .search_doc_chunks_fts_visible("etykieta parcel", 10, &nothing, None)
         .unwrap();
     assert!(
         hits.iter().any(|h| h.document_id == "d1"),

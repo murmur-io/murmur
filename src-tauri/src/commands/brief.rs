@@ -3,7 +3,7 @@
 //! Extracted verbatim from `commands/mod.rs` (God-file split, PURE MOVE — every body is
 //! byte-identical, only relocated). Two clusters:
 //!   1. `generate_digest` — synthesizes a Weekly Vault Digest. GATED: the cloud corpus is built from
-//!      VISIBLE meetings + VISIBLE notes only (`list_meetings_visible(unlocked)` +
+//!      VISIBLE meetings + VISIBLE notes only (`list_meetings_visible(unlocked, None, None)` +
 //!      `get_note_if_visible(unlocked)` — the same `visibility_clause` predicate MCP uses), so a
 //!      sealed-and-not-session-unlocked meeting's TITLE and markdown NEVER leave the device. The
 //!      NOTES-role provider is built through `provider_for` (consent gate + redaction firewall).
@@ -63,7 +63,7 @@ pub async fn generate_digest(
     // corpus (the whole-note-or-skip budgeting + the omitted-count marker) is factored into the
     // pure `assemble_digest_corpus` so it is unit-testable without a live provider.
     let mut entries: Vec<DigestEntry> = Vec::new();
-    for m in state.db.list_meetings_visible(300, &unlocked)? {
+    for m in state.db.list_meetings_visible(300, &unlocked, None)? {
         if m.started_at.as_str() < cutoff.as_str() {
             continue;
         }

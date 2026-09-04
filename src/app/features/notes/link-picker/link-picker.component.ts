@@ -139,6 +139,19 @@ export class LinkPickerComponent {
    * the template; they only guard the fetch orchestration.
    */
   private hasMore = false;
+  /**
+   * Offset into the RAW, unfiltered backend list.
+   *
+   * `loadMore` used to page on `candidates().length`, which was safe only while `withoutAnchor`
+   * dropped at most ONE row (the anchor). It now also drops containers, and containers sort LAST in
+   * the backend ordering — i.e. exactly onto the pages `loadMore` fetches. Paging on the filtered
+   * length then re-requests the same offset forever: the page comes back all containers, the
+   * filtered list does not grow, `hasMore` stays true because the RAW page was full, and every ↓
+   * keystroke re-issues an identical no-op IPC while the rest of the list stays unreachable.
+   *
+   * `<mur-source-picker>` already keeps a raw offset for exactly this reason; this mirrors it.
+   */
+  private rawOffset = 0;
   /** Re-entrancy guard: one append fetch at a time. */
   private loadingMore = false;
   /** One pending paint-time position update at most. */
@@ -196,13 +209,23 @@ export class LinkPickerComponent {
   }
 
   /** Drop the anchor item (the thing this picker links FROM) so it can't be picked as its own target. */
+  /**
+   * Drop what must not be offered as a `[[` target: the anchor itself, and CONTAINERS.
+   *
+   * `list_link_candidates` gained a container leg so a Space/folder can be picked as an Ask SCOPE.
+   * A wikilink is a different thing — it points at a document — and a Space is not one, so folder
+   * names must not become insertable link targets here. Both fetch paths (first page and
+   * load-more) go through this one filter, so the exclusion cannot be added to one and missed on
+   * the other.
+   */
   private withoutAnchor(rows: NoteCitation[]): NoteCitation[] {
+    const linkable = rows.filter((r) => r.kind !== "container");
     const k = this.excludeKind();
     const i = this.excludeId();
     if (!k || !i) {
-      return rows;
+      return linkable;
     }
-    return rows.filter((r) => !(r.kind === k && r.id === i));
+    return linkable.filter((r) => !(r.kind === k && r.id === i));
   }
 
   private async fetch(q: string): Promise<void> {
@@ -213,9 +236,11 @@ export class LinkPickerComponent {
       if (seq !== this.requestSeq) {
         return; // superseded by a newer query.
       }
-      // `hasMore` keys on the RAW page length (the backend paginates the unfiltered list); the
-      // anchor is dropped only from what we display, so a full raw page still means "more to load".
+      // `hasMore` keys on the RAW page length, and so does the next offset (`rawOffset`), because
+      // the backend paginates the UNFILTERED list. Display-side filtering — the anchor, and now
+      // every container — must never move the cursor, or the two disagree and paging stalls.
       this.hasMore = raw.length === PAGE_SIZE;
+      this.rawOffset = raw.length;
       const rows = this.withoutAnchor(raw);
       this.candidates.set(rows);
       this.candidatesChange.emit(rows);
@@ -249,13 +274,14 @@ export class LinkPickerComponent {
     try {
       const rawPage = await this.ipc.listLinkCandidates(
         this.query(),
-        this.candidates().length,
+        this.rawOffset,
         PAGE_SIZE,
       );
       if (seq !== this.requestSeq) {
         return; // a newer query reset the list while this page was in flight.
       }
       this.hasMore = rawPage.length === PAGE_SIZE;
+      this.rawOffset += rawPage.length;
       const page = this.withoutAnchor(rawPage);
       // Dedupe on append: a row that shifted pages mid-scroll (e.g. a title
       // edit reordered recency) must not repeat — the template's

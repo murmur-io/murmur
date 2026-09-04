@@ -3,7 +3,7 @@
 //!
 //! ## Modes
 //!
-//! - **FTS** — `Db::search_visible_in_range(query, …, temporal-window)` → the meeting ids in BM25
+//! - **FTS** — `Db::search_visible_in_range(query, …, temporal-window, None, None)` → the meeting ids in BM25
 //!   order (with the Brain v2 L1.5 date filter + temporal window fallback, exactly as the
 //!   `search_meetings` tool queries it).
 //! - **Semantic** — embed the query (asymmetric `embed_query`), then
@@ -54,7 +54,7 @@ fn fts_ranked(
     // Fetch a few extra candidates so the top-k cutoff is applied to a full list, not a truncated one.
     let limit = (k.max(1) * 4) as i64;
     let date_filter = extract_date_filter(query, today);
-    let hits = db.search_visible_in_range(query, limit, unlocked, date_filter)?;
+    let hits = db.search_visible_in_range(query, limit, unlocked, date_filter, None)?;
     Ok(hits.into_iter().map(|h| h.meeting.id).collect())
 }
 
@@ -79,7 +79,7 @@ fn semantic_ranked(
     }
     // KNN returns one hit per meeting (nearest chunk) already deduped by `search_semantic_visible`.
     // No S1 floor in the bake-off (0.0) — the committed baseline must stay byte-identical.
-    let hits = db.search_semantic_visible(&query_vec, (k.max(1) * 4) as i64, 0.0, unlocked)?;
+    let hits = db.search_semantic_visible(&query_vec, (k.max(1) * 4) as i64, 0.0, unlocked, None)?;
     Ok(hits.into_iter().map(|h| h.meeting.id).collect())
 }
 
@@ -106,6 +106,7 @@ fn hybrid_hits(
         0.0, // no S1 floor in the bake-off — the committed baseline must stay byte-identical.
         unlocked,
         date_filter,
+        None, // the bake-off measures the WHOLE vault; a container scope would change the baseline
     )
 }
 

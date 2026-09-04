@@ -1065,7 +1065,7 @@ fn a_locked_pre_note_meeting_is_hidden_enumerated_for_seal_and_not_audio_prunabl
     })
     .unwrap();
 
-    assert!(db.list_meetings_visible(50, &HashSet::new()).unwrap().is_empty());
+    assert!(db.list_meetings_visible(50, &HashSet::new(), None).unwrap().is_empty());
     assert_eq!(
         container_items_inner(&db, &HashSet::new(), None, ItemKind::Meeting, 0, 50)
             .unwrap()
@@ -1522,7 +1522,7 @@ fn migration_leaves_conflicting_legacy_folders_ambiguous_and_visibility_fails_cl
     assert!(canonical.is_none());
     assert!(matches!(db.folder_for_meeting("m1"), Err(AppError::Locked(_))));
     assert!(
-        db.list_meetings_visible(50, &HashSet::new())
+        db.list_meetings_visible(50, &HashSet::new(), None)
             .unwrap()
             .iter()
             .all(|meeting| meeting.id != "m1"),

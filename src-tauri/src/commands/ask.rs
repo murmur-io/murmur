@@ -559,6 +559,13 @@ pub(crate) fn build_ask_vault_floor_prompt(
     reranker: Option<&dyn crate::rerank::Reranker>,
     explicit_sources: Option<&[crate::storage::models::SourceRef]>,
     pinned_org_item_id: Option<&str>,
+    // CONTAINER SCOPE — folder/Space ids the answer must be drawn from, or `None` for the whole
+    // vault. Deliberately NOT part of `explicit_sources`: those are PINNED CONTENT, packed into the
+    // corpus verbatim, and `LinkKind::Container` is excluded from that set on purpose (a container
+    // holds no text of its own). A scope is the other thing entirely — it narrows RETRIEVAL, so a
+    // folder of a hundred notes costs what a folder of five costs, and ranking still decides what
+    // is relevant inside it.
+    scope_folder_ids: Option<&[String]>,
 ) -> Result<AskFloorPrompt, AppError> {
     // Budget on the ASK-role provider's RESOLVED connection — the corpus egresses to it. With
     // role keys absent this is the legacy `provider_id` for EVERY brain_backend (the pre-role
@@ -571,8 +578,24 @@ pub(crate) fn build_ask_vault_floor_prompt(
     // gated link-expansion) — the user controls the context. Same `unlocked` visibility gate as
     // every search leg (a sealed source/neighbour contributes nothing). `None` ⇒ the exact existing
     // whole-vault search below, byte-for-byte.
+    // Expand each scoped container to its SUBTREE. Scoping to a Space means "everything filed
+    // under it", which is the opposite of what a container RELATION does (that one never fans out)
+    // — the difference is the point: a relation says where something belongs, a scope says where to
+    // look. Resolution is by folder id, so the scope survives a rename or a move of the folder.
+    let scope_ids: Option<Vec<String>> = match scope_folder_ids {
+        Some(ids) if !ids.is_empty() => Some(db.folder_scope_ids(ids)?),
+        _ => None,
+    };
+    let scope = scope_ids.as_deref();
     let has_pinned_sources = explicit_sources.map(|s| !s.is_empty()).unwrap_or(false);
-    let (corpus, sources) = if has_pinned_sources || pinned_org_item_id.is_some() {
+    // A SCOPE routes to the SEARCH path, because a scope is an instruction about where to look and
+    // the pinned branch skips searching entirely ("vault-wide search SKIPPED"). Taking the pinned
+    // branch while a scope is set discarded it silently — the second half of the unreachability bug.
+    // Pinned items are not lost: with a scope present they are packed FIRST, below, and the scoped
+    // search fills the remaining budget, the same shape the org-item + sources composition uses.
+    let (corpus, sources) = if (has_pinned_sources || pinned_org_item_id.is_some())
+        && scope.is_none()
+    {
         // PINNED corpus (deterministic; vault-wide search SKIPPED). Pack the pinned ORG item FIRST
         // (the shared note being viewed — pinned so it's ALWAYS in context; the local Brain's search
         // never surfaces org-feed content), then the explicit sources (+ their gated link-expansion).
@@ -606,15 +629,82 @@ pub(crate) fn build_ask_vault_floor_prompt(
             Vec::new()
         };
         (corpus, sources)
-    } else if config.semantic_search_enabled {
-        let query_vec = ask_query_vector(question, true);
-        crate::summarize::vault_context::build_vault_context_hybrid_visible(
-            db, question, &ask_conn, &query_vec, unlocked, reranker,
-        )?
     } else {
-        crate::summarize::vault_context::build_vault_context_visible(
-            db, question, &ask_conn, unlocked,
-        )?
+        // SEARCH path. With a scope set, anything the user ALSO pinned is packed first so it cannot
+        // be lost by routing here, and the scoped search fills what is left of the one budget.
+        //
+        // DELIBERATE EXCEPTION to "scoped means scoped": a pinned source brings its capped active
+        // neighbours with it, and those can sit outside the scope. That is the user's own explicit
+        // pin, so it is correct — but it means a scope is not a hard egress boundary once pins are
+        // also set. Every neighbour is still visibility-gated and content-source-filtered.
+        let (mut corpus, mut sources) = if scope.is_some() {
+            let budget = crate::summarize::vault_context::budget_for(&ask_conn);
+            let mut pinned_corpus = String::new();
+            let mut pinned_sources = Vec::new();
+            if let Some(org_id) = pinned_org_item_id {
+                pinned_corpus.push_str(&crate::summarize::vault_context::pack_pinned_org_item(
+                    db, org_id, &ask_conn,
+                )?);
+            }
+            if let Some(srcs) = explicit_sources.filter(|s| !s.is_empty()) {
+                let (c, s) =
+                    crate::summarize::vault_context::build_vault_context_pinned_visible_with_budget(
+                        db,
+                        srcs,
+                        budget.saturating_sub(pinned_corpus.len()),
+                        unlocked,
+                    )?;
+                if !pinned_corpus.is_empty() && !c.is_empty() {
+                    pinned_corpus.push_str("\n\n");
+                }
+                pinned_corpus.push_str(&c);
+                pinned_sources = s;
+            }
+            (pinned_corpus, pinned_sources)
+        } else {
+            (String::new(), Vec::new())
+        };
+        let (found, found_sources) = if config.semantic_search_enabled {
+            let query_vec = ask_query_vector(question, true);
+            crate::summarize::vault_context::build_vault_context_hybrid_visible(
+                db, question, &ask_conn, &query_vec, unlocked, reranker, scope,
+            )?
+        } else {
+            crate::summarize::vault_context::build_vault_context_visible(
+                db, question, &ask_conn, unlocked, scope,
+            )?
+        };
+        if !corpus.is_empty() && !found.is_empty() {
+            corpus.push_str("\n\n");
+        }
+        // ONE budget across both halves — a scoped Ask on a small local model must not get two.
+        let remaining =
+            crate::summarize::vault_context::budget_for(&ask_conn).saturating_sub(corpus.len());
+        corpus.extend(found.chars().take(remaining));
+        // DEDUPE by meeting. Pinning a meeting that also lives inside the scoped Space is a natural
+        // thing to do, and before this composition existed the two halves were mutually exclusive
+        // branches so a repeat was structurally impossible. Now it is not: the same meeting can
+        // arrive from the pinned pack and again from the search. `AskVaultResult.sources` is passed
+        // to the FE unchanged and rendered with `track s.origin?.orgItemId ?? s.meetingId`, so a
+        // duplicate is a duplicate Angular track key (NG0955) — a rendering fault, not just noise.
+        // The PINNED entry is kept: it is the one the user asked for by name.
+        // Dedupe on the SAME expression the FE tracks by — `origin.orgItemId ?? meetingId` — not on
+        // `meeting_id` alone. They are identical today only because `VaultSource.origin` is `None`
+        // at every construction site; the day the org-origin chip is wired, deduping on the meeting
+        // would start DROPPING a distinct org source, which is the opposite failure from the
+        // duplicate this fixes. Matching the track key is immune to that and costs nothing now.
+        let key = |s: &crate::storage::models::VaultSource| -> (Option<String>, String) {
+            (
+                s.origin.as_ref().and_then(|o| o.org_item_id.clone()),
+                s.meeting_id.clone(),
+            )
+        };
+        for source in found_sources {
+            if !sources.iter().any(|s| key(s) == key(&source)) {
+                sources.push(source);
+            }
+        }
+        (corpus, sources)
     };
     if corpus.trim().is_empty() {
         return Ok(AskFloorPrompt::Empty(AskVaultResult {
