@@ -49,13 +49,60 @@ async function mockMeetingNote(page: Page): Promise<void> {
       },
     ],
     get_backlinks: () => [],
-    list_link_candidates: () =>
-      Array.from({ length: 30 }, (_, index) => ({
-        kind: "note",
-        id: `scroll-candidate-${index}`,
-        title: `Scroll candidate ${String(index).padStart(2, "0")}`,
-        snippet: "",
-      })),
+    get_related_picker_bootstrap: () => ({
+      spaces: [
+        {
+          id: "p-scroll",
+          name: "Performance Space",
+          level: "project",
+          emoji: null,
+          locked: false,
+          unlocked: false,
+          linkable: true,
+          groups: [{ kind: "meeting", total: 30 }],
+          folders: [],
+        },
+      ],
+      unclassified: [],
+      anchor: {
+        kind: "meeting",
+        containerId: "p-scroll",
+        path: ["p-scroll"],
+        index: 15,
+        // Production centres a bounded 24-item window on the anchor:
+        // max(0, index - 24 / 2) = 3 for index 15.
+        offset: 3,
+        items: Array.from({ length: 24 }, (_, windowIndex) => {
+          const index = windowIndex + 3;
+          return index === 15
+            ? {
+                kind: "meeting",
+                id: "m-atlas-roadmap",
+                title: "Q2 Roadmap Planning",
+              }
+            : {
+                kind: "meeting",
+                id: `scroll-candidate-${index}`,
+                title: `Scroll candidate ${String(index).padStart(2, "0")}`,
+              };
+        }),
+        total: 30,
+      },
+    }),
+    list_shared_workspace: () => ({
+      spaces: [],
+      sharedBrains: {
+        orgId: "shared",
+        orgName: "Shared",
+        name: "Shared Brains",
+        level: "virtual",
+        access: "view",
+        authorHint: "",
+        folders: [],
+        items: [],
+        position: 0,
+      },
+    }),
     list_builtin_recipes: (args: unknown) => {
       const w = window as unknown as { __recipeReads?: unknown[] };
       (w.__recipeReads ??= []).push({ command: "list_builtin_recipes", args });
@@ -87,36 +134,44 @@ async function openRelatedPicker(page: Page) {
   await expect(trigger).toBeVisible();
   await trigger.click();
 
-  const input = panel.getByPlaceholder(/Link a meeting, note/);
-  const picker = page.locator(".link-pop");
-  await expect(input).toBeVisible();
-  await expect(picker.locator(".link-pop-row")).toHaveCount(30);
-  return { input, panel, picker };
+  const picker = page.getByRole("dialog", { name: "Add related" });
+  const search = picker.getByPlaceholder("Search every Space…");
+  const tree = picker.locator(".rhp-tree");
+  await expect(picker).toBeVisible();
+  await expect(search).toBeVisible();
+  await expect(tree.locator('[data-row^="i:meeting:"]')).toHaveCount(24);
+  await expect(
+    tree.getByRole("treeitem", { name: "Load earlier" }),
+  ).toBeVisible();
+  await expect(tree.getByRole("treeitem", { name: "Load more" })).toBeVisible();
+  return { picker, search, tree };
 }
 
-async function waitForPickerAnchorMotion(page: Page): Promise<void> {
-  await page.locator(".cx-link-input").evaluate(async (element) => {
-    const animations = new Set<Animation>();
-    for (
-      let current: Element | null = element;
-      current;
-      current = current.parentElement
-    ) {
-      for (const animation of current.getAnimations()) {
-        animations.add(animation);
+async function waitForPickerMotion(page: Page): Promise<void> {
+  await page
+    .getByRole("dialog", { name: "Add related" })
+    .evaluate(async (element) => {
+      const animations = new Set<Animation>();
+      for (
+        let current: Element | null = element;
+        current;
+        current = current.parentElement
+      ) {
+        for (const animation of current.getAnimations()) {
+          animations.add(animation);
+        }
       }
-    }
-    await Promise.all(
-      [...animations].map((animation) =>
-        animation.finished.catch(() => undefined),
-      ),
-    );
-    await new Promise<void>((resolve) =>
-      requestAnimationFrame(() =>
-        requestAnimationFrame(() => resolve()),
-      ),
-    );
-  });
+      await Promise.all(
+        [...animations].map((animation) =>
+          animation.finished.catch(() => undefined),
+        ),
+      );
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => resolve()),
+        ),
+      );
+    });
 }
 
 test("meeting Note view omits Generate without loading recipe catalogs", async ({
@@ -167,76 +222,40 @@ test("meeting Related is the first, prominent, expanded Note section", async ({
   ).toBeVisible();
 });
 
-// FIXME(flaky, 2026-07-26): the pixel-precision scroll assertion below
-// (`Math.min(belowGap, aboveGap) < 8`) races the reflow that repositions the picker
-// after `window.scrollBy`, so it flakes ~20% on the CI web lane and blocked several PR
-// merges. Disabled with `test.fixme` (skips it) UNTIL it is made deterministic — wait
-// for the picker to settle post-scroll before measuring, or loosen the 8px tolerance —
-// then re-enable. It is unrelated to backend changes (the e2e mocks the Tauri invoke).
-test.fixme("Related picker follows its live input when the page scrolls", async ({
-  page,
-}) => {
-  const { input, picker } = await openRelatedPicker(page);
-  await input.scrollIntoViewIfNeeded();
-
-  await page.evaluate(() => window.scrollBy(0, 180));
-  await page.waitForTimeout(100);
-
-  const geometry = await Promise.all([
-    input.boundingBox(),
-    picker.boundingBox(),
-  ]);
-  const inputBox = geometry[0];
-  const pickerBox = geometry[1];
-  expect(inputBox).not.toBeNull();
-  expect(pickerBox).not.toBeNull();
-
-  const belowGap = Math.abs(
-    pickerBox!.y - (inputBox!.y + inputBox!.height + 4),
-  );
-  const aboveGap = Math.abs(
-    inputBox!.y - (pickerBox!.y + pickerBox!.height + 4),
-  );
-  expect(Math.min(belowGap, aboveGap)).toBeLessThan(8);
-});
-
-test("Related picker fits beside its input in the default 900x680 window", async ({
+test("Related hierarchy picker fits in the default 900x680 meeting window", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 900, height: 680 });
-  const { input, picker } = await openRelatedPicker(page);
-  await waitForPickerAnchorMotion(page);
+  const { picker, search, tree } = await openRelatedPicker(page);
+  await waitForPickerMotion(page);
 
-  const [inputBox, pickerBox] = await Promise.all([
-    input.boundingBox(),
+  const [pickerBox, searchBox, treeBox] = await Promise.all([
     picker.boundingBox(),
+    search.boundingBox(),
+    tree.boundingBox(),
   ]);
-  expect(inputBox).not.toBeNull();
   expect(pickerBox).not.toBeNull();
-
-  const inputTop = inputBox!.y;
-  const inputBottom = inputBox!.y + inputBox!.height;
-  const pickerTop = pickerBox!.y;
-  const pickerBottom = pickerBox!.y + pickerBox!.height;
-  expect(pickerBottom <= inputTop || pickerTop >= inputBottom).toBe(true);
-  expect(
-    Math.min(
-      Math.abs(pickerTop - inputBottom),
-      Math.abs(inputTop - pickerBottom),
-    ),
-  ).toBeLessThan(8);
-  expect(pickerTop).toBeGreaterThanOrEqual(8);
-  expect(pickerBottom).toBeLessThanOrEqual(672);
+  expect(searchBox).not.toBeNull();
+  expect(treeBox).not.toBeNull();
+  expect(pickerBox!.x).toBeGreaterThanOrEqual(8);
+  expect(pickerBox!.y).toBeGreaterThanOrEqual(8);
+  expect(pickerBox!.x + pickerBox!.width).toBeLessThanOrEqual(892);
+  expect(pickerBox!.y + pickerBox!.height).toBeLessThanOrEqual(672);
+  expect(searchBox!.y).toBeGreaterThanOrEqual(pickerBox!.y);
+  expect(treeBox!.y).toBeGreaterThan(searchBox!.y + searchBox!.height);
+  expect(treeBox!.y + treeBox!.height).toBeLessThanOrEqual(
+    pickerBox!.y + pickerBox!.height,
+  );
 });
 
 test("fast scrolling inside Related picker does not re-layout or blank it", async ({
   page,
 }) => {
-  const { picker } = await openRelatedPicker(page);
-  await waitForPickerAnchorMotion(page);
-  await expect(picker).toHaveCSS("overscroll-behavior", "contain");
+  const { picker, tree } = await openRelatedPicker(page);
+  await waitForPickerMotion(page);
+  await expect(tree).toHaveCSS("overscroll-behavior", "contain");
 
-  const measurements = await picker.evaluate(async (element) => {
+  const measurements = await tree.evaluate(async (element) => {
     const descriptor = Object.getOwnPropertyDescriptor(
       HTMLElement.prototype,
       "offsetHeight",
@@ -280,9 +299,9 @@ test("fast scrolling inside Related picker does not re-layout or blank it", asyn
 
   expect(measurements.supported).toBe(true);
   expect(measurements.reads).toBe(0);
-  await expect(picker.locator(".link-pop-row")).toHaveCount(30);
-  await expect(picker.locator(".link-pop-empty")).toHaveCount(0);
+  await expect(tree.locator('[data-row^="i:meeting:"]')).toHaveCount(24);
+  await expect(tree.locator(".rhp-state")).toHaveCount(0);
   await expect(
-    picker.getByRole("option", { name: /Scroll candidate 29/ }),
+    picker.getByRole("treeitem", { name: /Scroll candidate 26/ }),
   ).toBeVisible();
 });

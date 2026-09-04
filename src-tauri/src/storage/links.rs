@@ -127,21 +127,67 @@ pub(crate) fn meeting_sealed_at_rest_tx(
     .map_err(map_err)
 }
 
+/// SQL predicate: the `folders` row aliased `f` is a container a CONTAINER LINK ENDPOINT may name.
+///
+/// Deliberately the same four structural facts the workspace tree renders on
+/// (`storage::workspace_store::renderable_container` + the Project/Folder level split), restated
+/// here in the ONE place the link writer/reader both consume, so a chip can never point at a place
+/// the user cannot see:
+///   * a USER container kind (`meeting`/`note`) that is not the machine-owned `.murmur/` subtree;
+///   * NOT the reserved always-open note root (`is_root` — the synthetic "Not classified" Notes
+///     section, which is a presentation device, not a place);
+///   * a real hierarchy level (`project` = a Space, `folder`).
+///
+/// The LOCK half is NOT here: it is the caller's `visibility_clause`, so a session-unlocked sealed
+/// container stays linkable exactly as long as the session says it is.
+const CONTAINER_ENDPOINT_STRUCTURE: &str = "COALESCE(f.kind, 'meeting') IN ('meeting','note')
+     AND f.path <> '.murmur'
+     AND f.path NOT LIKE '.murmur/%'
+     AND COALESCE(f.is_root, 0) = 0
+     AND COALESCE(f.level, 'folder') IN ('project','folder')";
+
 /// Is a link ENDPOINT `(kind, id)` sealed-at-rest RIGHT NOW, inside the caller's write tx? A
 /// `meeting` endpoint reads [`meeting_sealed_at_rest_tx`]; a `note`/`document` endpoint (both live in
 /// the `documents` id space) reads [`doc_sealed_at_rest_tx`]. Brain v3 audit Fix 0 — the one probe
 /// the link writers key their in-tx edge refusal on, so a link naming a sealed neighbour never lands
 /// at rest.
+///
+/// `unlocked` is the caller's SESSION unlock snapshot. Only the `container` arm reads it (the other
+/// kinds key on session-independent at-rest facts); passing an empty set therefore changes nothing
+/// for them, and fails a locked container CLOSED — which is what every non-command writer
+/// (`index_wikilinks_for_source`, `auto_link_semantic`) wants, since none of them can produce a
+/// container endpoint in the first place.
 fn link_endpoint_sealed_at_rest_tx(
     tx: &rusqlite::Transaction<'_>,
     kind: crate::links::LinkKind,
     id: &str,
+    unlocked: &HashSet<String>,
 ) -> Result<bool> {
     match kind {
         crate::links::LinkKind::Meeting => meeting_sealed_at_rest_tx(tx, id),
         // A `note` id IS a `documents` id, so both non-meeting kinds probe the documents row.
         crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
             doc_sealed_at_rest_tx(tx, id)
+        }
+        // A container has no content of its own to blank, so "sealed at rest" is instead
+        // "not a renderable, unsealed-or-session-unlocked place". Repeating the WHOLE endpoint
+        // validity check inside the write transaction (not just the lock half) is what makes a
+        // TOCTOU rename-to-system-path / reparent / relock unable to land a durable row naming a
+        // place the reader would then refuse to resolve.
+        crate::links::LinkKind::Container => {
+            let visible = visibility_clause("f", unlocked);
+            let sql = format!(
+                "SELECT EXISTS(
+                   SELECT 1 FROM folders f
+                    WHERE f.id = ?1 AND {CONTAINER_ENDPOINT_STRUCTURE} AND {visible}
+                 )"
+            );
+            let ok: bool = tx
+                .query_row(&sql, rusqlite::params![id], |r| {
+                    Ok(r.get::<_, i64>(0)? != 0)
+                })
+                .map_err(map_err)?;
+            Ok(!ok)
         }
         // Org items have no folder seal domain. Availability is a joined+enabled+live local replica
         // check, repeated inside the edge write transaction to close context/leave races.
@@ -188,6 +234,13 @@ pub struct LinkRowSnapshot {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotEndpointState {
+    Present,
+    PendingTrashRestore,
+    Gone,
+}
+
 impl Db {
     /// Brain v3 PR-3 — idempotent LINK-ENGINE schema: the `links` table records DERIVED, content-
     /// revealing relations between `meeting|note|document` rows. Three edge kinds:
@@ -223,6 +276,24 @@ impl Db {
              );
              CREATE INDEX IF NOT EXISTS idx_links_src ON links(src_kind, src_id);
              CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst_kind, dst_id);
+             CREATE TABLE IF NOT EXISTS org_document_terminal_deletions (
+               org_id TEXT NOT NULL,
+               doc_id TEXT NOT NULL,
+               PRIMARY KEY (org_id, doc_id)
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS org_link_reauthorizations (
+               src_kind TEXT NOT NULL,
+               src_id TEXT NOT NULL,
+               dst_kind TEXT NOT NULL,
+               dst_id TEXT NOT NULL,
+               edge_type TEXT NOT NULL CHECK(edge_type = 'manual'),
+               CHECK(src_kind = 'org' OR dst_kind = 'org'),
+               PRIMARY KEY (src_kind, src_id, dst_kind, dst_id, edge_type)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS idx_org_link_reauth_src
+               ON org_link_reauthorizations(src_kind, src_id);
+             CREATE INDEX IF NOT EXISTS idx_org_link_reauth_dst
+               ON org_link_reauthorizations(dst_kind, dst_id);
              CREATE TABLE IF NOT EXISTS lock_marker_export_cleanup (
                source_kind TEXT NOT NULL CHECK(source_kind IN ('meeting','note')),
                source_id TEXT NOT NULL,
@@ -943,6 +1014,52 @@ impl Db {
         Ok(rows)
     }
 
+    /// Every link row touching an authored note id on EITHER side, for a trash snapshot.
+    ///
+    /// Old builds could label that authored-note endpoint as `document`; normalize only the side
+    /// whose id is being snapshotted back to the canonical `note` discriminator. The opposite side
+    /// is left verbatim (and may legitimately be an imported `document`). This matches today's
+    /// endpoint gate and prevents a captured legacy decision from becoming unrestorable merely
+    /// because authored notes and imports share the `documents` table.
+    pub fn link_rows_for_authored_note(&self, note_id: &str) -> Result<Vec<LinkRowSnapshot>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status,
+                        created_at
+                   FROM links
+                  WHERE (src_kind IN ('note','document') AND src_id = ?1)
+                     OR (dst_kind IN ('note','document') AND dst_id = ?1)
+                  ORDER BY src_kind, src_id, dst_kind, dst_id, edge_type",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![note_id], |r| {
+                let mut row = LinkRowSnapshot {
+                    src_kind: r.get(0)?,
+                    src_id: r.get(1)?,
+                    dst_kind: r.get(2)?,
+                    dst_id: r.get(3)?,
+                    edge_type: r.get(4)?,
+                    score: r.get(5)?,
+                    created_by: r.get(6)?,
+                    status: r.get(7)?,
+                    created_at: r.get(8)?,
+                };
+                if row.src_id == note_id && row.src_kind == "document" {
+                    row.src_kind = "note".to_string();
+                }
+                if row.dst_id == note_id && row.dst_kind == "document" {
+                    row.dst_kind = "note".to_string();
+                }
+                Ok(row)
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
     /// Is the far endpoint of a snapshotted row visible right now?
     ///
     /// "Far" is whichever side is not the meeting being restored — and a row may name it on either
@@ -956,7 +1073,13 @@ impl Db {
         ] {
             let visible = match kind {
                 "meeting" => self.meeting_is_visible(id, unlocked)?,
+                "note" => self.note_is_visible(id, unlocked)?,
                 "document" => self.document_is_visible(id, unlocked)?,
+                "org" => self.org_link_target_visible(id)?.is_some(),
+                // A container endpoint carries the whole structural + lock contract in ONE gated
+                // reader, so restoring an edge that names a place is checked exactly like the
+                // picker checks it.
+                "container" => self.container_endpoint_visible(id, unlocked)?.is_some(),
                 _ => false,
             };
             if !visible {
@@ -964,6 +1087,181 @@ impl Db {
             }
         }
         Ok(true)
+    }
+
+    /// State of one endpoint named by a snapshotted container decision.
+    ///
+    /// `PendingTrashRestore` is materially different from `Gone`: the former still has a durable
+    /// recovery journal. Keeping an id-only link row while that endpoint is absent makes restore
+    /// order-independent; every public reader continues to require both live endpoints, so the row
+    /// cannot reveal a title or even edge existence until the second item is restored. Permanent
+    /// trash purge removes such dormant rows (see `purge_dangling_links_for_trash_source`).
+    fn snapshot_endpoint_state(&self, kind: &str, id: &str) -> Result<SnapshotEndpointState> {
+        if kind == "org" {
+            return Ok(if self.org_link_target_visible(id)?.is_some() {
+                SnapshotEndpointState::Present
+            } else {
+                SnapshotEndpointState::Gone
+            });
+        }
+        let conn = self.lock();
+        let (present, pending): (i64, i64) = match kind {
+            "meeting" => conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1),
+                            EXISTS(SELECT 1 FROM trash_items WHERE source_id = ?1 AND kind = 'meeting')",
+                    rusqlite::params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(map_err)?,
+            "note" | "document" => conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM documents WHERE id = ?1 AND kind = ?2),
+                            EXISTS(SELECT 1 FROM trash_items WHERE source_id = ?1 AND kind = 'note')",
+                    rusqlite::params![id, kind],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(map_err)?,
+            "container" => {
+                let sql = format!(
+                    "SELECT EXISTS(
+                               SELECT 1 FROM folders f
+                                WHERE f.id = ?1 AND {CONTAINER_ENDPOINT_STRUCTURE}
+                             ),
+                            EXISTS(
+                               SELECT 1 FROM trash_items
+                                WHERE source_id = ?1 AND kind IN ('folder','noteFolder')
+                             )"
+                );
+                conn.query_row(&sql, rusqlite::params![id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .map_err(map_err)?
+            }
+            _ => (0, 0),
+        };
+        Ok(if present != 0 {
+            SnapshotEndpointState::Present
+        } else if pending != 0 {
+            SnapshotEndpointState::PendingTrashRestore
+        } else {
+            SnapshotEndpointState::Gone
+        })
+    }
+
+    /// Canonicalize the historical period when authored notes were emitted as `document` link
+    /// endpoints. A live `documents(kind='note')` row or a note trash journal is authoritative; an
+    /// actual imported document stays `document`. This applies to BOTH sides because a folder-owned
+    /// snapshot can carry the legacy item endpoint without that note owning a second copy.
+    fn canonicalize_snapshot_row(&self, row: &LinkRowSnapshot) -> Result<LinkRowSnapshot> {
+        let mut normalized = row.clone();
+        for (kind, id) in [
+            (&mut normalized.src_kind, normalized.src_id.as_str()),
+            (&mut normalized.dst_kind, normalized.dst_id.as_str()),
+        ] {
+            if kind.as_str() != "document" {
+                continue;
+            }
+            let is_authored_note: i64 = self
+                .lock()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM documents WHERE id = ?1 AND kind = 'note')
+                         OR EXISTS(SELECT 1 FROM trash_items WHERE source_id = ?1 AND kind = 'note')",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .map_err(map_err)?;
+            if is_authored_note != 0 {
+                *kind = "note".to_string();
+            }
+        }
+        Ok(normalized)
+    }
+
+    /// Whether a container decision still has a recoverable meaning. A missing endpoint backed by a
+    /// trash snapshot is kept as a dormant, id-only row; a permanently missing endpoint drops it.
+    ///
+    /// A well-formed Shared-document identity on a USER decision is deliberately the one exception
+    /// to the live-existence probe. Context disable, membership withdrawal and a predecessor
+    /// tombstone all make `org_link_target_visible` return the same `None`, yet the org lifecycle
+    /// intentionally preserves that opaque private decision for a genuine rejoin/successor. The
+    /// snapshot could only contain this row after the visible write gate accepted the stable
+    /// `org_id:doc_id`; retaining its ids does not make it readable because every public link reader
+    /// still gates BOTH endpoints live. Invalid identities and derived rows get no such exception.
+    fn container_row_is_recoverable(&self, row: &LinkRowSnapshot) -> Result<bool> {
+        let user_decision = Self::is_user_decision(row);
+        for (kind, id) in [
+            (row.src_kind.as_str(), row.src_id.as_str()),
+            (row.dst_kind.as_str(), row.dst_id.as_str()),
+        ] {
+            if kind == "org" && user_decision && parse_org_link_id(id).is_some() {
+                continue;
+            }
+            if self.snapshot_endpoint_state(kind, id)? == SnapshotEndpointState::Gone {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// A stable-document DELETE is stronger than temporary Shared withholding. Its durable marker
+    /// blocks every older trash snapshot naming that document. The only override is an exact,
+    /// gated manual-link provenance witness written after the most recent terminal DELETE; no wall
+    /// clock is involved, and deleting the document again invalidates that witness atomically.
+    fn row_survives_terminal_org_delete_tx(
+        tx: &rusqlite::Transaction<'_>,
+        row: &LinkRowSnapshot,
+    ) -> Result<bool> {
+        let mut names_terminal_document = false;
+        for (kind, id) in [
+            (row.src_kind.as_str(), row.src_id.as_str()),
+            (row.dst_kind.as_str(), row.dst_id.as_str()),
+        ] {
+            if kind != "org" {
+                continue;
+            }
+            let Some((org_id, doc_id)) = parse_org_link_id(id) else {
+                return Ok(false);
+            };
+            let terminal: i64 = tx
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM org_document_terminal_deletions
+                        WHERE org_id = ?1 AND doc_id = ?2
+                     )",
+                    rusqlite::params![org_id, doc_id],
+                    |r| r.get(0),
+                )
+                .map_err(map_err)?;
+            names_terminal_document |= terminal != 0;
+        }
+        if !names_terminal_document {
+            return Ok(true);
+        }
+        let exact_user_witness = if row.edge_type == "manual"
+            && row.created_by == "user"
+            && row.status == "active"
+        {
+            tx.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM org_link_reauthorizations
+                    WHERE src_kind = ?1 AND src_id = ?2
+                      AND dst_kind = ?3 AND dst_id = ?4 AND edge_type = ?5
+                 )",
+                rusqlite::params![
+                    row.src_kind,
+                    row.src_id,
+                    row.dst_kind,
+                    row.dst_id,
+                    row.edge_type
+                ],
+                |r| Ok(r.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?
+        } else {
+            false
+        };
+        Ok(exact_user_witness)
     }
 
     /// Is this snapshotted row one the USER decided on, rather than one the app derived?
@@ -993,7 +1291,10 @@ impl Db {
     /// `wikilink` leg self-heals through the re-index that follows a restore; the inbound leg and
     /// the companion/semantic rows do not, which is what this filter is for.
     ///
-    /// User decisions are kept regardless — exactly as a seal keeps them.
+    /// User decisions are normally kept regardless — exactly as a seal keeps them. A container
+    /// decision whose missing endpoint still has a trash journal is also kept as a dormant id-only
+    /// row, making two-endpoint restores independent of deletion/restoration order. A permanently
+    /// gone endpoint drops the row, and permanent trash purge removes any dormant row waiting on it.
     pub fn restore_link_rows(
         &self,
         rows: &[LinkRowSnapshot],
@@ -1002,11 +1303,21 @@ impl Db {
         if rows.is_empty() {
             return Ok(0);
         }
-        // Decided BEFORE the connection lock: the visibility helpers take it themselves, and this
-        // one holds it for the whole insert transaction.
-        let mut keep: Vec<&LinkRowSnapshot> = Vec::with_capacity(rows.len());
-        for row in rows {
-            if Self::is_user_decision(row) || self.endpoints_visible(row, unlocked)? {
+        // Decided BEFORE the connection lock: the visibility/canonicalization helpers take it
+        // themselves, and the insert below holds it for the whole transaction.
+        let normalized = rows
+            .iter()
+            .map(|row| self.canonicalize_snapshot_row(row))
+            .collect::<Result<Vec<_>>>()?;
+        let mut keep: Vec<&LinkRowSnapshot> = Vec::with_capacity(normalized.len());
+        for row in &normalized {
+            let names_container = row.src_kind == "container" || row.dst_kind == "container";
+            let should_keep = if names_container {
+                self.container_row_is_recoverable(row)?
+            } else {
+                Self::is_user_decision(row) || self.endpoints_visible(row, unlocked)?
+            };
+            if should_keep {
                 keep.push(row);
             }
         }
@@ -1015,6 +1326,13 @@ impl Db {
         let tx = conn.transaction().map_err(map_err)?;
         let mut restored = 0usize;
         for row in keep {
+            // This check shares the INSERT transaction with the terminal-delete/reauthorization
+            // witnesses. A concurrent permanent Shared deletion can therefore land wholly before
+            // us (row refused) or wholly after us (the deletion purges it), never between decision
+            // and publication.
+            if !Self::row_survives_terminal_org_delete_tx(&tx, row)? {
+                continue;
+            }
             restored += tx
                 .execute(
                     "INSERT OR IGNORE INTO links
@@ -1037,6 +1355,102 @@ impl Db {
         }
         tx.commit().map_err(map_err)?;
         Ok(restored)
+    }
+
+    /// Remove dormant relation rows waiting on an endpoint whose trash journal is being destroyed.
+    ///
+    /// A live endpoint wins: this is a no-op if a retry already recreated the source but has not yet
+    /// consumed its trash row. Otherwise the source is permanently gone after purge, so retaining a
+    /// pending container decision would turn a recoverability aid into an eternal dangling edge.
+    pub(crate) fn purge_dangling_links_for_trash_source(
+        &self,
+        trash_kind: &str,
+        source_id: &str,
+    ) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let live: i64 = match trash_kind {
+            "meeting" => tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1)",
+                    rusqlite::params![source_id],
+                    |r| r.get(0),
+                )
+                .map_err(map_err)?,
+            "note" => tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM documents WHERE id = ?1)",
+                    rusqlite::params![source_id],
+                    |r| r.get(0),
+                )
+                .map_err(map_err)?,
+            "folder" | "noteFolder" => tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM folders WHERE id = ?1)",
+                    rusqlite::params![source_id],
+                    |r| r.get(0),
+                )
+                .map_err(map_err)?,
+            _ => {
+                return Err(AppError::InvalidArg(
+                    "invalid trash kind for dangling-link purge".into(),
+                ));
+            }
+        };
+        if live != 0 {
+            tx.commit().map_err(map_err)?;
+            return Ok(0);
+        }
+        let removed = match trash_kind {
+            "meeting" => tx.execute(
+                "DELETE FROM links
+                  WHERE (src_kind = 'meeting' AND src_id = ?1)
+                     OR (dst_kind = 'meeting' AND dst_id = ?1)",
+                rusqlite::params![source_id],
+            ),
+            "note" => tx.execute(
+                "DELETE FROM links
+                  WHERE (src_kind IN ('note','document') AND src_id = ?1)
+                     OR (dst_kind IN ('note','document') AND dst_id = ?1)",
+                rusqlite::params![source_id],
+            ),
+            "folder" | "noteFolder" => tx.execute(
+                "DELETE FROM links
+                  WHERE (src_kind = 'container' AND src_id = ?1)
+                     OR (dst_kind = 'container' AND dst_id = ?1)",
+                rusqlite::params![source_id],
+            ),
+            _ => unreachable!("trash kind validated above"),
+        }
+        .map_err(map_err)?;
+        // This exact provenance witness lets a recoverable trash snapshot replay a manual Shared
+        // edge, including a fresh decision made after a terminal DELETE. Destroying the endpoint's
+        // final journal also destroys that authority; otherwise a future local id reuse could
+        // inherit it.
+        match trash_kind {
+            "meeting" => tx.execute(
+                "DELETE FROM org_link_reauthorizations
+                  WHERE (src_kind = 'meeting' AND src_id = ?1)
+                     OR (dst_kind = 'meeting' AND dst_id = ?1)",
+                rusqlite::params![source_id],
+            ),
+            "note" => tx.execute(
+                "DELETE FROM org_link_reauthorizations
+                  WHERE (src_kind IN ('note','document') AND src_id = ?1)
+                     OR (dst_kind IN ('note','document') AND dst_id = ?1)",
+                rusqlite::params![source_id],
+            ),
+            "folder" | "noteFolder" => tx.execute(
+                "DELETE FROM org_link_reauthorizations
+                  WHERE (src_kind = 'container' AND src_id = ?1)
+                     OR (dst_kind = 'container' AND dst_id = ?1)",
+                rusqlite::params![source_id],
+            ),
+            _ => unreachable!("trash kind validated above"),
+        }
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(removed)
     }
 
     /// Upsert ONE edge (idempotent on the UNIQUE key). For an UNDIRECTED (semantic) edge the caller
@@ -1141,7 +1555,7 @@ impl Db {
         // source's own endpoint is now sealed-at-rest, a re-derive would re-insert wikilink rows
         // behind the lock. Refuse silently (rollback via drop) — the source is sealed; its edges are
         // re-derived on unlock. Never a new row naming a sealed source.
-        if link_endpoint_sealed_at_rest_tx(&tx, src_kind, src_id)? {
+        if link_endpoint_sealed_at_rest_tx(&tx, src_kind, src_id, &HashSet::new())? {
             tracing::debug!(target: "links", src_kind = src_kind.as_str(), "wikilink index refused: source sealed at rest");
             return Ok(());
         }
@@ -1156,7 +1570,7 @@ impl Db {
             // Fix 0 (brain-v3 audit) — IN-TX sealed-at-rest DST re-check (TOCTOU): drop any target
             // whose endpoint sealed at rest since the OUTSIDE-tx resolve above, so a link never names
             // a now-sealed neighbour. The endpoint is re-derived on that folder's unlock.
-            if link_endpoint_sealed_at_rest_tx(&tx, *dst_kind, dst_id)? {
+            if link_endpoint_sealed_at_rest_tx(&tx, *dst_kind, dst_id, &HashSet::new())? {
                 continue;
             }
             Self::upsert_link_tx(
@@ -1385,6 +1799,23 @@ impl Db {
         dst_kind: &str,
         dst_id: &str,
     ) -> Result<()> {
+        self.upsert_manual_link_visible(src_kind, src_id, dst_kind, dst_id, &HashSet::new())
+    }
+
+    /// Session-aware twin of [`Self::upsert_manual_link`] — the shape `link_items_inner` calls.
+    ///
+    /// Only the `container` endpoint kind reads `unlocked`: a Space/folder carries no content of
+    /// its own to probe for a blanked plaintext column, so its at-rest re-check IS the session
+    /// visibility clause. Every other kind keys on a session-INDEPENDENT at-rest fact and ignores
+    /// the argument, which is why the no-set wrapper above stays byte-identical for them.
+    pub(crate) fn upsert_manual_link_visible(
+        &self,
+        src_kind: &str,
+        src_id: &str,
+        dst_kind: &str,
+        dst_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
@@ -1392,8 +1823,8 @@ impl Db {
             .ok_or_else(|| AppError::InvalidArg("invalid source link kind".into()))?;
         let dst = crate::links::LinkKind::parse(dst_kind)
             .ok_or_else(|| AppError::InvalidArg("invalid destination link kind".into()))?;
-        if link_endpoint_sealed_at_rest_tx(&tx, src, src_id)?
-            || link_endpoint_sealed_at_rest_tx(&tx, dst, dst_id)?
+        if link_endpoint_sealed_at_rest_tx(&tx, src, src_id, unlocked)?
+            || link_endpoint_sealed_at_rest_tx(&tx, dst, dst_id, unlocked)?
         {
             return Err(AppError::Locked(
                 "one of these items is no longer available to link".into(),
@@ -1402,6 +1833,50 @@ impl Db {
         Self::upsert_link_tx(
             &tx, src_kind, src_id, dst_kind, dst_id, "manual", 1.0, "user", "active", now,
         )?;
+        let mut names_shared_document = false;
+        for (kind, id) in [(src_kind, src_id), (dst_kind, dst_id)] {
+            if kind != "org" {
+                continue;
+            }
+            let Some((_org_id, _doc_id)) = parse_org_link_id(id) else {
+                continue;
+            };
+            names_shared_document = true;
+        }
+        // This exact witness distinguishes every manual Shared relation authored through the new,
+        // visibility-gated seam from a legacy row whose terminal history is unknown after upgrade.
+        // A terminal DELETE clears it atomically; a later explicit relink writes it again.
+        if names_shared_document {
+            let active: i64 = tx
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM links
+                        WHERE src_kind = ?1 AND src_id = ?2
+                          AND dst_kind = ?3 AND dst_id = ?4
+                          AND edge_type = 'manual' AND created_by = 'user' AND status = 'active'
+                     )",
+                    rusqlite::params![src_kind, src_id, dst_kind, dst_id],
+                    |r| r.get(0),
+                )
+                .map_err(map_err)?;
+            if active != 0 {
+                tx.execute(
+                    "INSERT OR IGNORE INTO org_link_reauthorizations
+                       (src_kind, src_id, dst_kind, dst_id, edge_type)
+                     VALUES (?1, ?2, ?3, ?4, 'manual')",
+                    rusqlite::params![src_kind, src_id, dst_kind, dst_id],
+                )
+                .map_err(map_err)?;
+            } else {
+                tx.execute(
+                    "DELETE FROM org_link_reauthorizations
+                      WHERE src_kind = ?1 AND src_id = ?2
+                        AND dst_kind = ?3 AND dst_id = ?4 AND edge_type = 'manual'",
+                    rusqlite::params![src_kind, src_id, dst_kind, dst_id],
+                )
+                .map_err(map_err)?;
+            }
+        }
         tx.commit().map_err(map_err)?;
         tracing::info!(
             target: "links",
@@ -1434,6 +1909,7 @@ impl Db {
             }],
             &[],
             false,
+            &HashSet::new(),
         )?;
         tracing::info!(
             target: "links",
@@ -1455,17 +1931,27 @@ impl Db {
         &self,
         manual_edges: &[crate::storage::models::ManualLinkEdge],
     ) -> Result<bool> {
-        self.delete_manual_links_with_marker_seals(manual_edges, &[])
+        self.delete_manual_links_with_marker_seals(manual_edges, &[], &HashSet::new())
     }
 
     /// Command-layer twin of [`Self::delete_manual_links`] carrying verified fresh seals for any
     /// session-unlocked locked source whose legacy marker is mutated in the transaction.
+    ///
+    /// `unlocked` is the caller's session snapshot, consumed only by a `container` endpoint's
+    /// in-transaction re-check (see [`link_endpoint_sealed_at_rest_tx`]) — so a relock landing
+    /// between the command's gate and this transaction cannot DELETE a relation either.
     pub(crate) fn delete_manual_links_with_marker_seals(
         &self,
         manual_edges: &[crate::storage::models::ManualLinkEdge],
         prepared_seals: &[PreparedManualMarkerSeal],
+        unlocked: &HashSet<String>,
     ) -> Result<bool> {
-        self.delete_manual_links_with_marker_seals_mode(manual_edges, prepared_seals, true)
+        self.delete_manual_links_with_marker_seals_mode(
+            manual_edges,
+            prepared_seals,
+            true,
+            unlocked,
+        )
     }
 
     fn delete_manual_links_with_marker_seals_mode(
@@ -1473,6 +1959,7 @@ impl Db {
         manual_edges: &[crate::storage::models::ManualLinkEdge],
         prepared_seals: &[PreparedManualMarkerSeal],
         strict_missing: bool,
+        unlocked: &HashSet<String>,
     ) -> Result<bool> {
         if manual_edges.is_empty() || manual_edges.len() > 2 {
             return Err(AppError::InvalidArg(
@@ -1504,8 +1991,8 @@ impl Db {
                 .ok_or_else(|| AppError::InvalidArg("invalid source link kind".into()))?;
             let dst = crate::links::LinkKind::parse(&edge.dst_kind)
                 .ok_or_else(|| AppError::InvalidArg("invalid destination link kind".into()))?;
-            if link_endpoint_sealed_at_rest_tx(&tx, src, &edge.src_id)?
-                || link_endpoint_sealed_at_rest_tx(&tx, dst, &edge.dst_id)?
+            if link_endpoint_sealed_at_rest_tx(&tx, src, &edge.src_id, unlocked)?
+                || link_endpoint_sealed_at_rest_tx(&tx, dst, &edge.dst_id, unlocked)?
             {
                 return Err(AppError::Locked(
                     "one of these items is no longer available to unlink".into(),
@@ -1528,6 +2015,13 @@ impl Db {
                     "one of the selected manual link edges no longer exists".into(),
                 ));
             }
+            tx.execute(
+                "DELETE FROM org_link_reauthorizations
+                  WHERE src_kind = ?1 AND src_id = ?2
+                    AND dst_kind = ?3 AND dst_id = ?4 AND edge_type = 'manual'",
+                rusqlite::params![edge.src_kind, edge.src_id, edge.dst_kind, edge.dst_id],
+            )
+            .map_err(map_err)?;
         }
         tx.commit().map_err(map_err)?;
         tracing::info!(
@@ -1561,7 +2055,9 @@ impl Db {
                 let expected_kind = match kind {
                     crate::links::LinkKind::Note => "note",
                     crate::links::LinkKind::Document => "document",
-                    crate::links::LinkKind::Meeting | crate::links::LinkKind::Org => unreachable!(),
+                    crate::links::LinkKind::Meeting
+                    | crate::links::LinkKind::Org
+                    | crate::links::LinkKind::Container => unreachable!(),
                 };
                 tx.query_row(
                     "SELECT COALESCE(NULLIF(TRIM(title), ''), name)
@@ -1572,6 +2068,10 @@ impl Db {
                 .optional()
                 .map_err(map_err)
             }
+            // A CONTAINER relation is graph-only: `link_items` never wrote a `[[Space]]` marker
+            // into any body, so there is no legacy marker to strip and nothing to resolve here.
+            // The caller skips a container destination before asking; this arm restates it.
+            crate::links::LinkKind::Container => Ok(None),
             crate::links::LinkKind::Org => {
                 let Some((org_id, doc_id)) = parse_org_link_id(id) else {
                     return Ok(None);
@@ -1615,6 +2115,13 @@ impl Db {
             }
             let dst = crate::links::LinkKind::parse(&edge.dst_kind)
                 .ok_or_else(|| AppError::InvalidArg("invalid destination link kind".into()))?;
+            // A CONTAINER destination is GRAPH-ONLY: `link_items` wrote no `[[Space]]` marker into
+            // the note body, so there is no legacy marker to scrub — and demanding a resolvable
+            // title here would turn every container unlink into a fail-closed `Locked` refusal for
+            // a relation that never touched markdown in the first place.
+            if dst == crate::links::LinkKind::Container {
+                continue;
+            }
             let title = Self::manual_marker_title_tx(tx, dst, &edge.dst_id)?.ok_or_else(|| {
                 AppError::Locked("one of these items is no longer available to unlink".into())
             })?;
@@ -2644,7 +3151,9 @@ impl Db {
                    JOIN doc_chunks dc ON dc.id = v.chunk_id
                   WHERE dc.document_id = ?1"
             }
-            crate::links::LinkKind::Org => return Ok(None),
+            // Neither a Shared Brain document nor a container has locally-embedded chunks: a
+            // container is a PLACE, so it can never be a semantic candidate at all.
+            crate::links::LinkKind::Org | crate::links::LinkKind::Container => return Ok(None),
         };
         let mut stmt = conn.prepare(sql).map_err(map_err)?;
         let rows = stmt
@@ -2775,7 +3284,9 @@ impl Db {
                 "AND kd.chunk_id NOT IN (SELECT id FROM doc_chunks WHERE document_id = ?3)"
                     .to_string(),
             ),
-            crate::links::LinkKind::Org => return Ok(Vec::new()),
+            crate::links::LinkKind::Org | crate::links::LinkKind::Container => {
+                return Ok(Vec::new())
+            }
         };
         // Each vec0 table gets its own single-MATCH CTE (vec0 allows one MATCH+k per query); the
         // meeting leg maps chunk→meeting and gates on the meeting's note folder; the doc leg maps
@@ -2920,7 +3431,7 @@ impl Db {
         // NOT run either, else a concurrent seal + this pass would strip the source's suggestions
         // that `purge_links_tx` is about to purge anyway — a no-op, but the refusal keeps this pass a
         // clean no-write.)
-        if link_endpoint_sealed_at_rest_tx(&tx, kind, id)? {
+        if link_endpoint_sealed_at_rest_tx(&tx, kind, id, &HashSet::new())? {
             tracing::debug!(target: "links", kind = kind.as_str(), "semantic auto-link refused: source sealed at rest");
             return Ok(0);
         }
@@ -2932,7 +3443,7 @@ impl Db {
             // candidate whose endpoint sealed at rest since the OUTSIDE-tx kNN, so a suggestion never
             // names a now-sealed neighbour. `knn_items_visible` already gates on the (stale) snapshot;
             // this closes the race window. Re-suggested when that folder unlocks.
-            if link_endpoint_sealed_at_rest_tx(&tx, c.kind, &c.id)? {
+            if link_endpoint_sealed_at_rest_tx(&tx, c.kind, &c.id, &HashSet::new())? {
                 continue;
             }
             let (src, dst) = crate::links::canonicalize_endpoints(
@@ -3102,11 +3613,21 @@ impl Db {
                 continue; // corrupt kind → skip defensively.
             };
             // ── GATE 2: the neighbour must be visible; else drop the edge (no title/existence leak). ──
-            let Some(other_title) =
-                self.link_endpoint_title_visible(other_kind, &other_id, unlocked)?
-            else {
-                continue;
-            };
+            // A CONTAINER neighbour resolves name AND level in ONE gated read, so the whole
+            // relation disappears the moment its Space/folder is sealed-and-not-unlocked, and
+            // reappears — with its CURRENT name, after any rename or reparent — on unlock.
+            let (other_title, other_container_level) =
+                if other_kind == crate::links::LinkKind::Container {
+                    match self.container_endpoint_visible(&other_id, unlocked)? {
+                        Some(container) => (container.name, Some(container.level)),
+                        None => continue,
+                    }
+                } else {
+                    match self.link_endpoint_title_visible(other_kind, &other_id, unlocked)? {
+                        Some(title) => (title, None),
+                        None => continue,
+                    }
+                };
             let navigation_id = if other_kind == crate::links::LinkKind::Org {
                 self.org_link_target_visible(&other_id)?
                     .map(|(item_id, _title)| item_id)
@@ -3120,6 +3641,7 @@ impl Db {
                 other_id,
                 navigation_id,
                 other_title,
+                other_container_level,
                 edge_type: et,
                 created_by: cb,
                 status: st,
@@ -3358,7 +3880,9 @@ impl Db {
                 let expected_kind = match kind {
                     crate::links::LinkKind::Note => "note",
                     crate::links::LinkKind::Document => "document",
-                    crate::links::LinkKind::Meeting | crate::links::LinkKind::Org => unreachable!(),
+                    crate::links::LinkKind::Meeting
+                    | crate::links::LinkKind::Org
+                    | crate::links::LinkKind::Container => unreachable!(),
                 };
                 let sql = format!(
                     "SELECT COALESCE(NULLIF(TRIM(d.title), ''), d.name)
@@ -3376,7 +3900,108 @@ impl Db {
             crate::links::LinkKind::Org => self
                 .org_link_target_visible(id)
                 .map(|target| target.map(|(_item_id, title)| title)),
+            // A CONTAINER endpoint resolves its CURRENT name — which is why the chip survives a
+            // rename and a reparent: the stored id is `folders.id`, and only the display string is
+            // read here. Gated on the SAME `visibility_clause` every other endpoint uses, so a
+            // sealed-and-not-session-unlocked Space is indistinguishable from one that never
+            // existed (`None`), and `links_for_visible` therefore hides the whole relation.
+            crate::links::LinkKind::Container => Ok(self
+                .container_endpoint_visible(id, unlocked)?
+                .map(|container| container.name)),
         }
+    }
+
+    /// The LIVE, gated identity of a `container` link endpoint: its current name and its
+    /// Space-vs-folder `level`.
+    ///
+    /// `None` — indistinguishably — when the id names nothing, names a MACHINE-owned `.murmur/`
+    /// container, names the reserved always-open note root (the synthetic "Not classified" Notes
+    /// section, a presentation device rather than a place), carries a level outside
+    /// `project|folder`, or names a sealed-and-not-session-unlocked container. That is the whole
+    /// endpoint contract in ONE reader, so the write gate
+    /// (`commands::links::link_endpoint_is_unlocked`) and the read gate
+    /// ([`Self::link_endpoint_title_visible`]) cannot drift apart.
+    pub fn container_endpoint_visible(
+        &self,
+        id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<crate::storage::models::ContainerEndpoint>> {
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        let sql = format!(
+            "SELECT f.name, COALESCE(f.level, 'folder')
+               FROM folders f
+              WHERE f.id = ?1 AND {CONTAINER_ENDPOINT_STRUCTURE} AND {visible}
+              LIMIT 1"
+        );
+        conn.query_row(&sql, rusqlite::params![id], |r| {
+            Ok(crate::storage::models::ContainerEndpoint {
+                name: r.get::<_, String>(0)?,
+                level: r.get::<_, String>(1)?,
+            })
+        })
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Every link row naming CONTAINER `folder_id` on EITHER side, for a folder trash snapshot.
+    ///
+    /// The delete purges these rows in the same transaction that drops the container (they would
+    /// otherwise dangle at an id that no longer exists), so — exactly like
+    /// [`Self::link_rows_for_meeting`] — the snapshot is their only copy, and it has to carry BOTH
+    /// directions: an edge naming the container as its destination is the user's own "this note is
+    /// about that Space" decision, and losing it is what makes a restored folder look unrelated to
+    /// everything.
+    pub fn link_rows_for_container(&self, folder_id: &str) -> Result<Vec<LinkRowSnapshot>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status,
+                        created_at
+                   FROM links
+                  WHERE (src_kind = 'container' AND src_id = ?1)
+                     OR (dst_kind = 'container' AND dst_id = ?1)
+                  ORDER BY src_kind, src_id, dst_kind, dst_id, edge_type",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| {
+                Ok(LinkRowSnapshot {
+                    src_kind: r.get(0)?,
+                    src_id: r.get(1)?,
+                    dst_kind: r.get(2)?,
+                    dst_id: r.get(3)?,
+                    edge_type: r.get(4)?,
+                    score: r.get(5)?,
+                    created_by: r.get(6)?,
+                    status: r.get(7)?,
+                    created_at: r.get(8)?,
+                })
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    /// Purge every link row incident on CONTAINER `folder_id`, inside the caller's delete tx.
+    ///
+    /// A permanent delete keeps NOTHING — the same `preserve_decisions = false` posture
+    /// [`Self::purge_links_tx`] takes for a deleted meeting/document: the endpoint is gone for
+    /// good, so a surviving decision row would be a dangling reference a future id reuse could
+    /// resurface. The trash snapshot taken BEFORE the delete is what keeps this reversible.
+    pub(crate) fn purge_container_links_tx(
+        tx: &rusqlite::Transaction<'_>,
+        folder_id: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "DELETE FROM links
+               WHERE (src_kind = 'container' AND src_id = ?1)
+                  OR (dst_kind = 'container' AND dst_id = ?1)",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
     }
 
     /// Resolve a strict stable Shared Brain `org_id:doc_id` composite to its current live feed item

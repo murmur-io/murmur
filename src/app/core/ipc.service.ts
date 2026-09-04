@@ -122,6 +122,7 @@ import type {
   OrgSyncReport,
   OrgTask,
   PeopleList,
+  PickerItemKind,
   PinResult,
   Posture,
   ProactiveHintPayload,
@@ -134,6 +135,9 @@ import type {
   RecordingStatus,
   ReindexProgress,
   ReindexResult,
+  RelatedPickerBootstrap,
+  RelatedPickerPage,
+  RelatedPickerSearchPage,
   ReminderDraft,
   ReminderSourceAnchor,
   ReminderSourceUpdatedPayload,
@@ -2928,6 +2932,79 @@ export class IpcService {
     return invoke<ContainerNode | null>("get_container", { id });
   }
 
+  // ── Related picker (the "Add related" hierarchy modal's own gated reader) ──
+  //
+  // Deliberately NOT `listWorkspaceTree` + `listContainerItems`: that pair is
+  // keyed on the global `ItemKind` (which carries task/dashboard), its payload is
+  // capped for a sidebar rather than for locating item #150, and the frontend
+  // caches it. Here the BACKEND owns truth and location on every call.
+
+  /**
+   * The picker's first frame: the metadata hierarchy, the anchor's ancestor path,
+   * and a BOUNDED window of the anchor's own siblings CENTRED on it — so opening
+   * Related from item #150 shows item #150 without shipping the other 149.
+   *
+   * REJECTS (`Locked`) — indistinguishably — for a sealed OR unknown anchor, before
+   * any hierarchy or count is computed. `anchor` is `null` for an anchor with no
+   * place in the local hierarchy (a Shared Brain item); the modal then just opens
+   * collapsed.
+   */
+  getRelatedPickerBootstrap(
+    anchorKind: LinkKind,
+    anchorId: string,
+  ): Promise<RelatedPickerBootstrap> {
+    return invoke<RelatedPickerBootstrap>("get_related_picker_bootstrap", {
+      anchorKind,
+      anchorId,
+    });
+  }
+
+  /**
+   * One lazy, stable page of a scope's linkable leaves. `containerId: null` is the
+   * synthetic "Not classified" node. Because the bootstrap CENTRES, both
+   * `Load earlier` (a lower offset) and `Load more` (a higher one) are ordinary
+   * calls against the same ordering. A sealed-and-not-unlocked container is
+   * REFUSED, never answered with an empty page.
+   */
+  listRelatedPickerItems(
+    anchorKind: LinkKind,
+    anchorId: string,
+    containerId: string | null,
+    kind: PickerItemKind,
+    offset: number,
+    limit: number,
+  ): Promise<RelatedPickerPage> {
+    return invoke<RelatedPickerPage>("list_related_picker_items", {
+      anchorKind,
+      anchorId,
+      containerId,
+      kind,
+      offset,
+      limit,
+    });
+  }
+
+  /**
+   * Bounded, gated search across every linkable local leaf, with full
+   * `Space / folder` breadcrumbs. Carries the SAME anchor gate as the bootstrap, so
+   * a sealed anchor cannot use search to walk around its own lock.
+   */
+  searchRelatedPicker(
+    anchorKind: LinkKind,
+    anchorId: string,
+    query: string,
+    offset: number,
+    limit: number,
+  ): Promise<RelatedPickerSearchPage> {
+    return invoke<RelatedPickerSearchPage>("search_related_picker", {
+      anchorKind,
+      anchorId,
+      query,
+      offset,
+      limit,
+    });
+  }
+
   // ── folders + per-folder lock lifecycle (PHASE0-PLAN Stage C) ──
 
   /** The folder tree (roots → children) with per-folder note counts + session lock state. */
@@ -3716,7 +3793,9 @@ export class IpcService {
    * a count only; the subscriber refetches through the gated `listTrash`.
    */
   onTrashUpdated(cb: (p: TrashUpdatedPayload) => void): Promise<UnlistenFn> {
-    return listen<TrashUpdatedPayload>(EVENT_TRASH_UPDATED, (e) => cb(e.payload));
+    return listen<TrashUpdatedPayload>(EVENT_TRASH_UPDATED, (e) =>
+      cb(e.payload),
+    );
   }
 
   /** Count-only reminder invalidation. Canonical rows are always refetched. */

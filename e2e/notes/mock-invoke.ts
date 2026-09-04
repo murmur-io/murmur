@@ -95,6 +95,121 @@ export async function mockNotes(
         : { id: args.id, name: "Notes", level: "folder", emoji: null, tint: null, locked: false, unlocked: false, isRoot: false, folders: [], groups: [] },
     list_container_items: (args: { kind: string }) => ({ kind: args.kind, total: 0, items: [] }),
 
+    // --- the "Add related" hierarchy picker's gated reader ---
+    // The Notes specs anchor on `/notes/n1`, which lives in `nf1`. The default
+    // fixture therefore opens with `Workspace / Notes` expanded and `n1` marked
+    // Current, plus a sealed Space (`nf2`) whose NAME is all it discloses.
+    // Explicit handlers, not the base mock's `default:` fallback — an unhandled
+    // `list_*` resolves to `[]` there, which would render exactly like a vault
+    // with nothing in it and greenwash a command that never ran.
+    get_related_picker_bootstrap: (args: {
+      anchorKind: string;
+      anchorId: string;
+    }) => ({
+      spaces: [
+        {
+          id: "p-root",
+          name: "Workspace",
+          level: "project",
+          emoji: null,
+          locked: false,
+          unlocked: false,
+          linkable: true,
+          groups: [],
+          folders: [
+            {
+              id: "nf1",
+              name: "Notes",
+              level: "folder",
+              emoji: null,
+              locked: false,
+              unlocked: false,
+              linkable: true,
+              groups: [
+                { kind: "note", total: 2 },
+                { kind: "meeting", total: 1 },
+              ],
+              folders: [],
+            },
+            {
+              id: "nf2",
+              name: "Work",
+              level: "folder",
+              emoji: null,
+              locked: true,
+              unlocked: false,
+              linkable: false,
+              groups: [],
+              folders: [],
+            },
+          ],
+        },
+      ],
+      unclassified: [{ kind: "meeting", total: 1 }],
+      anchor:
+        args.anchorKind === "note" && args.anchorId === "n1"
+          ? {
+              kind: "note",
+              containerId: "nf1",
+              path: ["p-root", "nf1"],
+              index: 0,
+              offset: 0,
+              items: [
+                { kind: "note", id: "n1", title: "My First Note" },
+                { kind: "note", id: "n2", title: "Weekly plan" },
+              ],
+              total: 2,
+            }
+          : null,
+    }),
+    list_related_picker_items: (args: {
+      containerId: string | null;
+      kind: string;
+      offset: number;
+      limit: number;
+    }) => {
+      const rows: Record<string, { kind: string; id: string; title: string }[]> =
+        {
+          "nf1|note": [
+            { kind: "note", id: "n1", title: "My First Note" },
+            { kind: "note", id: "n2", title: "Weekly plan" },
+          ],
+          "nf1|meeting": [
+            { kind: "meeting", id: "m-cand", title: "Some meeting" },
+          ],
+          "u|meeting": [
+            { kind: "meeting", id: "m-loose", title: "Unfiled recording" },
+          ],
+        };
+      const key = `${args.containerId ?? "u"}|${args.kind}`;
+      const items = rows[key] ?? [];
+      return {
+        kind: args.kind,
+        offset: args.offset,
+        items: items.slice(args.offset, args.offset + args.limit),
+        total: items.length,
+      };
+    },
+    search_related_picker: (args: { query: string }) => {
+      const all = [
+        {
+          kind: "note",
+          id: "n2",
+          title: "Weekly plan",
+          breadcrumb: ["Workspace", "Notes"],
+        },
+        {
+          kind: "meeting",
+          id: "m-loose",
+          title: "Unfiled recording",
+          breadcrumb: ["Not classified"],
+        },
+      ];
+      const q = args.query.trim().toLowerCase();
+      const hits = all.filter((row) => row.title.toLowerCase().includes(q));
+      return { offset: 0, hits, total: hits.length };
+    },
+
     list_note_folders: () => [
       { id: "nf1", name: "Notes", path: "Notes", parentId: null, locked: false, kind: "note" },
       { id: "nf2", name: "Work", path: "Notes/Work", parentId: null, locked: true, kind: "note" },

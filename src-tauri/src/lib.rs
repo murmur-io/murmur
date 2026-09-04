@@ -505,6 +505,12 @@ pub fn run() {
             commands::list_workspace_tree,
             commands::list_container_items,
             commands::get_container,
+            // The "Add related" hierarchy picker's own gated reader — separate from the workspace
+            // tree above on purpose (three linkable leaf kinds, never task/dashboard; a bounded
+            // window that CONTAINS the anchor rather than a capped tree payload).
+            commands::get_related_picker_bootstrap,
+            commands::list_related_picker_items,
+            commands::search_related_picker,
             commands::plan_workspace_organization,
             commands::apply_workspace_organization,
             commands::create_space,

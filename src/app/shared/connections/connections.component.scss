@@ -114,28 +114,6 @@
   align-self: flex-start;
 }
 
-/* The chooser's filter input (replaces the trigger while open). */
-.cx-link-input {
-  flex: 1 1 auto;
-  margin-left: auto;
-  min-width: 12rem;
-  max-width: 22rem;
-  padding: 5px var(--space-3);
-  background: var(--surface-raised);
-  border: 1px solid var(--accent-ring);
-  border-radius: var(--radius-pill);
-  color: var(--text-primary);
-  font: inherit;
-  font-size: 13px;
-}
-.cx-link-input::placeholder {
-  color: var(--text-muted);
-}
-.cx-link-input:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-
 /* A deterministic chip + its optional hover × remove control. The × sits just
    INSIDE the pill's trailing edge (revealed on hover of the wrap) so a manual
    link reads as one removable unit. */
@@ -251,6 +229,13 @@
   background: var(--surface-overlay);
   color: var(--text-muted);
   border: 1px solid var(--border-subtle);
+}
+/* A container chip names a PLACE, so it reads as a quiet outlined badge rather than the
+   filled "this is a document" tones above — the same distinction the tree glyphs draw. */
+.cx-kind--container {
+  background: transparent;
+  color: var(--graph-space);
+  border: 1px solid color-mix(in srgb, var(--graph-space) 35%, transparent);
 }
 .cx-kind--org {
   background: var(--success-soft);

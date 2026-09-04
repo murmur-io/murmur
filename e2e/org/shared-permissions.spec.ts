@@ -72,14 +72,76 @@ test("view-only received item has reverse Related but no edit or management cont
           ]
         : [];
     },
-    list_link_candidates: () => [
-      {
-        kind: "note",
-        id: "note-9",
-        title: "Local follow-up",
-        snippet: "",
-      },
-    ],
+    get_related_picker_bootstrap: (args: {
+      anchorKind: string;
+      anchorId: string;
+    }) => {
+      const w = window as unknown as { __relatedBootstrapCalls?: unknown[] };
+      (w.__relatedBootstrapCalls ??= []).push(args);
+      return {
+        spaces: [
+          {
+            id: "p-root",
+            name: "Workspace",
+            level: "project",
+            emoji: null,
+            locked: false,
+            unlocked: false,
+            linkable: true,
+            groups: [],
+            folders: [
+              {
+                id: "nf1",
+                name: "Notes",
+                level: "folder",
+                emoji: null,
+                locked: false,
+                unlocked: false,
+                linkable: true,
+                groups: [{ kind: "note", total: 1 }],
+                folders: [],
+              },
+            ],
+          },
+        ],
+        unclassified: [],
+        anchor: null,
+      };
+    },
+    list_related_picker_items: (args: { kind: string; offset: number }) => ({
+      kind: args.kind,
+      offset: args.offset,
+      items:
+        args.kind === "note"
+          ? [{ kind: "note", id: "note-9", title: "Local follow-up" }]
+          : [],
+      total: args.kind === "note" ? 1 : 0,
+    }),
+    search_related_picker: (args: {
+      anchorKind: string;
+      anchorId: string;
+      query: string;
+      offset: number;
+      limit: number;
+    }) => {
+      const w = window as unknown as { __relatedSearchCalls?: unknown[] };
+      (w.__relatedSearchCalls ??= []).push(args);
+      const matches = args.query.trim().toLowerCase() === "local follow-up";
+      return {
+        offset: 0,
+        hits: matches
+          ? [
+              {
+                kind: "note",
+                id: "note-9",
+                title: "Local follow-up",
+                breadcrumb: ["Workspace", "Notes"],
+              },
+            ]
+          : [],
+        total: matches ? 1 : 0,
+      };
+    },
     link_items: (args: unknown) => {
       const w = window as unknown as {
         __reverseLinkCalls?: unknown[];
@@ -108,10 +170,20 @@ test("view-only received item has reverse Related but no edit or management cont
 
   const connections = page.locator("app-connections");
   await connections.getByRole("button", { name: "Link", exact: true }).click();
-  await page
-    .locator(".link-pop")
-    .getByRole("option", { name: /Local follow-up/ })
-    .dispatchEvent("click");
+  const picker = page.getByRole("dialog", { name: "Add related" });
+  await expect(picker).toBeVisible();
+  await expect.poll(async () =>
+    page.evaluate(
+      () =>
+        (
+          window as unknown as { __relatedBootstrapCalls?: unknown[] }
+        ).__relatedBootstrapCalls ?? [],
+    ),
+  ).toContainEqual({ anchorKind: "org", anchorId: VIEW_LINK_ID });
+  await picker.getByPlaceholder("Search every Space…").fill("Local follow-up");
+  await picker
+    .locator('[data-row="h:note:note-9"] .rhp-row-main')
+    .click();
   await expect(connections.getByText("Local follow-up")).toBeVisible();
   await expect.poll(async () =>
     page.evaluate(
@@ -124,6 +196,19 @@ test("view-only received item has reverse Related but no edit or management cont
     srcId: VIEW_LINK_ID,
     dstKind: "note",
     dstId: "note-9",
+  });
+  await expect.poll(async () =>
+    page.evaluate(
+      () =>
+        (window as unknown as { __relatedSearchCalls?: unknown[] })
+          .__relatedSearchCalls ?? [],
+    ),
+  ).toContainEqual({
+    anchorKind: "org",
+    anchorId: VIEW_LINK_ID,
+    query: "Local follow-up",
+    offset: 0,
+    limit: 30,
   });
 });
 

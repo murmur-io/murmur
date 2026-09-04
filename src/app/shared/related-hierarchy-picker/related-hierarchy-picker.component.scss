@@ -1,0 +1,521 @@
+/* "Add related" — the opaque modal hierarchy picker.
+   T3: this floats OVER content, so it is `--surface-overlay` with NO backdrop-filter. Glass never
+   stacks on glass; the frosted `.card` here would bleed the note body straight through the tree. */
+
+.rhp-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  display: grid;
+  place-items: center;
+  padding: var(--space-5);
+  background: var(--scrim);
+}
+
+.rhp {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  /* Bounded by the VISUAL viewport (`dvh`), so the mobile/short-window case cannot push the footer
+     off-screen — the tree is the only thing that gives. */
+  width: min(720px, 100%);
+  max-height: min(720px, calc(100dvh - var(--space-6)));
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-overlay);
+  backdrop-filter: none;
+  box-shadow: var(--shadow-lg);
+  color: var(--text-primary);
+}
+
+/* ── Header (fixed) ─────────────────────────────────────────────────────── */
+
+.rhp-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  flex: 0 0 auto;
+  padding: var(--space-5) var(--space-5) var(--space-3);
+}
+
+.rhp-mark {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.rhp-heading {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.rhp-heading h2 {
+  margin: 0;
+  font-size: var(--font-lg, 17px);
+  font-weight: 650;
+  letter-spacing: -0.005em;
+}
+
+.rhp-heading p {
+  margin: var(--space-1) 0 0;
+  color: var(--text-secondary);
+  font-size: var(--font-sm, 12.5px);
+}
+
+.rhp-close {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.rhp-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.rhp-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+/* ── Search (fixed) ─────────────────────────────────────────────────────── */
+
+.rhp-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  margin: 0 var(--space-5);
+}
+
+.rhp-search-glyph {
+  position: absolute;
+  left: var(--space-3);
+  display: grid;
+  place-items: center;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.rhp-search-field {
+  width: 100%;
+  padding: var(--space-3) var(--space-6) var(--space-3) var(--space-7);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.rhp-search-field::placeholder {
+  color: var(--text-muted);
+}
+
+.rhp-search-field:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.rhp-search-clear {
+  position: absolute;
+  right: var(--space-2);
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.rhp-search-clear:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.rhp-search-clear:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+.rhp-context {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 0 0 auto;
+  margin: var(--space-3) var(--space-5) 0;
+  color: var(--text-secondary);
+  font-size: var(--font-sm, 12.5px);
+  min-height: 1.2em;
+}
+
+.rhp-context-lead {
+  color: var(--text-muted);
+}
+
+.rhp-context strong {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* ── Tree (the ONLY scrollport) ─────────────────────────────────────────── */
+
+.rhp-tree {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* `overflow-x: hidden` rather than `auto`: a deep indent must never produce a horizontal
+     scrollbar inside the modal, let alone on the document. */
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding: var(--space-3) var(--space-4) var(--space-2);
+}
+
+.rhp-state {
+  margin: var(--space-5) 0;
+  color: var(--text-muted);
+  font-size: var(--font-sm, 12.5px);
+  text-align: center;
+}
+
+.rhp-state--error {
+  color: var(--text-secondary);
+}
+
+/* ── One row ────────────────────────────────────────────────────────────── */
+
+.rhp-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  /* The indent lives on a custom property so the depth is data, not a nested selector chain. */
+  padding-left: calc(var(--rhp-depth, 0) * var(--tree-indent));
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  min-height: 34px;
+}
+
+.rhp-row:hover {
+  background: var(--surface-hover);
+}
+
+.rhp-row:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.rhp-row.is-current {
+  background: var(--accent-soft);
+}
+
+.rhp-row.is-linked,
+.rhp-row.is-locked {
+  color: var(--text-muted);
+}
+
+.rhp-disclosure,
+.rhp-disclosure-spacer {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+}
+
+.rhp-disclosure {
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.rhp-disclosure:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.rhp-chevron {
+  display: grid;
+  place-items: center;
+  transition: transform var(--transition-fast);
+}
+
+.rhp-chevron.is-open {
+  transform: rotate(90deg);
+}
+
+.rhp-glyph {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  color: var(--text-muted);
+}
+
+.rhp-glyph[data-tone="meeting"] { color: var(--graph-meeting); }
+.rhp-glyph[data-tone="note"] { color: var(--graph-note); }
+.rhp-glyph[data-tone="document"] { color: var(--graph-document); }
+.rhp-glyph[data-tone="space"] { color: var(--graph-space); }
+.rhp-glyph[data-tone="folder"] { color: var(--graph-folder); }
+.rhp-glyph[data-tone="shared"] { color: var(--graph-entity); }
+.rhp-glyph[data-tone="unclassified"] { color: var(--text-muted); }
+.rhp-glyph[data-tone="page"] { color: var(--text-muted); }
+
+.rhp-row-main {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rhp-row-main:disabled {
+  cursor: default;
+}
+
+.rhp-row-main:focus-visible {
+  outline: none;
+}
+
+.rhp-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-width: 0;
+}
+
+.rhp-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rhp-meta {
+  overflow: hidden;
+  max-width: 100%;
+  color: var(--text-muted);
+  font-size: var(--font-xs, 11.5px);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rhp-tag {
+  flex: 0 0 auto;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-pill);
+  font-size: var(--font-xs, 11px);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.rhp-tag--current {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.rhp-tag--linked {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.rhp-tag--contains {
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+}
+
+.rhp-tag--locked {
+  background: var(--surface-hover);
+  color: var(--text-muted);
+}
+
+.rhp-action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 0 0 auto;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--font-xs, 11.5px);
+  font-weight: 600;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--transition-fast), color var(--transition-fast);
+}
+
+.rhp-row:hover .rhp-action,
+.rhp-action:focus-visible,
+.rhp-action--done {
+  opacity: 1;
+}
+
+.rhp-action:hover:not(:disabled) {
+  border-color: var(--accent-soft);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.rhp-action:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+.rhp-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.rhp-action--done {
+  color: var(--success);
+  cursor: default;
+}
+
+/* ── Footer (fixed) ─────────────────────────────────────────────────────── */
+
+.rhp-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 0 0 auto;
+  padding: var(--space-3) var(--space-5) var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: var(--font-xs, 11.5px);
+}
+
+.rhp-foot-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.rhp-foot-copy strong {
+  color: var(--text-secondary);
+  font-weight: 620;
+}
+
+.rhp-cancel {
+  flex: 0 0 auto;
+}
+
+/* ── The container confirmation ─────────────────────────────────────────── */
+
+.rhp-confirm-layer {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--space-5);
+  background: var(--scrim);
+}
+
+.rhp-confirm {
+  width: min(420px, 100%);
+  padding: var(--space-5);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-overlay);
+  backdrop-filter: none;
+  box-shadow: var(--shadow-lg);
+}
+
+.rhp-confirm-kicker {
+  margin: 0;
+  color: var(--accent-hover);
+  font-size: var(--font-xs, 11px);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.rhp-confirm h3 {
+  margin: var(--space-2) 0 0;
+  font-size: var(--font-md, 15px);
+  font-weight: 650;
+}
+
+.rhp-confirm-body {
+  margin: var(--space-2) 0 0;
+  color: var(--text-secondary);
+  font-size: var(--font-sm, 12.5px);
+  line-height: 1.5;
+}
+
+.rhp-confirm-body strong {
+  color: var(--text-primary);
+}
+
+.rhp-confirm-path {
+  margin: var(--space-2) 0 0;
+  color: var(--text-muted);
+  font-size: var(--font-xs, 11.5px);
+}
+
+.rhp-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
+/* ── Short / narrow windows ─────────────────────────────────────────────── */
+
+@media (max-height: 560px) {
+  .rhp {
+    max-height: calc(100dvh - var(--space-4));
+  }
+
+  .rhp-head {
+    padding-top: var(--space-3);
+    padding-bottom: var(--space-2);
+  }
+
+  .rhp-heading p {
+    display: none;
+  }
+
+  .rhp-mark {
+    width: 32px;
+    height: 32px;
+  }
+}
+
+@media (max-width: 620px) {
+  .rhp-scrim {
+    padding: var(--space-2);
+  }
+
+  .rhp-foot-copy {
+    display: none;
+  }
+}

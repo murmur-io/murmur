@@ -23,11 +23,11 @@
 //!
 //! # What is deliberately NOT snapshotted
 //!
-//! Derived data — FTS rows, vec0 embeddings, `doc_chunks`, entity mentions, graph edges, analytics
-//! aggregates. All of it is re-derivable from the canonical content, and re-deriving on restore is
-//! strictly safer than freezing a copy that could disagree with a later schema. Restore re-indexes
-//! best-effort and logs a warning on failure; the canonical rows are already back by then, so a
-//! failed re-index degrades search, never content.
+//! Derived data — FTS rows, vec0 embeddings, `doc_chunks`, and analytics aggregates. All of it is
+//! re-derivable from canonical content, and re-deriving on restore is strictly safer than freezing a
+//! copy that could disagree with a later schema. Non-derivable relations and meeting entity mentions
+//! ARE snapshotted; losing an explicit user decision is content loss. Restore re-indexes derived
+//! state best-effort only after the canonical rows and required relations are back.
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
@@ -174,6 +174,11 @@ struct NoteSnapshot {
     /// Inline images — they cascade-delete with the `documents` row.
     #[serde(default)]
     attachments: Vec<AttachmentSnapshot>,
+    /// Every relation naming this authored note on either side. `delete_document` purges all of
+    /// them, including the new note-to-container decision, so the trash snapshot is their only
+    /// recoverable copy. Additive/defaulted for entries created by older builds.
+    #[serde(default)]
+    links: Vec<crate::storage::links::LinkRowSnapshot>,
 }
 
 /// A container's restorable state, plus WHERE its contents were rehomed to.
@@ -203,6 +208,16 @@ struct FolderSnapshot {
     /// can tell the user their lock did not survive rather than letting them assume it did.
     #[serde(default)]
     was_locked: bool,
+    /// Manual CONTAINER relations naming this folder on EITHER side ("this note is about that
+    /// Space"). The delete purges them in the same transaction that drops the row — they would
+    /// otherwise dangle at an id that no longer exists — so the snapshot is their only copy, and
+    /// it has to carry both directions for the same reason `MeetingSnapshot::links` does.
+    ///
+    /// `#[serde(default)]`, and the snapshot VERSION is deliberately NOT bumped: an additive
+    /// optional field is exactly what the version contract already allows, and bumping would make
+    /// every entry already sitting in a user's trash unreadable by this binary.
+    #[serde(default)]
+    links: Vec<crate::storage::links::LinkRowSnapshot>,
     /// The row's presentation/placement columns (`kind`/`level`/`emoji`/`tint`/`position`/`is_root`).
     /// Optional so a snapshot written before this field existed still restores — it falls back to the
     /// migration's own defaults. Without it a restored Workspace would silently demote from Project
@@ -260,6 +275,25 @@ pub(crate) fn retention_days(state: &AppState) -> i64 {
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|d| (MIN_TRASH_RETENTION_DAYS..=MAX_TRASH_RETENTION_DAYS).contains(d))
         .unwrap_or(DEFAULT_TRASH_RETENTION_DAYS)
+}
+
+/// Refuse a second delete while an earlier restore of this exact source is incomplete.
+///
+/// A retry shell is intentionally left live when required relation replay fails. Treating it as a
+/// fresh deletion would create two snapshots that both claim the same audio/relation resources.
+/// New inserts also enforce this atomically in the storage layer; this early guard prevents the
+/// delete path from revoking shares or changing lock state before it learns that deletion is not
+/// currently legal.
+pub(crate) fn refuse_pending_recovery_journal(
+    state: &AppState,
+    source_id: &str,
+) -> Result<(), AppError> {
+    if state.db.count_trash_entries_for_source(source_id)? != 0 {
+        return Err(AppError::Unavailable(
+            "this item has an incomplete restore; retry restore before deleting it again".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// When an entry deleted at `deleted_at` expires. An unparseable timestamp yields `None`, and every
@@ -442,6 +476,7 @@ pub(crate) fn capture_note(state: &AppState, note_id: &str) -> Result<String, Ap
             .iter()
             .map(attachment_to_snapshot)
             .collect(),
+        links: state.db.link_rows_for_authored_note(note_id)?,
     };
     let label = row
         .title
@@ -467,6 +502,9 @@ pub(crate) fn capture_note(state: &AppState, note_id: &str) -> Result<String, Ap
                 if a.data_hex != b.data_hex {
                     return Some("an inline image's bytes did not round-trip".to_string());
                 }
+            }
+            if restored.links != snapshot.links {
+                return Some("the note's graph edges did not round-trip".to_string());
             }
             None
         },
@@ -501,6 +539,7 @@ pub(crate) fn capture_folder(
         meeting_ids: meeting_ids.to_vec(),
         note_ids: note_ids.to_vec(),
         was_locked: folder.locked,
+        links: state.db.link_rows_for_container(&folder.id)?,
         presentation: state.db.folder_presentation(&folder.id)?,
     };
     let label = folder.name.clone();
@@ -525,6 +564,9 @@ pub(crate) fn capture_folder(
             }
             if restored.path != snapshot.path {
                 return Some("the folder's vault path did not round-trip".to_string());
+            }
+            if restored.links != snapshot.links {
+                return Some("the folder's container relations did not round-trip".to_string());
             }
             None
         },
@@ -1266,6 +1308,10 @@ pub async fn restore_trash_item(
     state: State<'_, AppState>,
     entry_id: String,
 ) -> Result<(), AppError> {
+    // Restoring can recreate a hierarchy endpoint and re-file content into it. Serialize that
+    // publication with delete/move/share mutations before entering the synchronous lifecycle
+    // interval below, in the same lock order as the other hierarchy commands.
+    let _share_mutation = state.lock_org_mutation().await;
     let st = state.inner();
     restore_trash_item_inner(st, &entry_id).await?;
     emit_trash_updated(&app, st);
@@ -1292,26 +1338,31 @@ pub(crate) async fn restore_trash_item_inner(
     let kind = TrashKind::from_str(&entry.kind)
         .ok_or_else(|| AppError::Storage(format!("unknown trash kind {}", entry.kind)))?;
 
-    // GUARD SCOPING is per-kind, and deliberately so — the lifecycle mutex is a NON-REENTRANT std
-    // Mutex, so who holds it decides which helpers are callable:
-    //   * meeting/note restore run UNDER it (serialized against a concurrent lock/relock landing
-    //     mid-restore) and therefore must use the `_under_lifecycle_authorized` export seam;
-    //   * folder restore must NOT hold it, because it re-files members through
-    //     `move_note_doc_inner`, which takes the guard itself for its own double-gate.
-    // Holding it across the whole match, as this first did, self-deadlocked both ways.
+    // Every restore — INCLUDING the final trash-entry consumption — is one lifecycle interval.
+    // Otherwise a concurrent folder delete can remove a just-recreated container after its row is
+    // inserted but before its relations are replayed. `restore_link_rows` correctly skips an absent
+    // endpoint; consuming the snapshot after that skip would then silently lose the user's only
+    // copy of those relations.
+    //
+    // The lifecycle mutex is non-reentrant, so helpers called below must use their explicit
+    // `_under_lifecycle` / `_under_lifecycle_authorized` seams rather than acquiring it again.
     match kind {
         TrashKind::Meeting => {
             let _lifecycle = lifecycle_guard(st);
             restore_meeting(st, &entry.payload)?;
+            st.db.delete_trash_entry(&entry_id)?;
         }
         TrashKind::Note => {
             let _lifecycle = lifecycle_guard(st);
             restore_note(st, &entry.payload)?;
+            st.db.delete_trash_entry(&entry_id)?;
         }
-        TrashKind::Folder | TrashKind::NoteFolder => restore_folder(st, &entry.payload)?,
+        TrashKind::Folder | TrashKind::NoteFolder => {
+            let lifecycle = lifecycle_guard(st);
+            restore_folder(st, &lifecycle, &entry_id, &entry.payload)?;
+            st.db.delete_trash_entry(&entry_id)?;
+        }
     }
-
-    st.db.delete_trash_entry(&entry_id)?;
     bump_seal_epoch(st);
     tracing::info!(target: "trash", entry_id = %entry_id, kind = kind.as_str(), "restored from trash");
     Ok(())
@@ -1417,17 +1468,51 @@ pub(crate) async fn purge_one_for_test(state: &AppState, entry_id: &str) -> Resu
     purge_one(state, entry_id, None).await
 }
 
+/// Content-free check for a restore shell whose recovery journal is still present. Purging that
+/// journal would turn a retryable partial restore into loss (meeting audio/full payload, note
+/// relations, or folder member placement), so both manual and expiry purge must refuse it.
+fn trash_source_is_live(
+    state: &AppState,
+    kind: TrashKind,
+    source_id: &str,
+) -> Result<bool, AppError> {
+    match kind {
+        TrashKind::Meeting => Ok(state.db.get_meeting_gate_anchor(source_id)?.is_some()),
+        TrashKind::Note => Ok(state.db.note_gate_anchor(source_id)?.is_some()),
+        TrashKind::Folder | TrashKind::NoteFolder => {
+            Ok(state.db.folder_by_id(source_id)?.is_some())
+        }
+    }
+}
+
 /// Destroy ONE entry's content and its row. The entry must already be proven readable.
 async fn purge_one(
     state: &AppState,
     entry_id: &str,
     app: Option<&AppHandle>,
 ) -> Result<(), AppError> {
+    // Serialize the final journal destruction with restores and all source/container lifecycle
+    // mutations. In particular, a restore may publish a dormant id-only container relation while
+    // its far endpoint is still in trash; purge must either happen before that decision or remove it
+    // afterwards, never race between the endpoint check and row insertion.
+    let _lifecycle = lifecycle_guard(state);
     let Some(entry) = state.db.get_trash_entry(entry_id)? else {
         return Ok(());
     };
     let kind = TrashKind::from_str(&entry.kind)
         .ok_or_else(|| AppError::Storage(format!("unknown trash kind {}", entry.kind)))?;
+    if trash_source_is_live(state, kind, &entry.source_id)? {
+        return Err(AppError::Unavailable(
+            "this item has an incomplete restore; retry restore before discarding its recovery journal"
+                .into(),
+        ));
+    }
+    if state.db.count_trash_entries_for_source(&entry.source_id)? != 1 {
+        return Err(AppError::Unavailable(
+            "multiple recovery journals claim this item; restore them instead of discarding shared resources"
+                .into(),
+        ));
+    }
     match kind {
         TrashKind::Meeting => {
             // The meeting's rows are already gone; what survives is its audio on disk. Remove every
@@ -1456,6 +1541,12 @@ async fn purge_one(
             }
         }
     }
+    // A restore of the other endpoint may have re-published this decision as a dormant row. Once
+    // this journal is discarded there is no path by which the absent endpoint can return, so remove
+    // the row in the same lifecycle interval. A live retry shell makes this a deliberate no-op.
+    state
+        .db
+        .purge_dangling_links_for_trash_source(kind.as_str(), &entry.source_id)?;
     state.db.delete_trash_entry(entry_id)?;
     if let Some(app) = app {
         crate::events::emit_content_deleted(app, kind.as_str(), &entry.source_id);
@@ -1466,18 +1557,38 @@ async fn purge_one(
 
 // ── RESTORE ──────────────────────────────────────────────────────────────────────────────────────
 
+/// Replay non-derivable user decisions as a required restore step. A storage failure is different
+/// from a missing/superseded far endpoint: `restore_link_rows` deliberately returns a smaller count
+/// for the latter, but an `Err` means no durable decision replay was proven and the trash journal
+/// must survive.
+fn restore_snapshotted_links(
+    state: &AppState,
+    links: &[crate::storage::links::LinkRowSnapshot],
+) -> Result<usize, AppError> {
+    let unlocked = unlocked_snapshot(state)?;
+    state.db.restore_link_rows(links, &unlocked)
+}
+
+fn meeting_matches_restore_identity(
+    existing: &crate::storage::Meeting,
+    expected: &crate::storage::Meeting,
+) -> bool {
+    existing.id == expected.id
+        && existing.started_at == expected.started_at
+        && existing.ended_at == expected.ended_at
+        && existing.title == expected.title
+        && existing.duration_s == expected.duration_s
+        && existing.audio_path == expected.audio_path
+        && existing.status == expected.status
+}
+
 /// Re-insert a meeting and everything the snapshot carried, then re-derive its indexes best-effort.
 fn restore_meeting(state: &AppState, payload: &str) -> Result<(), AppError> {
     let s: MeetingSnapshot = parse_snapshot(payload)?;
-    if state.db.get_meeting(&s.id)?.is_some() {
-        return Err(AppError::InvalidArg(
-            "a recording with this id already exists — nothing to restore".into(),
-        ));
-    }
     // The snapshot's folder may have been deleted meanwhile. Restore to the vault ROOT rather than
     // failing: getting the recording back matters more than getting its filing back, and an
     // unfiled recording is a state the app already handles everywhere.
-    let folder_id = match s.folder_id.as_deref() {
+    let desired_folder_id = match s.folder_id.as_deref() {
         Some(fid) if state.db.folder_by_id(fid)?.is_some() => Some(fid.to_string()),
         Some(fid) => {
             tracing::info!(target: "trash", meeting_id = %s.id, missing_folder = %fid, "restoring to vault root — original folder is gone");
@@ -1485,23 +1596,7 @@ fn restore_meeting(state: &AppState, payload: &str) -> Result<(), AppError> {
         }
         None => None,
     };
-    // Refuse to write plaintext into a folder that is sealed and not unlocked this session.
-    if let Some(fid) = folder_id.as_deref() {
-        if !folder_is_unlocked(state, fid)? {
-            return Err(AppError::Locked(
-                "unlock the destination folder before restoring this recording".into(),
-            ));
-        }
-    }
-
-    // The delete opened an org-source CLOSURE on this id, and the `closing_*_guard` triggers abort
-    // every write to a closing source — including the ones this restore is about to make. Retire it
-    // first: the id is coming back to life, which is the one case the closure was not written for.
-    // Safe because the delete already revoked every live org share (revoke-before-delete), so no
-    // server item survives for the sync tick to re-pull.
-    state.db.clear_org_source_closure("meeting", &s.id)?;
-
-    let meeting = crate::storage::Meeting {
+    let expected = crate::storage::Meeting {
         id: s.id.clone(),
         started_at: s.started_at.clone(),
         ended_at: s.ended_at.clone(),
@@ -1509,11 +1604,56 @@ fn restore_meeting(state: &AppState, payload: &str) -> Result<(), AppError> {
         duration_s: s.duration_s,
         audio_path: s.audio_path.clone(),
         status: s.status.parse()?,
-        folder_id: folder_id.clone(),
+        folder_id: desired_folder_id.clone(),
     };
-    state.db.insert_meeting(&meeting)?;
-    if let Some(fid) = folder_id.as_deref() {
-        state.db.set_meeting_folder(&s.id, Some(fid))?;
+
+    // A required relation replay can fail after the source row was inserted. Keep that exact shell
+    // and the trash journal instead of deleting through the broad production cascade (which also
+    // purges unrelated rollups/Ask history). Retry recognizes only the immutable snapshot identity;
+    // current filing is allowed to differ because a newer user move must win.
+    if state.db.get_meeting_gate_anchor(&s.id)?.is_some() {
+        if !meeting_is_unlocked(state, &s.id)? {
+            return Err(AppError::Locked(
+                "unlock the restored recording before retrying".into(),
+            ));
+        }
+        let existing = state.db.get_meeting(&s.id)?.ok_or_else(|| {
+            AppError::Storage("the restored recording disappeared during retry".into())
+        })?;
+        if !meeting_matches_restore_identity(&existing, &expected) {
+            return Err(AppError::InvalidArg(
+                "a different recording with this id already exists — refusing restore".into(),
+            ));
+        }
+    } else {
+        // Refuse to write plaintext into a folder that is sealed and not unlocked this session.
+        if let Some(fid) = desired_folder_id.as_deref() {
+            if !folder_is_unlocked(state, fid)? {
+                return Err(AppError::Locked(
+                    "unlock the destination folder before restoring this recording".into(),
+                ));
+            }
+        }
+
+        // The delete opened an org-source CLOSURE on this id, and the `closing_*_guard` triggers
+        // abort writes to it. Retire it only when birthing the retry shell; a later retry must not
+        // disturb fresh source state.
+        state.db.clear_org_source_closure("meeting", &s.id)?;
+        state.db.insert_meeting(&expected)?;
+    }
+
+    // Manual/container relations are canonical user decisions, not derived cache. Replay them
+    // before any other payload rows. A DB error leaves this exact minimal shell plus the snapshot;
+    // retry resumes here without running a destructive delete cascade.
+    let restored_links = restore_snapshotted_links(state, &s.links)?;
+    if restored_links < s.links.len() {
+        tracing::info!(
+            target: "trash",
+            meeting_id = %s.id,
+            restored = restored_links,
+            snapshotted = s.links.len(),
+            "some snapshotted links were superseded by later decisions"
+        );
     }
 
     let segments: Vec<crate::transcribe::types::Segment> = s
@@ -1573,32 +1713,6 @@ fn restore_meeting(state: &AppState, payload: &str) -> Result<(), AppError> {
         &s.attachments,
     );
 
-    // Graph edges. These are NOT re-derivable: deleting a meeting purges its links outright and
-    // cascades away its mentions, and re-indexing only rebuilds what can be inferred from text — a
-    // manual link somebody drew, or an inbound edge from another note, is gone for good otherwise.
-    // Restored BEFORE the re-index so the wikilink pass sees the edges that already exist and does
-    // not duplicate them.
-    //
-    // Best-effort, like the re-export below and for the same reason: the meeting itself is already
-    // back, and failing the whole restore over an edge would trade a large loss for a small one.
-    match state.db.restore_link_rows(&s.links, &state.unlocked_folders.lock().map(|g| g.clone()).unwrap_or_default()) {
-        Ok(n) => {
-            if n < s.links.len() {
-                // Not an error. `INSERT OR IGNORE` skips an edge the user has since dismissed or
-                // re-created, and a decision made after the delete outranks the snapshot.
-                tracing::info!(
-                    target: "trash",
-                    meeting_id = %s.id,
-                    restored = n,
-                    snapshotted = s.links.len(),
-                    "some snapshotted links were superseded by later decisions"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(target: "trash", meeting_id = %s.id, error = %e, "link restore failed")
-        }
-    }
     match state
         .db
         .restore_entity_mentions(&s.id, &s.entity_mentions)
@@ -1634,44 +1748,96 @@ fn restore_meeting(state: &AppState, payload: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn note_matches_restore_identity(
+    existing: &crate::storage::db::NoteRow,
+    snapshot: &NoteSnapshot,
+    restored_title: &str,
+) -> bool {
+    existing.id == snapshot.id
+        && existing.name == snapshot.name
+        && existing.title.as_deref() == Some(restored_title)
+        && existing.text == snapshot.text
+        && existing.created_at == snapshot.created_at
+}
+
 /// Re-insert an authored note, then re-export + re-index best-effort.
 fn restore_note(state: &AppState, payload: &str) -> Result<(), AppError> {
     let s: NoteSnapshot = parse_snapshot(payload)?;
-    if state.db.get_note_row(&s.id)?.is_some() {
-        return Err(AppError::InvalidArg(
-            "a note with this id already exists — nothing to restore".into(),
-        ));
-    }
+    let title = s.title.clone().unwrap_or_else(|| s.name.clone());
     // The note's folder may be gone; fall back to the notes root, which always exists.
-    let folder_id = if state.db.folder_by_id(&s.folder_id)?.is_some() {
+    let desired_folder_id = if state.db.folder_by_id(&s.folder_id)?.is_some() {
         s.folder_id.clone()
     } else {
         let root = state.db.ensure_notes_root()?;
         tracing::info!(target: "trash", note_id = %s.id, missing_folder = %s.folder_id, "restoring to notes root — original folder is gone");
         root
     };
-    if !folder_is_unlocked(state, &folder_id)? {
-        return Err(AppError::Locked(
-            "unlock the destination folder before restoring this note".into(),
-        ));
+    if let Some((existing_folder_id, _, _)) = state.db.note_gate_anchor(&s.id)? {
+        // Same retry shape as a meeting: relation replay failed after a minimal note shell landed.
+        // Gate through the content-free anchor before reading the row, then accept only the exact
+        // snapshot identity. Preserve a newer filing decision by using its current folder.
+        if !folder_is_unlocked(state, &existing_folder_id)? {
+            return Err(AppError::Locked(
+                "unlock the restored note before retrying".into(),
+            ));
+        }
+        let existing = state.db.get_note_row(&s.id)?.ok_or_else(|| {
+            AppError::Storage("the restored note disappeared during retry".into())
+        })?;
+        if !note_matches_restore_identity(&existing, &s, &title) {
+            return Err(AppError::InvalidArg(
+                "a different note with this id already exists — refusing restore".into(),
+            ));
+        }
+    } else {
+        if !folder_is_unlocked(state, &desired_folder_id)? {
+            return Err(AppError::Locked(
+                "unlock the destination folder before restoring this note".into(),
+            ));
+        }
+
+        // Same closure retirement as the meeting restore — only for the first shell birth.
+        state.db.clear_org_source_closure("document", &s.id)?;
+        let destination_locked = state
+            .db
+            .folder_by_id(&desired_folder_id)?
+            .map(|folder| folder.locked)
+            .unwrap_or(false);
+        if destination_locked {
+            // Seal BEFORE insert and store plaintext+ciphertext atomically. A failed key read or
+            // verification leaves no blob-less plaintext row inside a sealed folder.
+            let blob = sealed_document_blob(state, &desired_folder_id, &s.id, &s.text)?;
+            state.db.insert_note_sealed(
+                &s.id,
+                &desired_folder_id,
+                &s.name,
+                &title,
+                &s.text,
+                &blob,
+                s.created_at,
+            )?;
+        } else {
+            state.db.insert_note(
+                &s.id,
+                &desired_folder_id,
+                &s.name,
+                &title,
+                &s.text,
+                s.created_at,
+            )?;
+        }
     }
 
-    // Same closure retirement as the meeting restore — see the comment there.
-    state.db.clear_org_source_closure("document", &s.id)?;
-
-    let title = s.title.clone().unwrap_or_else(|| s.name.clone());
-    state.db.insert_note(
-        &s.id,
-        &folder_id,
-        &s.name,
-        &title,
-        &s.text,
-        s.created_at,
-    )?;
-    // A restore into a SEALED (session-unlocked) folder must not leave plaintext at rest — re-seal
-    // it through the same helper every authored-note write path uses.
-    let now = chrono::Utc::now().timestamp_millis();
-    reseal_document_if_locked(state, &folder_id, &s.id, &title, &s.text, now)?;
+    let restored_links = restore_snapshotted_links(state, &s.links)?;
+    if restored_links < s.links.len() {
+        tracing::info!(
+            target: "trash",
+            note_id = %s.id,
+            restored = restored_links,
+            snapshotted = s.links.len(),
+            "some snapshotted note links were superseded by later decisions"
+        );
+    }
 
     // Inline images before the export, so the `.md` is written against images that exist.
     restore_attachments(
@@ -1699,75 +1865,152 @@ fn restore_note(state: &AppState, payload: &str) -> Result<(), AppError> {
 }
 
 /// Recreate a container and move its recorded members back into it.
-fn restore_folder(state: &AppState, payload: &str) -> Result<(), AppError> {
+fn restore_folder(
+    state: &AppState,
+    lifecycle: &std::sync::MutexGuard<'_, ()>,
+    entry_id: &str,
+    payload: &str,
+) -> Result<(), AppError> {
     let s: FolderSnapshot = parse_snapshot(payload)?;
-    if state.db.folder_by_id(&s.id)?.is_some() {
-        return Err(AppError::InvalidArg(
-            "a folder with this id already exists — nothing to restore".into(),
-        ));
-    }
-    // The parent may itself have been deleted. Restore at the ROOT rather than failing — the user
-    // can move it back, and refusing would strand the folder in the trash forever.
-    let parent_id = match s.parent_id.as_deref() {
-        Some(pid) if state.db.folder_by_id(pid)?.is_some() => Some(pid.to_string()),
-        Some(pid) => {
-            tracing::info!(target: "trash", folder_id = %s.id, missing_parent = %pid, "restoring at root — original parent is gone");
-            None
-        }
-        None => None,
-    };
-    // Restoring INTO a sealed parent would create an open container inside a sealed one — the exact
-    // state the container-creation gate exists to prevent. Refuse and let the user unlock first.
-    if let Some(pid) = parent_id.as_deref() {
-        if !folder_is_unlocked(state, pid)? {
-            return Err(AppError::Locked(
-                "unlock the parent folder before restoring this folder".into(),
-            ));
-        }
-    }
-
-    // A `path` collision means the user recreated a folder with the same name meanwhile. Restore
-    // under a suffixed path rather than failing the UNIQUE constraint.
-    let path = unique_folder_path(state, &s.path)?;
     // `presentation` was captured with the row; a snapshot written before those columns existed
     // falls back to the same defaults the migration uses, so an old entry still restores.
-    let presentation = s.presentation.clone().unwrap_or_else(|| {
-        crate::storage::trash_store::FolderPresentation {
-            kind: s.kind.clone(),
-            level: "folder".to_string(),
-            is_root: false,
-            emoji: None,
-            tint: None,
-            position: 0,
-        }
-    });
-    state.db.insert_restored_folder(
-        &s.id,
-        &s.name,
-        &path,
-        parent_id.as_deref(),
-        &s.created_at,
-        &presentation,
-    )?;
+    let presentation =
+        s.presentation
+            .clone()
+            .unwrap_or_else(|| crate::storage::trash_store::FolderPresentation {
+                kind: s.kind.clone(),
+                level: "folder".to_string(),
+                is_root: false,
+                emoji: None,
+                tint: None,
+                position: 0,
+            });
 
-    // Move the members back — each best-effort and individually gated: a member that has since been
-    // deleted, re-filed, or locked must not abort the whole restore.
+    // Folder restore is deliberately retryable. The first attempt may have recreated the folder
+    // and its members before relation replay failed; in that state the trash snapshot is still the
+    // recovery journal. Recognize only the row identity this snapshot itself could have produced,
+    // then continue replay. Path/parent are not compared: a legitimate restore may have chosen a
+    // collision suffix or root fallback, and the user may move the recovered row before retrying.
+    // Name + original created_at + full presentation + open state distinguish it from an unrelated
+    // id collision without overwriting any newer placement decision.
+    let already_restored = match state.db.folder_by_id(&s.id)? {
+        Some(existing) => {
+            let existing_presentation = state.db.folder_presentation(&s.id)?;
+            if existing.name != s.name
+                || existing.created_at != s.created_at
+                || existing.locked
+                || existing_presentation.as_ref() != Some(&presentation)
+            {
+                return Err(AppError::InvalidArg(
+                    "a different folder with this id already exists — refusing restore".into(),
+                ));
+            }
+            true
+        }
+        None => false,
+    };
+    // The parent may itself have been deleted. Restore at the ROOT rather than failing — the user
+    // can move it back, and refusing would strand the folder in the trash forever.
+    if !already_restored {
+        let parent_id = match s.parent_id.as_deref() {
+            Some(pid) if state.db.folder_by_id(pid)?.is_some() => Some(pid.to_string()),
+            Some(pid) => {
+                tracing::info!(target: "trash", folder_id = %s.id, missing_parent = %pid, "restoring at root — original parent is gone");
+                None
+            }
+            None => None,
+        };
+        // Restoring INTO a sealed parent would create an open container inside a sealed one — the
+        // exact state the container-creation gate exists to prevent. Refuse and let the user unlock.
+        if let Some(pid) = parent_id.as_deref() {
+            if !folder_is_unlocked(state, pid)? {
+                return Err(AppError::Locked(
+                    "unlock the parent folder before restoring this folder".into(),
+                ));
+            }
+        }
+
+        // A `path` collision means the user recreated a folder with the same name meanwhile.
+        // Restore under a suffixed path rather than failing the UNIQUE constraint.
+        let path = unique_folder_path(state, &s.path)?;
+        state.db.insert_restored_folder(
+            &s.id,
+            &s.name,
+            &path,
+            parent_id.as_deref(),
+            &s.created_at,
+            &presentation,
+        )?;
+    }
+
+    // Resolve each member at most once across every retry. The durable marker is essential: after a
+    // later required step fails, the user may explicitly move a restored member back to the SAME
+    // fallback used by folder deletion (Not classified / Notes root). Current placement alone then
+    // cannot distinguish that newer choice from an untouched member. A resolved marker makes the
+    // retry preserve it. Placement probes below are content-free gate anchors; a member re-filed
+    // into a sealed-not-unlocked folder never has its title/body/audio hydrated merely to skip it.
     for mid in &s.meeting_ids {
-        if state.db.get_meeting(mid)?.is_none() {
+        if state
+            .db
+            .trash_folder_member_was_resolved(entry_id, "meeting", mid)?
+        {
             continue;
         }
-        if let Err(e) = state.db.set_meeting_folder(mid, Some(&s.id)) {
-            tracing::warn!(target: "trash", meeting_id = %mid, error = %e, "could not re-file meeting on folder restore");
+        match state.db.get_meeting_gate_anchor(mid)? {
+            Some(meeting) if meeting.folder_id.is_none() => {
+                state.db.set_meeting_folder_for_trash_restore(
+                    entry_id,
+                    mid,
+                    &s.id,
+                )?;
+            }
+            _ => state
+                .db
+                .mark_trash_folder_member_resolved(entry_id, "meeting", mid)?,
         }
     }
+    let notes_root = if s.note_ids.is_empty() {
+        None
+    } else {
+        Some(state.db.ensure_notes_root()?)
+    };
     for nid in &s.note_ids {
-        match state.db.get_note_row(nid) {
-            Ok(Some(_)) => {
-                if let Err(e) = move_note_doc_inner(state, nid, &s.id) {
-                    tracing::warn!(target: "trash", note_id = %nid, error = %e, "could not re-file note on folder restore");
-                }
+        if state
+            .db
+            .trash_folder_member_was_resolved(entry_id, "note", nid)?
+        {
+            continue;
+        }
+        match state.db.note_gate_anchor(nid)? {
+            Some((folder_id, _, _)) if notes_root.as_deref() == Some(folder_id.as_str()) => {
+                move_note_doc_for_trash_restore_under_lifecycle(
+                    state, lifecycle, entry_id, nid, &s.id,
+                )?;
             }
-            _ => continue,
+            _ => state
+                .db
+                .mark_trash_folder_member_resolved(entry_id, "note", nid)?,
+        }
+    }
+    // Replay the EXACT directed container relations the delete purged. `INSERT OR IGNORE` inside
+    // `restore_link_rows` is the point: if the user has meanwhile made a NEWER explicit decision
+    // about the same pair, that decision wins rather than being overwritten by a resurrection.
+    // This replay is the LAST recoverability-bearing step and is NOT best-effort. On failure the
+    // error propagates to `restore_trash_item_inner`, which retains the snapshot; a retry recognizes
+    // the matching folder above and safely resumes. `restore_link_rows` commits its own transaction,
+    // so the caller cannot consume the trash entry until every accepted relation is durable.
+    if !s.links.is_empty() {
+        if state.db.folder_by_id(&s.id)?.is_none() {
+            return Err(AppError::Storage(
+                "the restored folder disappeared before its relations could be replayed".into(),
+            ));
+        }
+        let unlocked = unlocked_snapshot(state)?;
+        state.db.restore_link_rows(&s.links, &unlocked)?;
+        if state.db.folder_by_id(&s.id)?.is_none() {
+            return Err(AppError::Storage(
+                "the restored folder disappeared while its relations were replayed".into(),
+            ));
         }
     }
     Ok(())
@@ -1810,4 +2053,78 @@ fn unique_folder_path(state: &AppState, path: &str) -> Result<String, AppError> 
 fn emit_trash_updated(app: &AppHandle, state: &AppState) {
     let count = state.db.count_trash_entries().unwrap_or(0);
     crate::events::emit_trash_updated(app, count);
+}
+
+#[cfg(test)]
+mod folder_snapshot_format_tests {
+    use super::*;
+
+    /// A folder snapshot written BEFORE the `links` field existed still deserializes.
+    ///
+    /// `#[serde(default)]` is what keeps an entry ALREADY SITTING in a user's trash readable across
+    /// an app update — the case that actually matters, since a trash entry outlives the binary that
+    /// wrote it. It is also why [`SNAPSHOT_VERSION`] is deliberately NOT bumped for an additive
+    /// optional field: a bump would make every one of those entries unreadable to buy nothing.
+    #[test]
+    fn an_old_folder_snapshot_without_container_links_still_restores() {
+        let legacy = r#"{
+            "version": 1,
+            "id": "f1",
+            "name": "Atlas",
+            "path": "Product/Atlas",
+            "parent_id": "p1",
+            "created_at": "2026-03-01T09:00:00Z",
+            "kind": "meeting",
+            "meeting_ids": ["m1"],
+            "note_ids": []
+        }"#;
+        let raw: serde_json::Value = serde_json::from_str(legacy).unwrap();
+        assert!(
+            raw.get("links").is_none(),
+            "the fixture must genuinely predate the field, or it proves nothing"
+        );
+
+        let restored: FolderSnapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored.version, SNAPSHOT_VERSION);
+        assert_eq!(restored.name, "Atlas");
+        assert_eq!(restored.meeting_ids, vec!["m1".to_string()]);
+        assert!(
+            restored.links.is_empty(),
+            "an absent `links` field means NO container relations, never a parse failure"
+        );
+        assert!(restored.presentation.is_none());
+    }
+
+    /// A NEW snapshot round-trips its container relations verbatim — the property `capture_folder`
+    /// verifies before it lets any delete proceed.
+    #[test]
+    fn a_folder_snapshot_round_trips_its_container_links() {
+        let snapshot = FolderSnapshot {
+            version: SNAPSHOT_VERSION,
+            id: "f1".into(),
+            name: "Atlas".into(),
+            path: "Product/Atlas".into(),
+            parent_id: Some("p1".into()),
+            created_at: "2026-03-01T09:00:00Z".into(),
+            kind: "meeting".into(),
+            meeting_ids: vec![],
+            note_ids: vec![],
+            was_locked: false,
+            links: vec![crate::storage::links::LinkRowSnapshot {
+                src_kind: "meeting".into(),
+                src_id: "m1".into(),
+                dst_kind: "container".into(),
+                dst_id: "f1".into(),
+                edge_type: "manual".into(),
+                score: 1.0,
+                created_by: "user".into(),
+                status: "active".into(),
+                created_at: 1_700_000_000_000,
+            }],
+            presentation: None,
+        };
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let decoded: FolderSnapshot = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.links, snapshot.links);
+    }
 }

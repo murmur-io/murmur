@@ -1,5 +1,6 @@
 import { Injectable, inject } from "@angular/core";
 import { IpcService } from "../core/ipc.service";
+import { isContentLinkKind } from "../core/models";
 import type { LinkKind, SourceRef } from "../core/models";
 
 /**
@@ -10,8 +11,9 @@ import type { LinkKind, SourceRef } from "../core/models";
  * The default scope for an anchor `(kind, id)` is:
  *   1. the anchor itself (`{kind, id, title}`), then
  *   2. every ACTIVE (`status: "active"`) neighbour from {@link IpcService.listLinks}
- *      — deterministic wikilink/companion/manual edges — mapped to the neighbour's
- *      `{kind: otherKind, id: otherId, title: otherTitle}`.
+ *      whose kind carries MATERIAL CONTENT ({@link isContentLinkKind}) —
+ *      deterministic wikilink/companion/manual edges over meeting/note/document —
+ *      mapped to the neighbour's `{kind: otherKind, id: otherId, title: otherTitle}`.
  * The list is deduped by `kind + id` (the same identity `SourceRef` uses) with the
  * anchor kept first. `suggested` (un-accepted semantic) edges are deliberately
  * EXCLUDED — a default scope should only include links the user has confirmed.
@@ -45,6 +47,16 @@ export class SourceScopeService {
       for (const e of edges) {
         if (e.status !== "active") {
           continue; // only confirmed links seed the default scope.
+        }
+        // A default scope is a set of things the Brain will READ. Filter to the
+        // MATERIAL content kinds explicitly rather than accepting whatever kind
+        // the edge carries: a `container` edge names a PLACE (and must never be
+        // expanded into what it holds), and an `org` edge is somebody else's
+        // Shared Brain document. The backend refuses both — this keeps the
+        // picker's chips honest instead of showing a source that contributes
+        // nothing.
+        if (!isContentLinkKind(e.otherKind)) {
+          continue;
         }
         const key = e.otherKind + e.otherId;
         if (seen.has(key)) {

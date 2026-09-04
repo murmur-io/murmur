@@ -1724,6 +1724,14 @@ pub struct LinkEdge {
     pub navigation_id: Option<String>,
     /// The neighbour's current display title, resolved through the visibility gate.
     pub other_title: String,
+    /// For an `other_kind == "container"` neighbour ONLY: `"project"` (a Space) or `"folder"`.
+    ///
+    /// NON-CONTENT metadata — the same `folders.level` the sidebar already renders — carried so the
+    /// chip can pick its glyph and its noun ("Space" vs "folder") without a second IPC round-trip.
+    /// Space-vs-folder is deliberately a FIELD rather than a second `LinkKind`: one endpoint kind
+    /// keeps the write path, the purge path and every exhaustive match single-branched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_container_level: Option<String>,
     pub edge_type: String,
     pub created_by: String,
     pub status: String,
@@ -2544,6 +2552,118 @@ pub struct DashboardTile {
     /// Small per-kind JSON options bag (e.g. the Living-answer question).
     pub config: Option<String>,
     pub created_at: String,
+}
+
+// ── RELATED PICKER — the gated hierarchy the "Add related" modal walks ───────────────────────────
+//
+// A DELIBERATELY SEPARATE type family from `ItemKind`/`ContainerNode`. The global `ItemKind` carries
+// `task` and `dashboard`; the picker must never offer either, and "the enum has four variants but
+// two of them are filtered out at every call site" is precisely the shape that leaks one back in
+// the first time somebody adds a fifth. Three variants, no filtering.
+
+/// The three LINKABLE leaf kinds the picker offers: a recording, an authored note, and an imported
+/// document. Never a task, never a dashboard.
+///
+/// A unit enum, so `rename_all = "camelCase"` is sufficient and there are no variant FIELDS to
+/// rename — the distinction that broke `TileData` (#566/#568).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PickerItemKind {
+    Meeting,
+    Note,
+    Document,
+}
+
+impl PickerItemKind {
+    /// The fixed presentation order of a container's groups.
+    pub const ORDER: [PickerItemKind; 3] = [
+        PickerItemKind::Meeting,
+        PickerItemKind::Note,
+        PickerItemKind::Document,
+    ];
+
+    /// The `documents.kind` discriminator for the two `documents`-backed kinds. A meeting is not a
+    /// `documents` row at all, so it maps to the sentinel that matches nothing — the leaf builder
+    /// never asks, and a future caller that does gets an empty result rather than a note.
+    pub fn document_kind(self) -> &'static str {
+        match self {
+            PickerItemKind::Note => "note",
+            PickerItemKind::Document => "document",
+            PickerItemKind::Meeting => "",
+        }
+    }
+
+    /// The placeholder shown for a row with no usable title. Resolved in the READER (not the FE) so
+    /// the modal, its search results and its keyboard traversal all agree on one label.
+    pub fn untitled_label(self) -> &'static str {
+        match self {
+            PickerItemKind::Meeting => "Untitled recording",
+            PickerItemKind::Note => "Untitled note",
+            PickerItemKind::Document => "Untitled document",
+        }
+    }
+
+    /// The [`crate::links::LinkKind`] a picked row links AS.
+    pub fn link_kind(self) -> crate::links::LinkKind {
+        match self {
+            PickerItemKind::Meeting => crate::links::LinkKind::Meeting,
+            PickerItemKind::Note => crate::links::LinkKind::Note,
+            PickerItemKind::Document => crate::links::LinkKind::Document,
+        }
+    }
+}
+
+/// Which set of leaves a page/index query is scoped to.
+///
+/// Storage-internal: the wire carries `containerId: string | null`, and `null` means
+/// [`PickerScope::Unclassified`]. Modelling it as an enum here rather than an `Option<&str>` is what
+/// makes the two unclassified SOURCES explicit — an unfiled RECORDING has no container at all,
+/// while an unfiled NOTE lives in the reserved always-open note root — so neither leg can silently
+/// inherit the other's predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerScope {
+    /// The synthetic "Not classified" node: unfiled recordings + reserved-root notes/documents.
+    Unclassified,
+    /// A real, renderable container (a Space or a folder), by `folders.id`.
+    Container(String),
+}
+
+/// One linkable LEAF row. Carries NO on-disk path and NO snippet — a title and an id are everything
+/// a picker row needs, and everything else is content this read has no business disclosing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickerRow {
+    pub kind: PickerItemKind,
+    pub id: String,
+    /// Always present — the reader substitutes the per-kind placeholder rather than shipping a null
+    /// the FE would have to re-invent a label for.
+    pub title: String,
+}
+
+/// One SEARCH hit. Identical to a [`PickerRow`] plus the container it lives in, which the command
+/// layer turns into a full `Space / folder` breadcrumb from the hierarchy it already resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickerSearchRow {
+    pub kind: PickerItemKind,
+    pub id: String,
+    pub title: String,
+    /// `None` ⇒ the hit is unclassified (an unfiled recording, or a reserved-root note).
+    pub container_id: Option<String>,
+}
+
+/// The LIVE identity of a `container` link endpoint, resolved through the visibility gate.
+///
+/// Storage-internal (never crosses IPC on its own): the name feeds `LinkEdge::other_title` and the
+/// level feeds `LinkEdge::other_container_level`, so both come from ONE gated read rather than two
+/// that could disagree across a relock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerEndpoint {
+    /// The container's CURRENT visible name — resolved at read time, which is what makes a
+    /// container chip survive a rename.
+    pub name: String,
+    /// `"project"` (a Space) or `"folder"`.
+    pub level: String,
 }
 
 // ── WORKSPACE HIERARCHY — Projects › Folders › items ─────────────────────────────────────────────

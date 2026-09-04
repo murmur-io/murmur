@@ -74,4 +74,6 @@
   --graph-meeting: #ff9d5c;  /* warm amber — recorded meetings              */
   --graph-note: #4ce0a0;     /* mint — authored notes                       */
   --graph-document: #c86ff2; /* orchid — imported documents                 */
+  --graph-space: #6e76ff;    /* indigo — a Space (folders.level = project)  */
+  --graph-folder: #f5b14c;   /* amber — a folder inside a Space             */
 }

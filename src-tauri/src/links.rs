@@ -46,6 +46,19 @@ pub enum LinkKind {
     /// A private local edge to a Shared Brain document. Its local id is the revision-stable,
     /// org-scoped `org_id:doc_id` composite, never a feed `item_id` and never uploaded.
     Org,
+    /// A whole LOCAL CONTAINER — a Space (`folders.level='project'`) or a folder
+    /// (`folders.level='folder'`). Its id is the stable `folders.id`, which is why the relation
+    /// survives a rename AND a reparent; the visible name is resolved live at read time.
+    ///
+    /// Space-versus-folder is METADATA (`level`), not a second relation kind: one endpoint kind
+    /// keeps the write path, the purge path and every exhaustive match single-branched.
+    ///
+    /// A container relation is Related-panel METADATA ONLY. It names a place, never content, so it
+    /// is deliberately NOT a content source ([`LinkKind::is_content_source`]): it never enters an
+    /// Ask/provider scope, a summarization input, a semantic candidate set, an MCP content result,
+    /// or a note body. It NEVER fans out to the container's descendants — exactly one directed edge
+    /// is written.
+    Container,
 }
 
 impl LinkKind {
@@ -56,6 +69,7 @@ impl LinkKind {
             LinkKind::Note => "note",
             LinkKind::Document => "document",
             LinkKind::Org => "org",
+            LinkKind::Container => "container",
         }
     }
 
@@ -67,8 +81,24 @@ impl LinkKind {
             "note" => Some(LinkKind::Note),
             "document" => Some(LinkKind::Document),
             "org" => Some(LinkKind::Org),
+            "container" => Some(LinkKind::Container),
             _ => None,
         }
+    }
+
+    /// Is this endpoint MATERIAL CONTENT a provider/summarizer/retriever may read?
+    ///
+    /// The ONE predicate every "does this endpoint contribute text" site asks, so a new
+    /// metadata-only endpoint kind cannot silently widen an Ask scope, a conversion source, a
+    /// semantic candidate set, or an MCP content result by being forgotten at one call site. Both
+    /// `org` (a private graph relation to somebody else's Shared Brain document — public callers
+    /// already excluded it one `== LinkKind::Org` at a time) and `container` (a PLACE, which holds
+    /// no text of its own) answer `false`.
+    pub fn is_content_source(self) -> bool {
+        matches!(
+            self,
+            LinkKind::Meeting | LinkKind::Note | LinkKind::Document
+        )
     }
 }
 
@@ -206,14 +236,35 @@ mod tests {
             LinkKind::Note,
             LinkKind::Document,
             LinkKind::Org,
+            LinkKind::Container,
         ] {
             assert_eq!(LinkKind::parse(k.as_str()), Some(k));
         }
+        assert_eq!(LinkKind::parse("container"), Some(LinkKind::Container));
+        assert_eq!(LinkKind::Container.as_str(), "container");
         assert_eq!(LinkKind::parse("bogus"), None);
         assert_eq!(EdgeType::Semantic.as_str(), "semantic");
         assert!(EdgeType::Semantic.is_undirected());
         assert!(!EdgeType::Wikilink.is_undirected());
         assert!(!EdgeType::Companion.is_undirected());
+    }
+
+    /// The ONE content-source predicate: only the three MATERIAL local kinds answer `true`. A
+    /// metadata-only endpoint (`org`, `container`) must never widen an Ask/provider/summarizer
+    /// scope, so this is asserted rather than left to each call site to remember.
+    #[test]
+    fn only_material_local_kinds_are_content_sources() {
+        assert!(LinkKind::Meeting.is_content_source());
+        assert!(LinkKind::Note.is_content_source());
+        assert!(LinkKind::Document.is_content_source());
+        assert!(
+            !LinkKind::Org.is_content_source(),
+            "a Shared Brain relation is private graph metadata, never provider material"
+        );
+        assert!(
+            !LinkKind::Container.is_content_source(),
+            "a container names a PLACE — it holds no text and must never enter a content scope"
+        );
     }
 
     /// Every edge type round-trips through `as_str`/`parse`, and `manual` (note↔meeting-links PR-1)

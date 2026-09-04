@@ -9734,8 +9734,10 @@ async fn org_sweep_pending_with_policy(
     //     future bug that flips a row to `revoked` without evicting — keeps a fully decrypted, fully
     //     searchable replica of content it already withdrew from the server, and no queue re-drives a
     //     `revoked` row. This pass converges exactly those: for each `revoked` row that still names a
-    //     server item, ask the (indexed, content-free) replica state whether a LIVE local row remains
-    //     and, if so, run the ONE eviction primitive. NO NETWORK — the server tombstone already
+    //     server item, repair the exact retained deletion witness. A stable document repair evicts
+    //     ALL locally held revisions and installs its terminal relation marker even when the named
+    //     predecessor is already dead; a legacy item keeps the indexed live-state probe. NO NETWORK
+    //     — the server tombstone already
     //     happened for a `revoked` row, so re-issuing it would only re-DELETE an already-gone item on
     //     every launch. Runs BEFORE the logged-out / no-server early returns because it needs neither,
     //     and is a pure read (zero write transactions) once every replica has converged. It does NOT
@@ -9750,23 +9752,45 @@ async fn org_sweep_pending_with_policy(
         let Some(item_id) = row.item_id.as_deref() else {
             continue;
         };
-        if !state
-            .db
-            .org_replica_state(item_id)?
-            .is_some_and(|held| !held.tombstoned)
-        {
-            continue;
-        }
-        if policy
-            .commit(|| {
-                commit_org_visibility_reduction(
-                    state,
-                    app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
-                    || state.db.evict_org_item(item_id),
-                )
-            })?
-            .unwrap_or(false)
-        {
+        let repaired_now = if let Some(doc_id) = row.doc_id.as_deref() {
+            // A stable revoked journal with a retained server item id is durable proof that the
+            // old crash ordering completed its server DELETE but not local document
+            // terminalization. Repair the WHOLE stable resource even when this named predecessor
+            // is already tombstoned and a different revision remains live.
+            policy
+                .commit(|| {
+                    commit_org_visibility_reduction(
+                        state,
+                        app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
+                        || {
+                            state.db.repair_revoked_org_share_terminal_state(
+                                &row.id,
+                                &row.org_id,
+                                doc_id,
+                            )
+                        },
+                    )
+                })?
+                .unwrap_or(false)
+        } else {
+            if !state
+                .db
+                .org_replica_state(item_id)?
+                .is_some_and(|held| !held.tombstoned)
+            {
+                continue;
+            }
+            policy
+                .commit(|| {
+                    commit_org_visibility_reduction(
+                        state,
+                        app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
+                        || state.db.evict_org_item(item_id),
+                    )
+                })?
+                .unwrap_or(false)
+        };
+        if repaired_now {
             repaired += 1;
             advanced += 1;
             tracing::info!(
@@ -10563,6 +10587,8 @@ async fn org_sync_one(
         Tombstone {
             item_id: String,
             seq: u64,
+            doc_id: Option<String>,
+            is_current: bool,
         },
         /// A permanently un-ingestable item: advance the cursor past its seq (no DB write) so it never
         /// stalls the feed. Recorded in `report.errors`.
@@ -10637,6 +10663,8 @@ async fn org_sync_one(
             actions.push(FeedAction::Tombstone {
                 item_id: item.item_id.clone(),
                 seq: item.seq,
+                doc_id: item.doc_id.clone(),
+                is_current: resolved_org_item_is_current(item),
             });
             continue;
         }
@@ -10829,7 +10857,12 @@ async fn org_sync_one(
                             break;
                         }
                         match action {
-                            FeedAction::Tombstone { item_id, seq } => {
+                            FeedAction::Tombstone {
+                                item_id,
+                                seq,
+                                doc_id,
+                                is_current,
+                            } => {
                                 let Some((applied, _evicted)) = policy.commit(|| {
                                     if let Some(handle) = app_for_apply.as_ref() {
                                         let app_state = handle.state::<AppState>();
@@ -10838,15 +10871,26 @@ async fn org_sync_one(
                                             app_state.inner(),
                                             Some(handle),
                                             || {
-                                                outcome = db.commit_org_feed_tombstone_outcome(
-                                                    &org_id, &item_id, seq,
-                                                )?;
+                                                outcome = db
+                                                    .commit_org_feed_tombstone_with_metadata_outcome(
+                                                        &org_id,
+                                                        &item_id,
+                                                        seq,
+                                                        doc_id.as_deref(),
+                                                        is_current,
+                                                    )?;
                                                 Ok(outcome.1)
                                             },
                                         )?;
                                         Ok(outcome)
                                     } else {
-                                        db.commit_org_feed_tombstone_outcome(&org_id, &item_id, seq)
+                                        db.commit_org_feed_tombstone_with_metadata_outcome(
+                                            &org_id,
+                                            &item_id,
+                                            seq,
+                                            doc_id.as_deref(),
+                                            is_current,
+                                        )
                                     }
                                 })?
                                 else {
@@ -11199,8 +11243,14 @@ async fn org_reconcile_one(
             document_owner_user_id: Option<String>,
             is_current: bool,
         },
-        /// The feed says this item is withdrawn → evict the local replica.
-        Evict { item_id: String, seq: u64 },
+        /// The feed says this item is withdrawn → evict the local replica. Stable-document
+        /// metadata distinguishes a predecessor transition from an authoritative resource delete.
+        Evict {
+            item_id: String,
+            seq: u64,
+            doc_id: Option<String>,
+            is_current: bool,
+        },
         /// A CONTAINER manifest → write it into `org_containers`, not `org_items`.
         ///
         /// Kept a distinct action rather than a flag on `Ingest` so the apply arm cannot
@@ -11282,6 +11332,8 @@ async fn org_reconcile_one(
             actions.push(ReconcileAction::Evict {
                 item_id: item.item_id.clone(),
                 seq: item.seq,
+                doc_id: item.doc_id.clone(),
+                is_current: resolved_org_item_is_current(item),
             });
             continue;
         }
@@ -11475,17 +11527,34 @@ async fn org_reconcile_one(
                         }
                         progress = seq;
                     }
-                    ReconcileAction::Evict { item_id, seq } => {
+                    ReconcileAction::Evict {
+                        item_id,
+                        seq,
+                        doc_id,
+                        is_current,
+                    } => {
                         let Some(evicted) = policy.commit(|| {
                             if let Some(handle) = app_for_apply.as_ref() {
                                 let app_state = handle.state::<AppState>();
                                 commit_org_visibility_reduction(
                                     app_state.inner(),
                                     Some(handle),
-                                    || db.evict_org_item(&item_id),
+                                    || {
+                                        db.evict_org_reconcile_tombstone_with_metadata(
+                                            &org_id,
+                                            &item_id,
+                                            doc_id.as_deref(),
+                                            is_current,
+                                        )
+                                    },
                                 )
                             } else {
-                                db.evict_org_item(&item_id)
+                                db.evict_org_reconcile_tombstone_with_metadata(
+                                    &org_id,
+                                    &item_id,
+                                    doc_id.as_deref(),
+                                    is_current,
+                                )
                             }
                         })?
                         else {

@@ -54,7 +54,12 @@ export type ShellIcon =
   // Developer mode — the diagnostics surface behind the Settings toggle.
   // `developer` is the terminal chevron+caret; `logs` is a stack of log lines.
   | "developer"
-  | "logs";
+  | "logs"
+  // Relationship marks. `link` is the two-ring chain (create a relation);
+  // `close` is the plain X every dismissible overlay needs. Both live here rather
+  // than inline in one feature, so the next surface that needs them reuses one glyph.
+  | "link"
+  | "close";
 
 /**
  * Design System — one inline-SVG glyph, shared by the floating sidebar, the

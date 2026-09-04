@@ -46,6 +46,8 @@
   --graph-meeting: #d16a1e;
   --graph-note: #128a5e;
   --graph-document: #9d3fca;
+  --graph-space: #4750e0;
+  --graph-folder: #b57414;
   --shadow-sm: 0 1px 2px rgba(18, 18, 40, 0.10);
   --shadow-md: 0 12px 30px rgba(18, 18, 40, 0.10);
   --shadow-lg: 0 22px 55px rgba(18, 18, 40, 0.13);
@@ -107,6 +109,8 @@
     --graph-meeting: #d16a1e;
     --graph-note: #128a5e;
     --graph-document: #9d3fca;
+  --graph-space: #4750e0;
+  --graph-folder: #b57414;
     --shadow-sm: 0 1px 2px rgba(18, 18, 40, 0.10);
     --shadow-md: 0 12px 30px rgba(18, 18, 40, 0.10);
     --shadow-lg: 0 22px 55px rgba(18, 18, 40, 0.13);

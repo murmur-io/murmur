@@ -945,6 +945,8 @@ impl Db {
             "SELECT src_kind, src_id, dst_kind, dst_id, edge_type, score, status
                FROM links
               WHERE {status_pred}
+                AND src_kind IN ('meeting','note','document')
+                AND dst_kind IN ('meeting','note','document')
               ORDER BY score DESC, edge_type ASC, src_id ASC, dst_id ASC, id ASC
               LIMIT {}",
             MAX_FULL_GRAPH_LINK_EDGES + 1

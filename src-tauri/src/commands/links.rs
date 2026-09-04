@@ -83,7 +83,7 @@ pub async fn link_meeting_entities(
 fn parse_link_kind(s: &str) -> Result<crate::links::LinkKind, AppError> {
     crate::links::LinkKind::parse(s).ok_or_else(|| {
         AppError::InvalidArg(format!(
-            "unknown link kind {s:?} (expected \"meeting\", \"note\", \"document\", or \"org\")"
+            "unknown link kind {s:?} (expected \"meeting\", \"note\", \"document\", \"org\", or \"container\")"
         ))
     })
 }
@@ -233,7 +233,7 @@ pub(crate) fn dismiss_link_inner(state: &AppState, id: i64) -> Result<(), AppErr
 /// there is nothing legitimate to link. Used by `link_items`/`unlink_items` to refuse `AppError::Locked`
 /// before any write, so a manual edge is never created behind a lock and never reveals a locked
 /// neighbour.
-fn link_endpoint_is_unlocked(
+pub(crate) fn link_endpoint_is_unlocked(
     state: &AppState,
     kind: crate::links::LinkKind,
     id: &str,
@@ -258,6 +258,15 @@ fn link_endpoint_is_unlocked(
         // locally-held replica to a still-joined, context-enabled org and requires a current
         // non-tombstoned revision.
         crate::links::LinkKind::Org => Ok(state.db.org_link_target_visible(id)?.is_some()),
+        // A CONTAINER endpoint is a LOCAL Space/folder id. One gated reader answers the whole
+        // contract — existence, renderability (a user container kind outside the machine-owned
+        // `.murmur/` subtree), a real `project`/`folder` level, NOT the reserved always-open note
+        // root, and the current session unlock. Anything else is `false`: fail-closed, and
+        // indistinguishable, so the picker cannot become an existence oracle for a sealed Space.
+        crate::links::LinkKind::Container => {
+            let unlocked = unlocked_snapshot(state)?;
+            Ok(state.db.container_endpoint_visible(id, &unlocked)?.is_some())
+        }
     }
 }
 
@@ -315,9 +324,18 @@ pub(crate) fn link_items_inner(
             ));
         }
         // ── Persist the directed manual edge (idempotent on the UNIQUE key). ──
-        state
-            .db
-            .upsert_manual_link(src.as_str(), src_id, dst.as_str(), dst_id)?;
+        // The session snapshot rides into the transaction so a `container` endpoint's at-rest
+        // re-check sees the SAME unlock set this gate just consulted — a relock cannot land
+        // between them and still produce a durable row naming a sealed place. Exactly ONE row is
+        // written: a container link NEVER fans out to what the container holds.
+        let unlocked = unlocked_snapshot(state)?;
+        state.db.upsert_manual_link_visible(
+            src.as_str(),
+            src_id,
+            dst.as_str(),
+            dst_id,
+            &unlocked,
+        )?;
     }
     // The manual edge is the AUTHORITATIVE record of the link — the live `links` table drives the
     // Related panel. We DO NOT materialize a `[[Title]]` / `murmur:links` block into the note body:
@@ -410,6 +428,13 @@ fn prepare_manual_marker_seals(
             continue;
         }
         let dst = parse_link_kind(&edge.dst_kind)?;
+        // A CONTAINER destination is GRAPH-ONLY. `link_items` never materialized a `[[Space]]`
+        // marker into any note body for it, so there is no legacy marker to scrub — and demanding
+        // a resolvable marker title here would turn every container unlink into a fail-closed
+        // `Locked` refusal for a relation that never touched markdown.
+        if dst == crate::links::LinkKind::Container {
+            continue;
+        }
         let title = state
             .db
             .link_endpoint_title_visible(dst, &edge.dst_id, &unlocked)?
@@ -515,9 +540,15 @@ pub(crate) fn unlink_manual_edges_inner(
         // The DB transaction first strips any legacy source marker and enqueues the exact vault
         // cleanup intent, then deletes every requested manual tuple. Preparation failure rolls back
         // all mutations, so relock can never lose the last edge before a durable scrub exists.
-        state
-            .db
-            .delete_manual_links_with_marker_seals(manual_edges, &prepared_seals)?
+        // The session snapshot rides in for the same reason it does on the write side: a
+        // `container` endpoint re-checks visibility INSIDE the transaction, so a TOCTOU relock
+        // cannot delete a relation either.
+        let unlocked = unlocked_snapshot(state)?;
+        state.db.delete_manual_links_with_marker_seals(
+            manual_edges,
+            &prepared_seals,
+            &unlocked,
+        )?
     };
     // Filesystem publication runs after the DB commit, from a SQLCipher-backed retryable outbox.
     // Propagate failure: the DB marker is already safe and the outbox remains for relock/startup,

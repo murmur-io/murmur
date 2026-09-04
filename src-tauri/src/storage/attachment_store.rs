@@ -1479,6 +1479,35 @@ impl Db {
         folder_id: &str,
         plaintext: &HashMap<String, Vec<u8>>,
     ) -> Result<()> {
+        self.move_note_with_attachments_open_core(document_id, folder_id, plaintext, None)
+    }
+
+    /// Folder-trash restore twin of [`Db::move_note_with_attachments_open`]. The note placement,
+    /// attachment state, and per-member progress witness commit atomically. A retry can therefore
+    /// preserve a later explicit move back to the Notes root without guessing whether the fallback
+    /// placement came from the original folder delete.
+    pub(crate) fn move_note_with_attachments_open_for_trash_restore(
+        &self,
+        entry_id: &str,
+        document_id: &str,
+        folder_id: &str,
+        plaintext: &HashMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        self.move_note_with_attachments_open_core(
+            document_id,
+            folder_id,
+            plaintext,
+            Some(entry_id),
+        )
+    }
+
+    fn move_note_with_attachments_open_core(
+        &self,
+        document_id: &str,
+        folder_id: &str,
+        plaintext: &HashMap<String, Vec<u8>>,
+        restore_entry_id: Option<&str>,
+    ) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         let changed = tx
@@ -1514,6 +1543,25 @@ impl Db {
             if changed != 1 {
                 return Err(AppError::Storage(
                     "attachment disappeared during move".into(),
+                ));
+            }
+        }
+        if let Some(entry_id) = restore_entry_id {
+            let progress = tx
+                .execute(
+                    "INSERT INTO trash_folder_restore_members(entry_id,member_kind,member_id)
+                     SELECT ?1,'note',?2
+                      WHERE EXISTS(
+                        SELECT 1 FROM trash_items
+                         WHERE id=?1 AND kind IN ('folder','noteFolder')
+                      )",
+                    rusqlite::params![entry_id, document_id],
+                )
+                .map_err(map_err)?;
+            if progress != 1 {
+                return Err(AppError::Storage(
+                    "folder restore lost its recovery journal before recording note progress"
+                        .into(),
                 ));
             }
         }

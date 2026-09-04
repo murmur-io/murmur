@@ -34,7 +34,7 @@
 
 use rusqlite::OptionalExtension;
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::storage::db::{map_err, Db};
 
 /// Default retention before an entry is permanently purged. Overridable via the
@@ -154,7 +154,15 @@ impl Db {
              );
              CREATE INDEX IF NOT EXISTS idx_trash_deleted_at ON trash_items(deleted_at);
              CREATE INDEX IF NOT EXISTS idx_trash_source_folder ON trash_items(source_folder_id);
-             CREATE INDEX IF NOT EXISTS idx_trash_source ON trash_items(source_id);",
+             CREATE INDEX IF NOT EXISTS idx_trash_source ON trash_items(source_id);
+
+             CREATE TABLE IF NOT EXISTS trash_folder_restore_members (
+               entry_id TEXT NOT NULL,
+               member_kind TEXT NOT NULL CHECK(member_kind IN ('meeting','note')),
+               member_id TEXT NOT NULL,
+               PRIMARY KEY(entry_id, member_kind, member_id),
+               FOREIGN KEY(entry_id) REFERENCES trash_items(id) ON DELETE CASCADE
+             );",
         )
         .map_err(map_err)?;
         Ok(())
@@ -177,10 +185,12 @@ impl Db {
         deleted_at: &str,
     ) -> Result<()> {
         let conn = self.lock();
-        conn.execute(
+        let inserted = conn
+            .execute(
             "INSERT INTO trash_items
                (id, kind, source_id, source_folder_id, label, label_blob, payload, payload_blob, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, ?7)",
+             SELECT ?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, ?7
+              WHERE NOT EXISTS (SELECT 1 FROM trash_items WHERE source_id = ?3)",
             rusqlite::params![
                 id,
                 kind.as_str(),
@@ -192,6 +202,12 @@ impl Db {
             ],
         )
         .map_err(map_err)?;
+        if inserted != 1 {
+            return Err(AppError::Unavailable(
+                "this item already has a recovery journal; finish restoring it before deleting it again"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -215,10 +231,12 @@ impl Db {
         deleted_at: &str,
     ) -> Result<()> {
         let conn = self.lock();
-        conn.execute(
+        let inserted = conn
+            .execute(
             "INSERT INTO trash_items
                (id, kind, source_id, source_folder_id, label, label_blob, payload, payload_blob, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, '', ?5, '', ?6, ?7)",
+             SELECT ?1, ?2, ?3, ?4, '', ?5, '', ?6, ?7
+              WHERE NOT EXISTS (SELECT 1 FROM trash_items WHERE source_id = ?3)",
             rusqlite::params![
                 id,
                 kind.as_str(),
@@ -230,6 +248,94 @@ impl Db {
             ],
         )
         .map_err(map_err)?;
+        if inserted != 1 {
+            return Err(AppError::Unavailable(
+                "this item already has a recovery journal; finish restoring it before deleting it again"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// How many recovery journals claim one source id.
+    ///
+    /// New captures enforce zero-or-one atomically, but older databases may already contain
+    /// duplicates. Destructive callers use the count to fail closed instead of guessing which
+    /// snapshot owns shared resources such as a recording's audio paths.
+    pub(crate) fn count_trash_entries_for_source(&self, source_id: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM trash_items WHERE source_id = ?1",
+            rusqlite::params![source_id],
+            |r| r.get(0),
+        )
+        .map_err(map_err)
+    }
+
+    /// Whether this member's original folder placement has already been resolved by a restore
+    /// attempt. Once true, later retries never move it again: any subsequent placement, including
+    /// an explicit move back to the fallback inbox/root, is a newer user decision.
+    pub(crate) fn trash_folder_member_was_resolved(
+        &self,
+        entry_id: &str,
+        member_kind: &str,
+        member_id: &str,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM trash_folder_restore_members
+                  WHERE entry_id=?1 AND member_kind=?2 AND member_id=?3
+             )",
+            rusqlite::params![entry_id, member_kind, member_id],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
+        .map_err(map_err)
+    }
+
+    /// Record a no-write member decision (missing, already restored, or re-filed elsewhere).
+    /// Refuse if the recovery journal disappeared rather than leaving an unowned progress marker.
+    pub(crate) fn mark_trash_folder_member_resolved(
+        &self,
+        entry_id: &str,
+        member_kind: &str,
+        member_id: &str,
+    ) -> Result<()> {
+        if !matches!(member_kind, "meeting" | "note") {
+            return Err(AppError::InvalidArg(
+                "invalid trash restore member kind".into(),
+            ));
+        }
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "INSERT OR IGNORE INTO trash_folder_restore_members(entry_id,member_kind,member_id)
+                 SELECT ?1,?2,?3
+                  WHERE EXISTS(
+                    SELECT 1 FROM trash_items
+                     WHERE id=?1 AND kind IN ('folder','noteFolder')
+                  )",
+                rusqlite::params![entry_id, member_kind, member_id],
+            )
+            .map_err(map_err)?;
+        if changed == 0 {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM trash_folder_restore_members
+                          WHERE entry_id=?1 AND member_kind=?2 AND member_id=?3
+                     )",
+                    rusqlite::params![entry_id, member_kind, member_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_err)?;
+            if exists == 0 {
+                return Err(AppError::Storage(
+                    "folder restore lost its recovery journal before recording member progress"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -359,13 +465,19 @@ impl Db {
     /// Remove one entry row. Purging the entity's on-disk files is the CALLER's job (the command
     /// layer owns the filesystem, the db layer owns rows) — same split as the note `.md` deletion.
     pub(crate) fn delete_trash_entry(&self, id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM trash_folder_restore_members WHERE entry_id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
             "DELETE FROM trash_items WHERE id = ?1",
             rusqlite::params![id],
         )
         .map_err(map_err)?;
-        Ok(())
+        tx.commit().map_err(map_err)
     }
 
     /// Count of entries — the sidebar badge. Cheap enough to call on every trash event.
@@ -420,7 +532,7 @@ fn row_to_raw_trash_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawTrashEnt
 /// A folder's non-content presentation/placement columns — everything beyond the [`crate::storage::Folder`]
 /// struct that a faithful restore has to bring back. Without these a restored Workspace loses its
 /// emoji, tint, ordering and (worse) its `level`, which decides whether it is a Project or a Folder.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FolderPresentation {
     pub kind: String,
     pub level: String,

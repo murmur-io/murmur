@@ -883,6 +883,86 @@ scope to the GA-critical path only.
     CN("f-personal", "Personal", "project", { locked: true, groups: [] }),
   ];
 
+  // ── The "Add related" hierarchy picker's own gated reader ──
+  //
+  // Deliberately its OWN fixture rather than a reshuffle of WORKSPACE_TREE above:
+  // the picker's DTOs are a separate family (three linkable leaf kinds, never
+  // task/dashboard; metadata-only containers whose leaves page lazily), and a
+  // fixture that pretended otherwise would let the frontend agree with itself.
+  // Every command has an explicit case below, so the router's `default:` arm —
+  // which answers any unknown `list_*`/`get_*` with `[]` — can never make a
+  // missing command look like an empty vault.
+  const PICKER_GROUP = (kind, total) => ({ kind, total });
+
+  const PICKER_NODE = (id, name, level, extra = {}) => ({
+    id,
+    name,
+    level,
+    emoji: null,
+    locked: false,
+    unlocked: false,
+    linkable: true,
+    groups: [PICKER_GROUP("meeting", 2)],
+    folders: [],
+    ...extra,
+  });
+
+  const PICKER_ROW = (kind, id, title) => ({ kind, id, title });
+
+  /** Leaves per `${containerId ?? "u"}|${kind}` — what the lazy pager walks. */
+  const PICKER_ITEMS = {
+    "u|meeting": [
+      PICKER_ROW("meeting", "m-voice", "Voice note — launch thought"),
+      PICKER_ROW("meeting", "m-catchup", "Catch-up with Tomasz"),
+    ],
+    "u|note": [PICKER_ROW("note", "n-loose", "Loose idea: smaller beta")],
+    "f-atlas|meeting": [
+      PICKER_ROW("meeting", "m-research", "Research kickoff"),
+      PICKER_ROW("meeting", DEMO_MEETING_ID, "Q2 Roadmap Planning"),
+      PICKER_ROW("meeting", "m-retro", "Launch retro"),
+    ],
+    "f-atlas|note": [PICKER_ROW("note", "n-brief", "Research brief")],
+    "f-atlas|document": [PICKER_ROW("document", "d-plan", "Launch plan.pdf")],
+    "f-product|meeting": [PICKER_ROW("meeting", "m-pricing", "Pricing workshop")],
+  };
+
+  const PICKER_SPACES = [
+    PICKER_NODE("f-product", "Product", "project", {
+      groups: [PICKER_GROUP("meeting", 1)],
+      folders: [
+        PICKER_NODE("f-atlas", "Project Atlas", "folder", {
+          groups: [
+            PICKER_GROUP("meeting", 3),
+            PICKER_GROUP("note", 1),
+            PICKER_GROUP("document", 1),
+          ],
+        }),
+        PICKER_NODE("f-mobile", "Mobile Redesign", "folder", { groups: [] }),
+      ],
+    }),
+    // Sealed and not session-unlocked: a NAME, and nothing else — no groups, not
+    // even a zero, and `linkable: false` because the write gate would refuse it.
+    PICKER_NODE("f-personal", "Personal", "project", {
+      locked: true,
+      linkable: false,
+      groups: [],
+    }),
+  ];
+
+  const PICKER_BREADCRUMB = {
+    "f-product": ["Product"],
+    "f-atlas": ["Product", "Project Atlas"],
+    "f-mobile": ["Product", "Mobile Redesign"],
+  };
+
+  const PICKER_HIT_CONTAINER = {
+    "m-research": "f-atlas",
+    "m-retro": "f-atlas",
+    "n-brief": "f-atlas",
+    "d-plan": "f-atlas",
+    "m-pricing": "f-product",
+  };
+
   // The RECEIVED forest — containers and items other members shared with this
   // user. Shapes come from the Rust DTOs (`SharedWorkspace` / `SharedContainerNode`
   // / `SharedItemRow` in commands/org_containers.rs), not from the frontend's own
@@ -1552,6 +1632,64 @@ scope to the GA-critical path only.
       case "list_links": return LINKS_BY_KEY[`${args.kind}:${args.id}`] || [];
       case "get_backlinks": return BACKLINKS_BY_KEY[`${args.kind}:${args.id}`] || [];
       case "accept_link": case "dismiss_link": case "link_items": case "unlink_items": return null;
+
+      // ── the "Add related" hierarchy picker's gated reader ──
+      // Explicit cases, NOT the `default:` arm: that arm answers any unknown
+      // `list_*`/`get_*` with `[]`, which would make a command this app does not
+      // have look exactly like a vault with nothing in it.
+      case "get_related_picker_bootstrap": {
+        // The anchor is `Q2 Roadmap Planning`, filed in Product / Project Atlas —
+        // so the modal opens with exactly that path expanded and the anchor row
+        // inside a bounded window that contains it.
+        const anchorItems = PICKER_ITEMS["f-atlas|meeting"];
+        const anchorIndex = anchorItems.findIndex((row) => row.id === args?.anchorId);
+        return {
+          spaces: RICH() ? PICKER_SPACES : [],
+          unclassified: RICH()
+            ? [PICKER_GROUP("meeting", 2), PICKER_GROUP("note", 1)]
+            : [],
+          anchor:
+            RICH() && anchorIndex >= 0
+              ? {
+                  kind: "meeting",
+                  containerId: "f-atlas",
+                  path: ["f-product", "f-atlas"],
+                  index: anchorIndex,
+                  offset: 0,
+                  items: anchorItems,
+                  total: anchorItems.length,
+                }
+              : null,
+        };
+      }
+      case "list_related_picker_items": {
+        const key = `${args?.containerId ?? "u"}|${args?.kind}`;
+        const items = RICH() ? PICKER_ITEMS[key] || [] : [];
+        const offset = args?.offset ?? 0;
+        return {
+          kind: args?.kind,
+          offset,
+          items: items.slice(offset, offset + (args?.limit ?? 24)),
+          total: items.length,
+        };
+      }
+      case "search_related_picker": {
+        const q = String(args?.query ?? "").trim().toLowerCase();
+        const all = RICH()
+          ? Object.values(PICKER_ITEMS).flat()
+          : [];
+        const hits = all
+          .filter((row) => row.title.toLowerCase().includes(q))
+          .map((row) => ({
+            kind: row.kind,
+            id: row.id,
+            title: row.title,
+            breadcrumb: PICKER_BREADCRUMB[PICKER_HIT_CONTAINER[row.id]] || [
+              "Not classified",
+            ],
+          }));
+        return { offset: args?.offset ?? 0, hits, total: hits.length };
+      }
 
       // ── 2.0: receipts — grounded note lines trace back to the tape ──
       case "get_note_receipts": return RECEIPTS;

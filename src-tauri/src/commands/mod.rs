@@ -310,6 +310,19 @@ pub use workspace_commands::*;
 mod links_commands;
 pub use links_commands::*;
 
+// RELATED-PICKER command surface (the gated hierarchy + leaf paging behind the "Add related"
+// modal). A GATED read domain in its own right: every command takes the lifecycle guard, snapshots
+// the session unlock set under it, refuses a sealed-or-unknown ANCHOR indistinguishably before any
+// row is read, and discloses a sealed container's NAME but never its child titles, ids, totals or
+// search hits. It is deliberately NOT built on `workspace_commands` (whose `ItemKind` carries
+// task/dashboard and whose payload is capped for a tree, not for locating item #150) nor on the
+// flat `list_link_candidates`. Bound as `related_picker_commands` (via `#[path]`) to mirror the
+// sibling modules; the glob re-export makes every command resolve at `crate::commands::…` for
+// `generate_handler!`.
+#[path = "related_picker.rs"]
+mod related_picker_commands;
+pub use related_picker_commands::*;
+
 // CALENDAR connector command surface (local macOS Calendar — NOT sealed content) — extracted
 // verbatim (God-file split, PURE MOVE — every body byte-identical, only relocated). These reads hit
 // the user's LOCAL calendar (osascript / the `meetnotes-calendar` EventKit sidecar), never sealed
@@ -538,7 +551,8 @@ fn active_related_witness(
 /// The canonical companion note is this operation's structural OUTPUT, not user-selected secondary
 /// context. Exclude it by `documents.meeting_id` rather than by edge type: link collapse can expose
 /// the same endpoint through its generated `wikilink` representative instead of `companion`.
-/// Shared Brain Org relations stay private graph metadata and never become conversion input.
+/// Shared Brain Org and container relations stay private graph metadata and never become
+/// conversion input. A container names a place, not all the content inside it.
 fn active_conversion_related_edges(
     state: &AppState,
     meeting_id: &str,
@@ -550,8 +564,11 @@ fn active_conversion_related_edges(
         .links_for_visible(crate::links::LinkKind::Meeting, meeting_id, unlocked)?
         .into_iter()
         .filter(|edge| {
+            let material = crate::links::LinkKind::parse(&edge.other_kind)
+                .map(crate::links::LinkKind::is_content_source)
+                .unwrap_or(false);
             edge.status == "active"
-                && edge.other_kind != crate::links::LinkKind::Org.as_str()
+                && material
                 && !(edge.other_kind == "note"
                     && companion_note_id.as_deref() == Some(edge.other_id.as_str()))
         })
@@ -4556,6 +4573,7 @@ async fn delete_meeting_inner_notifying(
                 "this meeting is locked — unlock it before deleting it".into(),
             ));
         }
+        trash_commands::refuse_pending_recovery_journal(state, meeting_id)?;
     }
     let _org_mutation = state.lock_org_mutation().await;
     state.db.begin_org_source_closure("meeting", meeting_id)?;

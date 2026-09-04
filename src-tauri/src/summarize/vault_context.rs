@@ -535,10 +535,12 @@ pub(crate) fn resolve_vault_context_pinned_visible_inputs(
             }
             LinkKind::Note => db.note_is_visible(&source.id, unlocked)?,
             LinkKind::Document => db.document_is_visible(&source.id, unlocked)?,
-            // A Shared Brain edge is a private graph relation, not provider material. Exclude it
-            // before the typed snapshot so it cannot enter the corpus, lifecycle manifest, or
-            // neighbour expansion.
-            LinkKind::Org => false,
+            // A Shared Brain edge is a private graph relation, and a container edge names a PLACE
+            // that holds no text of its own — neither is provider material. Exclude both before the
+            // typed snapshot so they cannot enter the corpus, lifecycle manifest, or neighbour
+            // expansion. One predicate (`is_content_source`) so a future metadata-only endpoint
+            // kind is excluded by construction rather than by remembering this arm.
+            LinkKind::Org | LinkKind::Container => false,
         };
         if typed_visible && explicit_keys.insert(key) {
             explicit_refs.push(source.clone());
@@ -556,9 +558,11 @@ pub(crate) fn resolve_vault_context_pinned_visible_inputs(
             let Some(other_kind) = LinkKind::parse(&edge.other_kind) else {
                 continue;
             };
-            if other_kind == LinkKind::Org {
-                // Private Shared Brain relations are visible in the graph UI only. They never
-                // broaden a local or cloud provider's source snapshot.
+            if !other_kind.is_content_source() {
+                // Private Shared Brain relations and container (Space/folder) relations are visible
+                // in the Related panel / graph UI only. They never broaden a local or cloud
+                // provider's source snapshot — and a container relation in particular must NEVER
+                // expand to what the container holds.
                 continue;
             }
             let key = (edge.other_kind, edge.other_id);
@@ -673,9 +677,10 @@ fn resolve_pinned_source(
                 Vec::new(),
             )
         }
-        LinkKind::Org => {
-            // All public callers exclude Org before reaching this resolver. Keep the fallback
-            // content-free and fail-closed if a future internal caller bypasses that selection.
+        LinkKind::Org | LinkKind::Container => {
+            // All public callers exclude the metadata-only kinds (`is_content_source`) before
+            // reaching this resolver. Keep the fallback content-free and fail-closed if a future
+            // internal caller bypasses that selection.
             return Ok(ResolvedPinnedSource {
                 source: source.clone(),
                 header: String::new(),
@@ -750,9 +755,10 @@ pub(crate) fn build_vault_context_exact_visible_with_budget(
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut sections = Vec::new();
     for source in sources {
-        if source.kind == LinkKind::Org {
-            // Conversion accepts only local typed sources. Shared Brain relations stay private
-            // graph metadata and are never resolved into provider context.
+        if !source.kind.is_content_source() {
+            // Conversion accepts only local MATERIAL typed sources. Shared Brain relations and
+            // container (Space/folder) relations stay private graph metadata and are never
+            // resolved into provider context.
             continue;
         }
         let key = (source.kind.as_str().to_string(), source.id.clone());
