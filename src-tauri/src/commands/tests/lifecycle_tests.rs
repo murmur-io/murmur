@@ -16749,20 +16749,19 @@
         let _ = std::fs::remove_file(&wav);
     }
 
-    /// RETRY FROM A DUAL-STREAM ARCHIVE — it is accepted, and it comes back MONO.
+    /// RETRY FROM AN ARCHIVE ALONE — accepted, and mono, because the archive IS mono.
     ///
     /// A live recording keeps `Me` and `Others` apart by transcribing the microphone and the system
-    /// capture separately and merging them on wall-clock. A retry has neither: the raw per-stream
-    /// files are unlinked once the archive is proven durable (`cleanup_completed_archived_generation`
-    /// runs on the failure path too), so all a retry ever gets is the single archived WAV — and
-    /// `run_salvage_from_disk` opens it through `WavMonoSource`, which AVERAGES whatever channels it
-    /// finds into one.
+    /// capture separately and merging them on wall-clock. The canonical archive cannot carry that:
+    /// `publish_mix` writes `channels: 1` and SUMS both streams into it, so the split is destroyed at
+    /// publication — and even a two-channel WAV handed to `run_salvage_from_disk` is read through
+    /// `WavMonoSource`, which averages whatever channels it finds.
     ///
-    /// So a recovered transcript legitimately loses its speaker split. This test pins that as the
-    /// behaviour rather than leaving it to be discovered from a user's transcript: retry must keep
-    /// WORKING for a two-channel archive (the row is claimed, the path resolves), and the audio it
-    /// hands the pipeline is the channel mean, not a stream pair. If retry is ever taught to keep the
-    /// separation, the second half of this test is the assertion that has to go red first.
+    /// This test pins the FALLBACK: a meeting with no per-stream masters (an old recording, or one
+    /// whose masters the storage prune reclaimed) must still retry successfully, from the archive,
+    /// with one unattributed speaker. The separation itself is covered by
+    /// `a_retry_with_stream_masters_transcribes_them_separately` — masters are what restore it, and
+    /// this path is what still works when they are gone.
     #[test]
     fn retry_prep_accepts_a_two_channel_archive_and_salvage_reads_it_as_the_channel_mean() {
         use crate::audio::source::MonoSource;
@@ -16797,18 +16796,125 @@
             MeetingStatus::Recording,
         );
 
-        // And what salvage will actually feed Whisper is one mono track at the channel mean —
-        // 0.5 everywhere, with neither the 1.0 microphone nor the 0.0 system side recoverable.
+        // With no masters recorded, salvage reads the archive: one mono track at the channel mean.
+        assert_eq!(
+            state.db.get_meeting_master_paths(&mid).unwrap(),
+            (None, None),
+            "this meeting has no per-stream masters — the archive is the only source",
+        );
         let mut source = crate::audio::source::WavMonoSource::open(&wav).unwrap();
         assert_eq!(source.frames(), 4, "4 interleaved stereo frames");
         let frames = source.read_frames(0, 4).unwrap();
         assert_eq!(
             frames,
             vec![0.5, 0.5, 0.5, 0.5],
-            "salvage averages the two streams together — the speaker split does not survive a retry"
+            "without masters the archive is all there is, and it averages the streams together"
         );
 
         let _ = std::fs::remove_file(&wav);
+    }
+
+    /// T31 — WITH per-stream masters, a retry gets the two streams back, separately.
+    ///
+    /// This is the assertion the old version of the test above said would have to go red first. It
+    /// covers the SELECTION, which is the part that decides whether the split survives: given usable
+    /// masters, salvage must pick them over the archive, and it must reject a master it cannot
+    /// actually use rather than aborting a retry the archive could have served.
+    #[test]
+    fn a_retry_with_stream_masters_transcribes_them_separately() {
+        use crate::audio::source::MonoSource;
+
+        let state = build_state("retry-stream-masters");
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-retry-masters-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("m.wav");
+        let mic = dir.join("m.mic.wav");
+        let sys = dir.join("m.sys.wav");
+        // The archive is the SUM (0.5 everywhere); the masters keep the sides apart. The masters are
+        // written by the REAL producer, so they carry the promoted shape the retry path requires —
+        // a hand-rolled fixture would define a shape rather than exercise the one that ships.
+        crate::audio::write_wav_f32(&archive, &[0.5, 0.5, 0.5, 0.5], 16_000, 1).unwrap();
+        let mic_raw = dir.join("mic.f32");
+        let sys_raw = dir.join("sys.f32");
+        let mut mic_bytes = Vec::new();
+        let mut sys_bytes = Vec::new();
+        for _ in 0..4 {
+            mic_bytes.extend_from_slice(&1.0f32.to_le_bytes());
+            sys_bytes.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        std::fs::write(&mic_raw, &mic_bytes).unwrap();
+        std::fs::write(&sys_raw, &sys_bytes).unwrap();
+        crate::audio::source::publish_stream_master(&mic_raw, &dir, "g1", &mic, 0).unwrap();
+        crate::audio::source::publish_stream_master(&sys_raw, &dir, "g1", &sys, 0).unwrap();
+
+        let mid = uuid::Uuid::new_v4().to_string();
+        seed_meeting(&state.db, &mid, "# err", None);
+        state
+            .db
+            .finalize_meeting(&mid, "2026-09-04T10:00:00Z", 60, &archive.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .update_meeting_status(&mid, MeetingStatus::Error)
+            .unwrap();
+        state
+            .db
+            .set_meeting_mic_master_path(&mid, Some(mic.to_string_lossy().as_ref()))
+            .unwrap();
+        state
+            .db
+            .set_meeting_sys_master_path(&mid, Some(sys.to_string_lossy().as_ref()))
+            .unwrap();
+
+        // Both masters are usable, so salvage transcribes THEM, not the averaged archive.
+        let picked = crate::pipeline::readable_stream_masters(&state, &mid)
+            .expect("usable masters are selected over the archive");
+        assert_eq!(picked.0, mic);
+        assert_eq!(picked.1.as_deref(), Some(sys.as_path()));
+        // And they really are the separated sides, not the mean.
+        let mut m = crate::audio::source::WavMonoSource::open(&picked.0).unwrap();
+        assert!(m.read_frames(0, 4).unwrap().iter().all(|s| *s > 0.9));
+        let mut o = crate::audio::source::WavMonoSource::open(picked.1.as_ref().unwrap()).unwrap();
+        assert!(o.read_frames(0, 4).unwrap().iter().all(|s| *s < 0.1));
+
+        // A SEALED master is never decrypted here: the pointer is `.enc`, so it degrades to the
+        // archive rather than reaching for a key this path does not hold.
+        state
+            .db
+            .set_meeting_mic_master_path(&mid, Some(&format!("{}.enc", mic.to_string_lossy())))
+            .unwrap();
+        assert!(
+            crate::pipeline::readable_stream_masters(&state, &mid).is_none(),
+            "a sealed master falls back to the archive; it must not be decrypted here",
+        );
+
+        // A master the prune already reclaimed is likewise a fallback, not a failure.
+        state
+            .db
+            .set_meeting_mic_master_path(&mid, Some(mic.to_string_lossy().as_ref()))
+            .unwrap();
+        std::fs::remove_file(&mic).unwrap();
+        assert!(
+            crate::pipeline::readable_stream_masters(&state, &mid).is_none(),
+            "a missing mic master falls back to the archive",
+        );
+
+        // And the case lock-security review found: a user's HI-RES master (native-rate float32) is
+        // NOT usable here. It carries no front padding, and the merge hands both streams one
+        // `Instant` on the assumption that they do — accepting it would shift `Others` away from
+        // `Me` by the system start offset and silently produce a wrong transcript, for exactly the
+        // users who kept the faithful audio. It must degrade to the archive instead.
+        crate::audio::write_wav_f32(&mic, &[1.0, 1.0, 1.0, 1.0], 48_000, 1).unwrap();
+        assert!(
+            crate::pipeline::readable_stream_masters(&state, &mid).is_none(),
+            "an unpadded hi-res master must fall back to the archive, not be merged as if padded",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// LOCK MODEL — a salvage/retry pins the folder CK at entry. If screen-share relock lands while

@@ -786,6 +786,21 @@ pub(crate) struct WavMonoSource {
 }
 
 impl WavMonoSource {
+    /// True when this WAV has the shape a PROMOTED retry master is written with — 16 kHz, 16-bit
+    /// integer (see `publish_stream_master`). It is the PROVENANCE test that separates a retry aid
+    /// from a user's opt-in hi-res master, which is native-rate float32
+    /// (`stream_raw_to_float_wav`) or a byte copy of the system capture.
+    ///
+    /// Two things depend on telling them apart, and both are content-critical:
+    /// deleting a master after a retry (a hi-res one is the user's, never ours to remove) and
+    /// trusting that a master already carries the archive's front padding (only a promoted one
+    /// does — merging an unpadded master against a padded one silently shifts one speaker).
+    pub(crate) fn has_promoted_master_shape(&self) -> bool {
+        self.spec.sample_rate == crate::audio::TARGET_RATE_HZ
+            && self.spec.bits_per_sample == 16
+            && self.spec.sample_format == hound::SampleFormat::Int
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let file = open_existing_nofollow(path)?;
         let reader = hound::WavReader::new(file)
@@ -2651,6 +2666,180 @@ impl AtomicAudioPublisher {
     }
 }
 
+/// Publish ONE capture stream as a delay-aligned 16 kHz mono master WAV next to the archive.
+///
+/// WHY THIS EXISTS (T31). The canonical archive is `channels: 1` — [`AtomicAudioPublisher::publish_mix`]
+/// SUMS the microphone and the system capture into a single channel, so the `Me`/`Others` split is
+/// destroyed at publication and no amount of later processing recovers it. A retry that re-runs from
+/// the archive is therefore single-stream BY CONSTRUCTION. Keeping each stream as its own master is
+/// the only way a retry can reproduce what the live recording produced.
+///
+/// The master is written on the ARCHIVE's timeline: `delay` frames of leading silence are prepended,
+/// exactly the offset `publish_mix` applied when mixing this stream. Both masters then share one
+/// origin, so a retry hands [`crate::audio::merge::merge_streams`] two streams with the same
+/// `started_at` and the merge reduces to sort-and-label. It also means a human who plays a master
+/// hears it in sync with the archive.
+///
+/// At-rest handling is NOT new machinery: the meeting's `mic_master_path` / `sys_master_path`
+/// columns are already sealed, blanked, unsealed, crash-reconciled and prune-accounted (see
+/// `storage::seal_store` and `storage::usage`). This function only produces the file those columns
+/// have always been able to describe.
+///
+/// Published like the archive: staged in the PRIVATE inflight directory, proven readable, then
+/// hard-linked into place — `hard_link` refuses an existing destination, so this can never overwrite
+/// the faithful float32 master the opt-in hi-res publication writes under the same name.
+pub(crate) fn publish_stream_master(
+    source_path: &Path,
+    staging_dir: &Path,
+    generation_id: &str,
+    final_path: &Path,
+    delay_frames: u64,
+) -> Result<VerifiedFile> {
+    let mut source = RawF32LeSource::open(source_path, crate::audio::TARGET_RATE_HZ)?;
+    let total = delay_frames.saturating_add(source.frames());
+    if total == 0 {
+        return Err(AppError::Audio(
+            "stream master would be empty; nothing to publish".into(),
+        ));
+    }
+    let stem = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| AppError::Audio("stream master path has no file name".into()))?;
+    // Stage inside the PRIVATE (0700) recording-inflight directory, never beside the destination.
+    // A crash between the write and the publish would otherwise leave a plaintext WAV fragment in
+    // the asset-scoped audio directory that nothing sweeps: the crypto stage sweeper matches only
+    // its own marker, the generation part-reaper scans only inflight, and the storage prune deletes
+    // only paths a DB column names.
+    // Generation-scoped so the EXISTING staging reaper covers it: a crash during the write leaves a
+    // partial file that `tracked_generation_part_deletions` finds by generation-id prefix, instead of
+    // one only a same-pid rerun would clear.
+    let temp = staging_dir.join(format!(
+        ".{generation_id}.stream-master-{}-{}.part",
+        stem,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&temp);
+
+    {
+        let file = open_create_new_nofollow(&temp)?;
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: crate::audio::TARGET_RATE_HZ,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::new(file, spec)
+            .map_err(|e| AppError::Audio(format!("create stream master WAV: {e}")))?;
+        let mut offset = 0u64;
+        while offset < total {
+            let count = COPY_FRAMES.min((total - offset) as usize);
+            // Leading silence covers the alignment delay; past it, read the stream itself.
+            let window = if offset + count as u64 <= delay_frames {
+                vec![0.0f32; count]
+            } else if offset >= delay_frames {
+                source.read_frames(offset - delay_frames, count)?
+            } else {
+                let silent = (delay_frames - offset) as usize;
+                let mut w = vec![0.0f32; silent];
+                w.extend(source.read_frames(0, count - silent)?);
+                w
+            };
+            for sample in window {
+                writer
+                    .write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+                    .map_err(|e| AppError::Audio(format!("write stream master sample: {e}")))?;
+            }
+            offset += count as u64;
+        }
+        writer
+            .finalize()
+            .map_err(|e| AppError::Audio(format!("finalize stream master WAV: {e}")))?;
+    }
+    let staged = verify_existing_file(&temp)?;
+    // Prove the master is a readable WAV BEFORE it is published under a name the DB will point at.
+    // A column that names an unreadable file is worse than no column: every later read trusts it.
+    let readable = WavMonoSource::open(&temp)
+        .map(|s| s.frames() > 0 && s.sample_rate() > 0)
+        .unwrap_or(false);
+    if !readable {
+        VerifiedDeletion::for_file(&temp, &staged)?
+            .remove("remove unreadable stream master candidate")?;
+        return Err(AppError::Audio(
+            "published stream master is not a readable WAV".into(),
+        ));
+    }
+    // NO-CLOBBER publish. `rename` would replace the destination unconditionally; the pathnames a
+    // master uses are shared with the opt-in hi-res publication, so an overwrite would destroy a
+    // faithful float32 capture. `hard_link` fails with `AlreadyExists` instead, and the caller only
+    // reaches this function when the destination was absent.
+    std::fs::hard_link(&temp, final_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        AppError::Audio(format!("publish stream master without clobber: {e}"))
+    })?;
+    // From here the destination EXISTS. Every failure below must remove it again: a published master
+    // with no DB column naming it is invisible to the seal, the crash reconciler and the storage
+    // prune (all column-driven) and would survive a folder lock as untracked plaintext.
+    match publish_stream_master_tail(&temp, final_path, &staged) {
+        Ok(published) => Ok(published),
+        Err(error) => {
+            // Drop the staging link FIRST. `verify_existing_file` is
+            // `verify_existing_file_with_nlink(path, 1)`, so while the link survives the destination
+            // has two owned paths and the identity check below would `Err` — skipping the undo on
+            // every tail failure except the last one. Round-3 review caught exactly that: the
+            // comment above promised an undo the implementation did not perform.
+            let _ = std::fs::remove_file(&temp);
+            // Exact deletion only: remove `final_path` if and only if it still names the inode we
+            // just published. Anything else is somebody else's file.
+            if let Ok(current) = verify_existing_file(final_path) {
+                if current.device() == staged.device() && current.inode() == staged.inode() {
+                    let _ = std::fs::remove_file(final_path);
+                    let _ = sync_parent_dir(final_path, "sync stream master directory");
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The post-link half of [`publish_stream_master`], split out so its caller can undo an incomplete
+/// publication. Proves the destination and the staging link name one inode with two owned paths,
+/// then drops the staging link.
+fn publish_stream_master_tail(
+    temp: &Path,
+    final_path: &Path,
+    staged: &VerifiedFile,
+) -> Result<VerifiedFile> {
+    sync_parent_dir(final_path, "sync stream master directory")?;
+    let published = verify_existing_file_with_nlink(final_path, 2)?;
+    if published.device() != staged.device()
+        || published.inode() != staged.inode()
+        || published.byte_len() != staged.byte_len()
+        || published.sha256() != staged.sha256()
+    {
+        return Err(AppError::Audio(
+            "published stream master does not name the verified staging inode".into(),
+        ));
+    }
+    // Unlink the staging LINK, mirroring `AtomicAudioPublisher`: `VerifiedDeletion` is for a
+    // single-link inode and this one now has two owned paths, so the proof is that BOTH paths name
+    // the same inode with exactly two links before either is removed.
+    let staging_meta = std::fs::symlink_metadata(temp)
+        .map_err(|e| AppError::Audio(format!("inspect stream master staging link: {e}")))?;
+    if staging_meta.dev() != published.device()
+        || staging_meta.ino() != published.inode()
+        || staging_meta.nlink() != 2
+    {
+        return Err(AppError::Audio(
+            "stream master staging link does not name the published inode".into(),
+        ));
+    }
+    std::fs::remove_file(temp)
+        .map_err(|e| AppError::Audio(format!("remove stream master staging link: {e}")))?;
+    sync_parent_dir(temp, "sync stream master staging directory")?;
+    verify_existing_file(final_path)
+}
+
 fn mixed_window(
     mic: &mut RawF32LeSource,
     mic_delay: u64,
@@ -3656,6 +3845,189 @@ fn verify_open_handle(
 
 #[cfg(test)]
 mod tests {
+    /// T31 — a promoted master is the stream itself, shifted onto the ARCHIVE's timeline.
+    ///
+    /// The delay is not decoration: `publish_mix` front-pads each stream by exactly this many
+    /// frames when it builds the archive, so a master written WITHOUT the padding would place every
+    /// retry segment earlier than the recording it came from, and the two streams would be merged
+    /// against each other at the wrong offset.
+    #[test]
+    fn a_promoted_master_carries_the_archive_front_padding() {
+        use crate::audio::source::MonoSource;
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-master-pad-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("in.f32");
+        let samples: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
+        let mut bytes = Vec::new();
+        for s in &samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&raw, &bytes).unwrap();
+
+        let dest = dir.join("m.mic.wav");
+        publish_stream_master(&raw, &dir, "g1", &dest, 3).unwrap();
+        let mut got = WavMonoSource::open(&dest).unwrap();
+        assert_eq!(got.frames(), 7, "3 frames of padding + 4 of signal");
+        let frames = got.read_frames(0, 7).unwrap();
+        assert!(
+            frames[..3].iter().all(|s| *s == 0.0),
+            "the delay is leading SILENCE, not the stream shifted into it: {frames:?}"
+        );
+        assert!(
+            frames[3..].iter().all(|s| *s > 0.9),
+            "the stream itself follows the padding: {frames:?}"
+        );
+
+        // Zero delay is the mic-leading case and must not pad at all.
+        let dest0 = dir.join("m.sys.wav");
+        publish_stream_master(&raw, &dir, "g1", &dest0, 0).unwrap();
+        assert_eq!(WavMonoSource::open(&dest0).unwrap().frames(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A master is published ATOMICALLY: a reader never sees the staging dotfile under the final
+    /// name, and nothing is left behind once it lands.
+    #[test]
+    fn publishing_a_master_leaves_no_staging_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-master-atomic-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("in.f32");
+        std::fs::write(&raw, 0.5f32.to_le_bytes()).unwrap();
+        let dest = dir.join("m.mic.wav");
+        publish_stream_master(&raw, &dir, "g1", &dest, 0).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with('.') && n.ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging file survived: {leftovers:?}");
+        assert!(dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LOSS ORACLE — publishing a master must NEVER overwrite one that is already there.
+    ///
+    /// `{id}.mic.wav` / `{id}.sys.wav` are the same pathnames the opt-in `keep_hires_masters`
+    /// publication owns, and it writes FLOAT32 at the native capture rate. A retry aid is a 16 kHz
+    /// int16 downsample, and the raw capture is unlinked immediately after promotion — so a
+    /// clobbering publish would destroy the only faithful copy, irreversibly. The first version of
+    /// this function used a bare `rename`, which replaces the destination unconditionally; lock-
+    /// security review caught it. This asserts the destination survives byte-for-byte.
+    #[test]
+    fn publishing_a_master_never_overwrites_an_existing_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-master-noclobber-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("in.f32");
+        let mut bytes = Vec::new();
+        for s in [0.25f32; 8] {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&raw, &bytes).unwrap();
+
+        // Stand in for the user's faithful master: a DIFFERENT file already at the destination.
+        let dest = dir.join("m.mic.wav");
+        crate::audio::write_wav_f32(&dest, &[0.9, 0.8, 0.7], 48_000, 1).unwrap();
+        let before = std::fs::read(&dest).unwrap();
+
+        assert!(
+            publish_stream_master(&raw, &dir, "g1", &dest, 0).is_err(),
+            "an occupied destination must be REFUSED, not replaced",
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            before,
+            "the pre-existing master survives byte-for-byte",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PROVENANCE ORACLE — a promoted master and a user's hi-res master are distinguishable.
+    ///
+    /// Two content-critical decisions hang on this and nothing else: whether a successful retry may
+    /// DELETE a master (only one this pipeline wrote), and whether a retry may TRUST that a master
+    /// already carries the archive's front padding (only a promoted one does; merging an unpadded
+    /// master against a padded one silently shifts one speaker). Asking the live
+    /// `keep_hires_masters` setting instead — the first version — let a user destroy their only
+    /// faithful capture by toggling it off between the failure and the retry.
+    #[test]
+    fn a_promoted_master_is_distinguishable_from_a_hi_res_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-master-shape-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("in.f32");
+        let mut bytes = Vec::new();
+        for s in [0.5f32; 4] {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&raw, &bytes).unwrap();
+
+        let promoted = dir.join("m.mic.wav");
+        publish_stream_master(&raw, &dir, "g1", &promoted, 0).unwrap();
+        assert!(
+            WavMonoSource::open(&promoted)
+                .unwrap()
+                .has_promoted_master_shape(),
+            "16 kHz int16 is what promotion writes",
+        );
+
+        // A hi-res master: native capture rate, float32 — what `stream_raw_to_float_wav` produces.
+        let hires = dir.join("m.hires.wav");
+        crate::audio::write_wav_f32(&hires, &[0.5, 0.5, 0.5, 0.5], 48_000, 1).unwrap();
+        assert!(
+            !WavMonoSource::open(&hires)
+                .unwrap()
+                .has_promoted_master_shape(),
+            "a native-rate float32 master must never be mistaken for a retry aid",
+        );
+
+        // The rate alone is not enough: a float32 file AT 16 kHz is still not ours.
+        let f32_at_16k = dir.join("m.f32-16k.wav");
+        crate::audio::write_wav_f32(&f32_at_16k, &[0.5, 0.5], 16_000, 1).unwrap();
+        assert!(
+            !WavMonoSource::open(&f32_at_16k)
+                .unwrap()
+                .has_promoted_master_shape(),
+            "the sample FORMAT is part of the discriminator, not just the rate",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An EMPTY stream is refused rather than published: a zero-frame master would be a column
+    /// pointing at a file every later read has to special-case.
+    #[test]
+    fn an_empty_stream_is_not_published_as_a_master() {
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-master-empty-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("in.f32");
+        std::fs::write(&raw, b"").unwrap();
+        let dest = dir.join("m.mic.wav");
+        assert!(publish_stream_master(&raw, &dir, "g1", &dest, 0).is_err());
+        assert!(!dest.exists(), "nothing is published for an empty stream");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
