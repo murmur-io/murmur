@@ -518,6 +518,13 @@ pub(crate) async fn run_file_backed(
             // Once the canonical archive exists, it is the verified retry source. Best-effort
             // finish exact raw/transient cleanup now (including a transient injected failure) so
             // Retry/Delete/Lock do not remain blocked behind a dead pipeline owner.
+            //
+            // T31 — BEFORE that cleanup unlinks them, keep each capture stream as its own master.
+            // The archive is a MONO SUM (`publish_mix` writes `channels: 1`), so a retry that reads
+            // it back can only ever produce one unattributed speaker; the per-stream masters are
+            // what let a retry reproduce the live `Me`/`Others` split. Best-effort by contract: a
+            // failure here logs and leaves the retry exactly as capable as it was before.
+            promote_stream_masters(state, meeting_id, &generation_guard);
             let mut retired = false;
             for _ in 0..3 {
                 let cleanup = (|| -> Result<()> {
@@ -589,6 +596,131 @@ fn ensure_pipeline_meeting_unlocked(state: &AppState, meeting_id: &str) -> Resul
             "recording recovery lock state is unreadable; deferred fail-closed".into(),
         )),
     }
+}
+
+/// Keep each capture stream as its own 16 kHz mono master beside the archive, so a later retry can
+/// reproduce the `Me`/`Others` split (T31).
+///
+/// The canonical archive is a MONO SUM — [`crate::audio::source::AtomicAudioPublisher::publish_mix`]
+/// writes `channels: 1` — so the speaker separation is destroyed at publication and cannot be
+/// recovered from it by any means. Retaining the two 16 kHz streams that fed the mix is the only
+/// thing that lets `retry_transcription` transcribe them separately, exactly as the live run did.
+///
+/// Runs ONLY on the failure path, immediately before `cleanup_completed_archived_generation` unlinks
+/// those transients. That ordering matters twice: the files still exist, and the generation still
+/// retires on its FULL cleanup mask, because the transients are consumed (copied out) rather than
+/// retained — so no ledger state, no retirement guard and no reaping rule changes.
+///
+/// At-rest handling is pre-existing, not new surface: `mic_master_path` / `sys_master_path` are
+/// already sealed and blanked with the folder (`storage::seal_store`), decrypted by unlock,
+/// reconciled after a crash-while-unlocked, and deleted + CAS-cleared by the storage prune
+/// (`storage::usage`), which counts them toward the cap.
+///
+/// BEST-EFFORT by contract. Every failure logs and returns: a meeting that gets no masters retries
+/// from the mono archive exactly as it did before this existed. It must never convert a failed
+/// pipeline into a failed cleanup.
+fn promote_stream_masters(state: &AppState, meeting_id: &str, guard: &PipelineGenerationGuard<'_>) {
+    if let Err(error) = promote_stream_masters_inner(state, meeting_id, guard) {
+        // NO PII: the error text is filesystem/DB structure, never note or transcript content.
+        tracing::warn!(
+            target: "pipeline",
+            meeting_id,
+            error = %error,
+            "keeping per-stream masters failed; retry will fall back to the mono archive",
+        );
+    }
+}
+
+fn promote_stream_masters_inner(
+    state: &AppState,
+    meeting_id: &str,
+    guard: &PipelineGenerationGuard<'_>,
+) -> Result<()> {
+    let key = &guard.recording()?.key;
+    let snapshot = state
+        .db
+        .get_recording_generation_snapshot(key)?
+        .ok_or_else(|| AppError::Storage("failed pipeline lost its generation row".into()))?;
+
+    // Serialize the whole publish+persist window with Stop / Delete / Lock. The unlock check below
+    // is a point-in-time read; without this guard a session relock (manual "Lock all", or the
+    // screen-share auto-relock — neither is blocked by a nonterminal generation) could seal the
+    // folder between the check and the publish and strand a plaintext master behind the lock until
+    // the next launch repaired it. Promotion is fully synchronous, so nothing is awaited under it.
+    //
+    // An earlier revision of this function claimed the guard DEADLOCKS and left it out. That claim
+    // was wrong: the hang came from leftover test binaries of runs killed by a harness timeout, not
+    // from this lock. Measured from a clean process state, `cargo test --lib` is 3648 passed / 0
+    // failed WITH the guard held here.
+    let _lifecycle = crate::commands::lifecycle_guard(state);
+    // A master is plaintext audio published OUTSIDE the private inflight directory, so it takes the
+    // same gate the archive publication takes. A sealed-or-relocked meeting keeps its streams in
+    // inflight and loses only the split, never content.
+    ensure_pipeline_meeting_unlocked(state, meeting_id)?;
+
+    let inflight = recording_inflight_dir()?;
+    let wav_dir = audio_dir()?;
+    let generation = key.generation_id();
+    // Same front-padding the archive mix used, derived from the PERSISTED offset (the capture
+    // `Instant`s are long gone). Both masters therefore share the archive's origin.
+    let (mic_delay, sys_delay) = crate::audio::align::archive_delays_from_offset(
+        snapshot.system_start_offset_micros,
+        crate::audio::TARGET_RATE_HZ,
+    );
+
+    // NEVER overwrite an existing master. `{meeting_id}.mic.wav` / `.sys.wav` are the SAME pathnames
+    // the opt-in hi-res publication owns (`config.keep_hires_masters`, above in this file), and that
+    // one writes FLOAT32 at the native capture rate through a no-clobber link. A retry aid is a
+    // 16 kHz int16 downsample; renaming it over a faithful master would destroy the only high
+    // fidelity copy — the raw capture is unlinked by the cleanup that runs immediately after this.
+    // When a master is already there, promotion has nothing to add: the retry path reads whatever
+    // the columns name, so the user's own masters serve it.
+    let (existing_mic, existing_sys) = state
+        .db
+        .get_meeting_master_paths(meeting_id)
+        .unwrap_or((None, None));
+
+    let mic_16k = inflight.join(format!("{generation}.mic16.f32"));
+    let mic_dest = wav_dir.join(format!("{meeting_id}.mic.wav"));
+    if existing_mic.is_none() && !mic_dest.exists() && mic_16k.exists() {
+        let proof = crate::audio::source::publish_stream_master(
+            &mic_16k,
+            &inflight,
+            generation,
+            &mic_dest,
+            mic_delay as u64,
+        )?;
+        persist_master_pointer_or_reconcile(
+            &state.db,
+            meeting_id,
+            MasterPointerKind::Mic,
+            &mic_dest,
+            &proof,
+        )?;
+    }
+    let sys_16k = inflight.join(format!("{generation}.system16.f32"));
+    let sys_dest = wav_dir.join(format!("{meeting_id}.sys.wav"));
+    if existing_sys.is_none()
+        && !sys_dest.exists()
+        && snapshot.system_artifact.is_some()
+        && sys_16k.exists()
+    {
+        let proof = crate::audio::source::publish_stream_master(
+            &sys_16k,
+            &inflight,
+            generation,
+            &sys_dest,
+            sys_delay as u64,
+        )?;
+        persist_master_pointer_or_reconcile(
+            &state.db,
+            meeting_id,
+            MasterPointerKind::System,
+            &sys_dest,
+            &proof,
+        )?;
+    }
+    Ok(())
 }
 
 struct PipelineGenerationGuard<'a> {
@@ -1301,10 +1433,37 @@ pub async fn run_salvage_from_disk(
         meeting_id,
         seal_context,
     };
+    // T31 — prefer the per-stream masters when the failed run kept them: transcribing them
+    // SEPARATELY is the only way a retry reproduces the live `Me`/`Others` split, because the
+    // archive is a mono SUM of both streams. Absent (or unreadable) masters fall back to the
+    // archive, which is exactly the pre-T31 behaviour.
+    let masters = readable_stream_masters(state, meeting_id);
+    let mut stream_temps: Vec<(std::path::PathBuf, &'static str)> = Vec::new();
+    let mut temp_guards: Vec<RemoveOnDrop> = Vec::new();
+    if let Some((mic_master, sys_master)) = masters.as_ref() {
+        for (source_path, speaker) in [
+            (Some(mic_master), crate::audio::merge::SPEAKER_ME),
+            (sys_master.as_ref(), crate::audio::merge::SPEAKER_OTHERS),
+        ] {
+            let Some(source_path) = source_path else {
+                continue;
+            };
+            let temp = recording_inflight_dir()?.join(format!(
+                ".retry-{meeting_id}-{speaker}-{}.f32",
+                uuid::Uuid::new_v4()
+            ));
+            temp_guards.push(RemoveOnDrop(temp.clone()));
+            let mut source = WavMonoSource::open(source_path)?;
+            let _ = resample_source_to_f32le(&mut source, &temp)?;
+            stream_temps.push((temp, speaker));
+        }
+    }
     let temp =
         recording_inflight_dir()?.join(format!(".retry-{meeting_id}-{}.f32", uuid::Uuid::new_v4()));
     let _temp_guard = RemoveOnDrop(temp.clone());
-    let _ = resample_source_to_f32le(&mut archive, &temp)?;
+    if stream_temps.is_empty() {
+        let _ = resample_source_to_f32le(&mut archive, &temp)?;
+    }
     emit_status(app, "transcribing", "Transcribing audio…", meeting_id);
     let config = state
         .config
@@ -1328,13 +1487,35 @@ pub async fn run_salvage_from_disk(
             crate::perf::ResidentModelKind::Whisper,
             move || {
                 let transcriber = Transcriber::load(&model)?;
-                transcribe_raw_windows(
-                    &transcriber,
-                    &temp,
-                    language.as_deref(),
-                    vad.as_deref(),
-                    normalize,
-                )
+                if stream_temps.is_empty() {
+                    return transcribe_raw_windows(
+                        &transcriber,
+                        &temp,
+                        language.as_deref(),
+                        vad.as_deref(),
+                        normalize,
+                    );
+                }
+                // Both masters were written on the ARCHIVE's timeline (each already carries its
+                // own front padding), so they share one origin and the merge reduces to
+                // sort-and-label. One `Instant` for both is therefore correct, not an approximation.
+                let origin = std::time::Instant::now();
+                let mut streams = Vec::with_capacity(stream_temps.len());
+                for (path, speaker) in &stream_temps {
+                    let segments = transcribe_raw_windows(
+                        &transcriber,
+                        path,
+                        language.as_deref(),
+                        vad.as_deref(),
+                        normalize,
+                    )?;
+                    streams.push(crate::audio::merge::StreamInput {
+                        segments,
+                        started_at: origin,
+                        speaker,
+                    });
+                }
+                Ok(crate::audio::merge::merge_streams(streams))
             },
         ),
     )
@@ -1363,6 +1544,12 @@ pub async fn run_salvage_from_disk(
     )
     .await
     .and_then(|result| apply_deferred_seal(app, state, meeting_id, result));
+    // T31 — the masters existed to serve exactly this retry. It succeeded, so release the disk they
+    // hold (a 16 kHz mono master is ~115 MB per hour, per stream) rather than leaving it for the
+    // storage prune to reclaim later. Only on SUCCESS: a failed retry keeps them for the next one.
+    if result.is_ok() {
+        release_stream_masters(state, meeting_id);
+    }
     if let Err(error) = &result {
         let _ = state
             .db
@@ -1370,6 +1557,138 @@ pub async fn run_salvage_from_disk(
         emit_status(app, "error", &error.to_string(), meeting_id);
     }
     result
+}
+
+/// Delete a master THIS pipeline promoted, once a retry has consumed it.
+///
+/// **Provenance, not a live setting.** The first version asked
+/// `config.keep_hires_masters` — a global question about *now* — which lock-security review broke:
+/// a user who publishes float32 masters, hits a pipeline failure, then turns the setting off while
+/// investigating, and finally clicks Retry, had their only faithful capture deleted. The setting is
+/// live (`state.config`), so it does not describe who wrote the file. The WAV's SHAPE does: a
+/// promoted master is 16 kHz int16 by construction, a hi-res master is native-rate float32.
+/// `has_promoted_master_shape` is therefore the authorization, and `keep_hires_masters` stays only
+/// as an outer belt.
+///
+/// Three more things it must not do, all found by that review:
+/// - touch a **sealed** master (`.enc`): that is the lock model's, never this path's;
+/// - delete a plaintext whose sealed `.enc` twin exists: a session unlock re-points the column at
+///   the decrypted copy, and deleting it while clearing the column would orphan the `.enc` where no
+///   column-driven repair could ever find it again. The probe FAILS CLOSED — a stat error keeps the
+///   file, because the cost of a wrong `false` here is permanent;
+/// - run at all for a **locked** folder: the remove-then-clear pair is not atomic, and a process
+///   death between them leaves a locked meeting naming a plaintext that no longer exists and has no
+///   `.enc`, which `repair_locked_audio_at_rest` reports as unrecoverable and which takes the next
+///   launch down its graceful cannot-start path. For a locked folder the master is the lock model's
+///   and the prune's to manage.
+///
+/// Best-effort otherwise: leftover bytes are reclaimed by the storage prune, and a failure here must
+/// never turn a successful retry into a failed one.
+fn release_stream_masters(state: &AppState, meeting_id: &str) {
+    let keep_hires = state
+        .config
+        .lock()
+        .map(|c| c.keep_hires_masters)
+        .unwrap_or(true); // unreadable config → assume the user opted in, and keep
+    if keep_hires {
+        return;
+    }
+    // A DURABLY locked folder's at-rest audio is owned by the lock model and the prune; never
+    // interleave with it. `meeting_is_unlocked` is NOT this test — it answers true for a locked
+    // folder that is session-unlocked, which is the only locked state that can reach here at all
+    // (retry itself requires it). Round-3 review caught that: the guard was real defence, but not
+    // the one its comment claimed. Both checks are kept; they cover different things.
+    match state.db.folders_for_meeting(meeting_id) {
+        Ok(folder_ids) => {
+            for folder_id in folder_ids {
+                match state.db.folder_by_id(&folder_id) {
+                    Ok(Some(folder)) if !folder.locked => {}
+                    _ => return, // durably locked, dangling, or unreadable → leave it alone
+                }
+            }
+        }
+        Err(_) => return,
+    }
+    // And abort if a relock landed mid-retry and closed the session gate.
+    if !matches!(crate::commands::meeting_is_unlocked(state, meeting_id), Ok(true)) {
+        return;
+    }
+    let Ok((mic, sys)) = state.db.get_meeting_master_paths(meeting_id) else {
+        return;
+    };
+    for (raw, kind) in [(mic, MasterPointerKind::Mic), (sys, MasterPointerKind::System)] {
+        let Some(raw) = raw else { continue };
+        if raw.trim().is_empty() || raw.ends_with(crate::commands::ENC_SUFFIX) {
+            continue; // sealed — owned by the lock model, never by this path
+        }
+        // PROVENANCE gate: only a master with the promoted shape was written by this pipeline.
+        let promoted = WavMonoSource::open(std::path::Path::new(&raw))
+            .map(|s| s.has_promoted_master_shape())
+            .unwrap_or(false);
+        if !promoted {
+            continue; // native-rate / float32 → the user's hi-res master, not ours to delete
+        }
+        // Fail CLOSED on a stat error: keeping a file costs disk, orphaning an `.enc` costs content.
+        let sealed_twin = format!("{raw}{}", crate::commands::ENC_SUFFIX);
+        match crate::crypto::owned_regular_file_exists(
+            std::path::Path::new(&sealed_twin),
+            "probe sealed master twin before release",
+        ) {
+            Ok(false) => {}
+            _ => continue, // a sealed twin exists, or the probe failed — leave everything alone
+        }
+        if std::fs::remove_file(&raw).is_err() {
+            continue; // leave the column naming a file that is still there
+        }
+        let _ = match kind {
+            MasterPointerKind::Mic => state.db.clear_meeting_mic_master_path_if(meeting_id, &raw),
+            MasterPointerKind::System => {
+                state.db.clear_meeting_sys_master_path_if(meeting_id, &raw)
+            }
+        };
+    }
+}
+
+/// The meeting's per-stream masters, when BOTH the DB pointer and the file on disk are usable.
+///
+/// Returns `Some((mic, sys))` only if the mic master is present and readable; the system master is
+/// independently optional (a mic-only recording legitimately has none). `None` means "retry from the
+/// mono archive", which is the behaviour that shipped before T31 — so every rejection here is a
+/// graceful degradation, never a failure.
+///
+/// Three things are rejected, in this order:
+/// - a `.enc` pointer: the folder is SEALED. This path never decrypts; `retry_transcription_prep`
+///   already refuses a sealed meeting, and this is the second, independent net.
+/// - a missing file: the storage prune reclaims masters under the cap, so a column can name a file
+///   that is legitimately gone.
+/// - an unreadable/empty WAV: trusting it would abort a retry that the archive could have served.
+pub(crate) fn readable_stream_masters(
+    state: &AppState,
+    meeting_id: &str,
+) -> Option<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    let (mic, sys) = state.db.get_meeting_master_paths(meeting_id).ok()?;
+    let usable = |raw: Option<String>| -> Option<std::path::PathBuf> {
+        let raw = raw?;
+        if raw.trim().is_empty() || raw.ends_with(crate::commands::ENC_SUFFIX) {
+            return None;
+        }
+        let path = std::path::PathBuf::from(raw);
+        let ok = WavMonoSource::open(&path)
+            .map(|s| {
+                // Only a PROMOTED master may be used here. The merge below hands both streams one
+                // `Instant` because a promoted master already carries the archive's front padding;
+                // the opt-in hi-res masters do NOT (they are verbatim copies of the capture), so
+                // accepting one would silently shift `Others` away from `Me` by exactly the system
+                // start offset — a wrong transcript rather than a failed retry, and it would hit
+                // precisely the users who kept the faithful audio. They fall back to the archive,
+                // which is what they got before this existed.
+                s.frames() > 0 && s.sample_rate() > 0 && s.has_promoted_master_shape()
+            })
+            .unwrap_or(false);
+        ok.then_some(path)
+    };
+    let mic = usable(mic)?;
+    Some((mic, usable(sys)))
 }
 
 /// Drop-armed wrapper for [`crate::commands::finalize_salvage_lock_state`] — the salvage lock

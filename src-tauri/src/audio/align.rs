@@ -156,6 +156,27 @@ pub fn archive_delays(
     }
 }
 
+/// The same front-padding as [`archive_delays`], derived from the PERSISTED signed system offset
+/// instead of live `Instant`s.
+///
+/// A retry runs long after the capture `Instant`s are gone, but the ledger keeps
+/// `recording_generations.system_start_offset_micros` — the identical information, in micros. The
+/// archive path calls `archive_delays(None, ..)` (no measured leak), so its wall-clock branch is
+/// what this reproduces; `archive_delays_agrees_with_the_persisted_offset` pins the two together so
+/// they cannot drift apart.
+pub fn archive_delays_from_offset(
+    system_start_offset_micros: Option<i64>,
+    rate_hz: u32,
+) -> (usize, usize) {
+    let to_samples =
+        |micros: i64| ((micros.unsigned_abs() as f64 / 1_000_000.0) * rate_hz as f64).round() as usize;
+    match system_start_offset_micros {
+        Some(offset) if offset >= 0 => (0, to_samples(offset)),
+        Some(offset) => (to_samples(offset), 0),
+        None => (0, 0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +249,32 @@ mod tests {
         assert!(estimate_stream_offset(&mic, &sys).is_none());
         assert!(estimate_stream_offset(&mic, &[]).is_none());
         assert!(estimate_stream_offset(&[], &sys).is_none());
+    }
+
+    /// The persisted-offset derivation MUST agree with the live-`Instant` one, or a retry would
+    /// align its masters differently than the archive they were cut from.
+    #[test]
+    fn archive_delays_agrees_with_the_persisted_offset() {
+        let t0 = std::time::Instant::now();
+        for micros in [0i64, 1, 250_000, 1_000_000, 3_500_000] {
+            let sys = t0 + std::time::Duration::from_micros(micros as u64);
+            assert_eq!(
+                archive_delays(None, t0, Some(sys), 16_000),
+                archive_delays_from_offset(Some(micros), 16_000),
+                "system started {micros} us AFTER the mic",
+            );
+            let mic_late = t0 + std::time::Duration::from_micros(micros as u64);
+            assert_eq!(
+                archive_delays(None, mic_late, Some(t0), 16_000),
+                archive_delays_from_offset(Some(-micros), 16_000),
+                "system started {micros} us BEFORE the mic",
+            );
+        }
+        // No system track at all: both paths pad nothing.
+        assert_eq!(
+            archive_delays(None, t0, None, 16_000),
+            archive_delays_from_offset(None, 16_000),
+        );
     }
 
     /// archive_delays: measured leak wins; positive offset delays the SYSTEM track.
