@@ -1666,3 +1666,73 @@ fn ask_uses_a_real_embedder_when_one_is_available() {
         "semantic search off must not embed, even with an embedder in hand"
     );
 }
+
+/// THE WIRING, not the mechanism — a container scope must actually reach a query.
+///
+/// This is the test whose absence let the whole feature ship inert. The seven SQL-level oracles all
+/// exercised primitives (`folder_scope_ids`, `search_visible_scoped`, `list_meetings_visible`) and
+/// every one of them was green while `scope_folder_ids` could not reach a search leg at all: it was
+/// read only inside a branch gated on pinned sources / a pinned org item / a board id, and the
+/// pinned branch then skipped searching entirely. Picking a Space and nothing else — the FE's
+/// primary flow — dropped the scope silently and answered from the whole vault.
+///
+/// So this asserts through `build_ask_vault_floor_prompt`, the function production calls, with a
+/// scope and NOTHING else set.
+#[test]
+fn a_container_scope_alone_reaches_the_corpus_and_bounds_it() {
+    let db = tmp_db();
+    db.insert_folder(&crate::storage::models::Folder {
+        id: "f-in".into(),
+        name: "Inside".into(),
+        path: "Inside".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-09-04T00:00:00Z".into(),
+    })
+    .unwrap();
+    seed_note(&db, "m-in", "Atlas Inside", "atlas lives inside", Some("f-in"));
+    seed_note(&db, "m-out", "Atlas Outside", "atlas lives outside", None);
+
+    let cfg = AppConfig {
+        semantic_search_enabled: false,
+        ..AppConfig::default()
+    };
+    let unlocked = HashSet::new();
+    let scope = vec!["f-in".to_string()];
+
+    // Unscoped: both meetings are candidates.
+    let all = match build_ask_vault_floor_prompt(
+        &db, &cfg, &unlocked, "atlas", &[], "", None, None, None, None,
+    )
+    .unwrap()
+    {
+        AskFloorPrompt::Ready { sources, .. } => sources,
+        AskFloorPrompt::Empty(_) => panic!("a non-empty vault must yield Ready"),
+    };
+    assert_eq!(all.len(), 2, "unscoped sees both meetings");
+
+    // Scope ONLY — no pinned sources, no org item, no board. This is the case that was unreachable.
+    let scoped = match build_ask_vault_floor_prompt(
+        &db,
+        &cfg,
+        &unlocked,
+        "atlas",
+        &[],
+        "",
+        None,
+        None,
+        None,
+        Some(&scope),
+    )
+    .unwrap()
+    {
+        AskFloorPrompt::Ready { sources, .. } => sources,
+        AskFloorPrompt::Empty(_) => panic!("the scoped folder has matching content"),
+    };
+    let ids: Vec<&str> = scoped.iter().map(|s| s.meeting_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["m-in"],
+        "a scope on its own must bound the corpus, not be dropped",
+    );
+}

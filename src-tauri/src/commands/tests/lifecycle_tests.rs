@@ -12087,7 +12087,7 @@
         let unlocked = HashSet::new();
         let hits = state
             .db
-            .search_doc_chunks_fts_visible("bravo", 10, &unlocked)
+            .search_doc_chunks_fts_visible("bravo", 10, &unlocked, None)
             .unwrap();
         assert!(
             hits.iter().any(|h| h.document_id == id),
@@ -12095,7 +12095,7 @@
         );
         let tag_hits = state
             .db
-            .search_doc_chunks_fts_visible("frontmatteronlyterm", 10, &unlocked)
+            .search_doc_chunks_fts_visible("frontmatteronlyterm", 10, &unlocked, None)
             .unwrap();
         assert!(
             !tag_hits.iter().any(|h| h.document_id == id),
@@ -12108,7 +12108,7 @@
         let d2 = update_note_doc_inner(&state, &id, "Draft", v2).unwrap();
         let old = state
             .db
-            .search_doc_chunks_fts_visible("bravo", 10, &unlocked)
+            .search_doc_chunks_fts_visible("bravo", 10, &unlocked, None)
             .unwrap();
         assert!(
             !old.iter().any(|h| h.document_id == id),
@@ -12116,7 +12116,7 @@
         );
         let new = state
             .db
-            .search_doc_chunks_fts_visible("yankee", 10, &unlocked)
+            .search_doc_chunks_fts_visible("yankee", 10, &unlocked, None)
             .unwrap();
         assert!(
             new.iter().any(|h| h.document_id == id),
@@ -12153,7 +12153,7 @@
         assert!(
             state
                 .db
-                .search_doc_chunks_fts_visible("bravo", 10, &unlocked)
+                .search_doc_chunks_fts_visible("bravo", 10, &unlocked, None)
                 .unwrap()
                 .is_empty(),
             "cheap-saved body is not searchable until the deferred full save indexes it"
@@ -14486,7 +14486,7 @@
         let assert_leg_visibility = |unlocked: &HashSet<String>, expected: bool, phase: &str| {
             let fts_hit = state
                 .db
-                .search_doc_chunks_fts_visible("TAJNYTOKEN", 10, unlocked)
+                .search_doc_chunks_fts_visible("TAJNYTOKEN", 10, unlocked, None)
                 .unwrap()
                 .iter()
                 .any(|h| h.document_id == id);
@@ -15602,7 +15602,7 @@
         assert!(
             state
                 .db
-                .search_doc_chunks_fts_visible("szmaragdowy", 10, &nothing)
+                .search_doc_chunks_fts_visible("szmaragdowy", 10, &nothing, None)
                 .unwrap()
                 .iter()
                 .any(|h| h.document_id == "d-legacy"),
@@ -27509,7 +27509,7 @@
         );
         assert!(state
             .db
-            .search_doc_chunks_fts_visible("Plan", 10, &std::collections::HashSet::new())
+            .search_doc_chunks_fts_visible("Plan", 10, &std::collections::HashSet::new(), None)
             .unwrap()
             .iter()
             .any(|hit| hit.document_id == note.id));

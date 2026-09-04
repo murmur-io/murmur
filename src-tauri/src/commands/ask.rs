@@ -588,7 +588,14 @@ pub(crate) fn build_ask_vault_floor_prompt(
     };
     let scope = scope_ids.as_deref();
     let has_pinned_sources = explicit_sources.map(|s| !s.is_empty()).unwrap_or(false);
-    let (corpus, sources) = if has_pinned_sources || pinned_org_item_id.is_some() {
+    // A SCOPE routes to the SEARCH path, because a scope is an instruction about where to look and
+    // the pinned branch skips searching entirely ("vault-wide search SKIPPED"). Taking the pinned
+    // branch while a scope is set discarded it silently — the second half of the unreachability bug.
+    // Pinned items are not lost: with a scope present they are packed FIRST, below, and the scoped
+    // search fills the remaining budget, the same shape the org-item + sources composition uses.
+    let (corpus, sources) = if (has_pinned_sources || pinned_org_item_id.is_some())
+        && scope.is_none()
+    {
         // PINNED corpus (deterministic; vault-wide search SKIPPED). Pack the pinned ORG item FIRST
         // (the shared note being viewed — pinned so it's ALWAYS in context; the local Brain's search
         // never surfaces org-feed content), then the explicit sources (+ their gated link-expansion).
@@ -622,15 +629,55 @@ pub(crate) fn build_ask_vault_floor_prompt(
             Vec::new()
         };
         (corpus, sources)
-    } else if config.semantic_search_enabled {
-        let query_vec = ask_query_vector(question, true);
-        crate::summarize::vault_context::build_vault_context_hybrid_visible(
-            db, question, &ask_conn, &query_vec, unlocked, reranker, scope,
-        )?
     } else {
-        crate::summarize::vault_context::build_vault_context_visible(
-            db, question, &ask_conn, unlocked, scope,
-        )?
+        // SEARCH path. With a scope set, anything the user ALSO pinned is packed first so it cannot
+        // be lost by routing here, and the scoped search fills what is left of the one budget.
+        let (mut corpus, mut sources) = if scope.is_some() {
+            let budget = crate::summarize::vault_context::budget_for(&ask_conn);
+            let mut pinned_corpus = String::new();
+            let mut pinned_sources = Vec::new();
+            if let Some(org_id) = pinned_org_item_id {
+                pinned_corpus.push_str(&crate::summarize::vault_context::pack_pinned_org_item(
+                    db, org_id, &ask_conn,
+                )?);
+            }
+            if let Some(srcs) = explicit_sources.filter(|s| !s.is_empty()) {
+                let (c, s) =
+                    crate::summarize::vault_context::build_vault_context_pinned_visible_with_budget(
+                        db,
+                        srcs,
+                        budget.saturating_sub(pinned_corpus.len()),
+                        unlocked,
+                    )?;
+                if !pinned_corpus.is_empty() && !c.is_empty() {
+                    pinned_corpus.push_str("\n\n");
+                }
+                pinned_corpus.push_str(&c);
+                pinned_sources = s;
+            }
+            (pinned_corpus, pinned_sources)
+        } else {
+            (String::new(), Vec::new())
+        };
+        let (found, found_sources) = if config.semantic_search_enabled {
+            let query_vec = ask_query_vector(question, true);
+            crate::summarize::vault_context::build_vault_context_hybrid_visible(
+                db, question, &ask_conn, &query_vec, unlocked, reranker, scope,
+            )?
+        } else {
+            crate::summarize::vault_context::build_vault_context_visible(
+                db, question, &ask_conn, unlocked, scope,
+            )?
+        };
+        if !corpus.is_empty() && !found.is_empty() {
+            corpus.push_str("\n\n");
+        }
+        // ONE budget across both halves — a scoped Ask on a small local model must not get two.
+        let remaining =
+            crate::summarize::vault_context::budget_for(&ask_conn).saturating_sub(corpus.len());
+        corpus.extend(found.chars().take(remaining));
+        sources.extend(found_sources);
+        (corpus, sources)
     };
     if corpus.trim().is_empty() {
         return Ok(AskFloorPrompt::Empty(AskVaultResult {

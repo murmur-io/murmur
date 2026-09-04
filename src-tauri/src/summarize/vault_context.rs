@@ -169,7 +169,7 @@ pub fn build_vault_context_visible(
     // append the gated `## Documents` section from the keyword (FTS/BM25) leg alone — an empty
     // `query_vec` means no KNN leg. Same `visibility_clause` gate as every meeting leg, so a
     // sealed-not-unlocked folder's document chunks never enter the cloud-bound corpus.
-    pack_doc_chunks(db, query, &[], budget, &mut corpus, unlocked)?;
+    pack_doc_chunks(db, query, &[], budget, &mut corpus, unlocked, scope)?;
     Ok((corpus, sources))
 }
 
@@ -238,7 +238,7 @@ pub fn build_vault_context_hybrid_visible(
     let mut meetings: Vec<crate::storage::models::Meeting> =
         hits.into_iter().map(|h| h.meeting).collect();
     if meetings.is_empty() {
-        meetings = db.list_meetings_visible(30, unlocked, None)?;
+        meetings = db.list_meetings_visible(30, unlocked, scope)?;
     }
     let (mut corpus, sources) = pack_meetings(db, meetings, budget, unlocked)?;
     // Document ingestion: APPEND a gated `## Documents` section so the brain/Ask can also ground on
@@ -247,7 +247,7 @@ pub fn build_vault_context_hybrid_visible(
     // sealed-and-not-session-unlocked folder's document chunks are NEVER returned — identical gate
     // to the meeting legs. Each hit contributes its document name + best chunk snippet (no meeting
     // citation — documents are not meetings, so they don't add a `VaultSource`). Same `budget`.
-    pack_doc_chunks(db, query, query_vec, budget, &mut corpus, unlocked)?;
+    pack_doc_chunks(db, query, query_vec, budget, &mut corpus, unlocked, scope)?;
     Ok((corpus, sources))
 }
 
@@ -324,13 +324,14 @@ fn pack_doc_chunks(
     budget: usize,
     corpus: &mut String,
     unlocked: &HashSet<String>,
+    scope: Option<&[String]>,
 ) -> Result<()> {
     let knn = if query_vec.is_empty() {
         Vec::new()
     } else {
-        db.search_doc_chunks_visible(query_vec, 20, crate::embed::KNN_SEARCH_COSINE_FLOOR, unlocked)?
+        db.search_doc_chunks_visible(query_vec, 20, crate::embed::KNN_SEARCH_COSINE_FLOOR, unlocked, scope)?
     };
-    let fts = db.search_doc_chunks_fts_visible(query, 20, unlocked)?;
+    let fts = db.search_doc_chunks_fts_visible(query, 20, unlocked, scope)?;
     let mut hits = crate::embed::fuse_doc_hits(knn, fts);
     if hits.is_empty() {
         return Ok(());

@@ -6123,7 +6123,15 @@ pub(crate) async fn ask_vault_inner(
     if board_id.is_some() {
         remove_duplicate_dashboard_question(&mut history, &question);
     }
-    if pinned_sources.is_some() || pinned_org.is_some() || board_id.is_some() {
+    // A container SCOPE must reach the floor too. Leaving it out of this condition made the whole
+    // feature unreachable: picking a Space and nothing else left all three of the others `None`, so
+    // the request fell through to the vault-wide path with the scope silently dropped — the exact
+    // failure the board-id comment below records, reintroduced for containers.
+    if pinned_sources.is_some()
+        || pinned_org.is_some()
+        || board_id.is_some()
+        || scope_folders.is_some()
+    {
         // Snapshot AND resolve under ONE guard, exactly as `get_dashboard` does. Sharing
         // the caller's snapshot is not enough on its own: it prevents a second, later
         // snapshot but does not serialize against a relock landing between the snapshot

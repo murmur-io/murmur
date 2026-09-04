@@ -11165,7 +11165,7 @@ fn expand_serves_the_hit_sections_own_parent_when_siblings_corroborate() {
     seed_two_section_doc(&db, "d1", "f1");
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("pistachio", 20, &nothing)
+        .search_doc_chunks_fts_visible("pistachio", 20, &nothing, None)
         .unwrap();
     assert_eq!(hits.len(), 1, "one document → one deduped hit");
     let h = &hits[0];
@@ -11205,7 +11205,7 @@ fn expand_requires_two_corroborating_sibling_leaves() {
     seed_two_section_doc(&db, "d1", "f1");
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("zloty", 20, &nothing)
+        .search_doc_chunks_fts_visible("zloty", 20, &nothing, None)
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].level, 0, "the single matching Beta leaf wins");
@@ -11246,7 +11246,7 @@ fn flat_doc_hit_keeps_its_leaf_no_expansion() {
         .unwrap();
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("zanzibar", 20, &nothing)
+        .search_doc_chunks_fts_visible("zanzibar", 20, &nothing, None)
         .unwrap();
     assert_eq!(hits.len(), 1, "a mid-file leaf must be keyword-reachable");
     assert!(
@@ -11276,7 +11276,7 @@ fn expand_doc_parents_is_gated_and_returns_section_text() {
     let nothing = std::collections::HashSet::new();
     // Open folder → the corroborated Beta hit expands to its section text.
     let hits = db
-        .search_doc_chunks_fts_visible("pistachio", 20, &nothing)
+        .search_doc_chunks_fts_visible("pistachio", 20, &nothing, None)
         .unwrap();
     assert_eq!(hits.len(), 1);
     let open = db.expand_doc_parents_visible(&hits, &nothing).unwrap();
@@ -11346,7 +11346,7 @@ fn doc_chunk_search_is_gated_by_visibility() {
     // Open folder → visible.
     let nothing = std::collections::HashSet::new();
     assert!(
-        db.search_doc_chunks_visible(&query, 10, 0.0, &nothing)
+        db.search_doc_chunks_visible(&query, 10, 0.0, &nothing, None)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -11356,7 +11356,7 @@ fn doc_chunk_search_is_gated_by_visibility() {
     // Seal the folder (chunk row deliberately survives) → INVISIBLE with empty unlock set.
     db.set_folder_locked("f-locked", true, None).unwrap();
     let hidden = db
-        .search_doc_chunks_visible(&query, 10, 0.0, &nothing)
+        .search_doc_chunks_visible(&query, 10, 0.0, &nothing, None)
         .unwrap();
     assert!(
         !hidden.iter().any(|h| h.document_id == "d1"),
@@ -11367,7 +11367,7 @@ fn doc_chunk_search_is_gated_by_visibility() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
     let shown = db
-        .search_doc_chunks_visible(&query, 10, 0.0, &unlocked)
+        .search_doc_chunks_visible(&query, 10, 0.0, &unlocked, None)
         .unwrap();
     assert!(
         shown.iter().any(|h| h.document_id == "d1"),
@@ -11406,7 +11406,7 @@ fn index_document_chunks_none_embedder_chunks_no_vectors_fts_finds() {
 
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("pistachio", 10, &nothing)
+        .search_doc_chunks_fts_visible("pistachio", 10, &nothing, None)
         .unwrap();
     assert!(
         hits.iter()
@@ -11415,7 +11415,7 @@ fn index_document_chunks_none_embedder_chunks_no_vectors_fts_finds() {
     );
     // Punctuation-only query defuses to no hits (never an FTS syntax error).
     assert!(db
-        .search_doc_chunks_fts_visible("?!*(", 10, &nothing)
+        .search_doc_chunks_fts_visible("?!*(", 10, &nothing, None)
         .unwrap()
         .is_empty());
 }
@@ -11440,7 +11440,7 @@ fn index_document_chunks_reflow_is_noop_on_clean_md() {
     db.index_document_chunks("d1", None).unwrap();
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("pistachio", 10, &nothing)
+        .search_doc_chunks_fts_visible("pistachio", 10, &nothing, None)
         .unwrap();
     assert!(
         hits.iter()
@@ -11556,7 +11556,7 @@ fn index_document_chunks_reflow_defragments_letter_spaced_pdf_text() {
 
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("Frontend", 10, &nothing)
+        .search_doc_chunks_fts_visible("Frontend", 10, &nothing, None)
         .unwrap();
     assert!(
         hits.iter().any(|h| h.document_id == "d1"),
@@ -11619,7 +11619,7 @@ fn index_document_chunks_contact_digest_makes_phone_retrievable_by_nl_query() {
 
     let nothing = std::collections::HashSet::new();
     for q in ["numer telefonu", "phone number", "telefon"] {
-        let hits = db.search_doc_chunks_fts_visible(q, 10, &nothing).unwrap();
+        let hits = db.search_doc_chunks_fts_visible(q, 10, &nothing, None).unwrap();
         assert!(
             hits.iter().any(|h| h.document_id == "d-cv"),
             "query {q:?} must retrieve the CV via the contact digest: {hits:?}"
@@ -11631,7 +11631,7 @@ fn index_document_chunks_contact_digest_makes_phone_retrievable_by_nl_query() {
     }
     // The digest also carries the number itself (spaced + bare), so a digit query lands too.
     let by_number = db
-        .search_doc_chunks_fts_visible("786 327 907", 10, &nothing)
+        .search_doc_chunks_fts_visible("786 327 907", 10, &nothing, None)
         .unwrap();
     assert!(
         by_number.iter().any(|h| h.document_id == "d-cv"),
@@ -11761,7 +11761,7 @@ fn doc_chunk_fts_search_is_gated_by_visibility() {
 
     let nothing = std::collections::HashSet::new();
     assert!(
-        db.search_doc_chunks_fts_visible("launch", 10, &nothing)
+        db.search_doc_chunks_fts_visible("launch", 10, &nothing, None)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -11771,7 +11771,7 @@ fn doc_chunk_fts_search_is_gated_by_visibility() {
     // Seal the folder (chunk row deliberately survives) → INVISIBLE with empty unlock set.
     db.set_folder_locked("f-locked", true, None).unwrap();
     assert!(
-        !db.search_doc_chunks_fts_visible("launch", 10, &nothing)
+        !db.search_doc_chunks_fts_visible("launch", 10, &nothing, None)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -11782,7 +11782,7 @@ fn doc_chunk_fts_search_is_gated_by_visibility() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
     assert!(
-        db.search_doc_chunks_fts_visible("launch", 10, &unlocked)
+        db.search_doc_chunks_fts_visible("launch", 10, &unlocked, None)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -11829,7 +11829,7 @@ fn doc_fts_tokens_purged_with_chunks_and_restored_on_reindex() {
     );
     let nothing = std::collections::HashSet::new();
     assert!(db
-        .search_doc_chunks_fts_visible("unicornfeather", 10, &nothing)
+        .search_doc_chunks_fts_visible("unicornfeather", 10, &nothing, None)
         .unwrap()
         .is_empty());
 
@@ -11859,7 +11859,7 @@ fn doc_fts_matches_polish_diacritics_folded() {
     let nothing = std::collections::HashSet::new();
     for q in ["budzet", "jazn", "gesla"] {
         assert!(
-            db.search_doc_chunks_fts_visible(q, 10, &nothing)
+            db.search_doc_chunks_fts_visible(q, 10, &nothing, None)
                 .unwrap()
                 .iter()
                 .any(|h| h.document_id == "d1"),
@@ -11867,7 +11867,7 @@ fn doc_fts_matches_polish_diacritics_folded() {
         );
     }
     assert!(
-        db.search_doc_chunks_fts_visible("gęślą", 10, &nothing)
+        db.search_doc_chunks_fts_visible("gęślą", 10, &nothing, None)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -16391,7 +16391,7 @@ fn s1_floor_drops_orthogonal_doc_chunk() {
     let query = one_hot(0);
 
     let all = db
-        .search_doc_chunks_visible(&query, 10, 0.0, &nothing)
+        .search_doc_chunks_visible(&query, 10, 0.0, &nothing, None)
         .unwrap();
     let ids: Vec<&str> = all.iter().map(|h| h.document_id.as_str()).collect();
     assert!(
@@ -16400,7 +16400,7 @@ fn s1_floor_drops_orthogonal_doc_chunk() {
     );
 
     let floored = db
-        .search_doc_chunks_visible(&query, 10, 0.75, &nothing)
+        .search_doc_chunks_visible(&query, 10, 0.75, &nothing, None)
         .unwrap();
     let fids: Vec<&str> = floored.iter().map(|h| h.document_id.as_str()).collect();
     assert_eq!(
@@ -16497,7 +16497,7 @@ fn s2_and_to_or_fallback_recovers_multiword_miss_docs() {
     db.index_document_chunks("d1", None).unwrap();
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_doc_chunks_fts_visible("etykieta parcel", 10, &nothing)
+        .search_doc_chunks_fts_visible("etykieta parcel", 10, &nothing, None)
         .unwrap();
     assert!(
         hits.iter().any(|h| h.document_id == "d1"),

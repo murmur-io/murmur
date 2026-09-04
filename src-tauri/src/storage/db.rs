@@ -5324,7 +5324,7 @@ impl Db {
         if fts_scored.is_empty() && range.is_some() {
             // Temporal fallback (L1.5): no lexical match inside the window ⇒ the window IS the
             // query — visible in-range meetings, newest-first, positionally scored.
-            let in_window = self.meetings_in_range_visible(range, limit, unlocked, None)?;
+            let in_window = self.meetings_in_range_visible(range, limit, unlocked, scope)?;
             fts_scored = in_window
                 .iter()
                 .enumerate()
@@ -6323,12 +6323,17 @@ impl Db {
         k: i64,
         min_cosine: f32,
         unlocked: &HashSet<String>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<DocChunkHit>> {
         if query_vec.is_empty() || k <= 0 {
             return Ok(Vec::new());
         }
         let conn = self.lock();
         let visible = visibility_clause("f", unlocked);
+        // Notes and DOCUMENTS are folder-anchored too, so a container scope must narrow them
+        // exactly as it narrows meetings — otherwise a scoped Ask still appends the whole vault's
+        // notes to a cloud-bound corpus.
+        let scoped = folder_scope_clause("d", scope);
         // KNN isolated to the vec0 table in a CTE; visibility + document columns joined OUTSIDE it.
         // The trailing `knn.distance` column feeds the S1 relevance floor (dropped below-floor).
         let sql = format!(
@@ -6343,7 +6348,7 @@ impl Db {
                JOIN doc_chunks dc ON dc.id = knn.chunk_id
                JOIN documents d ON d.id = dc.document_id
                JOIN folders f ON f.id = d.folder_id
-              WHERE d.kind IN ('note','document') AND {visible}
+              WHERE d.kind IN ('note','document') AND {visible}{scoped}
               ORDER BY knn.distance ASC, d.id ASC"
         );
         let blob = crate::embed::vec_to_blob(query_vec);
@@ -6385,6 +6390,7 @@ impl Db {
         query: &str,
         limit: i64,
         unlocked: &HashSet<String>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<DocChunkHit>> {
         if limit <= 0 {
             return Ok(Vec::new());
@@ -6395,6 +6401,10 @@ impl Db {
         };
         let conn = self.lock();
         let visible = visibility_clause("f", unlocked);
+        // Notes and DOCUMENTS are folder-anchored too, so a container scope must narrow them
+        // exactly as it narrows meetings — otherwise a scoped Ask still appends the whole vault's
+        // notes to a cloud-bound corpus.
+        let scoped = folder_scope_clause("d", scope);
         let sql = format!(
             "SELECT d.id, d.name, d.folder_id, dc.text, d.kind,
                     dc.id, dc.parent_id, dc.section_path, dc.page_no, dc.level
@@ -6403,7 +6413,7 @@ impl Db {
                JOIN documents d ON d.id = dc.document_id
                JOIN folders f ON f.id = d.folder_id
               WHERE fts_doc_chunks MATCH ?1
-                AND d.kind IN ('note','document') AND {visible}
+                AND d.kind IN ('note','document') AND {visible}{scoped}
               ORDER BY bm25(fts_doc_chunks) ASC, d.id ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;

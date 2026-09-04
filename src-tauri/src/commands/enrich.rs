@@ -885,13 +885,14 @@ pub(crate) fn gather_note_enhance_citations(
                     MAX_CITATIONS as i64,
                     0.0,
                     &unlocked,
+                    None,
                 )?,
                 None => Vec::new(),
             }
         } else {
             state
                 .db
-                .search_doc_chunks_fts_visible(&query, MAX_CITATIONS as i64, &unlocked)?
+                .search_doc_chunks_fts_visible(&query, MAX_CITATIONS as i64, &unlocked, None)?
         };
         for hit in doc_hits {
             if hit.document_id == req.note_id {
