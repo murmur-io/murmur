@@ -11239,7 +11239,7 @@ pub(crate) fn stop_all_capture(state: &AppState) {
 
 /// Suffix marking an audio file as AES-GCM-encrypted-at-rest (sealed folder). The presence of
 /// this suffix on `meetings.audio_path` is the on-disk "audio is sealed" signal.
-const ENC_SUFFIX: &str = ".enc";
+pub(crate) const ENC_SUFFIX: &str = ".enc";
 
 // ── B7/B8 AAD context binding ──────────────────────────────────────────────────────────────────
 //

@@ -2651,6 +2651,103 @@ impl AtomicAudioPublisher {
     }
 }
 
+/// Publish ONE capture stream as a delay-aligned 16 kHz mono master WAV next to the archive.
+///
+/// WHY THIS EXISTS (T31). The canonical archive is `channels: 1` — [`AtomicAudioPublisher::publish_mix`]
+/// SUMS the microphone and the system capture into a single channel, so the `Me`/`Others` split is
+/// destroyed at publication and no amount of later processing recovers it. A retry that re-runs from
+/// the archive is therefore single-stream BY CONSTRUCTION. Keeping each stream as its own master is
+/// the only way a retry can reproduce what the live recording produced.
+///
+/// The master is written on the ARCHIVE's timeline: `delay` frames of leading silence are prepended,
+/// exactly the offset `publish_mix` applied when mixing this stream. Both masters then share one
+/// origin, so a retry hands [`crate::audio::merge::merge_streams`] two streams with the same
+/// `started_at` and the merge reduces to sort-and-label. It also means a human who plays a master
+/// hears it in sync with the archive.
+///
+/// At-rest handling is NOT new machinery: the meeting's `mic_master_path` / `sys_master_path`
+/// columns are already sealed, blanked, unsealed, crash-reconciled and prune-accounted (see
+/// `storage::seal_store` and `storage::usage`). This function only produces the file those columns
+/// have always been able to describe.
+///
+/// Atomic like the archive: written to a same-directory dotfile, fsynced, then `rename`d into place,
+/// so a crash can never leave a half-written master that a later read would trust.
+pub(crate) fn publish_stream_master(
+    source_path: &Path,
+    final_path: &Path,
+    delay_frames: u64,
+) -> Result<VerifiedFile> {
+    let mut source = RawF32LeSource::open(source_path, crate::audio::TARGET_RATE_HZ)?;
+    let total = delay_frames.saturating_add(source.frames());
+    if total == 0 {
+        return Err(AppError::Audio(
+            "stream master would be empty; nothing to publish".into(),
+        ));
+    }
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| AppError::Audio("stream master path has no parent dir".into()))?;
+    let stem = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| AppError::Audio("stream master path has no file name".into()))?;
+    let temp = parent.join(format!(".{stem}.{}.part", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+
+    {
+        let file = open_create_new_nofollow(&temp)?;
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: crate::audio::TARGET_RATE_HZ,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::new(file, spec)
+            .map_err(|e| AppError::Audio(format!("create stream master WAV: {e}")))?;
+        let mut offset = 0u64;
+        while offset < total {
+            let count = COPY_FRAMES.min((total - offset) as usize);
+            // Leading silence covers the alignment delay; past it, read the stream itself.
+            let window = if offset + count as u64 <= delay_frames {
+                vec![0.0f32; count]
+            } else if offset >= delay_frames {
+                source.read_frames(offset - delay_frames, count)?
+            } else {
+                let silent = (delay_frames - offset) as usize;
+                let mut w = vec![0.0f32; silent];
+                w.extend(source.read_frames(0, count - silent)?);
+                w
+            };
+            for sample in window {
+                writer
+                    .write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)
+                    .map_err(|e| AppError::Audio(format!("write stream master sample: {e}")))?;
+            }
+            offset += count as u64;
+        }
+        writer
+            .finalize()
+            .map_err(|e| AppError::Audio(format!("finalize stream master WAV: {e}")))?;
+    }
+    let staged = verify_existing_file(&temp)?;
+    // Prove the master is a readable WAV BEFORE it is published under a name the DB will point at.
+    // A column that names an unreadable file is worse than no column: every later read trusts it.
+    let readable = WavMonoSource::open(&temp)
+        .map(|s| s.frames() > 0 && s.sample_rate() > 0)
+        .unwrap_or(false);
+    if !readable {
+        VerifiedDeletion::for_file(&temp, &staged)?
+            .remove("remove unreadable stream master candidate")?;
+        return Err(AppError::Audio(
+            "published stream master is not a readable WAV".into(),
+        ));
+    }
+    std::fs::rename(&temp, final_path)
+        .map_err(|e| AppError::Audio(format!("publish stream master: {e}")))?;
+    sync_parent_dir(final_path, "sync stream master directory")?;
+    verify_existing_file(final_path)
+}
+
 fn mixed_window(
     mic: &mut RawF32LeSource,
     mic_delay: u64,
@@ -3656,6 +3753,94 @@ fn verify_open_handle(
 
 #[cfg(test)]
 mod tests {
+    /// T31 — a promoted master is the stream itself, shifted onto the ARCHIVE's timeline.
+    ///
+    /// The delay is not decoration: `publish_mix` front-pads each stream by exactly this many
+    /// frames when it builds the archive, so a master written WITHOUT the padding would place every
+    /// retry segment earlier than the recording it came from, and the two streams would be merged
+    /// against each other at the wrong offset.
+    #[test]
+    fn a_promoted_master_carries_the_archive_front_padding() {
+        use crate::audio::source::MonoSource;
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-master-pad-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("in.f32");
+        let samples: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
+        let mut bytes = Vec::new();
+        for s in &samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&raw, &bytes).unwrap();
+
+        let dest = dir.join("m.mic.wav");
+        publish_stream_master(&raw, &dest, 3).unwrap();
+        let mut got = WavMonoSource::open(&dest).unwrap();
+        assert_eq!(got.frames(), 7, "3 frames of padding + 4 of signal");
+        let frames = got.read_frames(0, 7).unwrap();
+        assert!(
+            frames[..3].iter().all(|s| *s == 0.0),
+            "the delay is leading SILENCE, not the stream shifted into it: {frames:?}"
+        );
+        assert!(
+            frames[3..].iter().all(|s| *s > 0.9),
+            "the stream itself follows the padding: {frames:?}"
+        );
+
+        // Zero delay is the mic-leading case and must not pad at all.
+        let dest0 = dir.join("m.sys.wav");
+        publish_stream_master(&raw, &dest0, 0).unwrap();
+        assert_eq!(WavMonoSource::open(&dest0).unwrap().frames(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A master is published ATOMICALLY: a reader never sees the staging dotfile under the final
+    /// name, and nothing is left behind once it lands.
+    #[test]
+    fn publishing_a_master_leaves_no_staging_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-master-atomic-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("in.f32");
+        std::fs::write(&raw, 0.5f32.to_le_bytes()).unwrap();
+        let dest = dir.join("m.mic.wav");
+        publish_stream_master(&raw, &dest, 0).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with('.') && n.ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging file survived: {leftovers:?}");
+        assert!(dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An EMPTY stream is refused rather than published: a zero-frame master would be a column
+    /// pointing at a file every later read has to special-case.
+    #[test]
+    fn an_empty_stream_is_not_published_as_a_master() {
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-master-empty-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("in.f32");
+        std::fs::write(&raw, b"").unwrap();
+        let dest = dir.join("m.mic.wav");
+        assert!(publish_stream_master(&raw, &dest, 0).is_err());
+        assert!(!dest.exists(), "nothing is published for an empty stream");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
