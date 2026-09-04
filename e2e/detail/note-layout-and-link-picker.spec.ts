@@ -69,9 +69,12 @@ async function mockMeetingNote(page: Page): Promise<void> {
         containerId: "p-scroll",
         path: ["p-scroll"],
         index: 15,
-        offset: 0,
-        items: Array.from({ length: 30 }, (_, index) =>
-          index === 15
+        // Production centres a bounded 24-item window on the anchor:
+        // max(0, index - 24 / 2) = 3 for index 15.
+        offset: 3,
+        items: Array.from({ length: 24 }, (_, windowIndex) => {
+          const index = windowIndex + 3;
+          return index === 15
             ? {
                 kind: "meeting",
                 id: "m-atlas-roadmap",
@@ -81,8 +84,8 @@ async function mockMeetingNote(page: Page): Promise<void> {
                 kind: "meeting",
                 id: `scroll-candidate-${index}`,
                 title: `Scroll candidate ${String(index).padStart(2, "0")}`,
-              },
-        ),
+              };
+        }),
         total: 30,
       },
     }),
@@ -136,7 +139,11 @@ async function openRelatedPicker(page: Page) {
   const tree = picker.locator(".rhp-tree");
   await expect(picker).toBeVisible();
   await expect(search).toBeVisible();
-  await expect(tree.locator(".rhp-row")).toHaveCount(33);
+  await expect(tree.locator('[data-row^="i:meeting:"]')).toHaveCount(24);
+  await expect(
+    tree.getByRole("treeitem", { name: "Load earlier" }),
+  ).toBeVisible();
+  await expect(tree.getByRole("treeitem", { name: "Load more" })).toBeVisible();
   return { picker, search, tree };
 }
 
@@ -292,9 +299,9 @@ test("fast scrolling inside Related picker does not re-layout or blank it", asyn
 
   expect(measurements.supported).toBe(true);
   expect(measurements.reads).toBe(0);
-  await expect(tree.locator(".rhp-row")).toHaveCount(33);
+  await expect(tree.locator('[data-row^="i:meeting:"]')).toHaveCount(24);
   await expect(tree.locator(".rhp-state")).toHaveCount(0);
   await expect(
-    picker.getByRole("treeitem", { name: /Scroll candidate 29/ }),
+    picker.getByRole("treeitem", { name: /Scroll candidate 26/ }),
   ).toBeVisible();
 });
