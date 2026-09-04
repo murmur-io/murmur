@@ -72,14 +72,23 @@ test("view-only received item has reverse Related but no edit or management cont
           ]
         : [];
     },
-    list_link_candidates: () => [
-      {
-        kind: "note",
-        id: "note-9",
-        title: "Local follow-up",
-        snippet: "",
-      },
-    ],
+    search_related_picker: (args: { query: string }) => {
+      const matches = args.query.trim().toLowerCase() === "local follow-up";
+      return {
+        offset: 0,
+        hits: matches
+          ? [
+              {
+                kind: "note",
+                id: "note-9",
+                title: "Local follow-up",
+                breadcrumb: ["Workspace", "Notes"],
+              },
+            ]
+          : [],
+        total: matches ? 1 : 0,
+      };
+    },
     link_items: (args: unknown) => {
       const w = window as unknown as {
         __reverseLinkCalls?: unknown[];
@@ -108,10 +117,12 @@ test("view-only received item has reverse Related but no edit or management cont
 
   const connections = page.locator("app-connections");
   await connections.getByRole("button", { name: "Link", exact: true }).click();
-  await page
-    .locator(".link-pop")
-    .getByRole("option", { name: /Local follow-up/ })
-    .dispatchEvent("click");
+  const picker = page.getByRole("dialog", { name: "Add related" });
+  await expect(picker).toBeVisible();
+  await picker.getByPlaceholder("Search every Space…").fill("Local follow-up");
+  await picker
+    .locator('[data-row="h:note:note-9"] .rhp-row-main')
+    .click();
   await expect(connections.getByText("Local follow-up")).toBeVisible();
   await expect.poll(async () =>
     page.evaluate(
