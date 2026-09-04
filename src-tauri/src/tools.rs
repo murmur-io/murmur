@@ -743,7 +743,7 @@ pub fn execute_tool(
             let docs = db
                 .search_doc_chunks_fts_visible(q, 20, unlocked)
                 .unwrap_or_default();
-            match db.search_visible_in_range(q, 20, unlocked, date_filter) {
+            match db.search_visible_in_range(q, 20, unlocked, date_filter, None) {
                 Ok(hits) if hits.is_empty() && docs.is_empty() => {
                     Ok(format!("No meetings or documents match \"{q}\"."))
                 }
@@ -771,7 +771,7 @@ pub fn execute_tool(
             // labelled as keyword matching so the model is never told a semantic search ran.
             if !config.semantic_search_enabled {
                 let hits = db
-                    .search_visible_in_range(q, 20, unlocked, date_filter)
+                    .search_visible_in_range(q, 20, unlocked, date_filter, None)
                     .map_err(|e| AppError::Storage(format!("search failed: {e}")))?;
                 let docs = db
                     .search_doc_chunks_fts_visible(q, 20, unlocked)
@@ -794,7 +794,7 @@ pub fn execute_tool(
                 Ok(embedder) => embedder,
                 Err(_) => {
                     let hits = db
-                        .search_visible_in_range(q, 20, unlocked, date_filter)
+                        .search_visible_in_range(q, 20, unlocked, date_filter, None)
                         .map_err(|e| AppError::Storage(format!("search failed: {e}")))?;
                     let docs = db
                         .search_doc_chunks_fts_visible(q, 20, unlocked)
@@ -859,6 +859,7 @@ pub fn execute_tool(
                 crate::embed::KNN_SEARCH_COSINE_FLOOR,
                 unlocked,
                 date_filter,
+                None, // the MCP search tool is vault-wide; scoping is an Ask-side choice
             ) {
                 Ok(hits) if hits.is_empty() && docs.is_empty() => {
                     Ok(format!("No meetings or documents match \"{q}\"."))

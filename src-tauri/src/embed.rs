@@ -3301,7 +3301,7 @@ mod tests {
         for q in &set.0 {
             let df = crate::summarize::temporal::extract_date_filter(&q.query, today);
             let hits = db
-                .search_visible_in_range(&q.query, 40, &empties, df)
+                .search_visible_in_range(&q.query, 40, &empties, df, None)
                 .unwrap();
             if hits.is_empty() {
                 empty += 1;

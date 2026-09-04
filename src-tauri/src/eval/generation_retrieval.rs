@@ -518,7 +518,8 @@ pub(crate) fn build_evidence() -> Result<RetrievalQualityEvidence> {
                 PRODUCT_CANDIDATE_LIMIT,
                 &unlocked,
                 date_filter.clone(),
-            )?
+            None,
+        )?
             .into_iter()
             .map(|hit| hit.meeting.id)
             .collect::<Vec<_>>();
@@ -533,7 +534,8 @@ pub(crate) fn build_evidence() -> Result<RetrievalQualityEvidence> {
                 PRODUCT_CANDIDATE_LIMIT,
                 crate::embed::KNN_SEARCH_COSINE_FLOOR,
                 &unlocked,
-            )?
+        None,
+    )?
             .into_iter()
             .map(|hit| hit.meeting.id)
             .collect::<Vec<_>>();
@@ -545,7 +547,8 @@ pub(crate) fn build_evidence() -> Result<RetrievalQualityEvidence> {
                 crate::embed::KNN_SEARCH_COSINE_FLOOR,
                 &unlocked,
                 date_filter,
-            )?
+        None,
+    )?
             .into_iter()
             .map(|hit| hit.meeting.id)
             .collect::<Vec<_>>();
@@ -873,11 +876,11 @@ mod tests {
 
         let locked = HashSet::new();
         assert!(db
-            .search_visible_in_range(&query, PRODUCT_CANDIDATE_LIMIT, &locked, None)
+            .search_visible_in_range(&query, PRODUCT_CANDIDATE_LIMIT, &locked, None, None)
             .unwrap()
             .is_empty());
         assert!(db
-            .search_semantic_visible(&query_vec, PRODUCT_CANDIDATE_LIMIT, 0.0, &locked,)
+            .search_semantic_visible(&query_vec, PRODUCT_CANDIDATE_LIMIT, 0.0, &locked, None)
             .unwrap()
             .is_empty());
         assert!(db
@@ -888,19 +891,20 @@ mod tests {
                 crate::embed::KNN_SEARCH_COSINE_FLOOR,
                 &locked,
                 None,
-            )
+        None,
+    )
             .unwrap()
             .is_empty());
 
         let mut unlocked = HashSet::new();
         unlocked.insert("f-locked".to_string());
         assert!(db
-            .search_visible_in_range(&query, PRODUCT_CANDIDATE_LIMIT, &unlocked, None)
+            .search_visible_in_range(&query, PRODUCT_CANDIDATE_LIMIT, &unlocked, None, None)
             .unwrap()
             .iter()
             .any(|hit| hit.meeting.id == "locked-meeting"));
         assert!(db
-            .search_semantic_visible(&query_vec, PRODUCT_CANDIDATE_LIMIT, 0.0, &unlocked,)
+            .search_semantic_visible(&query_vec, PRODUCT_CANDIDATE_LIMIT, 0.0, &unlocked, None)
             .unwrap()
             .iter()
             .any(|hit| hit.meeting.id == "locked-meeting"));
@@ -912,7 +916,8 @@ mod tests {
                 crate::embed::KNN_SEARCH_COSINE_FLOOR,
                 &unlocked,
                 None,
-            )
+        None,
+    )
             .unwrap()
             .iter()
             .any(|hit| hit.meeting.id == "locked-meeting"));

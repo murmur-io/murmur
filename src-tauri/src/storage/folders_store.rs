@@ -1270,6 +1270,89 @@ impl Db {
     /// for legacy rows that could not be canonicalized safely. Returning *all* of those legacy
     /// folders lets the command-layer gate require every governing folder to be readable instead
     /// of accidentally choosing an unlocked sibling beside a locked one.
+    /// Every folder id in the SUBTREE rooted at `folder_id` — the folder itself plus all its
+    /// descendants — for scoping a vault search to one Space or folder.
+    ///
+    /// WHY THIS EXISTS. A container RELATION (`LinkKind::Container`) is deliberately metadata-only:
+    /// it names a place and never expands to what the place holds. That is correct for a relation,
+    /// but it left no way to say "answer from what is in this folder" — the only choices were
+    /// pinning items one by one or searching the whole vault. A container SCOPE is the missing
+    /// third thing, and it is a different mechanism on purpose: it narrows RETRIEVAL rather than
+    /// packing content, so a folder holding a hundred notes costs the same as one holding five.
+    ///
+    /// Descendants come from the `path` prefix, which `create_folder` composes as
+    /// `parent.path + '/' + name` and every reparent rewrites for the whole subtree — so a prefix
+    /// match is exact, and no recursive CTE is needed. The comparison is done in Rust rather than
+    /// with SQL `LIKE` because a folder NAME is user text: `%` or `_` in a name would silently
+    /// widen a `LIKE` pattern into folders the user never scoped to.
+    ///
+    /// NOT a visibility decision. This answers only "which folders are inside this one"; whether a
+    /// meeting in them may be READ is still decided by `meeting_visibility_clause`, which every
+    /// caller ANDs with the id set this returns. A locked-and-not-session-unlocked folder therefore
+    /// contributes nothing, without this function having to know about locks at all.
+    pub fn folder_subtree_ids(&self, folder_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let root: Option<String> = conn
+            .query_row(
+                "SELECT path FROM folders WHERE id = ?1",
+                rusqlite::params![folder_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .flatten();
+        // No such folder, or one with no path: scope to exactly that id and nothing else. Returning
+        // an EMPTY set would read as "no scope" to a caller that treats empty as unscoped, which is
+        // the one interpretation that must never happen — it would silently widen to the vault.
+        let Some(root_path) = root.filter(|p| !p.is_empty()) else {
+            return Ok(vec![folder_id.to_string()]);
+        };
+        let prefix = format!("{root_path}/");
+        let mut stmt = conn
+            .prepare("SELECT id, path FROM folders")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .map_err(map_err)?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let (id, path) = row.map_err(map_err)?;
+            let path = path.unwrap_or_default();
+            if id == folder_id || path == root_path || path.starts_with(&prefix) {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            ids.push(folder_id.to_string());
+        }
+        Ok(ids)
+    }
+
+    /// Expand a set of container ids into the SCOPE they denote — each one plus its whole subtree,
+    /// deduplicated.
+    ///
+    /// This exists so "a scope" has exactly ONE meaning in the codebase. Passing a raw, unexpanded
+    /// id list to a scoped search silently narrows to the folder's own direct contents and hides
+    /// everything in its sub-folders — a wrong answer that looks like a working feature. Every
+    /// caller that turns a user's chosen containers into a search scope goes through here.
+    ///
+    /// Recomputed per call ON PURPOSE. A scope is a LIVE query, not a snapshot: a note filed into
+    /// the folder tomorrow, or a sub-folder created under it, is in scope without the user
+    /// re-choosing anything — which is the whole reason a scope beats pinning items one by one.
+    pub fn folder_scope_ids(&self, container_ids: &[String]) -> Result<Vec<String>> {
+        let mut scope: Vec<String> = Vec::new();
+        for id in container_ids {
+            for descendant in self.folder_subtree_ids(id)? {
+                if !scope.contains(&descendant) {
+                    scope.push(descendant);
+                }
+            }
+        }
+        Ok(scope)
+    }
+
     pub fn folders_for_meeting(&self, meeting_id: &str) -> Result<Vec<String>> {
         let conn = self.lock();
         let canonical = conn

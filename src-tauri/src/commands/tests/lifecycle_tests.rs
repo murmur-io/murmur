@@ -14372,7 +14372,8 @@
             "fioletowoszary",
             "anthropic",
             &nothing,
-        )
+        None,
+    )
         .unwrap();
         assert!(
             // Assert on a CONTENT word absent from the query — sentinels echo the query itself
@@ -14495,7 +14496,8 @@
                 "TAJNYTOKEN",
                 "anthropic",
                 unlocked,
-            )
+        None,
+    )
             .unwrap();
             assert_eq!(
                 corpus.contains("przejęcia"),
@@ -21470,7 +21472,7 @@
         let emb = crate::embed::StubEmbedder;
         let qv = emb.embed(std::slice::from_ref(&text.to_string())).unwrap();
         let qvec = qv.into_iter().next().unwrap_or_default();
-        db.search_semantic_visible(&qvec, 50, 0.0, unlocked)
+        db.search_semantic_visible(&qvec, 50, 0.0, unlocked, None)
             .unwrap()
             .iter()
             .any(|h| h.meeting.id == mid)
@@ -24751,7 +24753,8 @@
                 None,
                 None,
                 Some("it-p"),
-            )
+        None,
+    )
             .unwrap()
         };
         let assert_empty_without_disclosure = |prompt: AskFloorPrompt| match prompt {
@@ -43602,7 +43605,7 @@ fn recording_filing_attachment_rollback_preserves_replacement_symlink_and_unknow
             .is_empty());
         assert!(state
             .db
-            .list_meetings_visible(200, &none)
+            .list_meetings_visible(200, &none, None)
             .unwrap()
             .is_empty());
         assert!(state.db.list_entities_visible(&none).unwrap().is_empty());

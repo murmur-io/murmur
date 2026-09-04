@@ -504,12 +504,14 @@ impl Db {
         &self,
         entity_ids: &[String],
         unlocked: &HashSet<String>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<Meeting>> {
         if entity_ids.is_empty() {
             return Ok(Vec::new());
         }
         let conn = self.lock();
         let meeting_visible = meeting_visibility_clause("m", unlocked);
+        let scoped = crate::storage::db::folder_scope_clause("m", scope);
         let placeholders = (1..=entity_ids.len())
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
@@ -520,7 +522,7 @@ impl Db {
                FROM entity_mentions em \
                JOIN meetings m ON m.id = em.meeting_id \
               WHERE em.entity_id IN ({placeholders}) \
-                AND {meeting_visible} \
+                AND {meeting_visible}{scoped} \
               GROUP BY m.id \
               ORDER BY COUNT(DISTINCT em.entity_id) DESC, m.started_at DESC, m.id DESC"
         );
@@ -616,7 +618,7 @@ impl Db {
             });
         }
         // Meetings (visible-meeting predicate; capped to keep the payload bounded).
-        for m in self.list_meetings_visible(MAX_FULL_GRAPH_PER_KIND as i64, unlocked)? {
+        for m in self.list_meetings_visible(MAX_FULL_GRAPH_PER_KIND as i64, unlocked, None)? {
             visible.insert((FullGraphNodeKind::Meeting.as_str(), m.id.clone()));
             let label = m
                 .title

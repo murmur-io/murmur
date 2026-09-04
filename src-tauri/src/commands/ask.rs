@@ -559,6 +559,13 @@ pub(crate) fn build_ask_vault_floor_prompt(
     reranker: Option<&dyn crate::rerank::Reranker>,
     explicit_sources: Option<&[crate::storage::models::SourceRef]>,
     pinned_org_item_id: Option<&str>,
+    // CONTAINER SCOPE — folder/Space ids the answer must be drawn from, or `None` for the whole
+    // vault. Deliberately NOT part of `explicit_sources`: those are PINNED CONTENT, packed into the
+    // corpus verbatim, and `LinkKind::Container` is excluded from that set on purpose (a container
+    // holds no text of its own). A scope is the other thing entirely — it narrows RETRIEVAL, so a
+    // folder of a hundred notes costs what a folder of five costs, and ranking still decides what
+    // is relevant inside it.
+    scope_folder_ids: Option<&[String]>,
 ) -> Result<AskFloorPrompt, AppError> {
     // Budget on the ASK-role provider's RESOLVED connection — the corpus egresses to it. With
     // role keys absent this is the legacy `provider_id` for EVERY brain_backend (the pre-role
@@ -571,6 +578,15 @@ pub(crate) fn build_ask_vault_floor_prompt(
     // gated link-expansion) — the user controls the context. Same `unlocked` visibility gate as
     // every search leg (a sealed source/neighbour contributes nothing). `None` ⇒ the exact existing
     // whole-vault search below, byte-for-byte.
+    // Expand each scoped container to its SUBTREE. Scoping to a Space means "everything filed
+    // under it", which is the opposite of what a container RELATION does (that one never fans out)
+    // — the difference is the point: a relation says where something belongs, a scope says where to
+    // look. Resolution is by folder id, so the scope survives a rename or a move of the folder.
+    let scope_ids: Option<Vec<String>> = match scope_folder_ids {
+        Some(ids) if !ids.is_empty() => Some(db.folder_scope_ids(ids)?),
+        _ => None,
+    };
+    let scope = scope_ids.as_deref();
     let has_pinned_sources = explicit_sources.map(|s| !s.is_empty()).unwrap_or(false);
     let (corpus, sources) = if has_pinned_sources || pinned_org_item_id.is_some() {
         // PINNED corpus (deterministic; vault-wide search SKIPPED). Pack the pinned ORG item FIRST
@@ -609,11 +625,11 @@ pub(crate) fn build_ask_vault_floor_prompt(
     } else if config.semantic_search_enabled {
         let query_vec = ask_query_vector(question, true);
         crate::summarize::vault_context::build_vault_context_hybrid_visible(
-            db, question, &ask_conn, &query_vec, unlocked, reranker,
+            db, question, &ask_conn, &query_vec, unlocked, reranker, scope,
         )?
     } else {
         crate::summarize::vault_context::build_vault_context_visible(
-            db, question, &ask_conn, unlocked,
+            db, question, &ask_conn, unlocked, scope,
         )?
     };
     if corpus.trim().is_empty() {

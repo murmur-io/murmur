@@ -202,6 +202,7 @@
           class="ask-sources"
           [selected]="sources()"
           (selectedChange)="onSourcesChange($event)"
+          [allowedKinds]="askSourceKinds"
           [dashboard]="dashboard()"
           (dashboardChange)="onDashboardChange($event)"
           dashboardMode="composite"

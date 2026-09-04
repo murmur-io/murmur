@@ -382,7 +382,7 @@ fn gated_candidates(
             // No temporal window here: the grounding query is a derived salient-term string, not
             // a user question (a temporal phrase in it would be note prose, not intent).
             Some(qv) if !qv.is_empty() => {
-                db.search_hybrid_visible(query, &qv, limit, 0.0, unlocked, None)
+                db.search_hybrid_visible(query, &qv, limit, 0.0, unlocked, None, None)
             }
             // Empty/degenerate query vector → FTS (never a stub-vector KNN).
             _ => db.search_visible(query, limit, unlocked),

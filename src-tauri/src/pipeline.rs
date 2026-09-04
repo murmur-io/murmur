@@ -5470,7 +5470,7 @@ mod tests {
             ))
             .unwrap();
         let qvec = qv.into_iter().next().unwrap_or_default();
-        db.search_semantic_visible(&qvec, 10, 0.0, unlocked)
+        db.search_semantic_visible(&qvec, 10, 0.0, unlocked, None)
             .unwrap()
             .iter()
             .any(|h| h.meeting.id == mid)

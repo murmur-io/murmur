@@ -98,7 +98,7 @@ pub fn build_brief_corpus(
 
     let mut corpus = String::new();
     let mut meeting_ids = Vec::new();
-    for m in db.list_meetings_visible(300, &no_unlocks)? {
+    for m in db.list_meetings_visible(300, &no_unlocks, None)? {
         if m.started_at.as_str() < cutoff.as_str() {
             continue;
         }

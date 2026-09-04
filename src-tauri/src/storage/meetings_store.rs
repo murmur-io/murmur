@@ -537,9 +537,14 @@ impl Db {
         &self,
         limit: i64,
         unlocked: &HashSet<String>,
+        scope: Option<&[String]>,
     ) -> Result<Vec<Meeting>> {
         let conn = self.lock();
         let meeting_visible = meeting_visible_sql(unlocked);
+        // Scope narrows the fallback too. Without this, a scoped question that matches nothing
+        // would answer from the WHOLE vault's recent meetings — silently outside the scope the
+        // user chose, which is worse than answering "nothing here".
+        let scoped = crate::storage::db::folder_scope_clause("m", scope);
         // A meeting is hidden only when EVERY note it has is sealed-and-not-unlocked. Expressed
         // as: no note row exists that is currently sealed-and-hidden for this meeting, unless a
         // sibling visible note exists. Simpler + correct: keep the meeting if it has zero notes
@@ -548,7 +553,7 @@ impl Db {
             "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
                     m.folder_id
                FROM meetings m
-              WHERE {meeting_visible}
+              WHERE {meeting_visible}{scoped}
               ORDER BY m.started_at DESC, m.id DESC
               LIMIT ?1"
         );

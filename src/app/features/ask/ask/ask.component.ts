@@ -22,6 +22,7 @@ import type {
   DashboardScopeRef,
   SourceRef,
   VaultSource,
+  LinkKind,
 } from "../../../core/models";
 import { SourcePickerComponent } from "../../../design-system/source-picker/source-picker.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
@@ -134,6 +135,40 @@ export class AskComponent implements OnInit {
    * their links; empty ⇒ pass `undefined` (whole-vault) to {@link askVault}.
    */
   readonly sources = signal<SourceRef[]>([]);
+
+  /**
+   * What the Sources picker may offer here — the content kinds it always offered, PLUS whole
+   * containers (a Space or folder).
+   *
+   * A container behaves differently from the rest and the split happens in {@link askScope}: a
+   * content source is PINNED (packed into the corpus verbatim), while a container is a SCOPE
+   * (retrieval is narrowed to what is filed under it, subtree included). That is why a container
+   * can be picked at all despite `LinkKind.Container` deliberately not being a content source —
+   * it never enters the corpus as text, it only says where to look.
+   */
+  protected readonly askSourceKinds: readonly LinkKind[] = [
+    "meeting",
+    "note",
+    "document",
+    "container",
+  ];
+
+  /**
+   * The picker selection, split into the two things the backend takes.
+   *
+   * `pinned` are exact items to pack; `scopeFolderIds` are containers to search inside. Sending a
+   * container as a pinned source would hand the packer a place that holds no text of its own — the
+   * backend refuses that by construction, so the split has to happen here.
+   */
+  protected askScope(): { pinned: SourceRef[]; scopeFolderIds: string[] } {
+    const selected = this.sources();
+    return {
+      pinned: selected.filter((s) => s.kind !== "container"),
+      scopeFolderIds: selected
+        .filter((s) => s.kind === "container")
+        .map((s) => s.id),
+    };
+  }
   /** One composite board identity; never expanded into child SourceRefs in the WebView. */
   readonly dashboard = signal<DashboardScopeRef | null>(null);
 
@@ -510,15 +545,19 @@ export class AskComponent implements OnInit {
 
     // Source-scoped Brain: an empty selection ⇒ pass undefined (whole-vault);
     // a non-empty selection pins the answer to those sources + their links.
-    const scope = this.sources();
+    // Pinned CONTENT and container SCOPE are two different instructions to the backend, so the
+    // one picker selection is split before it is sent: items get packed, containers narrow the
+    // search. Both empty ⇒ the unchanged whole-vault path.
+    const { pinned, scopeFolderIds } = this.askScope();
     try {
       const result = await this.ipc.askVaultPersisted(
         this.conversationScope,
         question,
         conversationId,
-        scope.length ? scope : undefined,
+        pinned.length ? pinned : undefined,
         askThreadId,
         this.dashboard()?.id,
+        scopeFolderIds.length ? scopeFolderIds : undefined,
       );
       if (requestSeq !== this.requestSeq) {
         return;

@@ -13,7 +13,7 @@
 //!      `download_brain_model`, `download_embed_model`, `reindex_embeddings`). The downloads are
 //!      INBOUND-ONLY model-file fetches (no egress). `reindex_embeddings` IS visibility-aware, but
 //!      it does so entirely through the SHARED `reindex_embeddings_inner` — whose corpus is exactly
-//!      `list_meetings_visible(unlocked)` (a sealed-not-session-unlocked meeting is never indexed) —
+//!      `list_meetings_visible(unlocked, None, None)` (a sealed-not-session-unlocked meeting is never indexed) —
 //!      which STAYS in `commands/mod.rs` (it is also called by the startup repair tick + covered by
 //!      the lifecycle tests). The `ReindexResult` DTO and every reindex/backfill HELPER
 //!      (`reindex_embeddings_inner`, `backfill_document_chunks`, `index_document_row_kind_routed`)
@@ -796,7 +796,7 @@ pub async fn download_embed_model(app: AppHandle) -> Result<String, AppError> {
 /// runs after turning `semantic_search_enabled` on, or after installing the e5 model so the old
 /// STUB-embedded chunks get replaced by real e5 vectors).
 ///
-/// GATING (lock-model): the corpus is exactly `list_meetings_visible(unlocked)` — a sealed-and-not-
+/// GATING (lock-model): the corpus is exactly `list_meetings_visible(unlocked, None, None)` — a sealed-and-not-
 /// session-unlocked meeting is NEVER returned, so its plaintext is never chunked/embedded, and its
 /// chunks STAY purged (the seal already purged them; we don't touch them). For each visible meeting
 /// we re-fetch its note through `get_note_if_visible(unlocked)` (defense-in-depth: skip if the note

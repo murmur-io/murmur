@@ -129,7 +129,7 @@ pub fn build_vault_context(
     query: &str,
     provider_id: &str,
 ) -> Result<(String, Vec<VaultSource>)> {
-    build_vault_context_visible(db, query, provider_id, &HashSet::new())
+    build_vault_context_visible(db, query, provider_id, &HashSet::new(), None)
 }
 
 /// Returns (corpus, sources). Picks VISIBLE meetings relevant to `query` (full-text search),
@@ -143,6 +143,7 @@ pub fn build_vault_context_visible(
     query: &str,
     provider_id: &str,
     unlocked: &HashSet<String>,
+    scope: Option<&[String]>,
 ) -> Result<(String, Vec<VaultSource>)> {
     let budget = budget_for(provider_id);
 
@@ -155,12 +156,12 @@ pub fn build_vault_context_visible(
     // apply the sealed-folder visibility clause against `unlocked`, so sealed-not-unlocked
     // meetings are filtered out of the candidate set before any content is read.
     let mut meetings: Vec<crate::storage::models::Meeting> = db
-        .search_visible_in_range(query, 40, unlocked, date_filter)?
+        .search_visible_in_range(query, 40, unlocked, date_filter, scope)?
         .into_iter()
         .map(|h| h.meeting)
         .collect();
     if meetings.is_empty() {
-        meetings = db.list_meetings_visible(30, unlocked)?;
+        meetings = db.list_meetings_visible(30, unlocked, scope)?;
     }
 
     let (mut corpus, sources) = pack_meetings(db, meetings, budget, unlocked)?;
@@ -189,6 +190,7 @@ pub fn build_vault_context_hybrid_visible(
     query_vec: &[f32],
     unlocked: &HashSet<String>,
     reranker: Option<&dyn crate::rerank::Reranker>,
+    scope: Option<&[String]>,
 ) -> Result<(String, Vec<VaultSource>)> {
     let budget = budget_for(provider_id);
     // Brain v2 L1.5 — temporal window (all hybrid legs apply it; query-time `now` anchor).
@@ -201,6 +203,7 @@ pub fn build_vault_context_hybrid_visible(
         crate::embed::KNN_SEARCH_COSINE_FLOOR,
         unlocked,
         date_filter,
+        scope,
     )?;
 
     // Brain v2 L1.4 — the RERANKER seam (Ask-only): reorder the TOP-K fused candidates before
@@ -235,7 +238,7 @@ pub fn build_vault_context_hybrid_visible(
     let mut meetings: Vec<crate::storage::models::Meeting> =
         hits.into_iter().map(|h| h.meeting).collect();
     if meetings.is_empty() {
-        meetings = db.list_meetings_visible(30, unlocked)?;
+        meetings = db.list_meetings_visible(30, unlocked, None)?;
     }
     let (mut corpus, sources) = pack_meetings(db, meetings, budget, unlocked)?;
     // Document ingestion: APPEND a gated `## Documents` section so the brain/Ask can also ground on
@@ -271,7 +274,7 @@ pub fn build_meeting_listing_visible(
     let date_filter =
         crate::summarize::temporal::extract_date_filter(query, chrono::Utc::now().date_naive());
     let mut meetings: Vec<crate::storage::models::Meeting> = if query_vec.is_empty() {
-        db.search_visible_in_range(query, limit, unlocked, date_filter)?
+        db.search_visible_in_range(query, limit, unlocked, date_filter, None)?
             .into_iter()
             .map(|h| h.meeting)
             .collect()
@@ -283,13 +286,14 @@ pub fn build_meeting_listing_visible(
             crate::embed::KNN_SEARCH_COSINE_FLOOR,
             unlocked,
             date_filter,
+            None,
         )?
             .into_iter()
             .map(|h| h.meeting)
             .collect()
     };
     if meetings.is_empty() {
-        meetings = db.list_meetings_visible(limit, unlocked)?;
+        meetings = db.list_meetings_visible(limit, unlocked, None)?;
     }
     let lines: Vec<String> = meetings
         .iter()
@@ -898,7 +902,7 @@ mod tests {
 
         let nothing = HashSet::new();
         let (whole, whole_sources) =
-            build_vault_context_visible(&db, "", crate::summarize::roles::CONN_LOCAL, &nothing)
+            build_vault_context_visible(&db, "", crate::summarize::roles::CONN_LOCAL, &nothing, None)
                 .unwrap();
         assert!(whole.contains("LOCAL-BUDGET-EVIDENCE"));
         assert_eq!(whole_sources.len(), 1);
@@ -963,14 +967,14 @@ mod tests {
 
         // Visibility-aware variant with an empty set agrees with the shim.
         let nothing = HashSet::new();
-        let (c0, _) = build_vault_context_visible(&db, "SECRET", "anthropic", &nothing).unwrap();
+        let (c0, _) = build_vault_context_visible(&db, "SECRET", "anthropic", &nothing, None).unwrap();
         assert!(!c0.contains("LOCKED-SECRET"));
 
         // Session-unlock the folder → its content is now legitimately available.
         let mut unlocked = HashSet::new();
         unlocked.insert("f-locked".to_string());
         let (corpus2, sources2) =
-            build_vault_context_visible(&db, "SECRET", "anthropic", &unlocked).unwrap();
+            build_vault_context_visible(&db, "SECRET", "anthropic", &unlocked, None).unwrap();
         assert!(
             corpus2.contains("LOCKED-SECRET"),
             "unlocked content must reappear"
@@ -1088,7 +1092,7 @@ mod tests {
 
         let nothing = HashSet::new();
         let (corpus, sources) =
-            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &nothing, None)
+            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &nothing, None, None)
                 .unwrap();
         assert!(
             corpus.contains("OPEN-SECRET"),
@@ -1103,7 +1107,7 @@ mod tests {
         let mut unlocked = HashSet::new();
         unlocked.insert("f-locked".to_string());
         let (corpus2, _) =
-            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &unlocked, None)
+            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &unlocked, None, None)
                 .unwrap();
         assert!(
             corpus2.contains("LOCKED-SECRET"),
@@ -1830,7 +1834,7 @@ mod tests {
         let nothing = HashSet::new();
         // Whole-vault (the `None`/no-picker path): BOTH meetings present (empty query → recent list).
         let (whole, whole_sources) =
-            build_vault_context_visible(&db, "", "anthropic", &nothing).unwrap();
+            build_vault_context_visible(&db, "", "anthropic", &nothing, None).unwrap();
         assert!(whole.contains("WHOLE-A"), "whole-vault contains meeting A");
         assert!(whole.contains("WHOLE-B"), "whole-vault contains meeting B");
         assert_eq!(whole_sources.len(), 2);

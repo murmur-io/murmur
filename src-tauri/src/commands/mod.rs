@@ -6017,6 +6017,14 @@ pub async fn ask_vault(
     // path is used and the item is packed FIRST, gated by `get_org_item` (tombstoned/disabled-org
     // ⇒ nothing). FE camelCase `pinnedOrgItemId`. `None`/empty ⇒ byte-identical to before.
     pinned_org_item_id: Option<String>,
+    // CONTAINER SCOPE (FE camelCase `scopeFolderIds`): answer from what is filed under these
+    // Spaces/folders, subtree included. This is a RETRIEVAL narrowing, not pinned content — the
+    // corpus is still assembled by search and ranking, just inside the scope, so scoping a folder
+    // with a hundred notes costs what five cost. `None`/empty ⇒ byte-identical whole-vault
+    // behaviour. It is a separate parameter from `explicit_sources` on purpose: a container is
+    // deliberately not a content source (`LinkKind::is_content_source`), and overloading that list
+    // would put a place where the packer expects text.
+    scope_folder_ids: Option<Vec<String>>,
     // The BOARD this question was asked from. Present ⇒ its DERIVED tiles (promises, drift,
     // pulse, reminders, person, living answer) are rendered as a labelled brief and prepended to
     // the pinned corpus — the tiles the user is looking at, which `get_dashboard_sources`
@@ -6042,6 +6050,7 @@ pub async fn ask_vault(
         ask_thread_id,
         explicit_sources,
         pinned_org_item_id,
+        scope_folder_ids,
         dashboard_id,
         None,
         None,
@@ -6059,6 +6068,7 @@ pub(crate) async fn ask_vault_inner(
     ask_thread_id: Option<String>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
     pinned_org_item_id: Option<String>,
+    scope_folder_ids: Option<Vec<String>>,
     dashboard_id: Option<String>,
     authoritative_snapshot: Option<DurableScopeSnapshot>,
     authoritative_dashboard: Option<dashboards::DashboardContextWitness>,
@@ -6100,6 +6110,9 @@ pub(crate) async fn ask_vault_inner(
     // BYTE-IDENTICAL to before.
     let pinned_sources = explicit_sources.filter(|s| !s.is_empty());
     let pinned_org = pinned_org_item_id.filter(|s| !s.trim().is_empty());
+    // Empty ⇒ None, so "scope with nothing selected" is the whole vault rather than a scope that
+    // matches no folder and would silently answer "I found nothing".
+    let scope_folders = scope_folder_ids.filter(|ids| !ids.is_empty());
     // A BOARD is a scope in its own right. Gating this on `pinned_sources` alone meant a
     // board whose tiles are ALL derived — a Promise ledger and nothing else, which is
     // precisely the case this exists for — produced an empty source list, missed the
@@ -6175,6 +6188,7 @@ pub(crate) async fn ask_vault_inner(
                 &state.heavy_inference,
                 pinned_sources,
                 pinned_org,
+                scope_folders.clone(),
                 dispatch_admission.clone(),
             )
             .await?
@@ -6261,6 +6275,7 @@ pub(crate) async fn ask_vault_inner(
         &state.heavy_inference,
         None, // whole-vault path: no explicit sources ⇒ the existing search corpus, unchanged.
         None, // …and no pinned org item — this is the vault-wide fallthrough.
+        None, // …and no container scope: this fallthrough is the whole vault by definition.
         dispatch_admission,
     )
     .await?;
@@ -6422,6 +6437,7 @@ async fn ask_vault_floor(
         heavy,
         explicit_sources,
         pinned_org_item_id,
+        None, // unauthorized-dispatch helper: no container scope
         None,
     )
     .await
@@ -6439,6 +6455,7 @@ async fn ask_vault_floor_authorized(
     heavy: &std::sync::Arc<tokio::sync::Semaphore>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
     pinned_org_item_id: Option<String>,
+    scope_folder_ids: Option<Vec<String>>,
     dispatch_admission: crate::state::ContentDispatchAdmission,
 ) -> Result<AskVaultResult, AppError> {
     ask_vault_floor_core(
@@ -6452,6 +6469,7 @@ async fn ask_vault_floor_authorized(
         heavy,
         explicit_sources,
         pinned_org_item_id,
+        scope_folder_ids,
         Some(dispatch_admission),
     )
     .await
@@ -6529,6 +6547,7 @@ async fn ask_vault_floor_core(
     heavy: &std::sync::Arc<tokio::sync::Semaphore>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
     pinned_org_item_id: Option<String>,
+    scope_folder_ids: Option<Vec<String>>,
     dispatch_admission: Option<crate::state::ContentDispatchAdmission>,
 ) -> Result<AskVaultResult, AppError> {
     // `build_ask_vault_floor_prompt` does the LOCAL/on-device work — query embedding (Candle/
@@ -6546,6 +6565,7 @@ async fn ask_vault_floor_core(
     let question_owned = question.to_string();
     let history_owned = history.to_vec();
     let memory_brief_owned = memory_brief.to_string();
+    let scope_folder_ids_owned = scope_folder_ids;
     let prompt = tokio::task::spawn_blocking(move || {
         build_ask_vault_floor_prompt(
             &db_for_prompt,
@@ -6557,6 +6577,7 @@ async fn ask_vault_floor_core(
             reranker.as_deref(),
             explicit_sources.as_deref(),
             pinned_org_item_id.as_deref(),
+            scope_folder_ids_owned.as_deref(),
         )
     })
     .await
@@ -6711,7 +6732,7 @@ pub fn topic_threads(state: State<'_, AppState>) -> Result<Vec<TopicThread>, App
     // blanking (and a sealed meeting's topics never surface cross-meeting).
     let unlocked = unlocked_snapshot(state.inner())?;
     let mut input = Vec::new();
-    for m in state.db.list_meetings_visible(500, &unlocked)? {
+    for m in state.db.list_meetings_visible(500, &unlocked, None)? {
         let Some(json) = state.db.get_timeline_data(&m.id)? else {
             continue;
         };
@@ -7911,7 +7932,7 @@ pub(crate) fn finish_related_meetings_result(
 /// backfill (zero vectors) still runs for visible documents that have no chunks yet, so keyword
 /// retrieval covers the write-only legacy rows.
 ///
-/// GATING (lock-model): the corpus is exactly `list_meetings_visible(unlocked)` — a sealed-and-not-
+/// GATING (lock-model): the corpus is exactly `list_meetings_visible(unlocked, None, None)` — a sealed-and-not-
 /// session-unlocked meeting is NEVER returned, so its plaintext is never chunked/embedded and its
 /// chunks STAY purged. Each meeting's note is re-checked through `get_note_if_visible(unlocked)`
 /// before `index_meeting_chunks` (PURGE-then-reinsert, so stale stub vectors are replaced).
@@ -7955,7 +7976,7 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
 
     // The corpus is the visibility-gated meeting list. `list_meetings_visible` already excludes
     // sealed-and-not-session-unlocked meetings (their notes are not visible under `visibility_clause`).
-    let meetings = db.list_meetings_visible(100_000, unlocked)?;
+    let meetings = db.list_meetings_visible(100_000, unlocked, None)?;
     let total = meetings.len();
 
     let mut indexed = 0usize;
@@ -8265,7 +8286,7 @@ pub(crate) fn backfill_missing_brain_indexes_capped(
     // MEETING half — flag + model gated (see the gating matrix above).
     let mut meetings = 0usize;
     if semantic_enabled && model_present {
-        for m in db.list_meetings_visible(100_000, &empty)? {
+        for m in db.list_meetings_visible(100_000, &empty, None)? {
             if remaining == 0 {
                 tracing::info!(
                     target: "rag",

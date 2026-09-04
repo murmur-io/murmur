@@ -708,7 +708,7 @@ pub(crate) fn build_explain_prompt(
 fn build_corpus(db: &Db) -> Result<Vec<CorpusDoc>> {
     let no_unlocks: HashSet<String> = HashSet::new();
     let mut corpus = Vec::new();
-    for m in db.list_meetings_visible(AUDIT_MAX_MEETINGS, &no_unlocks)? {
+    for m in db.list_meetings_visible(AUDIT_MAX_MEETINGS, &no_unlocks, None)? {
         let Some(note) = db.get_note_if_visible(&m.id, &no_unlocks)? else {
             continue;
         };

@@ -352,7 +352,8 @@ fn packed_with_provider(
             None,
             sources,
             None,
-        )
+        None,
+    )
         .unwrap()
         {
             AskFloorPrompt::Ready { system, user, .. } => Some(format!("{system}\n{user}")),

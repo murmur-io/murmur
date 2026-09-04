@@ -473,7 +473,7 @@ mod tests {
         let unlocked = HashSet::new(); // OPEN content only — the app's gate.
 
         let meetings = db
-            .list_meetings_visible(limit, &unlocked)
+            .list_meetings_visible(limit, &unlocked, None)
             .expect("list visible meetings");
 
         let mut total_receipts = 0usize;
