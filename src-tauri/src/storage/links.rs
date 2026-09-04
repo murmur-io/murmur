@@ -137,6 +137,7 @@ pub(crate) fn meeting_sealed_at_rest_tx(
 ///   * NOT the reserved always-open note root (`is_root` — the synthetic "Not classified" Notes
 ///     section, which is a presentation device, not a place);
 ///   * a real hierarchy level (`project` = a Space, `folder`).
+///
 /// The LOCK half is NOT here: it is the caller's `visibility_clause`, so a session-unlocked sealed
 /// container stays linkable exactly as long as the session says it is.
 const CONTAINER_ENDPOINT_STRUCTURE: &str = "COALESCE(f.kind, 'meeting') IN ('meeting','note')

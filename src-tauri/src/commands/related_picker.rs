@@ -611,6 +611,10 @@ pub async fn list_related_picker_items(
 }
 
 /// Inner of [`list_related_picker_items`] — the refusal and the clamp, unit-testable.
+///
+/// The arguments deliberately mirror the public IPC command one-for-one; keeping that boundary
+/// explicit makes the lock refusal and page clamp directly testable without constructing an app.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn related_picker_items_inner(
     db: &crate::storage::db::Db,
     unlocked: &std::collections::HashSet<String>,

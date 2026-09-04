@@ -447,6 +447,10 @@ impl Db {
     /// over the SAME stable orderings the tree uses, so paging is deterministic; the caller
     /// supplies breadcrumbs from the hierarchy it already holds, which is why nothing here
     /// returns a path.
+    ///
+    /// The visibility sets stay explicit because each is a separate privacy boundary: session
+    /// unlocks, hierarchy reachability, and breadcrumb matches must never be interchangeable.
+    #[allow(clippy::too_many_arguments)]
     pub fn related_picker_search(
         &self,
         query: &str,

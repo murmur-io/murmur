@@ -3162,9 +3162,9 @@ impl Db {
         };
         let mut evicted = false;
         for item_id in item_ids {
-            evicted |= Self::tombstone_org_item_tx(&tx, &item_id)?;
+            evicted |= Self::tombstone_org_item_tx(tx, &item_id)?;
         }
-        Self::purge_org_document_links_tx(&tx, org_id, doc_id)?;
+        Self::purge_org_document_links_tx(tx, org_id, doc_id)?;
         Ok(evicted)
     }
 
