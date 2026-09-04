@@ -1593,7 +1593,23 @@ fn release_stream_masters(state: &AppState, meeting_id: &str) {
     if keep_hires {
         return;
     }
-    // A locked folder's at-rest audio is owned by the lock model; never interleave with it.
+    // A DURABLY locked folder's at-rest audio is owned by the lock model and the prune; never
+    // interleave with it. `meeting_is_unlocked` is NOT this test — it answers true for a locked
+    // folder that is session-unlocked, which is the only locked state that can reach here at all
+    // (retry itself requires it). Round-3 review caught that: the guard was real defence, but not
+    // the one its comment claimed. Both checks are kept; they cover different things.
+    match state.db.folders_for_meeting(meeting_id) {
+        Ok(folder_ids) => {
+            for folder_id in folder_ids {
+                match state.db.folder_by_id(&folder_id) {
+                    Ok(Some(folder)) if !folder.locked => {}
+                    _ => return, // durably locked, dangling, or unreadable → leave it alone
+                }
+            }
+        }
+        Err(_) => return,
+    }
+    // And abort if a relock landed mid-retry and closed the session gate.
     if !matches!(crate::commands::meeting_is_unlocked(state, meeting_id), Ok(true)) {
         return;
     }

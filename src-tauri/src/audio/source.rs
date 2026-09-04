@@ -2783,6 +2783,12 @@ pub(crate) fn publish_stream_master(
     match publish_stream_master_tail(&temp, final_path, &staged) {
         Ok(published) => Ok(published),
         Err(error) => {
+            // Drop the staging link FIRST. `verify_existing_file` is
+            // `verify_existing_file_with_nlink(path, 1)`, so while the link survives the destination
+            // has two owned paths and the identity check below would `Err` — skipping the undo on
+            // every tail failure except the last one. Round-3 review caught exactly that: the
+            // comment above promised an undo the implementation did not perform.
+            let _ = std::fs::remove_file(&temp);
             // Exact deletion only: remove `final_path` if and only if it still names the inode we
             // just published. Anything else is somebody else's file.
             if let Ok(current) = verify_existing_file(final_path) {
@@ -2791,7 +2797,6 @@ pub(crate) fn publish_stream_master(
                     let _ = sync_parent_dir(final_path, "sync stream master directory");
                 }
             }
-            let _ = std::fs::remove_file(&temp);
             Err(error)
         }
     }
