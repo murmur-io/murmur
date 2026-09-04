@@ -196,13 +196,23 @@ export class LinkPickerComponent {
   }
 
   /** Drop the anchor item (the thing this picker links FROM) so it can't be picked as its own target. */
+  /**
+   * Drop what must not be offered as a `[[` target: the anchor itself, and CONTAINERS.
+   *
+   * `list_link_candidates` gained a container leg so a Space/folder can be picked as an Ask SCOPE.
+   * A wikilink is a different thing — it points at a document — and a Space is not one, so folder
+   * names must not become insertable link targets here. Both fetch paths (first page and
+   * load-more) go through this one filter, so the exclusion cannot be added to one and missed on
+   * the other.
+   */
   private withoutAnchor(rows: NoteCitation[]): NoteCitation[] {
+    const linkable = rows.filter((r) => r.kind !== "container");
     const k = this.excludeKind();
     const i = this.excludeId();
     if (!k || !i) {
-      return rows;
+      return linkable;
     }
-    return rows.filter((r) => !(r.kind === k && r.id === i));
+    return linkable.filter((r) => !(r.kind === k && r.id === i));
   }
 
   private async fetch(q: string): Promise<void> {

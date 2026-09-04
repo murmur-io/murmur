@@ -6153,7 +6153,12 @@ pub(crate) async fn ask_vault_inner(
             }
         }
         // A dashboard is a closed composite scope. Cross-vault user-memory would silently widen it.
-        let memory_brief = if composite.is_some() {
+        // A CONTAINER SCOPE is the same situation and takes the same answer: user-memory facts are
+        // stamped with the meeting they came from and `search_user_facts_visible` gates them on
+        // visibility but NOT on a folder, so they carry content from exactly the meetings the user
+        // just excluded — and `memory_block` puts them ABOVE the notes in the system prompt. Nothing
+        // sealed escapes either way; the point is that "scoped" has to mean scoped.
+        let memory_brief = if composite.is_some() || scope_folders.is_some() {
             String::new()
         } else {
             gated_memory_brief_for_injection(state, &unlocked, &question)

@@ -1736,3 +1736,102 @@ fn a_container_scope_alone_reaches_the_corpus_and_bounds_it() {
         "a scope on its own must bound the corpus, not be dropped",
     );
 }
+
+/// The SAME assertion on the SHIPPED default path.
+///
+/// The test above pins `semantic_search_enabled: false` to exercise the keyword builder. Semantic
+/// search ships ON, so that left the hybrid builder — which carried two of the four unscoped
+/// paths review found (its "recent meetings" fallback and the L1.5 temporal fallback) — with no
+/// end-to-end coverage at all. This is its twin.
+#[test]
+fn a_container_scope_bounds_the_corpus_on_the_default_semantic_path() {
+    let db = tmp_db();
+    db.insert_folder(&crate::storage::models::Folder {
+        id: "f-in".into(),
+        name: "Inside".into(),
+        path: "Inside".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-09-04T00:00:00Z".into(),
+    })
+    .unwrap();
+    seed_note(&db, "m-in", "Atlas Inside", "atlas lives inside", Some("f-in"));
+    seed_note(&db, "m-out", "Atlas Outside", "atlas lives outside", None);
+
+    // The DEFAULT: semantic search on. With an empty `vec_chunks` the KNN leg contributes nothing,
+    // so this exercises the hybrid builder's FTS + graph legs AND both of its fallbacks.
+    let cfg = AppConfig::default();
+    assert!(cfg.semantic_search_enabled, "the shipped default is semantic ON");
+    let unlocked = HashSet::new();
+    let scope = vec!["f-in".to_string()];
+
+    let scoped = match build_ask_vault_floor_prompt(
+        &db, &cfg, &unlocked, "atlas", &[], "", None, None, None, Some(&scope),
+    )
+    .unwrap()
+    {
+        AskFloorPrompt::Ready { sources, .. } => sources,
+        AskFloorPrompt::Empty(_) => panic!("the scoped folder has matching content"),
+    };
+    let ids: Vec<&str> = scoped.iter().map(|s| s.meeting_id.as_str()).collect();
+    assert_eq!(ids, vec!["m-in"], "the hybrid path is scoped too");
+
+    // A question that matches NOTHING inside the scope must not fall back to the vault. This is the
+    // branch that packed the 30 most recent meetings from everywhere.
+    let no_match = build_ask_vault_floor_prompt(
+        &db, &cfg, &unlocked, "zzzz-nothing-matches", &[], "", None, None, None, Some(&scope),
+    )
+    .unwrap();
+    if let AskFloorPrompt::Ready { sources, .. } = no_match {
+        let ids: Vec<&str> = sources.iter().map(|s| s.meeting_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"m-out"),
+            "the no-match fallback must stay inside the scope, got {ids:?}",
+        );
+    }
+}
+
+/// A meeting that is BOTH pinned and inside the scope appears ONCE.
+///
+/// The pinned+scope composition concatenates two source lists that were mutually exclusive before,
+/// so a repeat became possible for the first time. `AskVaultResult.sources` is rendered with
+/// `track s.origin?.orgItemId ?? s.meetingId`, and a duplicate track key is an Angular fault
+/// (NG0955), not merely a duplicate chip.
+#[test]
+fn a_meeting_pinned_inside_its_own_scope_is_not_listed_twice() {
+    use crate::storage::models::SourceRef;
+
+    let db = tmp_db();
+    db.insert_folder(&crate::storage::models::Folder {
+        id: "f-in".into(),
+        name: "Inside".into(),
+        path: "Inside".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-09-04T00:00:00Z".into(),
+    })
+    .unwrap();
+    seed_note(&db, "m-in", "Atlas Inside", "atlas lives inside", Some("f-in"));
+
+    let cfg = AppConfig {
+        semantic_search_enabled: false,
+        ..AppConfig::default()
+    };
+    let unlocked = HashSet::new();
+    let scope = vec!["f-in".to_string()];
+    let pinned = vec![SourceRef {
+        kind: crate::links::LinkKind::Meeting,
+        id: "m-in".into(),
+    }];
+
+    let sources = match build_ask_vault_floor_prompt(
+        &db, &cfg, &unlocked, "atlas", &[], "", None, Some(&pinned), None, Some(&scope),
+    )
+    .unwrap()
+    {
+        AskFloorPrompt::Ready { sources, .. } => sources,
+        AskFloorPrompt::Empty(_) => panic!("pinned + scoped content exists"),
+    };
+    let hits = sources.iter().filter(|s| s.meeting_id == "m-in").count();
+    assert_eq!(hits, 1, "pinned AND found inside the scope ⇒ one entry, got {sources:?}");
+}

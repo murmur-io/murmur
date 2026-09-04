@@ -9507,9 +9507,15 @@ pub(crate) fn note_snippet(markdown: &str) -> String {
 /// A meeting with no folder (`folder_id IS NULL` — Not classified) is outside every container and is
 /// therefore excluded by `IN`, which is the intended reading of "search inside this folder".
 ///
-/// Ids are folder UUIDs read back from the database, quoted the same way `visibility_clause` quotes
-/// the session unlock set. They are not user text; the folder NAME never reaches this SQL, which is
-/// why `folder_subtree_ids` resolves the subtree in Rust instead of with a `LIKE` over paths.
+/// Ids are quoted the same way `visibility_clause` quotes the session unlock set, and THAT is what
+/// makes this safe — not their provenance. They are usually folder UUIDs read back from the
+/// database, but `folder_subtree_ids` returns an unknown id verbatim, so a value that reached the
+/// backend from the frontend can land here. Doubling `'` inside a `'…'` literal is complete for
+/// SQLite (it has no backslash escapes in string literals), so `x') OR 1=1 --` renders as one
+/// literal. Do not remove the quoting on the belief that these are always internal ids.
+///
+/// The folder NAME still never reaches this SQL, which is why `folder_subtree_ids` resolves the
+/// subtree in Rust rather than with a `LIKE` over paths.
 pub(crate) fn folder_scope_clause(alias: &str, scope: Option<&[String]>) -> String {
     let Some(ids) = scope.filter(|ids| !ids.is_empty()) else {
         return String::new();

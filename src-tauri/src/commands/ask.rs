@@ -676,7 +676,18 @@ pub(crate) fn build_ask_vault_floor_prompt(
         let remaining =
             crate::summarize::vault_context::budget_for(&ask_conn).saturating_sub(corpus.len());
         corpus.extend(found.chars().take(remaining));
-        sources.extend(found_sources);
+        // DEDUPE by meeting. Pinning a meeting that also lives inside the scoped Space is a natural
+        // thing to do, and before this composition existed the two halves were mutually exclusive
+        // branches so a repeat was structurally impossible. Now it is not: the same meeting can
+        // arrive from the pinned pack and again from the search. `AskVaultResult.sources` is passed
+        // to the FE unchanged and rendered with `track s.origin?.orgItemId ?? s.meetingId`, so a
+        // duplicate is a duplicate Angular track key (NG0955) — a rendering fault, not just noise.
+        // The PINNED entry is kept: it is the one the user asked for by name.
+        for source in found_sources {
+            if !sources.iter().any(|s| s.meeting_id == source.meeting_id) {
+                sources.push(source);
+            }
+        }
         (corpus, sources)
     };
     if corpus.trim().is_empty() {
