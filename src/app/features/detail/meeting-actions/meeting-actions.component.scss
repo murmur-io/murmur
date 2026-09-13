@@ -5,6 +5,21 @@
   display: none;
 }
 
+/* In the drawer the panel IS the surface, so it drops the card's frame, fill and
+   wash: glass on glass reads as a box inside a box, and the drawer already has
+   the border and shadow. `is-bare` follows the drawer mount (`showClose`). */
+.act.is-bare {
+  padding: var(--space-4) var(--space-2);
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.act.is-bare::before {
+  content: none;
+}
+
 .act {
   position: relative;
   display: flex;
@@ -52,9 +67,45 @@
   color: var(--text-muted);
   font-size: 0.8125rem;
 }
-.act-patch {
+/* Close × for the drawer mount. Same geometry + hover language as the note
+   reminders drawer's `.panel-close`, kept local because that class lives in
+   that component's own styles. */
+.act-close {
+  display: inline-flex;
   flex: none;
-  height: 34px;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.act-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.act-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Empty state — only ever rendered by a host that asked for it. */
+.act-empty p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+.act-empty .act-empty-hint {
+  margin-top: var(--space-2);
+  font-size: 0.8125rem;
+}
+.act-patch {
+  align-self: flex-start;
+  height: 32px;
   padding: 0 var(--space-3);
   font-size: 0.8125rem;
   font-weight: 600;
@@ -94,24 +145,27 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
 }
+/* FLAT rows (2026-09-13, user request: no borders on the items). Each row was a
+   filled, bordered box — three cards inside a card inside a drawer. Separation
+   now comes from a hairline between rows and from the hover wash, which is all a
+   list this short needs. */
 .act-row {
   display: flex;
   align-items: flex-start;
   gap: var(--space-3);
-  padding: var(--space-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--surface-input);
+  padding: var(--space-3) var(--space-2);
+  border-radius: var(--radius-sm);
   animation: rise 360ms var(--transition) both;
   animation-delay: calc(var(--i, 0) * 45ms + 60ms);
-  transition:
-    border-color var(--transition),
-    background var(--transition);
+  transition: background var(--transition);
+}
+.act-row + .act-row {
+  border-top: 1px solid var(--border-subtle);
+  border-radius: 0;
 }
 .act-row:hover {
-  border-color: var(--border-strong);
+  background: var(--surface-hover);
 }
 
 /* Read-only done/not-done mark (mirrors the analysis checklist). */
@@ -201,43 +255,47 @@
   letter-spacing: -0.01em;
 }
 
-/* --- Per-row Reminders affordance --- */
-.act-row-action {
+/* --- Per-row reminder affordance: ICON only --- */
+.act-add {
+  display: inline-flex;
   flex: none;
   align-self: center;
-}
-.act-add {
-  height: 30px;
-  padding: 0 var(--space-3);
-  font-size: 0.8125rem;
-  white-space: nowrap;
-}
-.act-added {
-  display: inline-flex;
   align-items: center;
+  justify-content: center;
+  width: 30px;
   height: 30px;
-  padding: 0 var(--space-3);
-  border-radius: var(--radius-pill);
-  background: var(--success-soft);
-  color: var(--success);
-  font-size: 0.8125rem;
-  font-weight: 600;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.act-add:hover {
+  background: var(--surface-hover);
+  color: var(--accent-text);
+}
+.act-add:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.act-add:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
   white-space: nowrap;
-  animation: rise 240ms var(--transition) both;
 }
-
-/* Per-row Reminder error (e.g. permission denied). */
-.act-row-error {
-  margin: calc(var(--space-1) * -1) 0 0;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid rgba(255, 107, 107, 0.3);
-  border-radius: var(--radius-md);
-  background: var(--danger-soft);
-  color: var(--text-primary);
-  font-size: 0.8125rem;
-  animation: rise 200ms var(--transition) both;
-}
-
 @media (max-width: 720px) {
   .act-row {
     flex-wrap: wrap;

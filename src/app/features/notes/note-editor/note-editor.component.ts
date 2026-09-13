@@ -61,7 +61,6 @@ import { NoteSelectionToolbarComponent } from "../note-selection-toolbar/note-se
 import { NoteChatComponent } from "../note-chat/note-chat.component";
 import { MurCopyIdComponent } from "../../../design-system/copy-id/copy-id.component";
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
-import { MurToggleComponent } from "../../../design-system/toggle/toggle.component";
 import { parseDoc, serializeDoc } from "./front-matter";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { NoteRemindersPanelComponent } from "../../reminders/note-reminders-panel/note-reminders-panel.component";
@@ -145,6 +144,7 @@ const FULL_WIDTH_KEY = "murmur-note-full-width";
  */
 const NOTE_CHAT_OPEN_KEY = "murmur-note-chat-open";
 const NOTE_REMINDERS_OPEN_KEY = "murmur-note-reminders-open";
+const NOTE_SMART_OPEN_KEY = "murmur-note-smart-open";
 
 /**
  * The full note editor (FP2): a centered document with a borderless title, a
@@ -176,7 +176,6 @@ const NOTE_REMINDERS_OPEN_KEY = "murmur-note-reminders-open";
     NoteSelectionToolbarComponent,
     NoteSharePanelComponent,
     NoteChatComponent,
-    MurToggleComponent,
     MurCopyIdComponent,
     MurIconComponent,
     NoteRemindersPanelComponent,
@@ -359,6 +358,10 @@ export class NoteEditorComponent {
   /** The per-note reminders drawer. Persisted like the chat drawer, and
    * mutually exclusive with it — see {@link toggleNoteReminders}. */
   readonly noteRemindersOpen = signal(this.readStoredRemindersOpen());
+  /** The per-note Smart-reminders drawer (2026-09-13: the card used to sit in
+   * the note body). Persisted and mutually exclusive like its two siblings —
+   * one tool column at a time. */
+  readonly noteSmartOpen = signal(this.readStoredSmartOpen());
 
   /** The note-kind folders (for the Move menu + breadcrumb). */
   readonly noteFolders = signal<NoteFolder[]>([]);
@@ -658,11 +661,22 @@ export class NoteEditorComponent {
    */
   private readonly _publishDrawerWidth = effect(() => {
     const open =
-      !this.embedded() && (this.noteChatOpen() || this.noteRemindersOpen());
+      !this.embedded() &&
+      (this.noteChatOpen() || this.noteRemindersOpen() || this.noteSmartOpen());
     document.documentElement.style.setProperty(
       "--note-drawer-open-w",
       open ? "var(--note-drawer-w)" : "0px",
     );
+  });
+
+  /** Persist the reminders drawer open state (mirrors {@link _persistChatOpen}). */
+  private readonly _persistSmartOpen = effect(() => {
+    const value = this.noteSmartOpen();
+    try {
+      localStorage.setItem(NOTE_SMART_OPEN_KEY, value ? "1" : "0");
+    } catch {
+      // Private-mode / storage-disabled — the preference is not persisted.
+    }
   });
 
   /** Persist the reminders drawer open state (mirrors {@link _persistChatOpen}). */
@@ -2349,6 +2363,7 @@ export class NoteEditorComponent {
     // window rather than giving the user two panes worth reading side by side.
     if (next) {
       this.noteRemindersOpen.set(false);
+      this.noteSmartOpen.set(false);
     }
   }
 
@@ -2358,6 +2373,17 @@ export class NoteEditorComponent {
     this.noteRemindersOpen.set(next);
     if (next) {
       this.noteChatOpen.set(false);
+      this.noteSmartOpen.set(false);
+    }
+  }
+
+  /** Toggle the per-note Smart-reminders drawer (header button). */
+  toggleNoteSmart(): void {
+    const next = !this.noteSmartOpen();
+    this.noteSmartOpen.set(next);
+    if (next) {
+      this.noteChatOpen.set(false);
+      this.noteRemindersOpen.set(false);
     }
   }
 
@@ -2380,6 +2406,24 @@ export class NoteEditorComponent {
         return false;
       }
       return localStorage.getItem(NOTE_REMINDERS_OPEN_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  /** As above, for the Smart-reminders drawer. Last in the restore order, so a
+   * storage state with several flags set resolves to exactly one open column
+   * (chat wins, then reminders) — the exclusion holds on restore, not only on
+   * the click that established it. */
+  private readStoredSmartOpen(): boolean {
+    try {
+      if (
+        localStorage.getItem(NOTE_CHAT_OPEN_KEY) === "1" ||
+        localStorage.getItem(NOTE_REMINDERS_OPEN_KEY) === "1"
+      ) {
+        return false;
+      }
+      return localStorage.getItem(NOTE_SMART_OPEN_KEY) === "1";
     } catch {
       return false;
     }

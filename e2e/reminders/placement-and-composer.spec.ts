@@ -38,21 +38,68 @@ const ONE_SUGGESTION = [
   },
 ];
 
-test("meeting follow-ups are reachable without scrolling past the whole note", async ({
+test("meeting follow-ups are one header click away, never buried in the note", async ({
   page,
 }) => {
   await mockTauri(page, {}, { audit_reminder_suggestions: ONE_SUGGESTION });
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/meeting/m-q2-roadmap");
 
-  const actions = page.locator("app-meeting-actions");
-  await expect(actions).toBeVisible();
+  // The affordance MOVED rather than disappeared (same shape as the note
+  // editor's Reminders toggle): the panel no longer sits in the note flow at
+  // all, so no note length can push it out of reach.
+  await expect(page.locator("app-note-panel app-meeting-actions")).toHaveCount(0);
+  const toggle = page.getByRole("button", { name: "Action items", exact: true });
+  await expect(toggle).toBeVisible();
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
 
-  const box = await actions.boundingBox();
+  await toggle.click();
+  const drawer = page.locator(".actions-drawer");
+  await expect(drawer).toBeVisible();
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+
+  // Fully inside the first viewport height, whatever the note is doing.
+  const box = await drawer.boundingBox();
   expect(box).not.toBeNull();
-  // Inside the first viewport height. Previously this sat at line ~455 of a
-  // 481-line template — below Summary, Decisions, Related and the Q&A log.
   expect(box!.y).toBeLessThan(900);
+
+  // The panel owns its close control; the header toggle owns the state.
+  await drawer.getByRole("button", { name: "Close action items" }).click();
+  await expect(drawer).toHaveCount(0);
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+});
+
+test("the two right-docked drawers never stack on top of each other", async ({
+  page,
+}) => {
+  await mockTauri(page, {}, { audit_reminder_suggestions: ONE_SUGGESTION });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/meeting/m-q2-roadmap");
+
+  await page.getByRole("button", { name: "Action items", exact: true }).click();
+  await expect(page.locator(".actions-drawer")).toBeVisible();
+
+  // Ask docks to the same right edge — opening it must retire the other one.
+  await page.getByRole("button", { name: "Ask", exact: true }).click();
+  await expect(page.locator(".ask-drawer")).toBeVisible();
+  await expect(page.locator(".actions-drawer")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Action items", exact: true }).click();
+  await expect(page.locator(".actions-drawer")).toBeVisible();
+  await expect(page.locator(".ask-drawer")).toHaveCount(0);
+});
+
+test("an opened drawer explains itself when the meeting has no action items", async ({
+  page,
+}) => {
+  await mockTauri(page, {}, { get_action_items: [], audit_reminder_suggestions: [] });
+  await page.goto("/meeting/m-q2-roadmap");
+
+  await page.getByRole("button", { name: "Action items", exact: true }).click();
+  const drawer = page.locator(".actions-drawer");
+  await expect(drawer).toBeVisible();
+  // An empty shell would read as a broken panel; the empty state says why.
+  await expect(drawer.getByText("No action items in this note yet.")).toBeVisible();
 });
 
 test("idle surface keeps its affordance but drops the branded card", async ({
@@ -65,21 +112,27 @@ test("idle surface keeps its affordance but drops the branded card", async ({
   );
   await page.goto("/notes/n-atlas-prd");
 
+  // The affordance MOVED rather than disappeared — twice now. 701be0fc replaced
+  // the card's inline create button with the note's Reminders drawer; 2026-09-13
+  // moved the card itself out of the note body into its own drawer. So an idle
+  // note carries NO review chrome at all, and the affordance is the header
+  // toggle beside the other two tool columns.
   const card = page.locator("app-smart-reminder-card");
-  // The affordance MOVED rather than disappeared: 701be0fc replaced the card's
-  // inline create button with the note's Reminders drawer, and both mounts of the
-  // card now pass `[showCreateAction]="false"`. With nothing to review, nothing to
-  // create from and no error, the card's whole template is gated out — so an idle
-  // surface renders no card chrome at all, and the affordance is the header toggle.
+  await expect(card).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Reminders", exact: true }),
   ).toBeVisible();
-  // The kicker and the imperative heading are gone when there is nothing to
-  // review. NOT asserted by its literal text: the template ships a CURLY
-  // apostrophe (U+2019) in "Don’t", so a straight-quote assertion would match
-  // zero nodes on unchanged code and be vacuously green forever.
-  await expect(card.locator(".smart-kicker")).toHaveCount(0);
-  await expect(card.locator("section.smart-card")).toHaveCount(0);
+
+  // Summoned with nothing to review, the pane accounts for itself instead of
+  // coming up blank. NOT asserted by the heading's literal text: the template
+  // ships a CURLY apostrophe (U+2019) in "Don’t", so a straight-quote assertion
+  // would match zero nodes on unchanged code and be vacuously green forever.
+  await page
+    .getByRole("button", { name: "Smart reminders", exact: true })
+    .click();
+  await expect(card.locator("section.smart-card")).toHaveCount(1);
+  await expect(card.locator(".smart-kicker")).toHaveCount(1);
+  await expect(card.getByText("Nothing to review right now.")).toBeVisible();
 });
 
 test("composer opens with a resolved due readback and preset chips", async ({

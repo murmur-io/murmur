@@ -43,6 +43,12 @@ test("live-context panel drives fetch/add/clear with attribution and no console 
 
   await page.goto("/meeting/m-atlas-roadmap");
 
+  // Live context lives in a right-docked drawer now (2026-09-13); the header
+  // toggle OPENS it, and the egress still happens behind the panel's own
+  // labelled button inside.
+  await expect(page.locator("app-stage2-panel")).toHaveCount(0);
+  await page.getByRole("button", { name: "Live context", exact: true }).click();
+
   const panel = page.locator("app-stage2-panel");
   await expect(panel).toBeVisible();
 

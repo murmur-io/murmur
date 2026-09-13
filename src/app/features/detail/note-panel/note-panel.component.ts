@@ -18,9 +18,7 @@ import type {
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
 import { ConnectionsComponent } from "../../../shared/connections/connections.component";
-import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
 import { RelatedMeetingsComponent } from "../related-meetings/related-meetings.component";
-import { Stage2PanelComponent } from "../stage2-panel/stage2-panel.component";
 import { ToastService } from "../../../services/toast.service";
 import {
   NoteAttachmentService,
@@ -132,9 +130,7 @@ export interface AssistantQa {
     MarkdownComponent,
     AssistantSourcesComponent,
     ConnectionsComponent,
-    MeetingActionsComponent,
     RelatedMeetingsComponent,
-    Stage2PanelComponent,
   ],
   templateUrl: "./note-panel.component.html",
   styleUrl: "./note-panel.component.scss",
@@ -227,6 +223,13 @@ export class NotePanelComponent {
   readonly exportMaster = output<"mic" | "sys">();
   readonly linkGraph = output<void>();
   /** Bubbles the live-context panel's apply/clear up so the parent reloads the note. */
+  /**
+   * Bubbles a note rewrite up so the shell refetches. Live context used to be
+   * this panel's only emitter; it moved into its own drawer (2026-09-13) and
+   * emits straight to the shell, so this stays for the panel's OWN writes (the
+   * editor save path) and for any future in-flow surface. The shell's binding
+   * is therefore not dead — it is the same handler, one hop shorter.
+   */
   readonly noteChanged = output<void>();
   readonly edit = output<void>();
   readonly cancelEdit = output<void>();

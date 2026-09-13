@@ -516,8 +516,9 @@ const SCENES = {
     },
   },
 
-  /* 5. Action items. The scroll IS the action — they start at y≈637 and run past
-   *    the fold, so revealing them is both the reframe and the motion. */
+  /* 5. Action items. They live in a right-docked drawer now (2026-09-13), so the
+   *    OPENING is the action: one click on the header toggle slides the panel in.
+   *    The old scroll-to-reveal is gone with the inline card it revealed. */
   noteActions: {
     transition: "cut",
     async run(page, film) {
@@ -528,11 +529,12 @@ const SCENES = {
       film.frame("lower", { ms: 10 });
       film.title("Owners. Dates. *Done.*", {
         kicker: "Action items",
-        sub: "Into Apple Reminders or Obsidian Tasks.",
+        sub: "Into your reminders, or into the note itself.",
         dur: 4200,
       });
       await film.wait(500);
-      await film.reveal("app-meeting-actions");
+      await film.click('button[aria-label="Action items"]');
+      await film.reveal(".actions-drawer");
       await film.assertClean("noteActions");
       await film.wait(3100);
     },

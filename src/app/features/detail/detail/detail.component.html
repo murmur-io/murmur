@@ -1,4 +1,12 @@
-<section class="detail">
+<!-- `has-drawer` reserves the docked drawer's column so the page CONTENT — the
+     whole command row included — never ends up underneath a fixed overlay the
+     user then cannot click through. Before this, opening a drawer put the Ask
+     toggle (and, once the command bar joined the title row, Convert /
+     Re-summarize / Edit / More) behind it. -->
+<section
+  class="detail"
+  [class.has-drawer]="openDrawer() !== null && !locked() && !!detail()"
+>
   <a routerLink="/library" class="back">
     <span class="back-arrow" aria-hidden="true">←</span>
     <span>Meetings</span>
@@ -153,7 +161,172 @@
            Hidden while locked (nothing to ask a masked meeting). Inline SVG spark
            glyph (no icon lib, per convention); mirrors note-editor's Ask Brain. -->
       @if (!locked()) {
+        <!-- EVERY command for this meeting lives on the title row (2026-09-13,
+             user request: "wszystko powinno być w jednej linii obok tytułu").
+             The command bar used to be its own full-width card between the
+             header and the tabs, which cost a whole band of vertical space and
+             split one set of controls across two rows. It keeps its own
+             component + menus; only its chrome and its position changed. On a
+             narrow window `.head` wraps the cluster under the title rather than
+             squeezing it. -->
         <div class="head-actions">
+          <!-- VIEW SWITCHER (Note · Audio · Share) — icons, first in the row:
+               it selects WHAT you are looking at, so it reads before the
+               controls that act on it. It used to be a full-width segmented
+               band under the header; that band is gone. -->
+          <app-detail-tabs
+            [tabs]="detailTabs"
+            [active]="activeTab()"
+            (tabChange)="onDetailTabChange($event)"
+          />
+
+          <app-meeting-command-bar
+            [meetingId]="d.meeting.id"
+            [folderId]="d.meeting.folderId ?? null"
+            [notePresent]="!!note()"
+            [provenance]="provenanceLabel()"
+            [busy]="busy()"
+            [converting]="converting()"
+            [renaming]="renaming()"
+            [editing]="editing()"
+            [exporting]="exporting()"
+            [exportingCanvas]="exportingCanvas()"
+            [linking]="linking()"
+            [keepsMasters]="keepsMasters()"
+            [hasAudio]="!!audioSrc()"
+            [moveOpen]="moveOpen()"
+            [exportMsg]="exportMsg()"
+            (convert)="convertToNote(d.meeting.id, $event)"
+            (resummarize)="resummarize(d.meeting.id)"
+            (rename)="startRename()"
+            (move)="toggleMove()"
+            (moved)="onMoved($event)"
+            (closeMove)="closeMove()"
+            (delete)="askDelete()"
+            (copyMd)="copyMarkdown()"
+            (saveMd)="saveMarkdown(d.meeting.id, d.meeting.title)"
+            (savePdf)="saveAsPdf()"
+            (exportCanvas)="exportCanvas(d.meeting.id)"
+            (saveAudio)="saveAudio(d.meeting.id, d.meeting.title)"
+            (exportMaster)="exportMaster($event, d.meeting.id, d.meeting.title)"
+            (linkGraph)="linkGraph()"
+            (edit)="startEdit()"
+          />
+
+          <!-- Action items — summons the right-side follow-up drawer (below).
+               Icon-only, sitting beside Ask because it is the same kind of
+               control: a view OF this meeting, not an action on it. Mirrors the
+               note editor's Reminders toggle. -->
+          <button
+            type="button"
+            class="btn btn-ghost head-chat-btn"
+            [class.is-active]="actionsDrawerOpen()"
+            [attr.aria-expanded]="actionsDrawerOpen()"
+            aria-label="Action items"
+            title="Action items for this meeting"
+            (click)="toggleActionsDrawer()"
+          >
+            <svg
+              class="head-chat-glyph"
+              viewBox="0 0 16 16"
+              width="13"
+              height="13"
+              fill="none"
+              aria-hidden="true"
+            >
+              <path
+                d="M2.5 4.2 4 5.7l2.4-2.6M2.5 11.2 4 12.7l2.4-2.6"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M8.6 4.6h5M8.6 11.6h5"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+
+          <!-- Live context — connector enrichment. The TOGGLE only opens the
+               pane; the egress itself still happens behind the pane's own
+               labelled "Fetch live context" button, beside its "sends a query
+               out" pill. An unlabelled icon must never be the thing that sends
+               a query off the device. -->
+          <button
+            type="button"
+            class="btn btn-ghost head-chat-btn"
+            [class.is-active]="liveDrawerOpen()"
+            [attr.aria-expanded]="liveDrawerOpen()"
+            aria-label="Live context"
+            title="Live context from your connectors"
+            (click)="toggleLiveDrawer()"
+          >
+            <svg
+              class="head-chat-glyph"
+              viewBox="0 0 18 18"
+              width="13"
+              height="13"
+              fill="none"
+              aria-hidden="true"
+            >
+              <circle cx="9" cy="9" r="2" fill="currentColor" />
+              <path
+                d="M5.6 12.4a4.8 4.8 0 0 1 0-6.8M12.4 5.6a4.8 4.8 0 0 1 0 6.8"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+              <path
+                d="M3.3 14.7a8 8 0 0 1 0-11.4M14.7 3.3a8 8 0 0 1 0 11.4"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+
+          <!-- Smart reminders — the local suggestion surface, in its own drawer
+               (2026-09-13, user request). Sparkle-on-bell: the SUGGESTED sibling
+               of the plain action-items checklist. -->
+          <button
+            type="button"
+            class="btn btn-ghost head-chat-btn"
+            [class.is-active]="smartDrawerOpen()"
+            [attr.aria-expanded]="smartDrawerOpen()"
+            aria-label="Smart reminders"
+            title="Smart reminders for this meeting"
+            (click)="toggleSmartDrawer()"
+          >
+            <svg
+              class="head-chat-glyph"
+              viewBox="0 0 18 18"
+              width="13"
+              height="13"
+              fill="none"
+              aria-hidden="true"
+            >
+              <path
+                d="M8.6 3.3a3.8 3.8 0 0 0-3.8 3.8v2L3.6 11.4h10l-1.2-2.3v-2a3.8 3.8 0 0 0-3.8-3.8Z"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M7.1 13.3a1.6 1.6 0 0 0 3 0"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+              <path
+                d="m14.6 2 .5 1.4 1.4.5-1.4.5-.5 1.4-.5-1.4-1.4-.5 1.4-.5.5-1.4Z"
+                fill="currentColor"
+              />
+            </svg>
+          </button>
+
           <button
             type="button"
             class="btn btn-ghost head-chat-btn"
@@ -306,45 +479,6 @@
         </div>
       }
 
-      <app-meeting-command-bar
-        [meetingId]="d.meeting.id"
-        [folderId]="d.meeting.folderId ?? null"
-        [notePresent]="!!note()"
-        [provenance]="provenanceLabel()"
-        [busy]="busy()"
-        [converting]="converting()"
-        [renaming]="renaming()"
-        [editing]="editing()"
-        [exporting]="exporting()"
-        [exportingCanvas]="exportingCanvas()"
-        [linking]="linking()"
-        [keepsMasters]="keepsMasters()"
-        [hasAudio]="!!audioSrc()"
-        [moveOpen]="moveOpen()"
-        [exportMsg]="exportMsg()"
-        (convert)="convertToNote(d.meeting.id, $event)"
-        (resummarize)="resummarize(d.meeting.id)"
-        (rename)="startRename()"
-        (move)="toggleMove()"
-        (moved)="onMoved($event)"
-        (closeMove)="closeMove()"
-        (delete)="askDelete()"
-        (copyMd)="copyMarkdown()"
-        (saveMd)="saveMarkdown(d.meeting.id, d.meeting.title)"
-        (savePdf)="saveAsPdf()"
-        (exportCanvas)="exportCanvas(d.meeting.id)"
-        (saveAudio)="saveAudio(d.meeting.id, d.meeting.title)"
-        (exportMaster)="exportMaster($event, d.meeting.id, d.meeting.title)"
-        (linkGraph)="linkGraph()"
-        (edit)="startEdit()"
-      />
-
-      <!-- TAB BAR (Note · Audio · Share) — page-scale segmented control. -->
-      <app-detail-tabs
-        [tabs]="detailTabs"
-        [active]="activeTab()"
-        (tabChange)="onDetailTabChange($event)"
-      />
 
       <!-- One panel per active tab. Each owns its own inline styles (the
            reason for the split) + hosts the reused sub-components. -->
@@ -465,6 +599,82 @@
            the `askDrawerOpen() && !locked()` reactive guard tears it down the
            moment the meeting locks while open. `d.meeting` is the current
            (unlocked) meeting — safe to pass its title/id. -->
+      <!-- Action items + Smart reminders — the meeting's follow-up surfaces, in a
+           FLOATING, OPAQUE right-docked drawer (T3: var(--surface-overlay),
+           backdrop-filter:none — NOT the frosted .card). They used to sit inline
+           at the top of the Note tab; they live here now so the note reads as a
+           note, and so they survive tab switches. `!locked()` mirrors the Ask
+           drawer's reactive guard: a meeting that locks while the drawer is open
+           tears it down. -->
+      @if (actionsDrawerOpen() && !locked()) {
+        <aside
+          class="actions-drawer"
+          aria-label="Action items for this meeting"
+        >
+          <app-meeting-actions
+            [meetingId]="d.meeting.id"
+            [meetingTitle]="d.meeting.title"
+            [sourceRevision]="d.note?.markdown ?? null"
+            [showClose]="true"
+            [showEmptyState]="true"
+            (closed)="closeActionsDrawer()"
+          />
+        </aside>
+      }
+
+      <!-- Live context — the connector-enrichment surface, moved out of the note
+           flow (2026-09-13). Same docked frame + lock guard as its siblings. -->
+      @if (liveDrawerOpen() && !locked()) {
+        <aside class="live-drawer" aria-label="Live context for this meeting">
+          <div class="drawer-head">
+            <h2>Live context</h2>
+            <button
+              type="button"
+              class="drawer-close"
+              aria-label="Close live context"
+              title="Close live context"
+              (click)="closeLiveDrawer()"
+            >
+              <svg
+                viewBox="0 0 16 16"
+                width="14"
+                height="14"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="m4 4 8 8M12 4l-8 8"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </button>
+          </div>
+          <app-stage2-panel
+            [meetingId]="d.meeting.id"
+            (noteChanged)="reloadDetail()"
+          />
+        </aside>
+      }
+
+      <!-- Smart reminders — same docked frame and the same reactive lock guard
+           as the other two. It used to sit inline in the Note tab. -->
+      @if (smartDrawerOpen() && !locked()) {
+        <aside class="smart-drawer" aria-label="Smart reminders for this meeting">
+          <app-smart-reminder-card
+            sourceKind="meeting"
+            [sourceId]="d.meeting.id"
+            [sourceTitle]="d.meeting.title ?? 'Meeting'"
+            [sourceRevision]="d.note?.markdown ?? null"
+            [showCreateAction]="false"
+            [showClose]="true"
+            [showEmptyState]="true"
+            (closed)="closeSmartDrawer()"
+          />
+        </aside>
+      }
+
       @if (askDrawerOpen() && !locked()) {
         <aside class="ask-drawer" aria-label="Ask about this meeting">
           <app-meeting-chat

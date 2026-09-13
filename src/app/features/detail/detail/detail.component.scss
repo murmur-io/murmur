@@ -7,6 +7,20 @@
      instead of the viewport after the entrance animation finishes. */
   animation: rise 380ms var(--transition) backwards;
 }
+/* ONE source of truth for the docked drawers' width: the drawer boxes below use
+   it, and the page reserves exactly that much room while one is open. */
+:host {
+  --detail-drawer-w: clamp(320px, 30vw, 420px);
+}
+.detail.has-drawer {
+  padding-right: calc(var(--detail-drawer-w) + var(--space-4));
+  transition: padding-right var(--transition);
+}
+@media (prefers-reduced-motion: reduce) {
+  .detail.has-drawer {
+    transition: none;
+  }
+}
 
 /* --- Back link --- */
 .back {
@@ -50,13 +64,26 @@
 .head h2 {
   margin: 0;
 }
-/* Header actions cluster (the ✦ Ask summon button), right-aligned by the
-   .head's space-between; never shrinks below its content. */
+/* Header actions cluster — the WHOLE command set for this meeting (command bar
+   + the Action items and Ask drawer toggles) on the title row, right-aligned by
+   the .head's space-between.
+   `flex: 1 1 auto`, not `flex: none`: the cluster takes the row's slack, and a
+   flex item's implicit `min-width: auto` already stops it shrinking below its
+   own icons — so when the window is too narrow for title AND controls, .head's
+   `flex-wrap` drops the cluster onto its own row instead of squeezing the
+   title. No explicit min-width: an over-large one would force that wrap EARLY,
+   and the controls are icon-sized now (the app opens at 1170px wide). */
 .head-actions {
-  display: inline-flex;
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: var(--space-2);
-  flex: none;
+}
+/* The bar is one member of that cluster and may take the slack inside it. */
+.head-actions app-meeting-command-bar {
+  min-width: 0;
 }
 /* Ask summon toggle (ported from note-editor's Ask Brain): the glyph adopts the
    accent, and the active (drawer-open) state reads as a pressed neutral pill
@@ -94,7 +121,7 @@
   right: 0;
   bottom: 0;
   z-index: 100;
-  width: clamp(320px, 30vw, 420px);
+  width: var(--detail-drawer-w);
   display: flex;
   flex-direction: column;
   background: var(--surface-overlay);
@@ -103,6 +130,83 @@
   border-left: 1px solid var(--border-strong);
   box-shadow: var(--shadow-lg);
   animation: ask-drawer-in var(--transition);
+}
+/* Action items drawer — same right-docked frame as `.ask-drawer` (T3 opaque),
+   with its own scroll because the panel is a stack of cards rather than a chat
+   that owns one. Padding, not a bare surface: the cards inside keep their own
+   glass edges. */
+.actions-drawer,
+.live-drawer {
+  padding: var(--space-4);
+  gap: var(--space-4);
+  overflow-y: auto;
+}
+/* The smart panel is a pane in its own right — fixed header band, its own
+   scrolling body — so this drawer supplies the frame and nothing else. */
+.smart-drawer {
+  overflow: hidden;
+}
+.actions-drawer,
+.smart-drawer,
+.live-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 100;
+  width: var(--detail-drawer-w);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-overlay);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border-left: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+  animation: ask-drawer-in var(--transition);
+}
+@media (prefers-reduced-motion: reduce) {
+  .actions-drawer,
+  .smart-drawer,
+  .live-drawer {
+    animation: none;
+  }
+}
+
+/* Header for a drawer whose PANEL has no header of its own (the live-context
+   panel is a lane of controls, not a titled card). Its siblings own their
+   chrome; this one is supplied by the shell. */
+.drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.drawer-head h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+.drawer-close {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.drawer-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.drawer-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
 }
 /* The bare chat fills the whole drawer as ONE flat surface (its log owns the
    scroll, so the composer pins to the bottom with no empty strip below). */

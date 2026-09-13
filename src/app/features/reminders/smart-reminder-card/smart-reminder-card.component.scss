@@ -5,6 +5,46 @@
   padding: var(--space-5);
   border-color: var(--border-strong);
 }
+.smart-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* ── DRAWER MOUNT ───────────────────────────────────────────────────────────
+   In a drawer this is not a card in a column of cards — it IS the column, and
+   it has to behave like one: fill the height, keep a fixed header band, and let
+   only the body scroll. Without this the panel sized to its content and the
+   rows ran past the pane's edge (2026-09-13). Shaped after the sibling
+   `note-reminders-panel`, which solved the same problem for the same column. */
+:host(.in-drawer) {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+:host(.in-drawer) .smart-card.is-bare {
+  flex: 1 1 auto;
+  gap: 0;
+  min-height: 0;
+  min-width: 0;
+}
+:host(.in-drawer) .smart-head {
+  flex: none;
+  /* Matches the note header's band, like the reminders pane — the two line up
+     across the divider. */
+  min-height: 52px;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+:host(.in-drawer) .smart-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-3);
+}
 
 /* Idle: nothing to review. The surface keeps its affordance but stops paying
    for a frosted card, a kicker and an imperative heading. This is the whole
@@ -19,6 +59,11 @@
 
 .smart-card.is-strip .smart-head {
   justify-content: flex-start;
+}
+/* An idle strip's body holds nothing; `gap` on an empty flex box is 0, but the
+   box itself must not add a row of its own to the column above the note. */
+.smart-card.is-strip .smart-body:empty {
+  display: none;
 }
 
 /* Compact error inside the strip: one row, no panel, no extra vertical box.
@@ -84,16 +129,32 @@
 .suggestion-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  min-width: 0;
   padding: 0;
   list-style: none;
 }
 
+/* FLAT rows (2026-09-13): filled, bordered boxes stacked inside a bordered card
+   inside a drawer read as three nested frames. A hairline between rows and a
+   hover wash carry the separation instead. */
 .suggestion-row {
-  padding: var(--space-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--surface-input);
+  min-width: 0;
+  padding: var(--space-3) var(--space-2);
+  border-radius: var(--radius-sm);
+  transition: background var(--transition);
+}
+.suggestion-row + .suggestion-row {
+  border-top: 1px solid var(--border-subtle);
+  border-radius: 0;
+}
+.suggestion-row:hover {
+  background: var(--surface-hover);
+}
+/* A long commitment wraps inside its column instead of pushing the icons out of
+   the pane — the failure the narrow drawer exposed. */
+.suggestion-row strong,
+.suggestion-row > div:first-child span {
+  overflow-wrap: anywhere;
 }
 
 .suggestion-row > div:first-child {
@@ -114,7 +175,9 @@
 
 .suggestion-actions {
   flex: none;
-  gap: var(--space-2);
+  /* Icon buttons sit tight — the row reads as one control cluster, not two
+     separate chips (they were labelled pills until 2026-09-13). */
+  gap: var(--space-1);
 }
 
 @media (max-width: 720px) {
@@ -123,4 +186,87 @@
     align-items: flex-start;
     flex-direction: column;
   }
+}
+
+/* --- Drawer mount: the panel IS the surface, so it drops the card frame ------
+   (2026-09-13). Same reason as the action-items panel: the drawer already has
+   the border and the shadow, and glass on glass reads as a box in a box. */
+.smart-card.is-bare {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.smart-close {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.smart-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.smart-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+/* --- Icon-only row actions ------------------------------------------------ */
+.suggestion-btn {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.suggestion-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+/* The promote action keeps the accent — it is the one thing this row is FOR. */
+.suggestion-btn.is-primary {
+  color: var(--accent-text);
+}
+.suggestion-btn.is-primary:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+.suggestion-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.suggestion-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
