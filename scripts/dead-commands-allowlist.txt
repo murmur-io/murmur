@@ -47,3 +47,20 @@ org_sweep_pending: manual retry for stuck org shares; the background tick alread
 # cfg-gating that would mean maintaining two copies of a 350-entry generate_handler! list — which
 # is precisely the drift class this checker exists to catch. The body gate is the right place.
 reminder_runtime_probe_control: debug-only harness control; already refuses in release via cfg(not(debug_assertions))
+
+# ── Note-folder property schema (2026-09-13, user request: remove the note editor's
+#    "Properties" card — "to nie jest do niczego potrzebne"). That card was the ONLY invoke() of
+#    these two, so removing it left them registered and un-called.
+#
+# They stay rather than being deleted for one concrete reason: the schema they guard is still LIVE.
+# `tools.rs` reads it through the store (`list_note_folder_catalog_visible`) to project notes as a
+# typed database for the brain's `query_database` tool, so the read path is exercised by the
+# product — just not through these commands. `set_note_folder_schema` is the only WRITER that
+# layer has ever had; deleting it would make the schema permanently unpopulatable and quietly
+# reduce `query_database` to whatever folders were configured before this change.
+#
+# Both were re-checked against the allowlist's own bar: neither is an ungated content read.
+# `get` returns `Ok(vec![])` for a sealed-and-not-session-unlocked folder and `set` refuses it with
+# `AppError::Locked` — both via `folder_is_unlocked`, before any read, write or validation.
+get_note_folder_schema: schema still drives the brain's query_database tool; FE editor removed 2026-09-13, no UI writer left
+set_note_folder_schema: the schema layer's only writer; deleting it would make query_database's schema unpopulatable

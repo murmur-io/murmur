@@ -63,12 +63,6 @@ import { MurCopyIdComponent } from "../../../design-system/copy-id/copy-id.compo
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import { MurToggleComponent } from "../../../design-system/toggle/toggle.component";
 import { parseDoc, serializeDoc } from "./front-matter";
-import {
-  coerceForKind,
-  formatForYaml,
-  type PropertyKind,
-  type PropertySchemaField,
-} from "./property-field-types";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { NoteRemindersPanelComponent } from "../../reminders/note-reminders-panel/note-reminders-panel.component";
 import { SmartReminderCardComponent } from "../../reminders/smart-reminder-card/smart-reminder-card.component";
@@ -132,15 +126,6 @@ const SLASH_ITEMS: readonly SlashItem[] = [
 /** Up to this many chars of before/after context ship with an assistant request. */
 const CONTEXT_CHARS = 500;
 const AUTOSAVE_MS = 600;
-
-/** The property kinds offered when defining a NEW schema field (label + kind). */
-const PROPERTY_KIND_OPTIONS: readonly { kind: PropertyKind; label: string }[] = [
-  { kind: "text", label: "Text" },
-  { kind: "select", label: "Select" },
-  { kind: "date", label: "Date" },
-  { kind: "checkbox", label: "Checkbox" },
-  { kind: "number", label: "Number" },
-];
 
 /**
  * localStorage key for the "Full width" display preference: "1" = full width.
@@ -338,8 +323,6 @@ export class NoteEditorComponent {
    * changes the `locked` half — still gets the default.
    */
   private previewDefaultedFor: string | null = null;
-  /** Properties bar expanded. */
-  readonly propsOpen = signal(false);
   /** The autosave indicator. */
   readonly saveState = signal<SaveState>("idle");
   /**
@@ -354,20 +337,8 @@ export class NoteEditorComponent {
    * "Couldn’t save this note. Please try again." rather than nothing.
    */
   readonly saveErrorMessage = signal<string | null>(null);
-  /** The tag-input draft. */
-  readonly tagDraft = signal("");
   /** Which floating menu (if any) is open in the header. */
   readonly menu = signal<"none" | "move" | "more">("none");
-  /** Add-property menu open (the DEFINED-keys picker + "New property" hatch). */
-  readonly addingProp = signal(false);
-  /**
-   * The "New property" sub-form is open (a fresh key + kind that gets PERSISTED
-   * to the folder schema on commit). false = showing the defined-keys picker.
-   */
-  readonly definingProp = signal(false);
-  readonly propKeyDraft = signal("");
-  /** The kind chosen for a brand-new schema property (defaults to text). */
-  readonly propKindDraft = signal<PropertyKind>("text");
   /** Two-step delete confirm. */
   readonly confirmingDelete = signal(false);
   /** True while the Share modal is open over the document. */
@@ -456,8 +427,6 @@ export class NoteEditorComponent {
   );
   /** Coalesce captured scroll bursts into one post-render caret measurement. */
   private linkPickerRepositionQueued = false;
-  private readonly tagInput =
-    viewChild<ElementRef<HTMLInputElement>>("tagInput");
   private readonly selectionToolbar = viewChild(NoteSelectionToolbarComponent);
   private readonly brainPopover = viewChild(NoteBrainPopoverComponent);
   private readonly linkPicker = viewChild(LinkPickerComponent);
@@ -547,73 +516,11 @@ export class NoteEditorComponent {
     return folder ? folder.name : "Notes";
   });
 
-  /** The tags already used across notes — autocomplete suggestions for the tag input. */
-  readonly tagSuggestions = computed(() => {
-    const used = new Set<string>();
-    for (const n of this.notes.notes()) {
-      for (const t of n.tags) {
-        used.add(t);
-      }
-    }
-    // Drop tags already on this note + non-matching against the draft.
-    const own = new Set(this.tags());
-    const draft = this.tagDraft().trim().toLowerCase();
-    return [...used]
-      .filter((t) => !own.has(t) && (draft === "" || t.includes(draft)))
-      .slice(0, 6);
-  });
 
-  /**
-   * The property KIND options offered when defining a new schema field (template
-   * dropdown). Static — exposed as a field so the template can `@for` over it.
-   */
-  protected readonly propertyKindOptions = PROPERTY_KIND_OPTIONS;
 
-  /**
-   * The active note-folder's typed-property SCHEMA (Feature C) — read from the
-   * root {@link NotesService}, loaded reactively by {@link _loadSchema} when the
-   * note's folder changes. `[]` for a folder with no schema (or a locked folder,
-   * which the backend gates). Drives the SCHEMA-AWARE widget per property row and
-   * the Add-property menu's "defined keys first" list.
-   */
-  readonly folderSchema = computed<PropertySchemaField[]>(() =>
-    this.notes.folderSchema(),
-  );
 
-  /** Fast key → schema-field lookup for resolving a row's widget kind. */
-  private readonly schemaByKey = computed<Map<string, PropertySchemaField>>(
-    () => new Map(this.folderSchema().map((f) => [f.key, f])),
-  );
 
-  /**
-   * Property rows for the properties bar (stable order), each ENRICHED with its
-   * schema-resolved widget `kind` + select `options`. A key with no schema entry
-   * defaults to `text` (unchanged behavior). The underlying value stays the raw
-   * front-matter STRING — the widget coerces on read + writes back a string via
-   * `formatForYaml`, so `serializeDoc`'s round-trip is untouched.
-   */
-  readonly propertyRows = computed(() => {
-    const byKey = this.schemaByKey();
-    return Object.entries(this.properties()).map(([key, value]) => {
-      const field = byKey.get(key);
-      return {
-        key,
-        value,
-        kind: (field?.kind ?? "text") as PropertyKind,
-        options: field?.options ?? [],
-      };
-    });
-  });
 
-  /**
-   * The schema keys NOT yet present on this note — the Add-property menu offers
-   * these DEFINED keys first (with their kind badge) before the "New property"
-   * escape hatch.
-   */
-  readonly unusedSchemaFields = computed<PropertySchemaField[]>(() => {
-    const present = new Set(Object.keys(this.properties()));
-    return this.folderSchema().filter((f) => !present.has(f.key));
-  });
 
   /**
    * The app config (loaded best-effort in the constructor), the source for the
@@ -712,28 +619,7 @@ export class NoteEditorComponent {
     return [...titles];
   });
 
-  /**
-   * The folder id whose schema the editor should load — null while the note is
-   * locked/masked (the backend gates it to `[]` anyway). A `computed` so the
-   * schema effect below only re-runs on a REAL folder/lock change, not on every
-   * autosave (which replaces the `note()` object reference with an unchanged
-   * `folderId`).
-   */
-  private readonly _schemaFolderId = computed<string | null>(() => {
-    const doc = this.note();
-    return doc && !doc.locked ? doc.folderId : null;
-  });
 
-  /**
-   * Load the active note-folder's typed-property SCHEMA when its id changes
-   * (Feature C). Delegated to the root {@link NotesService} so the schema is
-   * shared with the folder Table/Board views; best-effort (the service captures
-   * errors). Legitimate signal-writing effect via the service (T1) — async IPC
-   * keyed on a single input.
-   */
-  private readonly _loadSchema = effect(() => {
-    void this.notes.loadSchema(this._schemaFolderId());
-  });
 
   /** Persist the "Full width" preference whenever it changes (mirrors AppShellComponent). */
   private readonly _persistFullWidth = effect(() => {
@@ -1199,7 +1085,6 @@ export class NoteEditorComponent {
     this.properties.set(
       Object.keys(doc.properties).length ? { ...doc.properties } : parsed.properties,
     );
-    this.propsOpen.set(this.tags().length > 0 || this.propertyRows().length > 0);
     this.applyPreviewDefault(doc, parsed.body);
     this.saveState.set("idle");
     this.dirtyFull = false;
@@ -1913,180 +1798,10 @@ export class NoteEditorComponent {
     void this.flushFull();
   }
 
-  // ── Tags ─────────────────────────────────────────────────────────────────
-
-  onTagInput(event: Event): void {
-    this.tagDraft.set((event.target as HTMLInputElement).value);
-  }
-
-  addTag(tag?: string): void {
-    const raw = (tag ?? this.tagDraft()).trim().replace(/^#/, "").toLowerCase();
-    if (!raw) {
-      return;
-    }
-    if (!this.tags().includes(raw)) {
-      this.tags.update((list) => [...list, raw]);
-      this.scheduleSave();
-    }
-    this.tagDraft.set("");
-    afterNextRender(() => this.tagInput()?.nativeElement.focus(), {
-      injector: this.injector,
-    });
-  }
-
-  removeTag(tag: string): void {
-    this.tags.update((list) => list.filter((t) => t !== tag));
-    this.scheduleSave();
-  }
-
-  toggleProps(): void {
-    this.propsOpen.update((v) => !v);
-  }
-
-  // ── Properties (schema-driven, Feature C) ─────────────────────────────────
-  // The `properties` signal stays Record<string,string>: every widget commit
-  // COERCES its raw value for the schema kind then stores the canonical STRING
-  // via `formatForYaml`, so `serializeDoc`'s byte-exact YAML round-trip is
-  // untouched. The Add-property menu offers the folder schema's DEFINED keys
-  // first, then a "New property" escape hatch that persists a new field to the
-  // folder schema (via `notes.saveSchema`) before adding it to this note.
-
-  /** Open the Add-property menu (defined-keys picker; not yet the new-property form). */
-  startAddProp(): void {
-    this.addingProp.set(true);
-    this.definingProp.set(false);
-    this.propKeyDraft.set("");
-    this.propKindDraft.set("text");
-  }
-
-  /** Close the Add-property menu / new-property form. */
-  cancelAddProp(): void {
-    this.addingProp.set(false);
-    this.definingProp.set(false);
-  }
-
-  /**
-   * Add an already-DEFINED schema field to this note (menu item). Seeds a coerced
-   * default for its kind (a checkbox starts `false`, everything else empty) so the
-   * widget renders immediately, then autosaves. No-op for `tags` (its own row).
-   */
-  addSchemaProp(field: PropertySchemaField): void {
-    if (field.key.toLowerCase() === "tags") {
-      this.cancelAddProp();
-      return;
-    }
-    const seed = formatForYaml(coerceForKind("", field.kind));
-    this.properties.update((props) => ({ ...props, [field.key]: seed }));
-    this.cancelAddProp();
-    this.scheduleSave();
-  }
-
-  /** Open the "New property" sub-form (a fresh key + kind, persisted to the schema). */
-  startDefineProp(): void {
-    this.definingProp.set(true);
-    this.propKeyDraft.set("");
-    this.propKindDraft.set("text");
-  }
-
-  onPropKeyInput(event: Event): void {
-    this.propKeyDraft.set((event.target as HTMLInputElement).value);
-  }
-  onPropKindInput(event: Event): void {
-    this.propKindDraft.set(
-      (event.target as HTMLSelectElement).value as PropertyKind,
-    );
-  }
-
-  /**
-   * Commit a BRAND-NEW property: PERSIST its `{key, kind}` to the folder schema
-   * (so the widget + the Table/Board views all see the kind), then add it to this
-   * note with a coerced default. If the schema save fails the note property is
-   * NOT added (the value would render as bare text with no kind), and a toast
-   * surfaces the failure. A duplicate key just re-focuses (no-op on the schema).
-   */
-  async createSchemaProperty(): Promise<void> {
-    const key = this.propKeyDraft().trim();
-    const kind = this.propKindDraft();
-    const doc = this.note();
-    if (!key || key.toLowerCase() === "tags" || !doc || doc.locked) {
-      this.cancelAddProp();
-      return;
-    }
-    // Already a property on this note? Just close (no duplicate schema entry).
-    if (key in this.properties()) {
-      this.cancelAddProp();
-      return;
-    }
-    const existing = this.folderSchema().find((f) => f.key === key);
-    const nextSchema: PropertySchemaField[] = existing
-      ? this.folderSchema()
-      : [...this.folderSchema(), { key, kind, options: [] }];
-    try {
-      if (!existing) {
-        await this.notes.saveSchema(doc.folderId, nextSchema);
-      }
-      const seed = formatForYaml(coerceForKind("", existing?.kind ?? kind));
-      this.properties.update((props) => ({ ...props, [key]: seed }));
-      this.cancelAddProp();
-      this.scheduleSave();
-    } catch {
-      this.toast.danger("Couldn’t save the property. Please try again.");
-    }
-  }
-
-  /**
-   * Edit a TEXT/DATE/NUMBER/SELECT property from an `<input>`/`<select>` change.
-   * Coerces the raw value for the row's schema kind and stores the canonical
-   * string, so the YAML round-trip is untouched. `kind` comes from the row's
-   * resolved schema (`text` when undefined).
-   */
-  editProp(key: string, kind: PropertyKind, event: Event): void {
-    const raw = (event.target as HTMLInputElement | HTMLSelectElement).value;
-    this.setPropRaw(key, kind, raw);
-  }
-
-  /** Set a SELECT property from a picked option value (schema-aware coerce). */
-  setSelectProp(key: string, kind: PropertyKind, value: string): void {
-    this.setPropRaw(key, kind, value);
-  }
-
-  /** Toggle a CHECKBOX property (from `mur-toggle`'s ngModelChange-equivalent). */
-  setCheckboxProp(key: string, checked: boolean): void {
-    const raw = formatForYaml({ kind: "checkbox", value: checked });
-    this.properties.update((props) => ({ ...props, [key]: raw }));
-    this.scheduleSave();
-  }
-
-  /** Read a CHECKBOX property's current boolean (for `mur-toggle`'s [checked]-equivalent). */
-  checkboxValue(value: string): boolean {
-    const coerced = coerceForKind(value, "checkbox");
-    return coerced.kind === "checkbox" ? coerced.value : false;
-  }
-
-  /**
-   * Whether a SELECT row's current value is one of its schema options. When it is
-   * NOT, the value is an out-of-schema passthrough — the template keeps it visible
-   * as an extra option so it is never silently dropped.
-   */
-  selectValueIsOffSchema(value: string, options: string[]): boolean {
-    return value.trim().length > 0 && !options.includes(value);
-  }
-
-  /** Coerce `raw` for `kind`, store the canonical string, autosave. Shared writer. */
-  private setPropRaw(key: string, kind: PropertyKind, raw: string): void {
-    const canonical = formatForYaml(coerceForKind(raw, kind));
-    this.properties.update((props) => ({ ...props, [key]: canonical }));
-    this.scheduleSave();
-  }
-
-  removeProp(key: string): void {
-    this.properties.update((props) => {
-      const next = { ...props };
-      delete next[key];
-      return next;
-    });
-    this.scheduleSave();
-  }
+  // TAGS + PROPERTIES EDITING REMOVED (2026-09-13) — see the note in the template.
+  // The `tags` / `properties` signals stay: they are loaded by `parseDoc` and written
+  // back by `serializeDoc`, so a note's front-matter round-trips byte-exact into the
+  // exported .md. Only the in-app editing surface is gone.
 
   // ── Edit / Preview ───────────────────────────────────────────────────────
 

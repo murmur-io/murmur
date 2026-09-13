@@ -2965,11 +2965,12 @@ export interface NoteFolder {
 
 // ── Feature C — typed note front-matter properties (a NEW, PARALLEL layer over
 // the plaintext `NoteDoc.properties: Record<string,string>`, which is UNCHANGED).
-// A folder-level SCHEMA names each property's KIND so the note editor can render
-// the right widget and the folder Table/Board views can render typed cells; the
-// underlying front-matter string round-trip (`front-matter.ts`) is untouched.
-// The pure coercion helpers live beside the editor
-// (`features/notes/note-editor/property-field-types.ts`) and re-export these.
+// A folder-level SCHEMA names each property's KIND so a typed view can render the
+// right cell; the underlying front-matter string round-trip (`front-matter.ts`) is
+// untouched. The note editor's Properties card — and the `property-field-types.ts`
+// coercion helpers that only served its widgets — were removed on 2026-09-13. These
+// types stay because they still mirror the LIVE Rust DTOs: `tools.rs` reads the same
+// schema for the brain's `query_database` tool.
 
 /** The kind a note-folder's property schema assigns to a property (drives the widget). */
 export type PropertyKind = "text" | "select" | "date" | "checkbox" | "number";
