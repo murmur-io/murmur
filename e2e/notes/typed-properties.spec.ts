@@ -128,8 +128,17 @@ test("a note's front-matter survives a BODY edit untouched (no Properties UI)", 
   await expect(page.locator(".prop-row")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "+ Add property" })).toHaveCount(0);
 
+  // A note WITH a body starts in Preview (see note-editor.spec.ts "a note with a
+  // body starts in Preview"), and Preview renders no textarea — so switch to Edit
+  // first or the body locator never resolves.
+  await page
+    .getByRole("group", { name: "Edit or preview" })
+    .getByRole("button", { name: "Edit", exact: true })
+    .click();
+
   // Edit the BODY only.
   const body = page.getByRole("textbox", { name: "Note body" });
+  await expect(body).toBeVisible();
   await body.click();
   await body.pressSequentially(" edited");
 

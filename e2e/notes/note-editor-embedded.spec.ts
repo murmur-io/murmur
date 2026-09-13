@@ -7,11 +7,13 @@ import { mockNotes } from "./mock-invoke";
  * create-note editing experience on a companion note. This spec proves BOTH
  * halves of the contract:
  *
- *   (a) the ROUTED `/notes/:id` path is unchanged — header + title + properties
- *       still render (regression gate for `embedded()===false`);
+ *   (a) the ROUTED `/notes/:id` path is unchanged — header + title still render
+ *       (regression gate for `embedded()===false`). The properties card it also
+ *       used to assert was removed app-wide on 2026-09-13; the assertion lives on
+ *       as its inverse rather than disappearing;
  *   (b) a `<app-note-editor [embedded]="true" [noteIdInput]="'n1'">` mount shows
  *       ONLY the body editor + a working selection toolbar / Ask Brain popover —
- *       NO header, NO title input, NO properties bar, NO backlinks — and loads
+ *       NO header, NO title input, NO backlinks — and loads
  *       its note from `noteIdInput`, NOT the route.
  *
  * The recording panel is the shipped embedded host, so (b) starts a mocked
@@ -20,7 +22,7 @@ import { mockNotes } from "./mock-invoke";
  * whose private module shape differs between local and CI dev servers.
  */
 
-test("(a) routed /notes/:id still renders header + title + properties (embedded=false unchanged)", async ({
+test("(a) routed /notes/:id still renders header + title (embedded=false unchanged)", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -35,7 +37,11 @@ test("(a) routed /notes/:id still renders header + title + properties (embedded=
   // The full routed chrome is present.
   await expect(page.locator(".editor-head")).toBeVisible();
   await expect(page.locator(".note-title-input")).toHaveValue("My First Note");
-  await expect(page.locator(".props")).toBeVisible();
+  // The Properties card was REMOVED on 2026-09-13 at the user's request; this used
+  // to assert it visible. Kept as its inverse rather than deleted, so the routed
+  // mount is still pinned on that surface — and so a revert has to come back
+  // through this line instead of silently re-adding the card.
+  await expect(page.locator(".props")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Preview", exact: true })).toBeVisible();
   // Share is no longer a top-level header button (2026-07-19 header slim) — it lives
   // in the ⋯ menu now. Open ⋯ and confirm "Share…" is still reachable there.
