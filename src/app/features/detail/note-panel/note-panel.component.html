@@ -236,10 +236,6 @@
     }
   </section>
 
-  <!-- LIVE CONTEXT — enrich this note with fresh detail from connected tools (Jira / Slack / web).
-       Sits right after the note summary; egress is on-demand + kept loud. Only rendered for an
-       unlocked meeting (note-panel itself is under the detail view's `@else (!locked())`). Bubbles
-       apply/clear up via (noteChanged) so the parent reloads the note. -->
   <!-- ASSISTANT Q&A (persisted in-meeting voice exchanges). -->
   @if (interactions().length) {
     <section class="block print-keep">

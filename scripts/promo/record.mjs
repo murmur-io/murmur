@@ -529,7 +529,7 @@ const SCENES = {
       film.frame("lower", { ms: 10 });
       film.title("Owners. Dates. *Done.*", {
         kicker: "Action items",
-        sub: "Into Apple Reminders or Obsidian Tasks.",
+        sub: "Into your reminders, or into the note itself.",
         dur: 4200,
       });
       await film.wait(500);

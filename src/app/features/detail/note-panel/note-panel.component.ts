@@ -223,6 +223,13 @@ export class NotePanelComponent {
   readonly exportMaster = output<"mic" | "sys">();
   readonly linkGraph = output<void>();
   /** Bubbles the live-context panel's apply/clear up so the parent reloads the note. */
+  /**
+   * Bubbles a note rewrite up so the shell refetches. Live context used to be
+   * this panel's only emitter; it moved into its own drawer (2026-09-13) and
+   * emits straight to the shell, so this stays for the panel's OWN writes (the
+   * editor save path) and for any future in-flow surface. The shell's binding
+   * is therefore not dead — it is the same handler, one hop shorter.
+   */
   readonly noteChanged = output<void>();
   readonly edit = output<void>();
   readonly cancelEdit = output<void>();

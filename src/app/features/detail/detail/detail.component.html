@@ -5,7 +5,7 @@
      Re-summarize / Edit / More) behind it. -->
 <section
   class="detail"
-  [class.has-drawer]="openDrawer() !== null && !locked()"
+  [class.has-drawer]="openDrawer() !== null && !locked() && !!detail()"
 >
   <a routerLink="/library" class="back">
     <span class="back-arrow" aria-hidden="true">←</span>

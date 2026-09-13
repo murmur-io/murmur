@@ -46,8 +46,12 @@
 .command-btn {
   justify-content: center;
   gap: 0;
-  min-height: var(--control-height-sm);
-  min-width: var(--control-height-sm);
+  /* A square target the size of `.btn`'s own height. NOT `--control-height-sm`:
+     that token is referenced in five places in this repo and DEFINED in none,
+     so it silently resolved to nothing and the squaring never happened. A
+     structural one-off px is the honest choice here; inventing a token would
+     also silently change the four other components that expect it. */
+  min-width: 40px;
   padding-inline: var(--space-2);
   white-space: nowrap;
 }

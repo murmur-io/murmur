@@ -2482,10 +2482,18 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
   // reaches the composer. Matches note-reminders-drawer.spec.ts.
   await expect(composer.getByText("n-atlas-prd", { exact: true })).toBeVisible();
   await composer.getByRole("button", { name: "Cancel" }).click();
-  // Leave the drawer as this block found it — the assertions after this one read
-  // the note surface, not the drawer.
-  await page.getByRole("button", { name: "Reminders", exact: true }).click();
+  // Back to the Smart-reminders column, which is what the rest of this test
+  // reads. It has to be OPEN for the edit below to be audited at all: the card
+  // lives in a drawer now (2026-09-13) and a closed drawer does not mount it, so
+  // nothing re-audits a note nobody is reviewing. Opening it also retires the
+  // reminders panel — one tool column at a time — which is what the previous
+  // step wanted anyway.
+  await openSmartDrawer(page);
   await expect(notePanel).toHaveCount(0);
+  await expect(noteCard).toBeVisible();
+  // Let the MOUNT's own audit land before the baseline is taken, or the edit's
+  // audit would be counted on top of it and the delta would read as 2.
+  await page.waitForTimeout(1_200);
 
   // A committed authored-note edit updates sourceRevision and re-audits once
   // after the debounce, instead of once per keystroke/autosave frame.

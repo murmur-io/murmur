@@ -31,11 +31,15 @@ import { ErrorCopyService } from "../../../core/copy/error-copy.service";
  * shows no empty panel. A host that mounts this as a deliberately-opened pane
  * passes `showEmptyState` and gets an explanatory empty state instead.
  *
- * It used to also carry {@link SmartReminderCardComponent}. That card STAYS in
- * the note flow (`note-panel`) now that this panel moved into a default-closed
- * drawer: the card is where the fail-closed "suggestions aren't available
- * securely right now" notice surfaces, and a security notice nobody can see
- * until they open a drawer is not a notice.
+ * It used to also carry {@link SmartReminderCardComponent}; that card is its own
+ * drawer now (2026-09-13, at the operator's request), on this surface and in the
+ * note editor.
+ *
+ * KNOWN COST, stated rather than hidden: the card is where the fail-closed
+ * "suggestions aren't available securely right now" notice surfaces, so that
+ * notice is no longer visible until someone opens the drawer. An indicator on
+ * the toggle is the fix if this bites; it needs the suggestion count hoisted to
+ * the host, since a closed drawer does not mount the card that knows it.
  */
 @Component({
   selector: "app-meeting-actions",
@@ -82,9 +86,6 @@ export class MeetingActionsComponent {
   /** Tracked so we can cancel the pending "Saved" reset on destroy (no leaks). */
   private patchSavedTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /** Convenience: whether there is anything to show (drives the host [hidden]). */
-  readonly hasItems = computed(() => this.items().length > 0);
-
   /**
    * Re-read the items whenever the meeting or the note revision behind them
    * changes. `ngOnInit` alone was enough while this panel was destroyed and
@@ -95,24 +96,33 @@ export class MeetingActionsComponent {
   private readonly _reload = effect(() => {
     const id = this.meetingId();
     this.sourceRevision();
-    void this.loadItems(id);
+    void this.loadItems(id, ++this.loadToken);
   });
+
+  /**
+   * Monotonic id for the in-flight load. Guarding on `meetingId` alone was not
+   * enough: the effect also re-runs on a `sourceRevision` change, and two loads
+   * for the SAME meeting are indistinguishable by id — so a slow first response
+   * could land after a newer one and win.
+   */
+  private loadToken = 0;
 
   /**
    * Load (or reload) the action items into the `items` signal (best-effort).
    * Takes the id it was started for and drops a late response once the panel
    * has moved on, so a slow fetch can never overwrite a newer meeting's items.
    */
-  private async loadItems(requestedId?: string): Promise<void> {
+  private async loadItems(requestedId?: string, token?: number): Promise<void> {
     const id = requestedId ?? this.meetingId();
+    const mine = token ?? ++this.loadToken;
     try {
       const items = await this.ipc.getActionItems(id);
-      if (id === this.meetingId()) {
+      if (mine === this.loadToken && id === this.meetingId()) {
         this.items.set(items);
       }
     } catch {
       // Leave whatever we have; an empty list simply hides the panel.
-      if (id === this.meetingId()) {
+      if (mine === this.loadToken && id === this.meetingId()) {
         this.items.set([]);
       }
     }
