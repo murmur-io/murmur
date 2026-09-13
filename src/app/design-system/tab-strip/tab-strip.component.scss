@@ -44,6 +44,32 @@
   display: flex;
   align-items: center;
   flex: none;
+  /* ABOVE THE WINDOW-DRAG STRIP (2026-09-13, user report: "nie dzialaja gorne
+     zakladki w wersji Paper, zarowno zamykanie jak i tworzenie nowych tabow").
+     `.shell-drag` (styles.css) is `position: fixed`, full width, 32px tall,
+     `z-index: 8` — the band you drag the window by. This strip is in flow at
+     the very top of `.main-col`, so without a stacking rank of its own every
+     control in it loses the hit test to that band: visible, and dead to a
+     click. The note editor's tool pane hit exactly this on 2026-09-06 and took
+     the sidebar's `z-index: 9`; these controls are the same kind of chrome and
+     take the same rank.
+
+     WHY PAPER MADE IT TOTAL, AND STUDIO ONLY HID IT: `app-shell` is padded by
+     `var(--shell-gutter)`, so the strip starts at the gutter. Studio's 8px put
+     each control's centre at y=32 — the first pixel BELOW the band, clickable
+     by one pixel of luck while the control's top half was already dead. Paper
+     sets `--shell-gutter: 0px` (skin-paper.css — the shell stops floating), the
+     strip slides up those 8px, and every centre lands at y=24, inside the band.
+     Measured with `document.elementFromPoint` on the running app: Paper
+     returned `div.shell-drag` for `.tab-label`, `.tab-close` AND `.tab-new`.
+
+     The rank goes on the ITEMS, not on `.tab-strip`: lifting the whole 48px row
+     would take the window's entire top edge across the content column out of
+     the drag region. Per-item, the gaps and the empty run after the last tab
+     still drag the window (verified: `elementFromPoint` there still returns
+     `div.shell-drag`), which is how a browser tab bar behaves. */
+  position: relative;
+  z-index: 9;
   max-width: 220px;
   height: 36px;
   border-radius: var(--radius-control);
@@ -132,6 +158,10 @@
   align-items: center;
   justify-content: center;
   flex: none;
+  /* Same drag-strip rank as `.tab-item` above — this button sits in the same
+     band and was equally dead to a click under Paper. */
+  position: relative;
+  z-index: 9;
   width: 30px;
   height: 30px;
   margin: 0 2px;
