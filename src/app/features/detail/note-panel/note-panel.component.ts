@@ -18,9 +18,7 @@ import type {
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
 import { ConnectionsComponent } from "../../../shared/connections/connections.component";
-import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
 import { RelatedMeetingsComponent } from "../related-meetings/related-meetings.component";
-import { Stage2PanelComponent } from "../stage2-panel/stage2-panel.component";
 import { ToastService } from "../../../services/toast.service";
 import {
   NoteAttachmentService,
@@ -132,9 +130,7 @@ export interface AssistantQa {
     MarkdownComponent,
     AssistantSourcesComponent,
     ConnectionsComponent,
-    MeetingActionsComponent,
     RelatedMeetingsComponent,
-    Stage2PanelComponent,
   ],
   templateUrl: "./note-panel.component.html",
   styleUrl: "./note-panel.component.scss",

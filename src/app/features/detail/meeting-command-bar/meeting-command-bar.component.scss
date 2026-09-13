@@ -15,15 +15,15 @@
   align-items: center;
 }
 
+/* Lives ON THE TITLE ROW (2026-09-13), not in its own full-width card between
+   the header and the tabs. So: no card chrome, no vertical margins — the row's
+   own `.head-actions` cluster provides the alignment, and the header supplies
+   the only band of space. The groups keep their internal order; `flex-end`
+   keeps them hugging the right edge as the title takes the slack. */
 .meeting-command-bar {
-  justify-content: space-between;
-  gap: var(--space-3);
-  margin: var(--space-4) 0 var(--space-5);
-  padding: var(--space-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-lg);
-  background: var(--surface-raised);
-  box-shadow: var(--shadow-sm);
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-2);
 }
 
 .command-primary,
@@ -33,14 +33,34 @@
   flex-wrap: wrap;
 }
 
+/* A hairline between "do something to this meeting" and "manage it", replacing
+   the separation the two ends of the old space-between bar used to carry. */
 .command-secondary {
-  margin-left: auto;
+  padding-left: var(--space-2);
+  border-left: 1px solid var(--border-subtle);
 }
 
+/* ICON-ONLY (2026-09-13, user request). Labels stay in the DOM as `.sr-only`
+   text, so every button keeps its accessible name — the tooltip and the screen
+   reader say the same word the label used to. Square targets, no label gap. */
 .command-btn {
-  gap: var(--space-2);
+  justify-content: center;
+  gap: 0;
   min-height: var(--control-height-sm);
-  padding-inline: var(--space-3);
+  min-width: var(--control-height-sm);
+  padding-inline: var(--space-2);
+  white-space: nowrap;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
   white-space: nowrap;
 }
 
@@ -76,6 +96,7 @@
   height: var(--space-4);
 }
 
+/* The provider mark alone; the model name lives in the tooltip + the a11y name. */
 .provider-pill {
   gap: var(--space-2);
   max-width: var(--meeting-command-provider-max);

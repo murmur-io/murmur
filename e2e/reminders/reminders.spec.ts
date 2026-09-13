@@ -3,6 +3,19 @@ import { mockTauri } from "../settings-ai/mock-invoke";
 import { enterEditMode } from "../notes/mock-invoke";
 
 /**
+ * The meeting's Smart-reminders surface lives in a right-docked drawer now
+ * (2026-09-13); it used to sit inline in the Note tab. The toggle is NOT gated
+ * on listener readiness — opening the pane is how you SEE a listener failure,
+ * so these tests must still reach it when the barrier is down.
+ */
+async function openSmartDrawer(page: Page): Promise<void> {
+  await page
+    .getByRole("button", { name: "Smart reminders", exact: true })
+    .click();
+}
+
+
+/**
  * Browse is a disclosure group inside the ONE sidebar now — it used to be a
  * separate "Browse sidebar" complementary panel — and it starts collapsed, so
  * the Reminders destination (and its unread `.count`) is not in the DOM until
@@ -1120,6 +1133,7 @@ test("Smart Reminder: visibility-listener registration failure prevents audit an
   );
 
   await page.goto("/meeting/m-atlas-roadmap");
+  await openSmartDrawer(page);
   const card = page.locator("app-smart-reminder-card");
   await expect(
     card.getByText(
@@ -1572,6 +1586,7 @@ test("Smart Reminder: a lock before listener readiness cannot rehydrate the pare
         ? Promise.resolve(null)
         : invoke(command, args);
   });
+  await openSmartDrawer(page);
   const card = page.locator("app-smart-reminder-card");
   const newReminder = page
     .getByTestId("meeting-command-bar")
@@ -1700,6 +1715,7 @@ test("Smart Reminder: a mounted meeting card drops stale rows after every canoni
         ? Promise.resolve(null)
         : invoke(command, args);
   });
+  await openSmartDrawer(page);
   const card = page.locator("app-smart-reminder-card");
   await expect(card.getByText("Before source edit")).toBeVisible();
   const initialAudits = await page.evaluate(
@@ -2380,6 +2396,7 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
     .filter({ hasText: "Confirm the Atlas launch owner" })
     .getByRole("button", { name: /Meeting · Q2 Roadmap Planning/ })
     .click();
+  await openSmartDrawer(page);
   const meetingCard = page.locator("app-smart-reminder-card");
   await expect(meetingCard).toBeVisible();
   await page
@@ -2439,6 +2456,10 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
     .getByRole("button", { name: /Atlas — PRD v3/ })
     .first()
     .click();
+  // The note's Smart-reminders surface is a drawer now (2026-09-13), like the
+  // meeting's — so it is summoned, not scrolled to.
+  await expect(page.locator("app-smart-reminder-card")).toHaveCount(0);
+  await openSmartDrawer(page);
   const noteCard = page.locator("app-smart-reminder-card");
   await expect(noteCard).toBeVisible();
   // The card's own create button is gone: 701be0fc replaced the inline action with

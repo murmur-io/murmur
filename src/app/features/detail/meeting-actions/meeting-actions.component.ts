@@ -2,60 +2,74 @@ import {
   ChangeDetectionStrategy,
   Component,
   DestroyRef,
-  OnInit,
   computed,
+  effect,
   inject,
   input,
+  output,
   signal,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
+import { ReminderComposerService } from "../../reminders/reminder-composer/reminder-composer.service";
 import type { ActionItem } from "../../../core/models";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
-import { SmartReminderCardComponent } from "../../reminders/smart-reminder-card/smart-reminder-card.component";
 
 /**
  * "Action items" — a glass panel listing the action-item checklist parsed from a
- * meeting's note (via {@link IpcService.getActionItems}). A presentational
- * sibling of the analysis + recipes + chat cards: the parent owns the meeting;
- * this component owns only the action-item list and the two side-effects it can
- * trigger over it — adding a single item to macOS Reminders
- * ({@link IpcService.addReminder}) and rewriting the whole note into Obsidian
- * Tasks format ({@link IpcService.patchNoteTasks}).
+ * meeting's note (via {@link IpcService.getActionItems}). The parent owns the
+ * meeting; this component owns only the action-item list and the two things it
+ * can do with it — turning one item into a MURMUR reminder anchored to this
+ * meeting (through {@link ReminderComposerService}, not macOS Reminders) and
+ * rewriting the whole note into Obsidian Tasks format
+ * ({@link IpcService.patchNoteTasks}).
  *
  * Lives in its own file so its inline styles get their own per-component
  * `anyComponentStyle` budget (the detail component's styles are near the cap),
  * mirroring {@link MeetingRecipesComponent} / {@link MeetingChatComponent}.
  *
- * Meetings with no action items render NOTHING — the host is hidden so the
- * detail view shows no empty panel.
+ * Meetings with no action items render NOTHING by default, so an inline mount
+ * shows no empty panel. A host that mounts this as a deliberately-opened pane
+ * passes `showEmptyState` and gets an explanatory empty state instead.
+ *
+ * It used to also carry {@link SmartReminderCardComponent}. That card STAYS in
+ * the note flow (`note-panel`) now that this panel moved into a default-closed
+ * drawer: the card is where the fail-closed "suggestions aren't available
+ * securely right now" notice surfaces, and a security notice nobody can see
+ * until they open a drawer is not a notice.
  */
 @Component({
   selector: "app-meeting-actions",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [SmartReminderCardComponent],
   templateUrl: "./meeting-actions.component.html",
   styleUrl: "./meeting-actions.component.scss",
 })
-export class MeetingActionsComponent implements OnInit {
+export class MeetingActionsComponent {
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly composer = inject(ReminderComposerService);
 
   /** The meeting whose note's action items are listed + patched. */
   readonly meetingId = input.required<string>();
   readonly meetingTitle = input<string | null>(null);
   readonly sourceRevision = input<string | null>(null);
+  /**
+   * Render the panel's own close control. True on the drawer mount (the detail
+   * shell owns the header toggle, this panel owns its chrome — the same split
+   * as the note's reminders drawer); false for any inline mount.
+   */
+  readonly showClose = input(false);
+  /**
+   * Render the card with an explanatory empty state instead of nothing when the
+   * meeting has no action items. The drawer sets it: a pane the user opened on
+   * purpose must say why it is empty rather than render an empty shell.
+   */
+  readonly showEmptyState = input(false);
+  /** Fired by the panel's close ×; the host owns the open/closed state. */
+  readonly closed = output<void>();
 
   /** The parsed action items; empty before load (and while none exist). */
   readonly items = signal<ActionItem[]>([]);
-
-  // --- Per-row Reminders state (keyed by item idx) ------------------------
-  /** Item indices with an in-flight addReminder call (disables their button). */
-  readonly busyIdx = signal<ReadonlySet<number>>(new Set());
-  /** Item indices added to Reminders (swaps the button for "Added ✓"). */
-  readonly addedIdx = signal<ReadonlySet<number>>(new Set());
-  /** Per-item inline error message (e.g. permission denied). */
-  readonly errorIdx = signal<ReadonlyMap<number, string>>(new Map());
 
   // --- Note-wide "Save to Obsidian Tasks" state ---------------------------
   /** True while a patchNoteTasks call is in flight. */
@@ -71,56 +85,84 @@ export class MeetingActionsComponent implements OnInit {
   /** Convenience: whether there is anything to show (drives the host [hidden]). */
   readonly hasItems = computed(() => this.items().length > 0);
 
-  async ngOnInit(): Promise<void> {
-    await this.loadItems();
-  }
+  /**
+   * Re-read the items whenever the meeting or the note revision behind them
+   * changes. `ngOnInit` alone was enough while this panel was destroyed and
+   * recreated on every Note/Audio tab switch; the drawer mount deliberately
+   * survives those, so without this a re-summarize or a note save would leave
+   * the list showing the previous note's commitments.
+   */
+  private readonly _reload = effect(() => {
+    const id = this.meetingId();
+    this.sourceRevision();
+    void this.loadItems(id);
+  });
 
-  /** Load (or reload) the action items into the `items` signal (best-effort). */
-  private async loadItems(): Promise<void> {
+  /**
+   * Load (or reload) the action items into the `items` signal (best-effort).
+   * Takes the id it was started for and drops a late response once the panel
+   * has moved on, so a slow fetch can never overwrite a newer meeting's items.
+   */
+  private async loadItems(requestedId?: string): Promise<void> {
+    const id = requestedId ?? this.meetingId();
     try {
-      this.items.set(await this.ipc.getActionItems(this.meetingId()));
+      const items = await this.ipc.getActionItems(id);
+      if (id === this.meetingId()) {
+        this.items.set(items);
+      }
     } catch {
       // Leave whatever we have; an empty list simply hides the panel.
-      this.items.set([]);
+      if (id === this.meetingId()) {
+        this.items.set([]);
+      }
     }
   }
 
   // --- Reminders -----------------------------------------------------------
 
   /**
-   * Add a single action item to macOS Reminders. Tracks per-row busy/added/error
-   * state by item idx; on a TCC permission rejection the raw error often reads
-   * obscurely, so a denial is mapped to a clear, actionable message.
+   * Turn one action item into a reminder IN MURMUR (2026-09-13, user request —
+   * it used to call `add_reminder`, which hands the text to macOS Reminders via
+   * osascript and leaves Murmur knowing nothing about it).
+   *
+   * This opens Murmur's own composer prefilled from the item: its text as the
+   * title, its 📅 date as the due date, and THIS meeting as the source anchor —
+   * so the reminder comes back attached to the meeting it came from, shows up in
+   * the Reminders inbox, and is visibility-gated like every other one.
+   *
+   * The composer, not a silent create, is the right shape here: `due_at` is NOT
+   * NULL in the store, and an action item frequently has no date at all. Rather
+   * than invent one, the user confirms the when — with everything else already
+   * filled in.
    */
-  async addToReminders(item: ActionItem): Promise<void> {
-    if (this.busyIdx().has(item.idx) || this.addedIdx().has(item.idx)) {
+  addToReminders(item: ActionItem): void {
+    if (!this.reminderReady()) {
       return;
     }
-    this.setBusy(item.idx, true);
-    this.clearRowError(item.idx);
-    try {
-      await this.ipc.addReminder(item.text, item.dueDate);
-      this.addedIdx.update((s) => new Set(s).add(item.idx));
-    } catch (e) {
-      this.setRowError(item.idx, this.reminderErrorMessage(e));
-    } finally {
-      this.setBusy(item.idx, false);
-    }
+    this.composer.openCreate({
+      title: item.text,
+      dueAt: dueDateToEpochMs(item.dueDate),
+      source: {
+        kind: "meeting",
+        id: this.meetingId(),
+        // The anchor stays OPAQUE — no parent-supplied title. Submit re-gates it
+        // and the canonical list resolves a title the session may actually see.
+        // Copied deliberately from `smart-reminder-card.newReminder()`; passing
+        // `meetingTitle()` here would route a title around that gate.
+        title: "",
+      },
+    });
   }
 
   /**
-   * Map a Reminders failure to a clear message (permission denial → settings).
-   *
-   * Keyed on the `[reminders-denied]` code (`errcode::REMINDERS_DENIED`) rather than on a
-   * `/permission|denied|access|authoriz|not allowed/` sweep over the raw string — that sweep also
-   * matched unrelated failures, and it rendered the osascript stderr verbatim on the miss.
+   * The composer can only be trusted once its privacy/visibility listeners are
+   * registered — same gate the command bar's "New reminder" applies. Until then
+   * the affordance is visible but inert, rather than opening a composer whose
+   * invalidation events nobody is listening for.
    */
-  private reminderErrorMessage(error: unknown): string {
-    if (this.errorCopy.is(error, "reminders-denied")) {
-      return "Grant Reminders access in System Settings.";
-    }
-    return this.errorCopy.because("Couldn’t add to Reminders", error);
-  }
+  readonly reminderReady = computed(
+    () => this.composer.listenerState() === "ready",
+  );
 
   // --- Save to Obsidian Tasks ---------------------------------------------
 
@@ -160,33 +202,23 @@ export class MeetingActionsComponent implements OnInit {
       }
     });
   }
+}
 
-  // --- Per-row state helpers (immutable Set/Map updates) ------------------
-
-  private setBusy(idx: number, busy: boolean): void {
-    this.busyIdx.update((s) => {
-      const next = new Set(s);
-      if (busy) {
-        next.add(idx);
-      } else {
-        next.delete(idx);
-      }
-      return next;
-    });
+/**
+ * An action item carries a plain `YYYY-MM-DD` (or nothing). The composer wants
+ * epoch milliseconds. Resolve at LOCAL midday, not midnight: a date-only value
+ * parsed as UTC midnight lands on the previous day for anyone west of Greenwich,
+ * which would quietly move every due date by one.
+ */
+function dueDateToEpochMs(dueDate: string | null): number | null {
+  if (!dueDate) {
+    return null;
   }
-
-  private setRowError(idx: number, message: string): void {
-    this.errorIdx.update((m) => new Map(m).set(idx, message));
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dueDate.trim());
+  if (!match) {
+    return null;
   }
-
-  private clearRowError(idx: number): void {
-    this.errorIdx.update((m) => {
-      if (!m.has(idx)) {
-        return m;
-      }
-      const next = new Map(m);
-      next.delete(idx);
-      return next;
-    });
-  }
+  const [, y, m, d] = match;
+  const at = new Date(Number(y), Number(m) - 1, Number(d), 12, 0, 0, 0);
+  return Number.isNaN(at.getTime()) ? null : at.getTime();
 }

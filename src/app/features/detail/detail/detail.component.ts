@@ -44,6 +44,9 @@ import { ToastService } from "../../../services/toast.service";
 import { referencedNoteAttachments } from "../../../services/note-attachment.service";
 import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
 import { AudioPanelComponent } from "../audio-panel/audio-panel.component";
+import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
+import { SmartReminderCardComponent } from "../../reminders/smart-reminder-card/smart-reminder-card.component";
+import { Stage2PanelComponent } from "../stage2-panel/stage2-panel.component";
 import { MeetingChatComponent } from "../meeting-chat/meeting-chat.component";
 import {
   DetailTabsComponent,
@@ -69,6 +72,9 @@ interface ActionItem {
   text: string;
 }
 
+/** The right-docked drawers this view can show, one at a time. */
+type DetailDrawer = "ask" | "actions" | "smart" | "live" | null;
+
 @Component({
   selector: "app-detail",
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -78,6 +84,9 @@ interface ActionItem {
     DetailTabsComponent,
     NotePanelComponent,
     AudioPanelComponent,
+    MeetingActionsComponent,
+    SmartReminderCardComponent,
+    Stage2PanelComponent,
     MeetingChatComponent,
     SharePanelComponent,
     VerifyPanelComponent,
@@ -197,8 +206,22 @@ export class DetailComponent implements OnInit {
    * tab switches AND the chat's `_prefill` runs once per meeting (not on every
    * Note-tab open). Default-closed, NOT persisted (a fresh ask each open).
    */
-  private readonly _askDrawerOpen = signal(false);
-  readonly askDrawerOpen = this._askDrawerOpen.asReadonly();
+  /**
+   * Which right-docked drawer is open, if any — ONE signal rather than a boolean
+   * per drawer. They all dock to the same edge, so "open" is a choice between
+   * them, not three independent flags: with booleans, every new drawer adds
+   * another pair of "close the other one" writes to forget, and the lock paths
+   * have to remember to clear each. This makes the exclusivity structural.
+   *
+   * Hosted in this shell (not in a tab panel) so a drawer survives Note/Audio/
+   * Share switches. Default-closed, never persisted — a re-summon is deliberate.
+   */
+  private readonly _openDrawer = signal<DetailDrawer>(null);
+  readonly openDrawer = this._openDrawer.asReadonly();
+  readonly askDrawerOpen = computed(() => this._openDrawer() === "ask");
+  readonly actionsDrawerOpen = computed(() => this._openDrawer() === "actions");
+  readonly smartDrawerOpen = computed(() => this._openDrawer() === "smart");
+  readonly liveDrawerOpen = computed(() => this._openDrawer() === "live");
 
   // --- Move-to-folder popover ---------------------------------------------
   /** True while the folder-picker popover is open. */
@@ -834,10 +857,10 @@ export class DetailComponent implements OnInit {
     this.draft.set("");
     this.attachments.set([]);
     this.meetingAttachmentBusy.set(false);
-    // Close the Ask drawer on a lock transition so it doesn't reappear on a
-    // later unlock (the `@if (askDrawerOpen() && !locked())` guard already hides
-    // it while locked; this makes a re-summon deliberate, matching default-closed).
-    this._askDrawerOpen.set(false);
+    // Retire any open drawer on a lock transition so none reappears on a later
+    // unlock (each template guard already hides its drawer while locked; this
+    // makes a re-summon deliberate, matching default-closed).
+    this._openDrawer.set(null);
     // Receipts leak WHEN/BY-WHOM: blank them (and any pending seek) synchronously
     // on the mask, matching the note/segments/audio the masked DTO already nulls.
     this.receipts.set([]);
@@ -853,6 +876,15 @@ export class DetailComponent implements OnInit {
       // within this same (possibly backgrounded) component instance.
       if (this.detail()?.meeting.id === id) {
         this.detail.set(fresh);
+        // A lock that arrives through THIS path (indeterminate folder, or a
+        // seal only the backend could see) never ran `maskLocally`, so an open
+        // drawer would stay latched behind its template guard and pop back up
+        // on the next unlock. Retire it on the refetched truth, so "closed by
+        // default, re-summon is deliberate" holds on every path into locked,
+        // not just the synchronous one.
+        if (fresh?.locked === true) {
+          this._openDrawer.set(null);
+        }
         // Keep the tab strip + persisted tab title truthful (F3): after a
         // lock this is the backend's "🔒 Locked", after an unlock the real one.
         if (fresh?.meeting.title) {
@@ -1121,8 +1153,8 @@ export class DetailComponent implements OnInit {
    * isn't found (e.g. reduced to nothing) — never throws.
    */
   toggleAskDrawer(): void {
-    const willOpen = !this._askDrawerOpen();
-    this._askDrawerOpen.set(willOpen);
+    const willOpen = !this.askDrawerOpen();
+    this._openDrawer.set(willOpen ? "ask" : null);
     if (willOpen) {
       afterNextRender(
         () => {
@@ -1137,7 +1169,50 @@ export class DetailComponent implements OnInit {
 
   /** Close the Ask drawer (the chat's × / the reactive lock guard). */
   closeAskDrawer(): void {
-    this._askDrawerOpen.set(false);
+    this.closeDrawer("ask");
+  }
+
+  // --- Action items + Smart reminders drawers ------------------------------
+
+  /** Toggle the "Action items" slideout (retiring whichever drawer was open). */
+  toggleActionsDrawer(): void {
+    this._openDrawer.set(this.actionsDrawerOpen() ? null : "actions");
+  }
+
+  /** Close the Action items drawer (the panel's × / the lock guard). */
+  closeActionsDrawer(): void {
+    this.closeDrawer("actions");
+  }
+
+  /** Toggle the "Smart reminders" slideout (retiring whichever was open). */
+  toggleSmartDrawer(): void {
+    this._openDrawer.set(this.smartDrawerOpen() ? null : "smart");
+  }
+
+  /** Close the Smart reminders drawer (the panel's × / the lock guard). */
+  closeSmartDrawer(): void {
+    this.closeDrawer("smart");
+  }
+
+  /** Toggle the "Live context" slideout (retiring whichever was open). */
+  toggleLiveDrawer(): void {
+    this._openDrawer.set(this.liveDrawerOpen() ? null : "live");
+  }
+
+  /** Close the Live context drawer (its × / the lock guard). */
+  closeLiveDrawer(): void {
+    this.closeDrawer("live");
+  }
+
+  /**
+   * Close one drawer BY NAME. A bare `set(null)` would let a stale close (a
+   * panel torn down after the user already opened a different drawer) shut the
+   * new one instead of its own.
+   */
+  private closeDrawer(which: Exclude<DetailDrawer, null>): void {
+    if (this._openDrawer() === which) {
+      this._openDrawer.set(null);
+    }
   }
 
   // --- Move to folder ------------------------------------------------------

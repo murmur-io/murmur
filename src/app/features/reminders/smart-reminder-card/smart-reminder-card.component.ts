@@ -6,6 +6,7 @@ import {
   effect,
   inject,
   input,
+  output,
   signal,
 } from "@angular/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -33,10 +34,18 @@ interface SuggestionVm {
 /**
  * Review-only contextual reminder surface. Auditing may stage suggestions but
  * never creates a reminder; every promotion opens the shared composer first.
+ *
+ * Two mount shapes. IN FLOW (the note editor) it is self-effacing: with nothing
+ * to review it renders no chrome at all. IN A DRAWER (meeting detail, 2026-09-13)
+ * the host passes `showClose` + `showEmptyState`, because a pane the user opened
+ * on purpose has to account for itself rather than come up blank.
  */
 @Component({
   selector: "app-smart-reminder-card",
   changeDetection: ChangeDetectionStrategy.OnPush,
+  // `showClose` is the drawer mount's tell; the host class lets the styles bind
+  // to it without every rule having to reach through a wrapper.
+  host: { "[class.in-drawer]": "showClose()" },
   templateUrl: "./smart-reminder-card.component.html",
   styleUrl: "./smart-reminder-card.component.scss",
 })
@@ -58,6 +67,19 @@ export class SmartReminderCardComponent {
    * the idle strip cannot duplicate the primary action.
    */
   readonly showCreateAction = input(true);
+  /**
+   * Render the panel's own close control — true on a drawer mount, where the
+   * host owns the toggle and the panel owns its chrome.
+   */
+  readonly showClose = input(false);
+  /**
+   * Render an explanatory empty state instead of nothing when there is nothing
+   * to review. The drawer mount asks for it; an in-flow mount must not, or it
+   * would plant a permanent empty card in the note.
+   */
+  readonly showEmptyState = input(false);
+  /** Fired by the panel's close ×; the host owns the open/closed state. */
+  readonly closed = output<void>();
 
   private readonly _suggestions = signal<ReminderSuggestionView[]>([]);
   readonly suggestions = this._suggestions.asReadonly();

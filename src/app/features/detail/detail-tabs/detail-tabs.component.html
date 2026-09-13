@@ -1,15 +1,63 @@
-<div class="tabbar seg" role="tablist" aria-label="Meeting sections">
+<!-- Icon-only view switcher, living IN the meeting's command row (2026-09-13,
+     user request). Each label stays in the DOM as `.sr-only` text, so the
+     accessible name is unchanged — a tab is still "Note" / "Audio" / "Share" to
+     a screen reader, to a tooltip and to every existing test locator. -->
+<div class="tabs" role="tablist" aria-label="Meeting sections">
   @for (t of tabs(); track t.id) {
     <button
       type="button"
-      class="seg-btn"
+      class="tab-btn"
       role="tab"
+      [title]="t.label"
       [class.is-active]="active() === t.id"
       [attr.aria-selected]="active() === t.id"
       (click)="tabChange.emit(t.id)"
     >
-      {{ t.label }}
+      @switch (t.id) {
+        @case ("audio") {
+          <!-- Waveform: the recording itself. -->
+          <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
+            <path
+              d="M3 7.4v3.2M6 5.2v7.6M9 3.4v11.2M12 6.1v5.8M15 8v2"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+            />
+          </svg>
+        }
+        @case ("share") {
+          <!-- Node with two outbound links: the meeting leaving this device. -->
+          <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
+            <circle cx="5" cy="9" r="2.1" stroke="currentColor" stroke-width="1.4" />
+            <circle cx="13" cy="4.6" r="2.1" stroke="currentColor" stroke-width="1.4" />
+            <circle cx="13" cy="13.4" r="2.1" stroke="currentColor" stroke-width="1.4" />
+            <path
+              d="m6.9 8 4.2-2.3M6.9 10l4.2 2.3"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+            />
+          </svg>
+        }
+        @default {
+          <!-- Lined page: the note. -->
+          <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
+            <path
+              d="M4.2 2.8h6L14 6.5v8.7H4.2V2.8Z"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linejoin="round"
+            />
+            <path
+              d="M10 2.8v3.7h3.8M6.6 9.6h4.8M6.6 12.1h3.2"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+            />
+          </svg>
+        }
+      }
+      <span class="sr-only">{{ t.label }}</span>
     </button>
   }
 </div>
-  

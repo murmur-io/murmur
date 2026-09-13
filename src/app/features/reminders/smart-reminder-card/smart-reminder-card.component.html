@@ -1,15 +1,16 @@
-@if (hasContent() || error() || showCreateAction()) {
+@if (hasContent() || error() || showCreateAction() || showEmptyState()) {
 <section
   class="smart-card"
-  [class.card]="hasContent()"
-  [class.is-strip]="!hasContent()"
+  [class.card]="hasContent() && !showClose()"
+  [class.is-strip]="!hasContent() && !showClose()"
+  [class.is-bare]="showClose()"
   aria-label="Reminders for this source"
 >
   <header class="smart-head">
     <!-- The branded heading is earned, not unconditional. With nothing to show
          this collapses to a single quiet row, which is what makes promoting the
          surface above the fold affordable. -->
-    @if (hasContent()) {
+    @if (hasContent() || showEmptyState()) {
       <div>
         <span class="smart-kicker">✦ Smart reminders</span>
         <h3>Don’t let this slip</h3>
@@ -25,63 +26,138 @@
         New reminder
       </button>
     }
-  </header>
-
-  @if (error(); as message) {
-    <div class="smart-error" role="alert">
-      <span>{{ message }}</span>
+    <!-- Close ×, owned by the panel on a drawer mount (the host owns the
+         toggle) — the same split the note's reminders drawer uses. -->
+    @if (showClose()) {
       <button
         type="button"
-        class="btn btn-ghost"
-        [disabled]="!listenerReady()"
-        (click)="retry()"
+        class="smart-close"
+        aria-label="Close smart reminders"
+        title="Close smart reminders"
+        (click)="closed.emit()"
       >
-        Retry
+        <svg
+          viewBox="0 0 16 16"
+          width="14"
+          height="14"
+          fill="none"
+          aria-hidden="true"
+        >
+          <path
+            d="m4 4 8 8M12 4l-8 8"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+          />
+        </svg>
       </button>
-    </div>
-  }
+    }
+  </header>
 
-  <!-- No loading branch. `_suggestions` is component-local and wiped on every
-       remount, so gating on `loading()` flashed "Reviewing this source locally…"
-       on EVERY note open — tolerable at the bottom of the page, but above the
-       fold it reads as the page stuttering. The idle strip just stays until
-       rows arrive. -->
-  @if (rows().length > 0) {
-    <p class="smart-intro">
-      Review these local suggestions. Murmur never creates them automatically.
-    </p>
-    <ul class="suggestion-list">
-      @for (row of rows(); track row.suggestion.id) {
-        <li class="suggestion-row">
-          <div>
-            <strong>{{ row.suggestion.title }}</strong>
-            @if (row.dueLabel; as due) {
-              <span>{{ due }}</span>
-            } @else {
-              <span>Choose a date before creating</span>
-            }
-          </div>
-          <div class="suggestion-actions">
-            <button
-              type="button"
-              class="btn btn-primary"
-              [disabled]="busy().has(row.suggestion.id)"
-              (click)="editAndCreate(row.suggestion)"
-            >
-              Edit &amp; create
-            </button>
-            <button
-              type="button"
-              class="btn btn-ghost"
-              [disabled]="busy().has(row.suggestion.id)"
-              (click)="dismiss(row.suggestion.id)"
-            >
-              {{ busy().has(row.suggestion.id) ? "Dismissing…" : "Dismiss" }}
-            </button>
-          </div>
-        </li>
-      }
-    </ul>
-  }
+  <div class="smart-body">
+    @if (error(); as message) {
+      <div class="smart-error" role="alert">
+        <span>{{ message }}</span>
+        <button
+          type="button"
+          class="btn btn-ghost"
+          [disabled]="!listenerReady()"
+          (click)="retry()"
+        >
+          Retry
+        </button>
+      </div>
+    }
+
+    <!-- No loading branch. `_suggestions` is component-local and wiped on every
+         remount, so gating on `loading()` flashed "Reviewing this source locally…"
+         on EVERY note open — tolerable at the bottom of the page, but above the
+         fold it reads as the page stuttering. The idle strip just stays until
+         rows arrive. -->
+    @if (rows().length > 0) {
+      <p class="smart-intro">
+        Review these local suggestions. Murmur never creates them automatically.
+      </p>
+      <ul class="suggestion-list">
+        @for (row of rows(); track row.suggestion.id) {
+          <li class="suggestion-row">
+            <div>
+              <strong>{{ row.suggestion.title }}</strong>
+              @if (row.dueLabel; as due) {
+                <span>{{ due }}</span>
+              } @else {
+                <span>Choose a date before creating</span>
+              }
+            </div>
+            <!-- ICON-only (2026-09-13, user request). The labels stay in the DOM
+                 as `.sr-only` text, so both buttons keep their accessible name —
+                 the tooltip, the screen reader and every existing test locator
+                 still say "Edit & create" / "Dismiss". -->
+            <div class="suggestion-actions">
+              <button
+                type="button"
+                class="suggestion-btn is-primary"
+                title="Edit &amp; create"
+                [disabled]="busy().has(row.suggestion.id)"
+                (click)="editAndCreate(row.suggestion)"
+              >
+                <svg
+                  viewBox="0 0 18 18"
+                  width="16"
+                  height="16"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="m4 13.8.7-3.2 6-6a1.4 1.4 0 0 1 2 0l.5.5a1.4 1.4 0 0 1 0 2l-6 6-3.2.7Z"
+                    stroke="currentColor"
+                    stroke-width="1.35"
+                    stroke-linejoin="round"
+                  />
+                  <path
+                    d="M13.2 11.6v3.6M11.4 13.4H15"
+                    stroke="currentColor"
+                    stroke-width="1.35"
+                    stroke-linecap="round"
+                  />
+                </svg>
+                <span class="sr-only">Edit &amp; create</span>
+              </button>
+              <button
+                type="button"
+                class="suggestion-btn"
+                title="Dismiss"
+                [disabled]="busy().has(row.suggestion.id)"
+                (click)="dismiss(row.suggestion.id)"
+              >
+                <svg
+                  viewBox="0 0 18 18"
+                  width="16"
+                  height="16"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="m5 5 8 8M13 5l-8 8"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                  />
+                </svg>
+                <span class="sr-only">{{
+                  busy().has(row.suggestion.id) ? "Dismissing…" : "Dismiss"
+                }}</span>
+              </button>
+            </div>
+          </li>
+        }
+      </ul>
+    } @else if (showEmptyState() && !error()) {
+      <p class="smart-intro">
+        Nothing to review right now. When a note commits someone to something with
+        a date, Murmur stages it here — locally, and never creates it on its own.
+      </p>
+    }
+  </div>
 </section>
 }

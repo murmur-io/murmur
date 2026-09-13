@@ -16,27 +16,44 @@ test.afterEach(({ page }) => {
   expect(consoleErrors.get(page) ?? []).toEqual([]);
 });
 
-test("meeting commands sit between tags and tabs with padded icon actions and no duplicate reminder", async ({
+test("meeting commands share the title row, above the tabs, with padded icon actions and no duplicate reminder", async ({
   page,
 }) => {
   await mockTauri(page, {}, { audit_reminder_suggestions: [] });
+  // A desktop window, stated explicitly: the single-row layout is a claim about
+  // a real window, and on a narrow one the cluster deliberately wraps under the
+  // title instead of squeezing. Pinning the width keeps this oracle about the
+  // layout rather than about Playwright's default viewport.
+  await page.setViewportSize({ width: 1600, height: 900 });
   await page.goto("/meeting/m-atlas-roadmap");
 
-  const tags = page.locator(".tag-editor");
+  const title = page.locator(".head h2");
   const commands = page.getByTestId("meeting-command-bar");
   const tabs = page.locator("app-detail-tabs");
   await expect(commands).toBeVisible({ timeout: 10_000 });
 
-  const [tagsBox, commandBox, tabsBox] = await Promise.all([
-    tags.boundingBox(),
+  const [titleBox, commandBox, tabsBox] = await Promise.all([
+    title.boundingBox(),
     commands.boundingBox(),
     tabs.boundingBox(),
   ]);
-  expect(tagsBox).not.toBeNull();
+  expect(titleBox).not.toBeNull();
   expect(commandBox).not.toBeNull();
   expect(tabsBox).not.toBeNull();
-  expect(tagsBox!.y + tagsBox!.height).toBeLessThan(commandBox!.y);
-  expect(commandBox!.y + commandBox!.height).toBeLessThan(tabsBox!.y);
+  // ONE line (2026-09-13): the bar was its own full-width card between the tag
+  // editor and the tabs, and the tabs were a full-width band below it. Title,
+  // view switcher and commands now share a single row, so every pair of boxes
+  // must OVERLAP vertically...
+  const overlapsRow = (box: { y: number; height: number }) => {
+    expect(box.y).toBeLessThan(titleBox!.y + titleBox!.height);
+    expect(box.y + box.height).toBeGreaterThan(titleBox!.y);
+  };
+  overlapsRow(commandBox!);
+  overlapsRow(tabsBox!);
+  // ...and read left-to-right as title → what you are looking at → what you can
+  // do to it.
+  expect(tabsBox!.x).toBeGreaterThan(titleBox!.x + titleBox!.width);
+  expect(commandBox!.x).toBeGreaterThan(tabsBox!.x);
 
   for (const name of [
     "New reminder",
@@ -57,7 +74,15 @@ test("meeting commands sit between tags and tabs with padded icon actions and no
   }
 
   await expect(page.getByRole("button", { name: "New reminder" })).toHaveCount(1);
-  await expect(page.locator("app-meeting-actions app-smart-reminder-card .smart-card")).toHaveCount(0);
+  // Both follow-up surfaces are drawers now, so neither is in the note flow and
+  // neither renders until summoned. Asserted on the card itself, never through
+  // a wrapper element: an ancestor that no longer exists would make this pass
+  // forever (which is exactly what this line used to do).
+  await expect(page.locator("app-smart-reminder-card")).toHaveCount(0);
+  await expect(page.locator("app-meeting-actions")).toHaveCount(0);
+  // Summoning it renders the card — with nothing to review, its empty state.
+  await page.getByRole("button", { name: "Smart reminders", exact: true }).click();
+  await expect(page.locator(".smart-drawer app-smart-reminder-card")).toHaveCount(1);
 });
 
 test("Edit keeps its command-bar slot but is accessibly disabled without a note", async ({
