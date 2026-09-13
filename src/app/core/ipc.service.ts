@@ -127,7 +127,6 @@ import type {
   PinResult,
   Posture,
   ProactiveHintPayload,
-  PropertySchemaField,
   ProviderStatus,
   PruneSummary,
   RecipientPreview,
@@ -3382,35 +3381,16 @@ export class IpcService {
     });
   }
 
-  // ── Feature C — typed note front-matter properties (folder-level schema +
-  // the typed notes list feeding the Table/Board views). All three are GATED
-  // backend-side on the folder unlock: a LOCKED folder returns `[]` from BOTH
-  // reads (empty schema + empty rows), so no typed view is offered for it and
-  // no sealed content leaks. `properties` (the plaintext front-matter map) is
-  // untouched — the schema is a NEW parallel layer describing how to render it.
-
-  /**
-   * The property SCHEMA for a note-folder: one {@link PropertySchemaField} per
-   * defined property (its key + kind + select options). Returns `[]` for a
-   * LOCKED (sealed-and-not-session-unlocked) folder — the backend gates it, so a
-   * locked folder never exposes a typed view.
-   */
-  getNoteFolderSchema(folderId: string): Promise<PropertySchemaField[]> {
-    return invoke<PropertySchemaField[]>("get_note_folder_schema", {
-      folderId,
-    });
-  }
-
-  /**
-   * Persist a note-folder's property schema (replaces the whole field set).
-   * Gated — rejects (`Locked`) for a sealed-and-not-session-unlocked folder.
-   */
-  setNoteFolderSchema(
-    folderId: string,
-    fields: PropertySchemaField[],
-  ): Promise<void> {
-    return invoke<void>("set_note_folder_schema", { folderId, fields });
-  }
+  // ── Feature C — the typed notes list feeding the Table/Board views. GATED
+  // backend-side on the folder unlock: a LOCKED folder returns `[]`, so no typed
+  // view is offered for it and no sealed content leaks. `properties` (the
+  // plaintext front-matter map) is untouched.
+  //
+  // The folder-SCHEMA wrappers (`get_note_folder_schema`/`set_note_folder_schema`)
+  // were dropped here on 2026-09-13 with the note editor's Properties card — the
+  // only caller. BOTH Rust commands stay registered and in use: `tools.rs` reads
+  // the schema for the brain's `query_database` tool. Re-add a wrapper here if a
+  // future FE surface needs one.
 
   /**
    * The TYPED notes list for a folder — one {@link TypedNoteRow} per note, each

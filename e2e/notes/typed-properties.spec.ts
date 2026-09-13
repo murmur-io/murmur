@@ -13,8 +13,13 @@ import { mockNotes } from "./mock-invoke";
  * NOTE (2026-07-14): the notes-home per-folder List/Table/Board VIEW MODE (the
  * old `mur-segmented` schema-gated switcher + `app-notes-table-view` /
  * `app-notes-board-view`) was REMOVED and replaced by the Meetings-style Saved
- * Views bar (`app-notes-view-switcher`, Board dropped). The EDITOR's typed
- * property widgets (test 1 below) are unchanged and still shipped.
+ * Views bar (`app-notes-view-switcher`, Board dropped).
+ *
+ * NOTE (2026-09-13): the EDITOR's Properties card and its typed widgets were removed
+ * at the user's request. Test 1 no longer drives widgets — it pins the invariant that
+ * survived them: a note's front-matter still round-trips through a save untouched, so
+ * nothing is stripped from the exported .md. `TYPED_OVERRIDES` stays for tests 2-3
+ * (the Saved Views bar and the lock gate), which never touched the editor.
  */
 
 /** The schema + typed-row overrides shared by these specs. */
@@ -89,19 +94,26 @@ const NOTE_WITH_PROPS = {
   }),
 };
 
-test("editor renders a SCHEMA-DRIVEN widget per property (checkbox → mur-toggle, select dropdown, date input) and toggling round-trips the front-matter", async ({
+test("a note's front-matter survives a BODY edit untouched (no Properties UI)", async ({
   page,
 }) => {
+  // REPLACES the schema-driven-widget test deleted on 2026-09-13 with the editor's
+  // Properties card. That test was the only guard that a save re-emits the note's
+  // YAML block intact, and the card's removal makes that MORE important, not less:
+  // nothing in the UI shows front-matter any more, so a regression that silently
+  // dropped it would reach the user's Obsidian vault invisibly — and destructively,
+  // since the exported .md is overwritten.
+  //
+  // Same invariant, asserted through the surface that still exists: load a note whose
+  // markdown carries tags + typed properties, edit only the BODY, and require every
+  // front-matter line back in the saved markdown.
   const consoleErrors: string[] = [];
   page.on("console", (msg) => {
     if (msg.type() === "error") consoleErrors.push(msg.text());
   });
   page.on("pageerror", (err) => consoleErrors.push(String(err)));
 
-  // Capture the exact markdown the editor sends to save_note_text so we can
-  // assert the front-matter round-trip stays byte-shaped.
   await mockNotes(page, {
-    ...TYPED_OVERRIDES,
     ...NOTE_WITH_PROPS,
     save_note_text: (args: { id: string; title: string; markdown: string }) => {
       (window as unknown as { __lastSave?: unknown }).__lastSave = args.markdown;
@@ -109,51 +121,46 @@ test("editor renders a SCHEMA-DRIVEN widget per property (checkbox → mur-toggl
     },
   });
   await page.goto("/notes/n1");
-
-  // Title hydrated → the doc loaded.
   await expect(page.locator(".note-title-input")).toHaveValue("My First Note");
 
-  // The properties bar auto-opens (it has props). Each row's KEY is present.
-  await expect(page.locator(".prop-key", { hasText: "Status" })).toBeVisible();
-  await expect(page.locator(".prop-key", { hasText: "Reviewed" })).toBeVisible();
-  await expect(page.locator(".prop-key", { hasText: "Due" })).toBeVisible();
+  // The card is GONE — the point of the change.
+  await expect(page.locator(".props")).toHaveCount(0);
+  await expect(page.locator(".prop-row")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "+ Add property" })).toHaveCount(0);
 
-  // Checkbox → a mur-toggle (NOT a text input). Find the Reviewed row.
-  const reviewedRow = page.locator(".prop-row", { hasText: "Reviewed" });
-  await expect(reviewedRow.locator("mur-toggle")).toBeVisible();
-  await expect(reviewedRow.locator('input[type="text"]')).toHaveCount(0);
-  // Its switch reflects the true value.
-  await expect(reviewedRow.locator('input.switch')).toBeChecked();
+  // A note WITH a body starts in Preview (see note-editor.spec.ts "a note with a
+  // body starts in Preview"), and Preview renders no textarea — so switch to Edit
+  // first or the body locator never resolves.
+  await page
+    .getByRole("group", { name: "Edit or preview" })
+    .getByRole("button", { name: "Edit", exact: true })
+    .click();
 
-  // Select → a native <select> carrying the schema options + the current value.
-  const statusRow = page.locator(".prop-row", { hasText: "Status" });
-  await expect(statusRow.locator("select")).toBeVisible();
-  await expect(statusRow.locator("select")).toHaveValue("In progress");
-  await expect(statusRow.locator("select option", { hasText: "Done" })).toHaveCount(1);
+  // Edit the BODY only.
+  const body = page.getByRole("textbox", { name: "Note body" });
+  await expect(body).toBeVisible();
+  await body.click();
+  await body.pressSequentially(" edited");
 
-  // Date → an <input type="date"> with the ISO value.
-  const dueRow = page.locator(".prop-row", { hasText: "Due" });
-  await expect(dueRow.locator('input[type="date"]')).toHaveValue("2026-08-01");
-
-  // Toggle the checkbox OFF → the editor writes `Reviewed: false` back into the
-  // SAME front-matter block (round-trip: still `key: value` scalars, no shape drift).
-  await reviewedRow.locator("input.switch").click();
   await expect
     .poll(() =>
       page.evaluate(
         () => (window as unknown as { __lastSave?: string }).__lastSave ?? "",
       ),
     )
-    .toContain("Reviewed: false");
+    .toContain("edited");
+
   const saved = await page.evaluate(
     () => (window as unknown as { __lastSave?: string }).__lastSave ?? "",
   );
-  // The other typed properties survived unchanged (no data loss on a typed edit).
-  expect(saved).toContain("Status: In progress");
-  expect(saved).toContain("Due: 2026-08-01");
-  expect(saved).toContain("tags: [idea]");
-  // Still a single leading --- … --- YAML block (the byte-exact serializer path).
+  // Every front-matter line the note arrived with is still there, in one leading
+  // YAML block. This is the assertion that fails if the removal ever grows teeth it
+  // should not have.
   expect(saved.startsWith("---\n")).toBeTruthy();
+  expect(saved).toContain("tags: [idea]");
+  expect(saved).toContain("Status: In progress");
+  expect(saved).toContain("Reviewed: true");
+  expect(saved).toContain("Due: 2026-08-01");
 
   expect(consoleErrors).toEqual([]);
 });
