@@ -213,150 +213,18 @@
             (edit)="startEdit()"
           />
 
-          <!-- Action items — summons the right-side follow-up drawer (below).
-               Icon-only, sitting beside Ask because it is the same kind of
-               control: a view OF this meeting, not an action on it. Mirrors the
-               note editor's Reminders toggle. -->
-          <button
-            type="button"
-            class="btn btn-ghost head-chat-btn"
-            [class.is-active]="actionsDrawerOpen()"
-            [attr.aria-expanded]="actionsDrawerOpen()"
-            aria-label="Action items"
-            title="Action items for this meeting"
-            (click)="toggleActionsDrawer()"
-          >
-            <svg
-              class="head-chat-glyph"
-              viewBox="0 0 16 16"
-              width="13"
-              height="13"
-              fill="none"
-              aria-hidden="true"
-            >
-              <path
-                d="M2.5 4.2 4 5.7l2.4-2.6M2.5 11.2 4 12.7l2.4-2.6"
-                stroke="currentColor"
-                stroke-width="1.3"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-              <path
-                d="M8.6 4.6h5M8.6 11.6h5"
-                stroke="currentColor"
-                stroke-width="1.3"
-                stroke-linecap="round"
-              />
-            </svg>
-          </button>
-
-          <!-- Live context — connector enrichment. The TOGGLE only opens the
-               pane; the egress itself still happens behind the pane's own
-               labelled "Fetch live context" button, beside its "sends a query
-               out" pill. An unlabelled icon must never be the thing that sends
-               a query off the device. -->
-          <button
-            type="button"
-            class="btn btn-ghost head-chat-btn"
-            [class.is-active]="liveDrawerOpen()"
-            [attr.aria-expanded]="liveDrawerOpen()"
-            aria-label="Live context"
-            title="Live context from your connectors"
-            (click)="toggleLiveDrawer()"
-          >
-            <svg
-              class="head-chat-glyph"
-              viewBox="0 0 18 18"
-              width="13"
-              height="13"
-              fill="none"
-              aria-hidden="true"
-            >
-              <circle cx="9" cy="9" r="2" fill="currentColor" />
-              <path
-                d="M5.6 12.4a4.8 4.8 0 0 1 0-6.8M12.4 5.6a4.8 4.8 0 0 1 0 6.8"
-                stroke="currentColor"
-                stroke-width="1.3"
-                stroke-linecap="round"
-              />
-              <path
-                d="M3.3 14.7a8 8 0 0 1 0-11.4M14.7 3.3a8 8 0 0 1 0 11.4"
-                stroke="currentColor"
-                stroke-width="1.3"
-                stroke-linecap="round"
-              />
-            </svg>
-          </button>
-
-          <!-- Smart reminders — the local suggestion surface, in its own drawer
-               (2026-09-13, user request). Sparkle-on-bell: the SUGGESTED sibling
-               of the plain action-items checklist. -->
-          <button
-            type="button"
-            class="btn btn-ghost head-chat-btn"
-            [class.is-active]="smartDrawerOpen()"
-            [attr.aria-expanded]="smartDrawerOpen()"
-            aria-label="Smart reminders"
-            title="Smart reminders for this meeting"
-            (click)="toggleSmartDrawer()"
-          >
-            <svg
-              class="head-chat-glyph"
-              viewBox="0 0 18 18"
-              width="13"
-              height="13"
-              fill="none"
-              aria-hidden="true"
-            >
-              <path
-                d="M8.6 3.3a3.8 3.8 0 0 0-3.8 3.8v2L3.6 11.4h10l-1.2-2.3v-2a3.8 3.8 0 0 0-3.8-3.8Z"
-                stroke="currentColor"
-                stroke-width="1.3"
-                stroke-linejoin="round"
-              />
-              <path
-                d="M7.1 13.3a1.6 1.6 0 0 0 3 0"
-                stroke="currentColor"
-                stroke-width="1.3"
-                stroke-linecap="round"
-              />
-              <path
-                d="m14.6 2 .5 1.4 1.4.5-1.4.5-.5 1.4-.5-1.4-1.4-.5 1.4-.5.5-1.4Z"
-                fill="currentColor"
-              />
-            </svg>
-          </button>
-
-          <button
-            type="button"
-            class="btn btn-ghost head-chat-btn"
-            [class.is-active]="askDrawerOpen()"
-            [attr.aria-expanded]="askDrawerOpen()"
-            (click)="toggleAskDrawer()"
-          >
-            <svg
-              class="head-chat-glyph"
-              viewBox="0 0 16 16"
-              width="13"
-              height="13"
-              fill="none"
-              aria-hidden="true"
-            >
-              <path
-                d="M8 1.5l1.3 3.2L12.5 6 9.3 7.3 8 10.5 6.7 7.3 3.5 6l3.2-1.3L8 1.5Z"
-                stroke="currentColor"
-                stroke-width="1.2"
-                stroke-linejoin="round"
-              />
-              <path
-                d="M12.5 10.5l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6.6-1.4Z"
-                stroke="currentColor"
-                stroke-width="1.1"
-                stroke-linejoin="round"
-              />
-            </svg>
-            Ask
-          </button>
+          <!-- The four tool drawers as ONE switcher. They were four separate
+               ghost toggles, which misdescribed the model: `_openDrawer` is a
+               single signal, so at most one is ever open and picking a second
+               retires the first. Drawing them as a segment says that up front
+               and gives the command row back three hit areas. Ask keeps a
+               VISIBLE label — it is the one thing here a user comes looking
+               for by name, and an unlabelled sparkle is not findable. -->
+          <app-detail-tools
+            [tools]="detailTools"
+            [active]="openDrawer()"
+            (toolChange)="onToolChange($event)"
+          />
         </div>
       }
     </header>

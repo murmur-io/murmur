@@ -5,6 +5,8 @@ import {
   output,
 } from "@angular/core";
 
+import { TooltipDirective } from "../../../design-system/tooltip/tooltip.directive";
+
 /** The three note-detail sections. Extensible: add an id + a `tabs` entry + a shell `@if`. */
 export type DetailTab = "note" | "audio" | "share";
 
@@ -28,6 +30,7 @@ export interface DetailTabDef {
 @Component({
   selector: "app-detail-tabs",
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [TooltipDirective],
   templateUrl: "./detail-tabs.component.html",
   styleUrl: "./detail-tabs.component.scss",
 })

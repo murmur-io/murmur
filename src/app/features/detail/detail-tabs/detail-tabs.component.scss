@@ -3,54 +3,10 @@
   flex: none;
 }
 
-/* A quiet icon group, not a page-scale band. The old bar was the small `.seg`
-   primitive stretched to full width, which gave a page-wide strip the visual
-   weight of content. This is chrome: it sits in the command row, states read
-   through luminance, and the accent is spent on the ACTIVE glyph only. */
-.tabs {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--surface-input);
-}
-
-.tab-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 28px;
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: background var(--transition), color var(--transition);
-}
-.tab-btn svg {
-  width: 17px;
-  height: 17px;
-}
-.tab-btn:hover:not(.is-active) {
-  background: var(--surface-hover);
-  color: var(--text-primary);
-}
-/* Neutral pressed chrome + accent glyph — the shell's active-item language
-   (`--shell-active-*`), so a selected tab reads the same as a selected rail
-   item instead of inventing a third way to say "current". */
-.tab-btn.is-active {
-  background: var(--shell-active-bg);
-  color: var(--accent-text);
-  box-shadow: var(--shell-active-shadow);
-}
-.tab-btn:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px var(--accent-ring);
-}
+/* The BOX is the shared `.seg.seg--icon` primitive (design-system/primitives.css)
+   — the meeting's command row shows two of these side by side, and they have to
+   be the same control rather than two lookalikes. Nothing about the view
+   switcher is special enough to own a private copy of it. */
 
 .sr-only {
   position: absolute;

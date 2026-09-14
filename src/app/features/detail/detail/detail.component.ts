@@ -54,6 +54,11 @@ import {
   type DetailTabDef,
 } from "../detail-tabs/detail-tabs.component";
 import {
+  DetailToolsComponent,
+  type DetailTool,
+  type DetailToolDef,
+} from "../detail-tools/detail-tools.component";
+import {
   NotePanelComponent,
   type AssistantQa,
   type NoteSection,
@@ -82,6 +87,7 @@ type DetailDrawer = "ask" | "actions" | "smart" | "live" | null;
     RouterLink,
     LockBadgeComponent,
     DetailTabsComponent,
+    DetailToolsComponent,
     NotePanelComponent,
     AudioPanelComponent,
     MeetingActionsComponent,
@@ -311,6 +317,29 @@ export class DetailComponent implements OnInit {
   ];
   /** The active detail tab (Note default). Reset per meeting in `loadMeeting`. */
   readonly activeTab = signal<DetailTab>("note");
+
+  // --- Tool drawers (Action items · Live context · Smart reminders · Ask) ---
+  /**
+   * The tool switcher's entries. `label` is the control's ACCESSIBLE NAME and
+   * is matched exactly by e2e locators ("Action items", "Live context", "Smart
+   * reminders", "Ask") — change one and you rename the control for screen
+   * readers and tests alike. Ask is the only one that shows its label: it is
+   * what a user goes looking for by name.
+   */
+  readonly detailTools: DetailToolDef[] = [
+    {
+      id: "actions",
+      label: "Action items",
+      hint: "Action items for this meeting",
+    },
+    { id: "live", label: "Live context", hint: "Live context from your connectors" },
+    {
+      id: "smart",
+      label: "Smart reminders",
+      hint: "Smart reminders for this meeting",
+    },
+    { id: "ask", label: "Ask", hint: "Ask about this meeting", showLabel: true },
+  ];
 
   /**
    * Whether this install keeps high-fidelity per-stream master archives (the
@@ -1202,6 +1231,29 @@ export class DetailComponent implements OnInit {
   /** Close the Live context drawer (its × / the lock guard). */
   closeLiveDrawer(): void {
     this.closeDrawer("live");
+  }
+
+  /**
+   * The tool switcher's single entry point. It dispatches to the per-drawer
+   * toggles rather than setting `_openDrawer` itself, because opening is not
+   * uniform — Ask focuses its composer — and a switcher that bypassed that
+   * would silently drop the side effect the drawer needs.
+   */
+  onToolChange(tool: DetailTool): void {
+    switch (tool) {
+      case "ask":
+        this.toggleAskDrawer();
+        return;
+      case "actions":
+        this.toggleActionsDrawer();
+        return;
+      case "smart":
+        this.toggleSmartDrawer();
+        return;
+      case "live":
+        this.toggleLiveDrawer();
+        return;
+    }
   }
 
   /**

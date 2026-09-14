@@ -1,0 +1,8 @@
+:host {
+  display: block;
+  flex: none;
+}
+
+/* The BOX is the shared `.seg.seg--icon` primitive (design-system/primitives.css),
+   the same one the view switcher uses — see the component doc for why these two
+   must not be two separately-authored lookalikes one row apart. */

@@ -64,9 +64,9 @@
 .head h2 {
   margin: 0;
 }
-/* Header actions cluster — the WHOLE command set for this meeting (command bar
-   + the Action items and Ask drawer toggles) on the title row, right-aligned by
-   the .head's space-between.
+/* Header actions cluster — the WHOLE command set for this meeting (the view
+   switcher, the command bar, and the tool switcher) on the title row,
+   right-aligned by the .head's space-between.
    `flex: 1 1 auto`, not `flex: none`: the cluster takes the row's slack, and a
    flex item's implicit `min-width: auto` already stops it shrinking below its
    own icons — so when the window is too narrow for title AND controls, .head's
@@ -85,28 +85,6 @@
 .head-actions app-meeting-command-bar {
   min-width: 0;
 }
-/* Ask summon toggle (ported from note-editor's Ask Brain): the glyph adopts the
-   accent, and the active (drawer-open) state reads as a pressed neutral pill
-   with the accent glyph/label. */
-.head-chat-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  height: 32px;
-  padding: 0 var(--space-3);
-  font-size: 0.85rem;
-}
-.head-chat-glyph {
-  color: var(--accent);
-}
-.head-chat-btn.is-active {
-  background: var(--surface-hover);
-  color: var(--accent-hover);
-}
-.head-chat-btn.is-active .head-chat-glyph {
-  color: var(--accent-hover);
-}
-
 /* ===== Ask drawer (right-docked slideout) =====
    A FLOATING, OPAQUE right-docked panel (trap T3): the .detail is a normal
    document-flow scrolling column (not a height-bounded flex viewport like the

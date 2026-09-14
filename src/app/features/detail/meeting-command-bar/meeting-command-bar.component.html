@@ -3,7 +3,7 @@
     <button
       type="button"
       class="btn btn-ghost command-btn"
-      title="New reminder"
+      appTooltip="New reminder"
       [disabled]="reminderListenerState() !== 'ready' || reminderOpening()"
       (click)="newReminder()"
     >
@@ -19,7 +19,7 @@
       <button
         type="button"
         class="btn btn-primary command-btn convert-main"
-        title="Convert to note"
+        appTooltip="Convert to note"
         [disabled]="busy() || converting()"
         (click)="convertDefault()"
       >
@@ -33,6 +33,7 @@
       <button
         type="button"
         class="btn btn-primary split-toggle"
+        appTooltip="Choose note template"
         aria-label="Choose note template"
         aria-haspopup="menu"
         [attr.aria-expanded]="templateOpen()"
@@ -90,7 +91,7 @@
     <button
       type="button"
       class="btn btn-ghost command-btn"
-      title="Re-summarize"
+      appTooltip="Re-summarize"
       [disabled]="busy() || renaming()"
       (click)="resummarize.emit()"
     >
@@ -105,21 +106,26 @@
 
   <div class="command-secondary">
     @if (provenance(); as provider) {
-      <span class="provider-pill" [title]="'Generated with ' + (provider.model || provider.provider)">
+      <span class="provider-pill" [appTooltip]="'Generated with ' + (provider.model || provider.provider)">
         <mur-provider-icon [provider]="provider.provider" />
         <span class="sr-only">{{ provider.model || provider.provider }}</span>
       </span>
     }
 
+    <!-- Edit is the only control here that can be disabled, and `[attr.title]`
+         is set for exactly that state. A disabled button dispatches no pointer
+         or focus events, so `[appTooltip]` cannot fire on it; the native
+         tooltip is slow and plainly styled, but it is the only thing left that
+         can say WHY the control is dead. The two can never both be live, since
+         the state that enables one silences the other. -->
     <button
       type="button"
       class="btn btn-ghost command-btn quiet-btn"
       [class.command-btn-active]="editing()"
-      [disabled]="!notePresent() || editing()"
+      [disabled]="editDisabled()"
       [attr.aria-pressed]="editing()"
-      [attr.title]="
-        !notePresent() ? 'No note to edit' : editing() ? 'Currently editing' : 'Edit note'
-      "
+      [appTooltip]="editHint()"
+      [attr.title]="editDisabled() ? editHint() : null"
       (click)="requestEdit()"
     >
       <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
@@ -132,7 +138,7 @@
       <button
         type="button"
         class="btn btn-ghost command-btn quiet-btn"
-        title="More actions"
+        appTooltip="More actions"
         aria-haspopup="menu"
         [attr.aria-expanded]="menuOpen()"
         [disabled]="busy()"

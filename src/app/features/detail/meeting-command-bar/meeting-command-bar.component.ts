@@ -4,6 +4,7 @@ import {
   DestroyRef,
   ElementRef,
   OnInit,
+  computed,
   inject,
   input,
   output,
@@ -14,6 +15,7 @@ import { IpcService } from "../../../core/ipc.service";
 import { MurProviderIconComponent } from "../../../design-system/provider-icon/provider-icon.component";
 import { ReminderComposerService } from "../../reminders/reminder-composer/reminder-composer.service";
 import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
+import { TooltipDirective } from "../../../design-system/tooltip/tooltip.directive";
 
 interface BuiltinTemplate {
   readonly id: string;
@@ -35,7 +37,7 @@ const BUILTIN_TEMPLATES: readonly BuiltinTemplate[] = [
 @Component({
   selector: "app-meeting-command-bar",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurProviderIconComponent, MoveToMenuComponent],
+  imports: [MurProviderIconComponent, MoveToMenuComponent, TooltipDirective],
   templateUrl: "./meeting-command-bar.component.html",
   styleUrl: "./meeting-command-bar.component.scss",
   host: {
@@ -63,6 +65,28 @@ export class MeetingCommandBarComponent implements OnInit {
   readonly linking = input(false);
   readonly keepsMasters = input(false);
   readonly hasAudio = input(false);
+
+  /** Edit is unavailable with no note, and redundant while already editing. */
+  readonly editDisabled = computed(() => !this.notePresent() || this.editing());
+
+  /**
+   * What Edit means right now — including, crucially, WHY it is unavailable.
+   *
+   * This is the one control in the row that can be disabled, and a disabled
+   * `<button>` receives no pointer or focus events in any engine, so
+   * `[appTooltip]` cannot fire on it. The explanation therefore falls back to
+   * the native `title` for exactly that state (see the template): slow and
+   * plainly styled, but present — and "Edit does nothing and will not say why"
+   * is a worse outcome than a slow tooltip. The two never overlap, because the
+   * state that enables one is the state that silences the other.
+   */
+  readonly editHint = computed(() =>
+    !this.notePresent()
+      ? "No note to edit"
+      : this.editing()
+        ? "Currently editing"
+        : "Edit note",
+  );
   readonly moveOpen = input(false);
   readonly exportMsg = input("");
 
