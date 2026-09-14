@@ -112,15 +112,20 @@
       </span>
     }
 
+    <!-- Edit is the only control here that can be disabled, and `[attr.title]`
+         is set for exactly that state. A disabled button dispatches no pointer
+         or focus events, so `[appTooltip]` cannot fire on it; the native
+         tooltip is slow and plainly styled, but it is the only thing left that
+         can say WHY the control is dead. The two can never both be live, since
+         the state that enables one silences the other. -->
     <button
       type="button"
       class="btn btn-ghost command-btn quiet-btn"
       [class.command-btn-active]="editing()"
-      [disabled]="!notePresent() || editing()"
+      [disabled]="editDisabled()"
       [attr.aria-pressed]="editing()"
-      [appTooltip]="
-        !notePresent() ? 'No note to edit' : editing() ? 'Currently editing' : 'Edit note'
-      "
+      [appTooltip]="editHint()"
+      [attr.title]="editDisabled() ? editHint() : null"
       (click)="requestEdit()"
     >
       <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">

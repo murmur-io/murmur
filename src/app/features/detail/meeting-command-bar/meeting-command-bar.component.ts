@@ -4,6 +4,7 @@ import {
   DestroyRef,
   ElementRef,
   OnInit,
+  computed,
   inject,
   input,
   output,
@@ -64,6 +65,28 @@ export class MeetingCommandBarComponent implements OnInit {
   readonly linking = input(false);
   readonly keepsMasters = input(false);
   readonly hasAudio = input(false);
+
+  /** Edit is unavailable with no note, and redundant while already editing. */
+  readonly editDisabled = computed(() => !this.notePresent() || this.editing());
+
+  /**
+   * What Edit means right now — including, crucially, WHY it is unavailable.
+   *
+   * This is the one control in the row that can be disabled, and a disabled
+   * `<button>` receives no pointer or focus events in any engine, so
+   * `[appTooltip]` cannot fire on it. The explanation therefore falls back to
+   * the native `title` for exactly that state (see the template): slow and
+   * plainly styled, but present — and "Edit does nothing and will not say why"
+   * is a worse outcome than a slow tooltip. The two never overlap, because the
+   * state that enables one is the state that silences the other.
+   */
+  readonly editHint = computed(() =>
+    !this.notePresent()
+      ? "No note to edit"
+      : this.editing()
+        ? "Currently editing"
+        : "Edit note",
+  );
   readonly moveOpen = input(false);
   readonly exportMsg = input("");
 

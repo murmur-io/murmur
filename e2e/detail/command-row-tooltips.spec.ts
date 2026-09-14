@@ -56,14 +56,21 @@ test("both switchers explain their glyphs, not just the loose buttons", async ({
   );
 });
 
-test("no control keeps a native title beside its tooltip", async ({ page }) => {
+test("no ENABLED control keeps a native title beside its tooltip", async ({
+  page,
+}) => {
   // Two tooltips for one control, ours immediately and the OS's a second
   // later, is the failure mode adopting the directive introduces if a call
   // site forgets to drop `title`. Nothing about the bubble's own behaviour
   // would reveal it.
+  //
+  // Scoped to enabled controls on purpose: a DISABLED button dispatches no
+  // pointer or focus events, so `[appTooltip]` cannot fire on it and the
+  // native `title` is deliberately kept as the only way it can still say why
+  // it is dead (Edit, meeting-command-bar). The two are never live together.
   await openMeeting(page);
   const titled = await page
-    .locator(".head-actions [title]")
+    .locator(".head-actions [title]:not(:disabled)")
     .evaluateAll((nodes) =>
       nodes.map((node) => node.getAttribute("title") ?? ""),
     );
@@ -115,9 +122,12 @@ test("a keyboard user gets the same explanation", async ({ page }) => {
   // all — a listener attached directly to the button saw none either. This
   // test is the thing that actually exercises it, under a focused browser.
   await openMeeting(page);
+  // The control is NAMED "More" (its `.sr-only` text) and EXPLAINED as "More
+  // actions" (the tooltip). Conflating the two is what made the first version
+  // of this test hunt for a button that does not exist.
   await page
     .locator(".head-actions")
-    .getByRole("button", { name: "More actions", exact: true })
+    .getByRole("button", { name: "More", exact: true })
     .focus();
   await expect(page.locator(bubble)).toHaveText("More actions");
 
