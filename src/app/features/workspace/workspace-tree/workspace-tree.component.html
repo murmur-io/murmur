@@ -195,7 +195,7 @@
             aria-selected="false"
             [attr.aria-level]="line.depth + 1"
             [style.padding-left]="
-              'calc(' + line.depth + ' * var(--tree-indent) + 20px)'
+              'calc(' + line.depth + ' * var(--tree-indent) + var(--see-all-indent))'
             "
             (click)="openAll(owner)"
           >

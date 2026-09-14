@@ -10,10 +10,13 @@
   z-index: var(--z-overlay);
 }
 
+/* An empty/error line stands in for the rows that are not there, so it starts
+   at the same x they would and is padded on the same horizontal step — it used
+   to sit at 12px while every row beside it sat at 8px. */
 .tree-state,
 .tree-error {
   margin: 0;
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-1) var(--sidebar-row-pad-x);
   font-size: 0.8rem;
   color: var(--text-muted);
 }
@@ -25,7 +28,7 @@
 .tree {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: var(--sidebar-row-gap);
   /* The rail scrolls vertically; a row wider than it would put its trailing control
      outside the scroll box, where a click lands on the rail instead of the button. */
   min-width: 0;
@@ -56,34 +59,26 @@ mur-tree-row:has(mur-row-menu.is-open) {
   align-items: center;
 }
 
-/* A project reads as the top of its own group: slightly stronger label, and a
-   little breathing room above so consecutive projects do not run together. */
+/* A project is a sibling in the tree, not a section of its own: it reads as
+   the head of its group through WEIGHT, and keeps the row pitch everything
+   else in the sidebar uses. It used to add 4px on top of that, which put the
+   top-level rows on a different pitch from the items nested under them. */
 .line--project {
   font-weight: 600;
-
-  &:not(:first-child) {
-    margin-top: var(--space-1);
-  }
-}
-
-/* A type-group header is chrome ABOUT the items below it, so it sits quieter
-   than both the container above and the items it introduces. */
-.line--group {
-  font-size: 0.78rem;
-  color: var(--text-tertiary);
-  letter-spacing: 0.02em;
 }
 
 .line--item {
   color: var(--text-secondary);
 }
 
-.line--unfiled {
-  margin-bottom: var(--space-1);
-}
-
+/* The inbox variant continues rows drawn at DEPTH 1, so it carries one nesting
+   step that the generic `.see-all` gets from its own `line.depth`. Dropping
+   that step is exactly what this file did when it traded the old magic
+   `calc(var(--tree-indent) + 20px)` for the token expression: the `20px` stood
+   in for the icon and was replaced, and the `--tree-indent` beside it was lost
+   in the same edit, leaving this row 10px left of every item above it. */
 .see-all--unfiled {
-  padding-left: calc(var(--tree-indent) + 20px);
+  padding-left: calc(var(--tree-indent) + var(--see-all-indent));
 }
 
 /* Session-unlocked is a PRIVACY state, so it carries the accent the rest of the
@@ -97,18 +92,37 @@ mur-tree-row:has(mur-row-menu.is-open) {
   color: var(--accent);
 }
 
+/* A continuation row is still a ROW: same height, same type, same pitch as the
+   items it continues — only the colour says it is secondary. It used to be a
+   25px line in a column of 34px rows, which is what made the bottom of each
+   inbox read as a different list.
+
+   Its label has no glyph, so it is padded by hand to the x every row label
+   starts at: the leading gutter, spelled out in the same tokens the rows use
+   instead of the magic `+ 20px` that used to stand in for the icon. */
 .see-all {
+  --see-all-indent: calc(
+    var(--sidebar-caret-slot) + var(--sidebar-caret-gap) +
+      var(--sidebar-row-pad-x) + var(--sidebar-icon-slot) +
+      var(--sidebar-label-gap)
+  );
+
   appearance: none;
-  border: 0;
+  /* Transparent, and load-bearing: it is the 1px `<mur-tree-row>` reserves for
+     its drop-target border, and without it this row's text sat 1px left of the
+     item labels directly above it. */
+  border: 1px solid transparent;
   background: none;
   width: 100%;
+  height: var(--sidebar-row-h);
   text-align: left;
-  padding-block: var(--space-1);
   padding-right: var(--space-2);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   color: var(--text-tertiary);
   font: inherit;
-  font-size: 0.78rem;
+  font-size: var(--sidebar-row-font);
+  font-weight: var(--sidebar-row-weight);
+  letter-spacing: var(--sidebar-row-tracking);
   cursor: pointer;
   transition:
     background var(--transition-fast),
