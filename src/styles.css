@@ -504,31 +504,62 @@ app-shell.sidebar-collapsed {
   display: none;
 }
 
-/* One row shape for every clickable line: destination, disclosure, footer. */
+/* One row shape for every clickable line: destination, disclosure, footer —
+   and, through the shared `--sidebar-*` tokens, the SAME shape `<mur-tree-row>`
+   draws for the workspace and shared trees. The two leading columns are the
+   tree's own gutter: a disclosure caret (or an equal-width spacer) and then a
+   fixed icon slot, so a Browse row's glyph sits at the same x as a folder's. */
 .primary-sidebar .sb-row {
   display: grid;
-  grid-template-columns: var(--space-6) 1fr auto;
+  grid-template-columns:
+    var(--sidebar-caret-slot) var(--sidebar-icon-slot) 1fr auto;
   align-items: center;
-  gap: var(--space-2);
+  gap: 0 var(--sidebar-caret-gap);
   width: 100%;
-  height: var(--space-7);
-  padding: 0 var(--space-2);
-  border: 0;
+  height: var(--sidebar-row-h);
+  padding: 0 var(--sidebar-row-pad-x);
+  /* Not decoration: `<mur-tree-row>` carries a 1px transparent border for its
+     drag-and-drop target states, and without the same border here a Browse
+     label landed exactly 1px left of a tree label at the same depth. Measured,
+     not guessed — 68px against 69px. */
+  border: 1px solid transparent;
   border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-secondary);
   font: inherit;
-  font-size: 0.9rem;
-  font-weight: 550;
+  font-size: var(--sidebar-row-font);
+  font-weight: var(--sidebar-row-weight);
+  letter-spacing: var(--sidebar-row-tracking);
   text-align: left;
   text-decoration: none;
   cursor: pointer;
   transition: color var(--transition-fast), background var(--transition-fast);
 }
 
+/* Column 2 holds the glyph; the label is pushed off it by the label gap
+   rather than by a uniform grid gap, because the caret sits tighter to the
+   icon than the icon does to the text (this is the tree's own spacing). */
+.primary-sidebar .sb-row > mur-icon {
+  display: grid;
+  place-items: center;
+  width: var(--sidebar-icon-slot);
+}
+
+.primary-sidebar .sb-row > .sb-label {
+  margin-left: calc(var(--sidebar-label-gap) - var(--sidebar-caret-gap));
+}
+
+/* An equal-width stand-in for the caret on a row that does not disclose
+   anything — the same device `<mur-tree-row>` uses for its leaf rows, and the
+   reason a leaf's icon lines up with an expandable row's icon. */
+.primary-sidebar .sb-caret--leaf {
+  pointer-events: none;
+}
+
 .primary-sidebar.collapsed .sb-row {
   grid-template-columns: 1fr;
   justify-items: center;
+  height: var(--space-6);
   padding: 0;
 }
 
@@ -557,17 +588,26 @@ app-shell.sidebar-collapsed {
   overscroll-behavior: contain;
 }
 
+/* ONE break between the sidebar's top-level groups (destinations, Workspaces,
+   Shared, Developer, Browse). Each group used to carry its own top padding,
+   and Browse — the only group with no header of its own — ended up with a
+   different break above it than its neighbours. */
+.primary-sidebar .sb-scroll > * + * {
+  margin-top: var(--sidebar-group-gap);
+}
+
 .primary-sidebar .sb-nav {
   flex: none;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--sidebar-row-gap);
   padding: 0 var(--space-2);
 }
 
 .primary-sidebar .sb-caret {
   display: grid;
   place-items: center;
+  width: var(--sidebar-caret-slot);
   color: var(--text-tertiary);
   transition: transform var(--transition-fast);
 }
@@ -576,21 +616,43 @@ app-shell.sidebar-collapsed {
   transform: rotate(90deg);
 }
 
+/* One nesting step for the whole sidebar: `--tree-indent`, the same token the
+   trees indent by. It used to be 16px of margin plus 8px of padding plus a 1px
+   guide — 25px, against the tree's 10px — which is why a Browse destination and
+   a folder at the same depth started their labels 6px apart. The guide goes
+   with it: the trees never had one. */
 .primary-sidebar .sb-sublist {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  margin: var(--space-1) 0 var(--space-2) var(--space-4);
-  padding-left: var(--space-2);
-  border-left: 1px solid var(--border-subtle);
+  gap: var(--sidebar-row-gap);
+  margin: 0 0 var(--space-2) var(--tree-indent);
 }
 
+/* A group label inside Browse's sub-list owns its own break — it separates one
+   run of destinations from the next, with nothing else between them, unlike a
+   section head, which already has the group break above it. It is also hung
+   back out of the sub-list's indent, so every header in the sidebar —
+   "Workspaces", "Shared", "Work" — starts its text at the same x: the header
+   belongs to the column, while the rows it heads stay indented. */
 .primary-sidebar .sb-group-label {
-  padding: var(--space-2) var(--space-2) var(--space-1);
+  margin-left: calc(-1 * var(--tree-indent));
+  padding: var(--sidebar-group-gap) var(--sidebar-row-pad-x) var(--space-1);
+}
+
+.primary-sidebar .sb-group-label:first-child {
+  padding-top: 0;
+}
+
+/* The two header kinds — a section head ("Workspaces", "Shared") and a group
+   label ("Work", "Intelligence") — are ONE piece of typography. They already
+   had the same type; what differed was the padding around them (8/4 against
+   4/4), so the same-looking label sat at a different height in each place. */
+.primary-sidebar .sb-group-label,
+.primary-sidebar .sb-section-title {
   color: var(--text-tertiary);
-  font-size: 0.7rem;
-  font-weight: 650;
-  letter-spacing: 0.06em;
+  font-size: var(--sidebar-section-font);
+  font-weight: var(--sidebar-section-weight);
+  letter-spacing: var(--sidebar-section-tracking);
   text-transform: uppercase;
 }
 
@@ -600,7 +662,8 @@ app-shell.sidebar-collapsed {
   display: flex;
   flex: none;
   flex-direction: column;
-  padding: var(--space-2) var(--space-2) 0;
+  gap: var(--sidebar-row-gap);
+  padding: 0 var(--space-2);
 }
 
 .primary-sidebar .sb-section-head {
@@ -608,22 +671,16 @@ app-shell.sidebar-collapsed {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-  padding: var(--space-1) var(--space-2);
+  padding: 0 var(--sidebar-row-pad-x) var(--space-1);
 }
 
-.primary-sidebar .sb-section-title {
-  color: var(--text-tertiary);
-  font-size: 0.7rem;
-  font-weight: 650;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
+/* Sized to the 0.7rem label it sits beside, not to a row: at 32px it was the
+   tallest thing in the header and set the head's height on its own. */
 .primary-sidebar .sb-section-action {
   display: grid;
   place-items: center;
-  width: var(--space-6);
-  height: var(--space-6);
+  width: var(--space-5);
+  height: var(--space-5);
   padding: 0;
   border: 0;
   border-radius: var(--radius-sm);
@@ -645,7 +702,7 @@ app-shell.sidebar-collapsed {
   display: flex;
   flex: none;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--sidebar-row-gap);
   padding: var(--space-2);
   border-top: 1px solid var(--border-subtle);
 }
@@ -745,8 +802,8 @@ app-shell.sidebar-collapsed {
 .primary-sidebar .sb-developer {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: var(--space-2) var(--space-2) 0;
+  gap: var(--sidebar-row-gap);
+  padding: 0 var(--space-2);
 }
 
 .primary-sidebar .sb-dev-label {
@@ -773,15 +830,16 @@ app-shell.sidebar-collapsed {
 .primary-sidebar .sb-browse {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: var(--space-2) var(--space-2) 0;
+  gap: var(--sidebar-row-gap);
+  padding: 0 var(--space-2);
 }
 
 .primary-sidebar .sb-shared {
   display: flex;
   flex: none;
   flex-direction: column;
-  padding: var(--space-2) var(--space-2) 0;
+  gap: var(--sidebar-row-gap);
+  padding: 0 var(--space-2);
 }
 
 /* The menu floats OVER the tree, so it takes the OPAQUE overlay surface — the

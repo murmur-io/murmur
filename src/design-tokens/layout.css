@@ -84,6 +84,47 @@
      without a new folder-icon+label block visually detaching from its parent. */
   --tree-indent: 10px;
 
+  /* ── ONE sidebar rhythm ────────────────────────────────────────────────
+     Every clickable line in the sidebar is the SAME box, whatever component
+     draws it: the destination rows (`.sb-row`, styles.css), the workspace and
+     shared trees (`<mur-tree-row>`), and the "View all" continuation
+     (`.see-all`). They were authored separately and had drifted into three
+     different widgets stacked in one column — measured in the running app on
+     2026-09-14:
+
+       family                 row height   pitch   label x
+       mur-tree-row (depth 0)     34px     37-40px    65px
+       .sb-row (Browse)           48px       50px     56px
+       .sb-row (Meetings/Notes)   48px       50px     81px
+       .see-all                   25px         --       --
+
+     Three heights, three label origins, and a disclosure caret on the LEFT in
+     the tree but on the RIGHT in Browse. Change these tokens, not the
+     components — a value edited in one of the three files is exactly how the
+     drift happened.
+
+     The leading gutter is two fixed slots so an expandable row and a leaf row
+     start their icon at the same x, and so a `.sb-row` icon lines up with a
+     tree-row icon: [pad][caret 20][4][icon 20][8][label]. */
+  --sidebar-row-h: 34px;
+  --sidebar-row-gap: 2px;
+  --sidebar-row-pad-x: var(--space-2);
+  --sidebar-caret-slot: 20px;
+  --sidebar-icon-slot: 20px;
+  --sidebar-caret-gap: var(--space-1);
+  --sidebar-label-gap: var(--space-2);
+  --sidebar-row-font: 0.9rem;
+  --sidebar-row-weight: 550;
+  --sidebar-row-tracking: -0.01em;
+  /* The ONE deliberate break in that rhythm: the space that separates a group
+     from the one above it (a section head, a group label, a new project). One
+     value, used everywhere a break is meant, so a gap reads as intentional
+     rather than as another component's default. */
+  --sidebar-group-gap: var(--space-3);
+  --sidebar-section-font: 0.7rem;
+  --sidebar-section-weight: 650;
+  --sidebar-section-tracking: 0.06em;
+
   /* `mur-tab-strip`'s REAL rendered height, set on `<html>` at runtime by
      `AppShellComponent`'s `_syncTabsStripHeight` effect (0px when no tabs
      are open). This `:root` default is only the pre-JS/fallback value — every

@@ -7,11 +7,15 @@
   display: flex;
   flex: none;
   align-items: center;
-  gap: var(--space-1);
-  /* A little breathing room on top of the tree's own 2px row gap — at the
-     tight gap alone, the hover/selected pill's rounded corners read as
-     crowding into the row right above/below it. */
-  margin-block: 1px;
+  gap: var(--sidebar-caret-gap);
+  /* THE sidebar row height (`--sidebar-row-h`, shared with `.sb-row` and
+     `.see-all`). It sits on the HOST, not on `.row-main`, so the 1px border
+     below is inside the height rather than added to it — with the height on
+     the inner button this row came out 2px taller than every other one.
+     Separation between rows is the container's `gap` (`--sidebar-row-gap`),
+     never a margin here: a margin stacks with that gap and puts the tree on a
+     different pitch from every other row group in the sidebar. */
+  height: var(--sidebar-row-h);
   border: 1px solid transparent;
   border-radius: var(--radius-md);
   transition:
@@ -57,8 +61,8 @@
   align-items: center;
   justify-content: center;
   flex: none;
-  width: 20px;
-  height: 20px;
+  width: var(--sidebar-caret-slot);
+  height: var(--sidebar-caret-slot);
   padding: 0;
   border: none;
   border-radius: var(--radius-sm);
@@ -89,18 +93,19 @@
 .row-main {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--sidebar-label-gap);
   flex: 1 1 auto;
   min-width: 0;
-  padding: 6px var(--space-2);
-  border: 1px solid transparent;
+  height: 100%;
+  padding: 0 var(--sidebar-row-pad-x);
+  border: 0;
   border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-secondary);
   font-family: inherit;
-  font-size: 0.9rem;
-  font-weight: 550;
-  letter-spacing: -0.01em;
+  font-size: var(--sidebar-row-font);
+  font-weight: var(--sidebar-row-weight);
+  letter-spacing: var(--sidebar-row-tracking);
   text-align: left;
   cursor: pointer;
   transition: color var(--transition);
@@ -112,9 +117,15 @@
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
+/* A FIXED slot, not a shrink-to-fit box: the glyphs differ in width (a 15px
+   svg, a project emoji), and without it every row's label started at a
+   slightly different x. */
 .row-icon {
   display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
+  width: var(--sidebar-icon-slot);
   color: var(--text-muted);
 }
 .row-icon[data-icon="space"] {
