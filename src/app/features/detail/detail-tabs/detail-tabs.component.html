@@ -8,7 +8,7 @@
       type="button"
       class="seg-btn"
       role="tab"
-      [title]="t.label"
+      [appTooltip]="t.label"
       [class.is-active]="active() === t.id"
       [attr.aria-selected]="active() === t.id"
       (click)="tabChange.emit(t.id)"
