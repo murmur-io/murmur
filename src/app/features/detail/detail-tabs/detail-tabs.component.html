@@ -2,11 +2,11 @@
      user request). Each label stays in the DOM as `.sr-only` text, so the
      accessible name is unchanged — a tab is still "Note" / "Audio" / "Share" to
      a screen reader, to a tooltip and to every existing test locator. -->
-<div class="tabs" role="tablist" aria-label="Meeting sections">
+<div class="seg seg--icon" role="tablist" aria-label="Meeting sections">
   @for (t of tabs(); track t.id) {
     <button
       type="button"
-      class="tab-btn"
+      class="seg-btn"
       role="tab"
       [title]="t.label"
       [class.is-active]="active() === t.id"

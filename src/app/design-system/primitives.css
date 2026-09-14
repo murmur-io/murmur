@@ -386,6 +386,42 @@ legend { padding: 0 var(--space-2); color: var(--text-secondary); font-size: 0.8
 .seg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-ring); }
 .seg-btn:disabled { cursor: not-allowed; opacity: 0.5; }
 
+/* --- Icon variant of the segment above -------------------------------------
+   The same control, sized as CHROME rather than as content: a fixed glyph box
+   instead of text padding, and the shell's neutral pressed pill
+   (`--shell-active-*`) with an accent GLYPH instead of the accent-soft fill —
+   so a selected segment reads like a selected rail item rather than inventing
+   a third way to say "current".
+
+   It lives here, not in a component, because the meeting's command row shows
+   TWO of these side by side (the view switcher and the tools switcher). Two
+   copies of ~40 lines of segment CSS one row apart is the drift this repo has
+   already paid for elsewhere; any divergence between them would be visible at
+   a glance. An item may carry a visible label (`.seg-btn.has-label`) — the
+   rest keep their name in `.sr-only` text. --- */
+.seg--icon { padding: 2px; gap: 2px; border-color: var(--border-subtle); }
+.seg--icon .seg-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 28px;
+  padding: 0;
+}
+.seg--icon .seg-btn svg { width: 17px; height: 17px; }
+/* Restores only the horizontal padding the icon box zeroed — the type is
+   already the `.seg-btn` base's, and restating it here is how two rules that
+   must agree start disagreeing. */
+.seg--icon .seg-btn.has-label {
+  gap: 5px;
+  padding: 0 var(--space-2);
+}
+.seg--icon .seg-btn.is-active {
+  background: var(--shell-active-bg);
+  color: var(--accent-text);
+  box-shadow: var(--shell-active-shadow);
+}
+
 /* --- Page-scale tab bar: the .seg/.seg-btn primitives above at full width with
    a larger touch target. NO CURRENT CONSUMER — meeting detail moved its tabs
    into the command row as icons (2026-09-13). Kept as an available primitive;
