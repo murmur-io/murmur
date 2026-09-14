@@ -25,6 +25,12 @@ SECRETS = [
     (re.compile(r"gh[ps]_[A-Za-z0-9]{20,}"), "token GitHub"),
 ]
 DEV_PLACEHOLDER = "0123456789abcdef" * 4
+# Cargo.lock zapisuje sumę kontrolną crates.io dokładnie w kształcie DEK-a: 64 hex.
+# Każdy bump zależności dodaje takie linie, więc bez tego wyjątku zwykły release
+# uczy przepuszczać MURMUR_ALLOW_SECRET=1 — a to rozbraja skaner na stałe, i to
+# akurat wtedy, gdy diff jest duży i najmniej się patrzy. Wzorzec jest zakotwiczony
+# na całą linię, więc klucz doklejony do takiej linii dalej się łapie.
+LOCKFILE_CHECKSUM = re.compile(r'^\+?\s*checksum = "[0-9a-f]{64}"\s*$')
 
 
 def deny(msg: str) -> "NoReturn":  # type: ignore[valid-type]
@@ -40,6 +46,8 @@ def git(*args: str) -> str:
 def secret_hits(added: str) -> list:
     hits = [label for pattern, label in SECRETS if pattern.search(added)]
     for line in added.splitlines():
+        if LOCKFILE_CHECKSUM.match(line):
+            continue
         if re.search(r"[0-9a-fA-F]{64}", line):
             documented = "MURMUR_DEV_DEK" in line or "MURMUR_DEV_KEK" in line
             if not (DEV_PLACEHOLDER in line and documented):
@@ -80,6 +88,17 @@ def selftest() -> None:
         failed.append("  skan sekretow NIE wykrywa klucza Anthropic")
     if secret_hits("+zwykla linia kodu"):
         failed.append("  skan sekretow ma falszywy alarm")
+    # Obie strony wyjatku na Cargo.lock: suma kontrolna ma przechodzic, a gole
+    # 64-hex (i klucz doklejony do takiej linii) ma dalej byc lapane.
+    # Rozbite na polowy z tego samego powodu co SECRETS wyzej: zeby ten plik
+    # nie wykrywal samego siebie.
+    lockhash = "b281d307588d634de920874890732659" + "e2e7672f72b5e10e81badc1a8a83621e"
+    if secret_hits('checksum = "' + lockhash + '"'):
+        failed.append("  skan sekretow bierze sume kontrolna Cargo.lock za DEK")
+    if not secret_hits(lockhash):
+        failed.append("  skan sekretow przestal wykrywac gole 64-hex")
+    if not secret_hits('checksum = "' + lockhash + '"  # ' + lockhash):
+        failed.append("  wyjatek na Cargo.lock jest za szeroki")
     if failed:
         print("guard selftest: FAIL", file=sys.stderr)
         print("\n".join(failed), file=sys.stderr)
