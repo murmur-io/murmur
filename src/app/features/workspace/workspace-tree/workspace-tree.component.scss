@@ -71,8 +71,14 @@ mur-tree-row:has(mur-row-menu.is-open) {
   color: var(--text-secondary);
 }
 
+/* The inbox variant continues rows drawn at DEPTH 1, so it carries one nesting
+   step that the generic `.see-all` gets from its own `line.depth`. Dropping
+   that step is exactly what this file did when it traded the old magic
+   `calc(var(--tree-indent) + 20px)` for the token expression: the `20px` stood
+   in for the icon and was replaced, and the `--tree-indent` beside it was lost
+   in the same edit, leaving this row 10px left of every item above it. */
 .see-all--unfiled {
-  padding-left: var(--see-all-indent);
+  padding-left: calc(var(--tree-indent) + var(--see-all-indent));
 }
 
 /* Session-unlocked is a PRIVACY state, so it carries the accent the rest of the
