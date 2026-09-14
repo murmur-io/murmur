@@ -3,7 +3,7 @@
     <button
       type="button"
       class="btn btn-ghost command-btn"
-      title="New reminder"
+      appTooltip="New reminder"
       [disabled]="reminderListenerState() !== 'ready' || reminderOpening()"
       (click)="newReminder()"
     >
@@ -19,7 +19,7 @@
       <button
         type="button"
         class="btn btn-primary command-btn convert-main"
-        title="Convert to note"
+        appTooltip="Convert to note"
         [disabled]="busy() || converting()"
         (click)="convertDefault()"
       >
@@ -33,6 +33,7 @@
       <button
         type="button"
         class="btn btn-primary split-toggle"
+        appTooltip="Choose note template"
         aria-label="Choose note template"
         aria-haspopup="menu"
         [attr.aria-expanded]="templateOpen()"
@@ -90,7 +91,7 @@
     <button
       type="button"
       class="btn btn-ghost command-btn"
-      title="Re-summarize"
+      appTooltip="Re-summarize"
       [disabled]="busy() || renaming()"
       (click)="resummarize.emit()"
     >
@@ -105,7 +106,7 @@
 
   <div class="command-secondary">
     @if (provenance(); as provider) {
-      <span class="provider-pill" [title]="'Generated with ' + (provider.model || provider.provider)">
+      <span class="provider-pill" [appTooltip]="'Generated with ' + (provider.model || provider.provider)">
         <mur-provider-icon [provider]="provider.provider" />
         <span class="sr-only">{{ provider.model || provider.provider }}</span>
       </span>
@@ -117,7 +118,7 @@
       [class.command-btn-active]="editing()"
       [disabled]="!notePresent() || editing()"
       [attr.aria-pressed]="editing()"
-      [attr.title]="
+      [appTooltip]="
         !notePresent() ? 'No note to edit' : editing() ? 'Currently editing' : 'Edit note'
       "
       (click)="requestEdit()"
@@ -132,7 +133,7 @@
       <button
         type="button"
         class="btn btn-ghost command-btn quiet-btn"
-        title="More actions"
+        appTooltip="More actions"
         aria-haspopup="menu"
         [attr.aria-expanded]="menuOpen()"
         [disabled]="busy()"

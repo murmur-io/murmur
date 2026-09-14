@@ -10,7 +10,7 @@
       class="seg-btn"
       [class.has-label]="t.showLabel"
       [class.is-active]="active() === t.id"
-      [title]="t.hint"
+      [appTooltip]="t.hint"
       [attr.aria-label]="t.showLabel ? null : t.label"
       [attr.aria-expanded]="active() === t.id"
       (click)="toolChange.emit(t.id)"

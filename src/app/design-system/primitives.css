@@ -386,6 +386,44 @@ legend { padding: 0 var(--space-2); color: var(--text-secondary); font-size: 0.8
 .seg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-ring); }
 .seg-btn:disabled { cursor: not-allowed; opacity: 0.5; }
 
+/* --- Tooltip bubble (`[appTooltip]`) ---------------------------------------
+   Lives here, not in a component, because the directive builds it on
+   `document.body` — a component's emulated-encapsulation styles would never
+   reach it there. It FLOATS over content, so it takes the opaque overlay
+   surface rather than the frosted `.card` (trap T3): a translucent bubble over
+   a dense command row is unreadable exactly where it is needed. --- */
+.mur-tooltip {
+  position: fixed;
+  z-index: var(--z-overlay);
+  max-width: 16rem;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-overlay);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: var(--shadow-md);
+  color: var(--text-primary);
+  font-size: 0.78rem;
+  font-weight: 550;
+  line-height: 1.35;
+  text-align: center;
+  white-space: normal;
+  /* It explains what the pointer is already on; it must never become what the
+     pointer is on. */
+  pointer-events: none;
+  animation: mur-tooltip-in 120ms var(--transition-fast);
+}
+
+@keyframes mur-tooltip-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mur-tooltip { animation: none; }
+}
+
 /* --- Icon variant of the segment above -------------------------------------
    The same control, sized as CHROME rather than as content: a fixed glyph box
    instead of text padding, and the shell's neutral pressed pill

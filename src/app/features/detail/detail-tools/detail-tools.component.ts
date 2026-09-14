@@ -5,6 +5,8 @@ import {
   output,
 } from "@angular/core";
 
+import { TooltipDirective } from "../../../design-system/tooltip/tooltip.directive";
+
 /** The meeting's four right-docked tool drawers. */
 export type DetailTool = "actions" | "live" | "smart" | "ask";
 
@@ -13,7 +15,7 @@ export interface DetailToolDef {
   id: DetailTool;
   /** The control's accessible name — kept EXACT: e2e locators match on it. */
   label: string;
-  /** The longer `title` tooltip; never the accessible name. */
+  /** The hover/focus explanation; never the accessible name. */
   hint: string;
   /** Render `label` visibly beside the glyph instead of only to a reader. */
   showLabel?: boolean;
@@ -43,6 +45,7 @@ export interface DetailToolDef {
 @Component({
   selector: "app-detail-tools",
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [TooltipDirective],
   templateUrl: "./detail-tools.component.html",
   styleUrl: "./detail-tools.component.scss",
 })

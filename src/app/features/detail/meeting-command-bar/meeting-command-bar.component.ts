@@ -14,6 +14,7 @@ import { IpcService } from "../../../core/ipc.service";
 import { MurProviderIconComponent } from "../../../design-system/provider-icon/provider-icon.component";
 import { ReminderComposerService } from "../../reminders/reminder-composer/reminder-composer.service";
 import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
+import { TooltipDirective } from "../../../design-system/tooltip/tooltip.directive";
 
 interface BuiltinTemplate {
   readonly id: string;
@@ -35,7 +36,7 @@ const BUILTIN_TEMPLATES: readonly BuiltinTemplate[] = [
 @Component({
   selector: "app-meeting-command-bar",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurProviderIconComponent, MoveToMenuComponent],
+  imports: [MurProviderIconComponent, MoveToMenuComponent, TooltipDirective],
   templateUrl: "./meeting-command-bar.component.html",
   styleUrl: "./meeting-command-bar.component.scss",
   host: {
