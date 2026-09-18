@@ -778,6 +778,8 @@ impl AppState {
             crate::storage::migration::encrypt_in_place(db_path, dek)?;
         }
         let db = Arc::new(Db::open_with_key(db_path, dek)?);
+        // Drain container renames before lock repair or any AppState/UI/MCP reader.
+        db.recover_container_moves()?;
         let config = Arc::new(Mutex::new(AppConfig::load(&db)?));
 
         // GLOBAL "one heavy inference at a time" gate — constructed BEFORE the reasoner so it can

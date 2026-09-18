@@ -53,6 +53,8 @@ const VIEWPORT_MARGIN_PX = 8;
  * </mur-row-menu>
  * ```
  */
+let nextRowMenuId = 0;
+
 @Component({
   selector: "mur-row-menu",
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -67,6 +69,7 @@ const VIEWPORT_MARGIN_PX = 8;
   styleUrl: "./row-menu.component.scss",
 })
 export class MurRowMenuComponent {
+  readonly panelId = `mur-row-menu-${++nextRowMenuId}`;
   private readonly host = inject(ElementRef<HTMLElement>);
   private readonly injector = inject(Injector);
   private readonly trigger =

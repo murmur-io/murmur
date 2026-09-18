@@ -155,7 +155,9 @@
           <div class="menu-group">
             <span class="menu-group-label">Manage</span>
             <button type="button" class="menu-item" role="menuitem" (click)="pickRename()" [disabled]="renaming()">Rename</button>
-            <button type="button" class="menu-item" role="menuitem" (click)="pickMove()">Move to folder…</button>
+            @if (moveAllowed()) {
+              <button type="button" class="menu-item" role="menuitem" (click)="pickMove($event)">Move…</button>
+            }
           </div>
           @if (notePresent()) {
             <div class="menu-group">
@@ -188,16 +190,6 @@
         </div>
       }
 
-      @if (moveOpen()) {
-        <div class="move-menu">
-          <app-move-to-menu
-            [meetingId]="meetingId()"
-            [currentFolderId]="folderId()"
-            (moved)="moved.emit($event)"
-            (closed)="closeMove.emit()"
-          />
-        </div>
-      }
     </div>
   </div>
 </div>

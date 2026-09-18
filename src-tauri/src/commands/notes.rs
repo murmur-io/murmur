@@ -58,6 +58,7 @@ pub(crate) fn create_note_inner(
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+insert so a
     // concurrent lock/relock cannot land between the unlock check and the row insert.
     let lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     create_note_under_lifecycle(state, &lifecycle, folder_id, title)
 }
 
@@ -231,6 +232,7 @@ pub(crate) async fn suggest_note_title_inner(
     // placeholder, never the stored title.
     let (folder_id, current, row_updated_at, row_text) = {
         let _lifecycle = lifecycle_guard(state);
+        state.db.ensure_container_move_ready()?;
         let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)?
         else {
             return Err(AppError::InvalidArg(crate::errcode::tag(
@@ -301,6 +303,7 @@ pub(crate) async fn suggest_note_title_inner(
     // folder gate before either committing OR returning the derived title; a concurrent relock must
     // turn the stale result into the harmless placeholder instead of leaking content-derived text.
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     let Some((current_folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)?
     else {
         return Err(AppError::InvalidArg(crate::errcode::tag(
@@ -341,6 +344,7 @@ pub fn get_note(state: State<'_, AppState>, id: String) -> Result<NoteDoc, AppEr
 /// Inner of [`get_note`] taking `&AppState` (unit-testable gate).
 pub(crate) fn get_note_inner(state: &AppState, id: &str) -> Result<NoteDoc, AppError> {
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     get_note_under_lifecycle_authorized(state, id)
 }
 
@@ -470,6 +474,7 @@ pub(crate) fn update_note_doc_inner_with(
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
     // concurrent relock/seal cannot land between the unlock check and the row write.
     let lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     let doc = update_note_doc_under_lifecycle_authorized(state, id, title, markdown)?;
 
     // PERF (brain-v3 audit H3, the `update_note_inner_with` twin): release the GLOBAL lifecycle
@@ -582,6 +587,7 @@ pub(crate) fn save_note_text_inner(
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
     // concurrent relock/seal cannot land between the unlock check and the row write.
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Err(AppError::InvalidArg(crate::errcode::tag(
             crate::errcode::NOTE_MISSING,
@@ -618,6 +624,7 @@ pub async fn move_note_doc(
     state: State<'_, AppState>,
     id: String,
     folder_id: String,
+    confirmed_encryption_boundary: Option<bool>,
 ) -> Result<(), AppError> {
     let _share_mutation = state.lock_org_mutation().await;
     let target_locked = state
@@ -627,14 +634,39 @@ pub async fn move_note_doc(
     if target_locked {
         emit_ask_history_invalidated_fail_closed(&app);
     }
-    move_note_doc_inner(state.inner(), &id, &folder_id)?;
+    move_note_doc_confirmed_inner(state.inner(), &id, &folder_id, confirmed_encryption_boundary.unwrap_or(false))?;
     // A move INTO a locked folder seals + purges ALL pending audit findings; an open-target move
     // purges nothing — the count-only ping is correct (and cheap) either way.
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
 }
 
-/// Inner of [`move_note_doc`] taking `&AppState` (unit-testable gate).
+/// The public writer checks the confirmation under the same gate as the seal/write.
+pub(crate) fn move_note_doc_confirmed_inner(
+    state: &AppState,
+    id: &str,
+    folder_id: &str,
+    confirmed: bool,
+) -> Result<(), AppError> {
+    let lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
+    // A session unlock permits reading/editing, never removing the durable folder seal by
+    // moving its content elsewhere. Recheck the raw source state under the write lifecycle
+    // interval, since it may have changed after destination bootstrap.
+    if let Some(source_folder_id) = state.db.folder_for_document(id)? {
+        if state.db.folder_by_id(&source_folder_id)?.is_some_and(|folder| folder.locked) {
+            return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::NOTE_LOCKED,
+                "remove the source folder lock before moving this item",
+            )));
+        }
+    }
+    require_move_encryption_confirmation(state, Some(folder_id), confirmed)?;
+    move_note_doc_under_lifecycle(state, &lifecycle, id, folder_id)
+}
+
+/// Test seam for exercising the underlying seal/unseal placement transitions.
+#[cfg(test)]
 pub(crate) fn move_note_doc_inner(
     state: &AppState,
     id: &str,
@@ -643,6 +675,7 @@ pub(crate) fn move_note_doc_inner(
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across the double gate + the
     // reassign/seal writes so a concurrent lock/relock cannot land mid-move.
     let lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     move_note_doc_under_lifecycle(state, &lifecycle, id, folder_id)
 }
 
@@ -677,7 +710,7 @@ fn move_note_doc_under_lifecycle_impl(
     folder_id: &str,
     restore_entry_id: Option<&str>,
 ) -> Result<(), AppError> {
-    let Some((source_folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
+    let Some(source_folder_id) = state.db.folder_for_document(id)? else {
         return Err(AppError::InvalidArg(crate::errcode::tag(
             crate::errcode::NOTE_MISSING,
             format!("no note {id}"),
@@ -691,7 +724,7 @@ fn move_note_doc_under_lifecycle_impl(
             "unlock the folder to move this note",
         )));
     }
-    let Some(row) = state.db.get_note_row(id)? else {
+    let Some(row) = state.db.movable_document_row(id)? else {
         return Err(AppError::InvalidArg(crate::errcode::tag(
             crate::errcode::NOTE_MISSING,
             format!("no note {id}"),
@@ -902,6 +935,7 @@ async fn delete_note_inner_notifying(
     // The revoke awaited the network. Re-check under the lifecycle mutex before touching plaintext
     // exports or rows; a concurrent relock may have changed the source gate meanwhile.
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Ok(());
     };
@@ -1158,6 +1192,7 @@ pub(crate) fn create_note_folder_inner(
     parent_id: Option<&str>,
 ) -> Result<NoteFolder, AppError> {
     let lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     create_note_folder_under_lifecycle(state, &lifecycle, name, parent_id)
 }
 
@@ -1304,138 +1339,14 @@ pub async fn move_note_folder(
     move_note_folder_inner(state.inner(), &id, parent_id.as_deref())
 }
 
-/// Refuse a move whose subtree contains ANY sealed container, session-unlocked or not.
-///
-/// Asks by PATH PREFIX, which is the same question the move's own rewrite asks. Walking
-/// parent links instead would disagree with the operation it guards on exactly the rows
-/// this step repairs — a shipped note container has a correct path and a NULL parent
-/// link — so a locked descendant would be invisible here and moved anyway. One query
-/// also has no depth to bound and no cycle to loop on.
-fn refuse_sealed_subtree(state: &AppState, path: &str) -> Result<(), AppError> {
-    if state.db.subtree_has_sealed_container(path)? {
-        return Err(AppError::Locked(
-            "this folder, or one inside it, is locked — remove the lock, move it, then lock \
-             it again"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Inner of [`move_note_folder`] taking `&AppState`.
+/// Legacy note-folder entry point; shares the crash-safe generic mover.
 pub(crate) fn move_note_folder_inner(
     state: &AppState,
     id: &str,
     parent_id: Option<&str>,
 ) -> Result<(), AppError> {
-    let _lifecycle = lifecycle_guard(state);
-    let folder = state
-        .db
-        .note_folder_by_id(id)?
-        .ok_or_else(|| AppError::InvalidArg(format!("no note folder {id}")))?;
-    // A move rewrites the `path` columns the seal keys its vault work off and physically
-    // relocates the directory, so the whole moved subtree must be OPEN — not merely
-    // session-unlocked. `ensure_folder_subtree_unlocked` accepts a sealed container that
-    // is unlocked for this session, which is right for a rename (the bytes stay where the
-    // seal can find them) but not here: a sealed container's vault directory holds
-    // ciphertext and blanked exports, and moving it re-points every recorded path while
-    // its blobs stay bound to keys and rows the move does not touch.
-    // The vault root is not movable, and it must be refused BEFORE the sealed-subtree
-    // question: an empty path makes the prefix "/%", which matches nothing, so the guard
-    // below would see an empty subtree and wave the move through. `rename_folder_inner`
-    // refuses the same container for the same reason — it is the one row whose path IS the
-    // vault, so composing filesystem work from it targets the vault itself.
-    if folder.path.is_empty() {
-        return Err(AppError::InvalidArg(
-            "this container is the workspace root and cannot be moved".into(),
-        ));
+    if state.db.folder_kind(id)?.as_deref() != Some("note") {
+        return Err(AppError::InvalidArg("no note folder".into()));
     }
-    refuse_sealed_subtree(state, &folder.path)?;
-    if parent_id == Some(id) {
-        return Err(AppError::InvalidArg(
-            "a folder cannot be its own parent".into(),
-        ));
-    }
-    // Resolve the destination FIRST — explicit, or the reserved note root — then gate it, then
-    // compose the path from THAT container. Identical to the creation path, and for the same reason:
-    // deciding the three separately let them name different containers, and a defaulted destination
-    // was never gated at all. `ensure_notes_root` is the resolver that cannot hand back a sealed row.
-    let target_id: String = match parent_id {
-        Some(pid) => pid.to_string(),
-        None => state.db.ensure_notes_root()?,
-    };
-    let target = state
-        .db
-        .note_folder_by_id(&target_id)?
-        .ok_or_else(|| AppError::InvalidArg(format!("no parent note folder {target_id}")))?;
-    // The destination's seal binds this container exactly as it binds a new one.
-    match container_parent_seal(state, &target_id)? {
-        ParentSeal::Open => {}
-        ParentSeal::SealChild => {
-            return Err(AppError::Locked(
-                "moving a folder into a sealed folder is not supported — remove the lock, move, \
-                 then lock again"
-                    .into(),
-            ))
-        }
-    }
-    // Same branch as both creates: an empty parent path is the vault root, so
-    // composing blindly would yield "/Name". All three writers compose alike, because
-    // a path is what the seal keys its vault work off.
-    let parent_path = target.path;
-    let new_path = if parent_path.is_empty() {
-        folder.name.clone()
-    } else {
-        format!("{parent_path}/{}", folder.name)
-    };
-    // A no-op ONLY when the destination already holds this container in both senses.
-    // Comparing paths alone let a re-parent silently do nothing on exactly the rows
-    // this step exists to repair: every note container a shipped build created has a
-    // correct path and a NULL parent link, so moving one to the container its path
-    // already names matched here and returned before writing the link.
-    if new_path == folder.path && folder.parent_id.as_deref() == Some(target_id.as_str()) {
-        return Ok(());
-    }
-    // A note-folder cannot move under its own descendant (would orphan the subtree). Descendants
-    // have a path prefixed by this folder's path + "/".
-    if parent_path == folder.path || parent_path.starts_with(&format!("{}/", folder.path)) {
-        return Err(AppError::InvalidArg(
-            "cannot move a folder into its own descendant".into(),
-        ));
-    }
-    // Move the vault directory (best-effort) + rewrite this folder's + descendants' paths in the DB.
-    // The RESOLVED destination, not the caller's argument: a defaulted move used to pass None
-    // straight through and blank the parent link, leaving a container the tree cannot reach.
-    reparent_note_folder_paths(state, id, &folder.path, &new_path, Some(&target_id))?;
-    Ok(())
-}
-
-/// Rewrite `folders.path` for a moved note-folder and EVERY descendant (prefix rewrite), reparent
-/// the row, and move the vault directory on disk (best-effort). Path uniqueness is preserved by the
-/// prefix rewrite (the whole subtree moves as a unit). Kept small + note-scoped (the meeting-folder
-/// rename has its own richer machinery; a note-folder tree is simpler).
-fn reparent_note_folder_paths(
-    state: &AppState,
-    id: &str,
-    old_path: &str,
-    new_path: &str,
-    parent_id: Option<&str>,
-) -> Result<(), AppError> {
-    // Vault dir move first (best-effort; a leftover/absent dir is reconcilable, lost content is not,
-    // but note content lives in the DB — the .md files are re-exportable).
-    if let Some(vault) = vault_path(state) {
-        let vault_root = std::path::Path::new(&vault);
-        let src = assert_in_vault(vault_root, std::path::Path::new(old_path))?;
-        let dst = assert_in_vault(vault_root, std::path::Path::new(new_path))?;
-        if src.exists() {
-            if let Some(parent) = dst.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::rename(&src, &dst);
-        }
-    }
-    state
-        .db
-        .reparent_note_folder(id, old_path, new_path, parent_id)?;
-    Ok(())
+    move_container_inner(state, id, parent_id)
 }

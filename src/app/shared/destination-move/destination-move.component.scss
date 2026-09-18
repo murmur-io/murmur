@@ -1,0 +1,40 @@
+:host {
+  display: contents;
+}
+
+.destination-confirm-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+  background: var(--scrim);
+}
+
+.destination-confirm {
+  width: min(100%, var(--destination-confirm-width));
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  border: var(--destination-border-width) solid var(--border-strong);
+  border-radius: var(--radius-xl);
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+}
+
+.destination-confirm h2,
+.destination-confirm p {
+  margin: 0;
+}
+
+.destination-confirm-mark {
+  color: var(--warning);
+}
+
+.destination-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}

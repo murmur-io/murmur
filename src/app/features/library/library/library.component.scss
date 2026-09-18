@@ -190,15 +190,6 @@
   text-overflow: ellipsis;
 }
 
-/* --- "Move to…" popover anchor (right edge of the row) --------------- */
-.move-anchor {
-  position: absolute;
-  top: calc(100% - var(--space-2));
-  right: var(--space-3);
-  z-index: 40;
-  animation: rise 160ms var(--transition) both;
-}
-
 /* --- Row ⋯ actions menu (the .menu primitive carries the OPAQUE overlay
    look per trap T3; only the anchoring lives here) -------------------- */
 .row-menu {
@@ -709,7 +700,6 @@
 @media (prefers-reduced-motion: reduce) {
   .folders-pane,
   .meetings-pane,
-  .move-anchor,
   .row-menu,
   .empty-illo {
     animation: none;

@@ -26,7 +26,7 @@
   <header class="editor-head">
     @if (note(); as doc) {
       @if (!doc.locked) {
-        <!-- Folder breadcrumb + Move menu (opaque overlay, T3). The "not sealed"
+        <!-- Folder breadcrumb + shared Move picker trigger. The "not sealed"
              privacy hint for an unfiled note is folded INTO the breadcrumb as a
              small 🔒-off glyph with a tooltip (2026-07-19 header slim), instead of a
              standalone pill — one fewer top-level control. -->
@@ -34,8 +34,12 @@
           <button
             type="button"
             class="crumb-btn"
-            (click)="toggleMenu('move')"
-            [attr.aria-expanded]="menu() === 'move'"
+            aria-haspopup="dialog"
+            [disabled]="currentOwnerSealed()"
+            [title]="
+              currentOwnerSealed() ? 'Remove the folder lock first' : 'Move note'
+            "
+            (click)="openMove($event)"
           >
             <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
               <path
@@ -69,27 +73,6 @@
                view depends on (`e2e/notes/note-chat-drawer.spec.ts`). Inside the crumb, the folder
                name truncates instead. -->
           <mur-copy-id [id]="doc.id" label="Note" />
-          @if (menu() === "move") {
-            <div class="menu head-menu" role="menu" aria-label="Move to folder">
-              <p class="menu-group-label">Move to…</p>
-              @for (folder of noteFolders(); track folder.id) {
-                <button
-                  type="button"
-                  class="menu-item"
-                  role="menuitem"
-                  [disabled]="folder.id === doc.folderId"
-                  (click)="moveTo(folder.id)"
-                >
-                  {{ folder.isRoot ? "Unfiled" : folder.name }}
-                  @if (folder.id === doc.folderId) {
-                    <span class="menu-here">Here</span>
-                  }
-                </button>
-              } @empty {
-                <p class="menu-empty">No folders yet.</p>
-              }
-            </div>
-          }
         </div>
 
         <span class="head-spacer"></span>

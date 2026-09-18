@@ -853,6 +853,9 @@ pub struct OrgItemHeader {
 pub struct OrgOwnedSource {
     pub kind: String,
     pub id: String,
+    /// Durable-open source admission for Move; session unlock alone is insufficient.
+    #[serde(default)]
+    pub movable: bool,
 }
 
 /// Shared Brain v1 — the content-free result of a manual `org_sync_now()` (counts + errors only).

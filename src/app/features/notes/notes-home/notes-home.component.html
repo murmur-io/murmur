@@ -72,10 +72,7 @@
          the note-folder / All-notes scope only (not an org replica list, not a
          locked folder). When no view is active the list below is unchanged. -->
     @if (activeOrgId() === null && !activeFolderLocked()) {
-      <app-notes-view-switcher
-        class="views-switcher"
-        (changed)="onViewChanged()"
-      />
+      <app-notes-view-switcher class="views-switcher" />
     }
 
     <!-- ===== Shared brains (orgs) — read-only replicated org notes =====
@@ -405,16 +402,27 @@
             width="44px"
           >
             <ng-template let-row>
-              <!-- Per-note "Move to…" affordance (hidden for masked rows + org rows). -->
-              @if (row.kind === "note" && !row.note.locked) {
+              <!-- Shared destination-picker trigger (hidden for masked rows + org rows). -->
+              @if (
+                row.kind === "note" &&
+                !row.note.locked &&
+                !sealedFolderIds().has(row.note.folderId)
+              ) {
                 <div class="row-move">
                   <button
                     type="button"
                     class="row-menu-btn"
-                    [attr.aria-expanded]="movePopoverId() === row.note.id"
-                    aria-label="Move note to a folder"
+                    aria-haspopup="dialog"
+                    aria-label="Move note"
                     title="Move to…"
-                    (click)="toggleMovePopover(row.note.id, $event)"
+                    (click)="
+                      openMove(
+                        row.note.id,
+                        row.note.title,
+                        row.note.folderId,
+                        $event
+                      )
+                    "
                   >
                     <svg
                       viewBox="0 0 16 16"
@@ -428,29 +436,6 @@
                       <circle cx="8" cy="12.5" r="1.2" fill="currentColor" />
                     </svg>
                   </button>
-
-                  @if (movePopoverId() === row.note.id) {
-                    <!-- Opaque move menu (T3): --surface-overlay, no blur. -->
-                    <div class="menu move-menu" role="menu">
-                      <p class="menu-group-label">Move to folder</p>
-                      @for (folder of noteFolders(); track folder.id) {
-                        <button
-                          type="button"
-                          class="menu-item"
-                          role="menuitem"
-                          [disabled]="folder.id === row.note.folderId"
-                          (click)="moveNote(row.note.id, folder.id)"
-                        >
-                          {{ folder.name }}
-                          @if (folder.id === row.note.folderId) {
-                            <span class="menu-current text-muted">current</span>
-                          }
-                        </button>
-                      } @empty {
-                        <p class="menu-empty text-muted">No folders yet.</p>
-                      }
-                    </div>
-                  }
                 </div>
               }
             </ng-template>
@@ -459,16 +444,6 @@
       }
     </div>
   </div>
-
-  <!-- Click-away scrim to close an open move popover. -->
-  @if (movePopoverId() !== null) {
-    <button
-      type="button"
-      class="move-scrim"
-      aria-label="Close menu"
-      (click)="closeMovePopover()"
-    ></button>
-  }
 
   <!-- Auto-organize review sheet (its own opaque modal T3). -->
   @if (organizeOpen()) {

@@ -81,7 +81,7 @@ test("a row with no audio left offers nothing to run again", async ({ page }) =>
   await expect(page.getByText("Planning sync")).toBeVisible({ timeout: 10_000 });
   await page.locator("li.row-item").first().hover();
   await page.getByRole("button", { name: "Meeting actions" }).first().click();
-  await expect(page.getByRole("menuitem", { name: "Move to folder…" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Move…" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Transcribe again" })).toHaveCount(0);
 });
 
@@ -99,6 +99,6 @@ test("a healthy row offers nothing to run again", async ({ page }) => {
   await expect(page.getByText("Planning sync")).toBeVisible({ timeout: 10_000 });
   await page.locator("li.row-item").first().hover();
   await page.getByRole("button", { name: "Meeting actions" }).first().click();
-  await expect(page.getByRole("menuitem", { name: "Move to folder…" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Move…" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Transcribe again" })).toHaveCount(0);
 });

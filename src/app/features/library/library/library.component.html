@@ -399,7 +399,7 @@
             <p class="empty-title">Nothing filed here yet</p>
             <p class="empty">
               Drag a meeting onto this folder, or choose
-              <span class="empty-chip-hint">Move to folder…</span>
+              <span class="empty-chip-hint">Move…</span>
               from a meeting’s ⋯ menu.
             </p>
           } @else if (activeTag() === null) {
@@ -424,9 +424,7 @@
               class="row-item"
               [class.is-confirming]="pendingDeleteId() === m.id"
               [class.is-dragging]="draggingId() === m.id"
-              [class.is-menu-open]="
-                rowMenuId() === m.id || movePopoverId() === m.id
-              "
+              [class.is-menu-open]="rowMenuId() === m.id"
             >
               <a
                 class="row"
@@ -596,18 +594,20 @@
                       </button>
                     </div>
                   }
-                  <div class="menu-group">
-                    <button
-                      type="button"
-                      class="menu-item"
-                      role="menuitem"
-                      (click)="
-                        $event.stopPropagation(); openMoveFromMenu(m.id)
-                      "
-                    >
-                      Move to folder…
-                    </button>
-                  </div>
+                  @if (it.canMove) {
+                    <div class="menu-group">
+                      <button
+                        type="button"
+                        class="menu-item"
+                        role="menuitem"
+                        (click)="
+                          $event.stopPropagation(); openMoveFromMenu(m, $event)
+                        "
+                      >
+                        Move…
+                      </button>
+                    </div>
+                  }
                   <div class="menu-group">
                     <button
                       type="button"
@@ -618,20 +618,6 @@
                       Delete meeting…
                     </button>
                   </div>
-                </div>
-              }
-
-              <!-- "Move to…" popover, anchored to the row's right edge. The
-                   picker owns the cross-encryption-boundary confirm + IPC; we
-                   just reconcile the local list on its moved event. -->
-              @if (movePopoverId() === m.id) {
-                <div class="move-anchor">
-                  <app-move-to-menu
-                    [meetingId]="m.id"
-                    [currentFolderId]="m.folderId ?? null"
-                    (moved)="onMoved(m.id, $event)"
-                    (closed)="closeMovePopover()"
-                  />
                 </div>
               }
 

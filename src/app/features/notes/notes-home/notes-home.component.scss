@@ -256,7 +256,7 @@
   margin-bottom: var(--space-3);
 }
 
-/* --- Per-row "Move to…" affordance (actions column) + opaque menu (T3) --- */
+/* --- Per-row shared destination-picker trigger (actions column) --- */
 .row-move {
   position: relative;
   display: flex;
@@ -285,35 +285,6 @@
   outline: none;
   box-shadow: 0 0 0 2px var(--accent-ring);
 }
-/* Opaque floating menu (T3): --surface-overlay, never the frosted card. */
-.move-menu {
-  position: absolute;
-  top: calc(100% + 4px);
-  right: 0;
-  z-index: 40;
-  min-width: 200px;
-  max-width: 280px;
-  max-height: 320px;
-  overflow-y: auto;
-}
-.menu-current {
-  margin-left: auto;
-  font-size: 0.72rem;
-}
-.menu-empty {
-  padding: var(--space-2) var(--space-3);
-  font-size: 0.82rem;
-}
-/* Full-viewport click-away target below the open menu. */
-.move-scrim {
-  position: fixed;
-  inset: 0;
-  z-index: 30;
-  border: 0;
-  background: transparent;
-  cursor: default;
-}
-
 /* Inline spinner (Auto-organize planning state). */
 .spin-ring {
   width: 14px;

@@ -3,141 +3,148 @@
      shows the previous tree while the (still unconditional) reload replaces it
      underneath. Gating on loading() alone is the 2026-07-12 "reload flash". -->
 @if (sectionEmpty() && loading()) {
-  <p class="tree-state">Loading{{ isOwnScope() ? " workspace" : " shared content" }}…</p>
+  <p class="tree-state">
+    Loading{{ isOwnScope() ? " workspace" : " shared content" }}…
+  </p>
 } @else if (sectionEmpty() && error(); as message) {
   <!-- The error must OUTRANK the empty state, or it is unreachable in the one case it exists to
        describe: a failed read has no rows, so "nothing shared with you" would win and assert
        something false. This branch is why the emptiness is explained rather than reported. -->
   <p class="tree-error" role="status">{{ message }}</p>
 } @else if (sectionEmpty()) {
-  <p class="tree-state">{{ isOwnScope() ? "No Workspaces yet" : "Nothing shared with you yet" }}</p>
+  <p class="tree-state">
+    {{ isOwnScope() ? "No Workspaces yet" : "Nothing shared with you yet" }}
+  </p>
 } @else {
   @if (error(); as message) {
     <!-- A failed refresh keeps the cached tree and says so, rather than
          blanking a view the user is navigating. -->
     <p class="tree-error" role="status">{{ message }}</p>
   }
-  <div class="tree" role="tree" [attr.aria-label]="isOwnScope() ? 'Workspaces' : 'Shared'">
+  <div
+    class="tree"
+    role="tree"
+    [attr.aria-label]="isOwnScope() ? 'Workspaces' : 'Shared'"
+  >
     @if (isOwnScope()) {
-    @if (unfiledRecordings(); as inbox) {
-      @if (inbox.total > 0) {
-        <!-- `container_id = NULL` is an honest inbox, not a synthetic Workspace:
+      @if (unfiledRecordings(); as inbox) {
+        @if (inbox.total > 0) {
+          <!-- `container_id = NULL` is an honest inbox, not a synthetic Workspace:
              it has no lock/manage/create affordances and cannot accept drops. -->
-        <mur-tree-row
-          class="line line--unfiled"
-          role="treeitem"
-          aria-level="1"
-          [attr.aria-selected]="currentPath() === '/library'"
-          [attr.aria-expanded]="unfiledExpanded()"
-          label="Unfiled recordings"
-          [depth]="0"
-          icon="meeting"
-          [count]="inbox.total"
-          [selected]="currentPath() === '/library'"
-          [expandable]="true"
-          [expanded]="unfiledExpanded()"
-          (toggleExpand)="toggleUnfiled()"
-          (activate)="openAllRecordings()"
-        />
-        @if (unfiledExpanded()) {
-          @for (item of inbox.items; track item.id) {
-            <mur-tree-row
-              class="line line--item line--unfiled-item"
-              role="treeitem"
-              aria-level="2"
-              [attr.aria-selected]="isItemSelected(item)"
-              [label]="itemTitle(item)"
-              [depth]="1"
-              icon="meeting"
-              [selected]="isItemSelected(item)"
-              [attr.draggable]="true"
-              (dragstart)="onDragStart($event, item, null)"
-              (dragend)="onDragEnd()"
-              (activate)="openItem(item)"
-            >
-              @if (unfiledMoveTargets(item); as targets) {
-                <mur-row-menu [label]="'Actions for recording ' + itemTitle(item)">
+          <mur-tree-row
+            class="line line--unfiled"
+            role="treeitem"
+            aria-level="1"
+            [attr.aria-selected]="currentPath() === '/library'"
+            [attr.aria-expanded]="unfiledExpanded()"
+            label="Unfiled recordings"
+            [depth]="0"
+            icon="meeting"
+            [count]="inbox.total"
+            [selected]="currentPath() === '/library'"
+            [expandable]="true"
+            [expanded]="unfiledExpanded()"
+            (toggleExpand)="toggleUnfiled()"
+            (activate)="openAllRecordings()"
+          />
+          @if (unfiledExpanded()) {
+            @for (item of inbox.items; track item.id) {
+              <mur-tree-row
+                class="line line--item line--unfiled-item"
+                role="treeitem"
+                aria-level="2"
+                [attr.aria-selected]="isItemSelected(item)"
+                [label]="itemTitle(item)"
+                [depth]="1"
+                icon="meeting"
+                [selected]="isItemSelected(item)"
+                [attr.draggable]="true"
+                (dragstart)="onDragStart($event, item, null)"
+                (dragend)="onDragEnd()"
+                (activate)="openItem(item)"
+              >
+                <mur-row-menu
+                  [label]="'Actions for recording ' + itemTitle(item)"
+                >
                   <span class="menu-group-label">Recording actions</span>
                   <button
                     type="button"
                     class="menu-item"
                     role="menuitem"
-                    [disabled]="targets.length === 0"
-                    (click)="openMove(item, null, targets)"
+                    (click)="openMove(item, null, $event)"
                   >
                     <mur-icon icon="move" />
-                    {{ targets.length > 0 ? "Move to Workspace or folder…" : "No open destination" }}
+                    Move…
                   </button>
                 </mur-row-menu>
-              }
-            </mur-tree-row>
-          }
-          @if (inbox.total > inbox.items.length) {
-            <button
-              type="button"
-              class="see-all see-all--unfiled"
-              role="treeitem"
-              aria-selected="false"
-              aria-level="2"
-              (click)="openAllRecordings()"
-            >
-              {{ viewAllRecordingsLabel(inbox.total) }}
-            </button>
+              </mur-tree-row>
+            }
+            @if (inbox.total > inbox.items.length) {
+              <button
+                type="button"
+                class="see-all see-all--unfiled"
+                role="treeitem"
+                aria-selected="false"
+                aria-level="2"
+                (click)="openAllRecordings()"
+              >
+                {{ viewAllRecordingsLabel(inbox.total) }}
+              </button>
+            }
           }
         }
       }
-    }
-    @if (unfiledNotes(); as inbox) {
-      @if (inbox.total > 0) {
-        <!-- The reserved note root rendered as an honest INBOX, not a folder:
+      @if (unfiledNotes(); as inbox) {
+        @if (inbox.total > 0) {
+          <!-- The reserved note root rendered as an honest INBOX, not a folder:
              it is the "Notes" section itself, so it carries no lock, manage or
              create affordance and accepts no drops — exactly like the unfiled
              recordings row above it. -->
-        <mur-tree-row
-          class="line line--unfiled"
-          role="treeitem"
-          aria-level="1"
-          [attr.aria-selected]="currentPath() === '/notes'"
-          [attr.aria-expanded]="unfiledNotesExpanded()"
-          label="Unfiled notes"
-          [depth]="0"
-          icon="note"
-          [count]="inbox.total"
-          [selected]="currentPath() === '/notes'"
-          [expandable]="true"
-          [expanded]="unfiledNotesExpanded()"
-          (toggleExpand)="toggleUnfiledNotes()"
-          (activate)="openAllNotes()"
-        />
-        @if (unfiledNotesExpanded()) {
-          @for (item of inbox.items; track item.id) {
-            <mur-tree-row
-              class="line line--item line--unfiled-item"
-              role="treeitem"
-              aria-level="2"
-              [attr.aria-selected]="isItemSelected(item)"
-              [label]="itemTitle(item)"
-              [depth]="1"
-              [icon]="kindIcon(item.kind)"
-              [selected]="isItemSelected(item)"
-              (activate)="openItem(item)"
-            />
-          }
-          @if (inbox.total > inbox.items.length) {
-            <button
-              type="button"
-              class="see-all see-all--unfiled"
-              role="treeitem"
-              aria-selected="false"
-              aria-level="2"
-              (click)="openAllNotes()"
-            >
-              {{ viewAllNotesLabel(inbox.total) }}
-            </button>
+          <mur-tree-row
+            class="line line--unfiled"
+            role="treeitem"
+            aria-level="1"
+            [attr.aria-selected]="currentPath() === '/notes'"
+            [attr.aria-expanded]="unfiledNotesExpanded()"
+            label="Unfiled notes"
+            [depth]="0"
+            icon="note"
+            [count]="inbox.total"
+            [selected]="currentPath() === '/notes'"
+            [expandable]="true"
+            [expanded]="unfiledNotesExpanded()"
+            (toggleExpand)="toggleUnfiledNotes()"
+            (activate)="openAllNotes()"
+          />
+          @if (unfiledNotesExpanded()) {
+            @for (item of inbox.items; track item.id) {
+              <mur-tree-row
+                class="line line--item line--unfiled-item"
+                role="treeitem"
+                aria-level="2"
+                [attr.aria-selected]="isItemSelected(item)"
+                [label]="itemTitle(item)"
+                [depth]="1"
+                [icon]="kindIcon(item.kind)"
+                [selected]="isItemSelected(item)"
+                (activate)="openItem(item)"
+              />
+            }
+            @if (inbox.total > inbox.items.length) {
+              <button
+                type="button"
+                class="see-all see-all--unfiled"
+                role="treeitem"
+                aria-selected="false"
+                aria-level="2"
+                (click)="openAllNotes()"
+              >
+                {{ viewAllNotesLabel(inbox.total) }}
+              </button>
+            }
           }
         }
       }
-    }
     }
     @for (line of lines(); track line.key) {
       @if (line.item; as item) {
@@ -156,34 +163,66 @@
             [depth]="line.depth"
             [icon]="kindIcon(item.kind)"
             [selected]="isItemSelected(item)"
-            [attr.draggable]="draggableKind(item) && !(item.kind === 'meeting' && owner.locked) ? true : null"
+            [attr.draggable]="
+              draggableKind(item) && !owner.locked
+                ? true
+                : null
+            "
             (dragstart)="onDragStart($event, item, owner)"
             (dragend)="onDragEnd()"
             (activate)="openItem(item)"
           >
             @if (sharedMark(line); as mark) {
-              <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
-                <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
-                  <circle cx="8" cy="4.8" r="2.1" stroke="currentColor" stroke-width="1.3" />
-                  <path d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+              <span
+                class="shared-mark"
+                role="img"
+                [attr.aria-label]="mark"
+                [title]="mark"
+              >
+                <svg
+                  viewBox="0 0 16 16"
+                  width="12"
+                  height="12"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <circle
+                    cx="8"
+                    cy="4.8"
+                    r="2.1"
+                    stroke="currentColor"
+                    stroke-width="1.3"
+                  />
+                  <path
+                    d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0"
+                    stroke="currentColor"
+                    stroke-width="1.3"
+                    stroke-linecap="round"
+                  />
                 </svg>
               </span>
             }
-            @if (moveTargetsFor(item, owner); as targets) {
-              <mur-row-menu [label]="'Actions for ' + item.kind + ' ' + itemTitle(item)">
-                <span class="menu-group-label">{{ itemKindLabel(item.kind) }} actions</span>
-                <button
-                  type="button"
-                  class="menu-item"
-                  role="menuitem"
-                  [disabled]="targets.length === 0"
-                  (click)="openMove(item, owner, targets)"
-                >
-                  <mur-icon icon="move" />
-                  {{ targets.length > 0 ? "Move to Workspace or folder…" : "No other open destination" }}
-                </button>
-              </mur-row-menu>
-            }
+            <mur-row-menu
+              [label]="'Actions for ' + item.kind + ' ' + itemTitle(item)"
+            >
+              <span class="menu-group-label"
+                >{{ itemKindLabel(item.kind) }} actions</span
+              >
+              <button
+                type="button"
+                class="menu-item"
+                role="menuitem"
+                [disabled]="owner.locked"
+                (click)="openMove(item, owner, $event)"
+              >
+                <mur-icon icon="move" />
+                {{
+                  owner.locked
+                    ? "Remove the folder lock first"
+                    : "Move…"
+                }}
+              </button>
+            </mur-row-menu>
           </mur-tree-row>
         }
       } @else if (line.seeAll) {
@@ -195,7 +234,9 @@
             aria-selected="false"
             [attr.aria-level]="line.depth + 1"
             [style.padding-left]="
-              'calc(' + line.depth + ' * var(--tree-indent) + var(--see-all-indent))'
+              'calc(' +
+              line.depth +
+              ' * var(--tree-indent) + var(--see-all-indent))'
             "
             (click)="openAll(owner)"
           >
@@ -216,14 +257,36 @@
           [selected]="isSharedItemSelected(sharedItem)"
           (activate)="openSharedItem(sharedItem)"
         >
-            @if (sharedMark(line); as mark) {
-              <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
-                <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
-                  <circle cx="8" cy="4.8" r="2.1" stroke="currentColor" stroke-width="1.3" />
-                  <path d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-                </svg>
-              </span>
-            }
+          @if (sharedMark(line); as mark) {
+            <span
+              class="shared-mark"
+              role="img"
+              [attr.aria-label]="mark"
+              [title]="mark"
+            >
+              <svg
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                aria-hidden="true"
+              >
+                <circle
+                  cx="8"
+                  cy="4.8"
+                  r="2.1"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                />
+                <path
+                  d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </span>
+          }
         </mur-tree-row>
       } @else if (line.shared; as shared) {
         <!-- A RECEIVED container: a shared Workspace, a shared folder, or the
@@ -236,7 +299,9 @@
           role="treeitem"
           [attr.aria-level]="line.depth + 1"
           [attr.aria-selected]="isSharedSelected(shared)"
-          [attr.aria-expanded]="sharedExpandable(shared) ? isSharedExpanded(shared) : null"
+          [attr.aria-expanded]="
+            sharedExpandable(shared) ? isSharedExpanded(shared) : null
+          "
           [attr.data-tint]="shared.tint ?? null"
           [label]="shared.name"
           [depth]="line.depth"
@@ -257,7 +322,7 @@
                 type="button"
                 class="menu-item"
                 role="menuitem"
-                (click)="openPlace(shared)"
+                (click)="openPlace(shared, $event)"
                 data-testid="place-shared"
               >
                 <mur-icon icon="move" />
@@ -277,10 +342,32 @@
             </mur-row-menu>
           }
           @if (sharedMark(line); as mark) {
-            <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
-              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
-                <circle cx="8" cy="4.8" r="2.1" stroke="currentColor" stroke-width="1.3" />
-                <path d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            <span
+              class="shared-mark"
+              role="img"
+              [attr.aria-label]="mark"
+              [title]="mark"
+            >
+              <svg
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                aria-hidden="true"
+              >
+                <circle
+                  cx="8"
+                  cy="4.8"
+                  r="2.1"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                />
+                <path
+                  d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                />
               </svg>
             </span>
           }
@@ -295,7 +382,11 @@
           role="treeitem"
           [attr.aria-level]="line.depth + 1"
           [attr.aria-selected]="isContainerSelected(container)"
-          [attr.aria-expanded]="containerExpandable(container) ? isContainerExpanded(container) : null"
+          [attr.aria-expanded]="
+            containerExpandable(container)
+              ? isContainerExpanded(container)
+              : null
+          "
           [attr.data-tint]="container.tint"
           [label]="container.name"
           [depth]="line.depth"
@@ -306,6 +397,7 @@
           [expanded]="isContainerExpanded(container)"
           appFolderDrop
           [dropFolderId]="container.id"
+          [dropDisabled]="container.locked"
           (dropItem)="onDropItem(container, $event)"
           (toggleExpand)="toggleContainer(container)"
           (activate)="openContainer(container)"
@@ -315,7 +407,10 @@
             [label]="'Actions for ' + container.name"
           >
             <span class="menu-group-label">
-              {{ container.level === "project" ? "Workspace" : "Folder" }} actions
+              {{
+                container.level === "project" ? "Workspace" : "Folder"
+              }}
+              actions
             </span>
             @if (isSealed(container)) {
               <button
@@ -329,35 +424,35 @@
               </button>
             } @else {
               @if (canCreateIn(container)) {
-              @if (canCreateNote(container)) {
+                @if (canCreateNote(container)) {
+                  <button
+                    type="button"
+                    class="menu-item"
+                    role="menuitem"
+                    (click)="newNote(container)"
+                  >
+                    <mur-icon icon="note-add" />
+                    Create note here
+                  </button>
+                }
                 <button
                   type="button"
                   class="menu-item"
                   role="menuitem"
-                  (click)="newNote(container)"
+                  (click)="newFolder(container)"
                 >
-                  <mur-icon icon="note-add" />
-                  Create note here
+                  <mur-icon icon="folder-add" />
+                  Create folder here
                 </button>
-              }
-              <button
-                type="button"
-                class="menu-item"
-                role="menuitem"
-                (click)="newFolder(container)"
-              >
-                <mur-icon icon="folder-add" />
-                Create folder here
-              </button>
-              <button
-                type="button"
-                class="menu-item"
-                role="menuitem"
-                (click)="newDashboard(container)"
-              >
-                <mur-icon icon="dashboards" />
-                Create dashboard here
-              </button>
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="newDashboard(container)"
+                >
+                  <mur-icon icon="dashboards" />
+                  Create dashboard here
+                </button>
               }
               @if (canLock(container)) {
                 <button
@@ -415,6 +510,17 @@
                   type="button"
                   class="menu-item"
                   role="menuitem"
+                  (click)="openContainerMove(container, $event)"
+                  [disabled]="container.locked"
+                  [title]="container.locked ? 'Remove the folder lock first' : 'Move container'"
+                >
+                  <mur-icon icon="move" />
+                  Move {{ containerNoun(container) }}…
+                </button>
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
                   (click)="startRename(container)"
                 >
                   <mur-icon icon="rename" />
@@ -436,10 +542,32 @@
             <!-- Same discipline as the unlocked mark below, for the same reason:
                  one dim glyph, the sentence on hover and for a screen reader. A
                  pill would take the row's spare width and truncate the name. -->
-            <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
-              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
-                <circle cx="8" cy="4.8" r="2.1" stroke="currentColor" stroke-width="1.3" />
-                <path d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            <span
+              class="shared-mark"
+              role="img"
+              [attr.aria-label]="mark"
+              [title]="mark"
+            >
+              <svg
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                aria-hidden="true"
+              >
+                <circle
+                  cx="8"
+                  cy="4.8"
+                  r="2.1"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                />
+                <path
+                  d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                />
               </svg>
             </span>
           }
@@ -455,9 +583,28 @@
               aria-label="Unlocked for this session"
               title="Unlocked for this session"
             >
-              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-                <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
-                <path d="M5.5 7V5.4a2.5 2.5 0 0 1 4.6-1.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+              <svg
+                viewBox="0 0 16 16"
+                width="13"
+                height="13"
+                fill="none"
+                aria-hidden="true"
+              >
+                <rect
+                  x="3.5"
+                  y="7"
+                  width="9"
+                  height="6"
+                  rx="1.4"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                />
+                <path
+                  d="M5.5 7V5.4a2.5 2.5 0 0 1 4.6-1.3"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                />
               </svg>
             </span>
           }
@@ -481,37 +628,6 @@
       (apply)="applyOrganize($event)"
       (replan)="replanOrganize($event)"
       (cancelled)="closeOrganize()"
-    />
-  </div>
-}
-
-@if (moveRequest(); as request) {
-  <div class="workspace-overlay-host" appTeleportToBody>
-    <app-workspace-move-sheet
-      [item]="request.item"
-      [fromLabel]="request.fromLabel"
-      [targets]="request.targets"
-      [busy]="moveBusy()"
-      [error]="moveError()"
-      (move)="moveItemTo($event)"
-      (cancelled)="closeMove()"
-    />
-  </div>
-}
-
-@if (placeRequest(); as request) {
-  <!-- Reuses the ordinary move sheet on purpose: to the user this IS a move.
-       What differs is invisible to them and load-bearing underneath — nothing
-       is published, and the content keeps updating from the org feed. -->
-  <div class="workspace-overlay-host" appTeleportToBody>
-    <app-workspace-move-sheet
-      [item]="{ kind: 'note', title: request.name }"
-      [fromLabel]="'Shared by ' + request.authorHint"
-      [targets]="placeTargets()"
-      [busy]="placeBusy()"
-      [error]="placeError()"
-      (move)="placeInto($event)"
-      (cancelled)="closePlace()"
     />
   </div>
 }

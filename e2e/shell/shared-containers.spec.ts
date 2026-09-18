@@ -1,3 +1,4 @@
+import { mockDestinationPicker } from "../notes/destination-picker-mock";
 import { expect, test, type Page } from "@playwright/test";
 
 import { mockTauri } from "../settings-ai/mock-invoke";
@@ -140,6 +141,7 @@ async function openSidebar(
       ...constants,
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/");
   await expect(
     page.getByRole("navigation", { name: "Primary navigation" }),
@@ -289,6 +291,7 @@ test("a received Workspace can be filed under a local Workspace, privately", asy
       list_container_share_status: CONTAINER_SHARES,
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/");
 
   const partners = page.getByRole("treeitem", { name: /Partners/ });
@@ -297,7 +300,8 @@ test("a received Workspace can be filed under a local Workspace, privately", asy
 
   const sheet = page.getByRole("dialog");
   await expect(sheet).toBeVisible();
-  await sheet.getByRole("button", { name: /Move to Acme/ }).click();
+  await sheet.getByRole("button", { name: /Choose Acme/ }).click();
+  await sheet.getByRole("button", { name: "Keep here", exact: true }).click();
 
   // Device-local: the placement is recorded, and NOTHING is published.
   await expect
@@ -348,6 +352,7 @@ test("a nested received folder can be filed too, and renders in exactly one plac
       list_container_share_status: CONTAINER_SHARES,
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/");
 
   // Expand both possible hosts, then assert the row exists exactly once.
@@ -398,6 +403,7 @@ test("a received loose item and an own standalone share each carry the marker", 
       ],
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/");
   await page
     .getByRole("treeitem", { name: /Acme/ })
@@ -461,6 +467,7 @@ test("an unreachable shared workspace shows an error, not an empty one", async (
       list_container_share_status: CONTAINER_SHARES,
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/");
   await expect(
     page.getByRole("navigation", { name: "Primary navigation" }),
@@ -499,6 +506,7 @@ test("a shared workspace still loading says so instead of claiming nothing is sh
       list_container_share_status: CONTAINER_SHARES,
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/");
   await expect(
     page.getByRole("navigation", { name: "Primary navigation" }),
