@@ -1115,17 +1115,34 @@ export interface LiveCaptionPayload {
   possibleQuestion?: boolean;
 }
 
+export type LiveCaptionsHealthState =
+  | "starting" | "ready" | "retrying" | "model-error" | "unavailable" | "paused" | "stopped";
+
+/** Content-free runtime health; model paths and raw errors never cross this seam. */
+export interface LiveTranscriptHealth {
+  meetingId: string;
+  others: "starting" | "ready" | "unavailable" | "degraded";
+  captionsState?: LiveCaptionsHealthState;
+  modelLabel?: string | null;
+  tickIntervalMs?: number | null;
+}
+
 export interface LiveTranscriptPage {
   lines: LiveCaptionPayload[];
   truncated: boolean;
   nextBeforeSeq?: number | null;
   othersState?: "starting" | "ready" | "unavailable" | "degraded";
+  captionsState?: LiveCaptionsHealthState;
+  modelLabel?: string | null;
+  tickIntervalMs?: number | null;
 }
 
 export type ProcessingQueueState = "queued" | "processing" | "failed";
 
 /** Scheduling metadata only. Transcript/audio never crosses this list seam. */
 export interface ProcessingQueueItem {
+  /** Worker lifetime snapshot, including gaps between claims; absent on older backends. */
+  queueRunning?: boolean;
   meetingId: string;
   title: string;
   state: ProcessingQueueState;

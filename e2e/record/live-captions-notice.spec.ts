@@ -108,7 +108,7 @@ test.describe("Record — the no-live-captions notice", () => {
     await expect(page.locator(notice)).toHaveCount(0);
   });
 
-  test("(e) while recording, the footer says captions are off instead of Listening…", async ({
+  test("(e) while recording, the rail says captions are off instead of Listening…", async ({
     page,
   }) => {
     await bootRecord(page, "modelMissing");
@@ -118,19 +118,14 @@ test.describe("Record — the no-live-captions notice", () => {
       timeout: 10_000,
     });
 
-    // The recording footer's ticker is replaced by the honest indicator…
-    await expect(page.locator("app-record .rec-foot .cc-off")).toBeVisible();
-    await expect(page.locator("app-record .rec-foot .cc-off")).toContainText(
-      "Captions off",
-    );
-    // …no eternal "Listening…" placeholder, and the live-captions scope hint is gone too.
-    await expect(page.locator("app-record .rec-foot .cc-idle")).toHaveCount(0);
-    await expect(page.locator("app-record .rec-foot .cc-scope")).toHaveCount(0);
-    // The banner-style notice stands down while recording (the footer carries the state).
+    // Caption honesty moves with the transcript into the rail.
+    await expect(page.locator("app-live-transcript-panel")).toContainText("Live captions are off");
+    await expect(page.locator("app-live-transcript-panel")).not.toContainText("Listening…");
+    await expect(page.locator("app-record .rec-foot .cc-line")).toHaveCount(0);
     await expect(page.locator(notice)).toHaveCount(0);
   });
 
-  test("(f) ready keeps the normal live-caption ticker while recording", async ({
+  test("(f) ready renders one transcript surface and waits for source health", async ({
     page,
   }) => {
     await bootRecord(page, "ready");
@@ -140,7 +135,7 @@ test.describe("Record — the no-live-captions notice", () => {
       timeout: 10_000,
     });
 
-    await expect(page.locator("app-record .rec-foot .cc-line")).toBeVisible();
+    await expect(page.locator("app-record .rec-foot .cc-line")).toHaveCount(0);
     await expect(page.locator("app-record .rec-foot .cc-off")).toHaveCount(0);
     // Model readiness alone cannot promise far-side capture. Wait for the
     // backend's actual source-health event before claiming both sides.

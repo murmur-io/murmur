@@ -176,7 +176,7 @@
 .jump-btn {
   position: absolute;
   right: var(--space-3);
-  bottom: var(--space-3);
+  bottom: calc(var(--space-8) + var(--space-3));
   left: var(--space-3);
   min-height: var(--space-8);
   border-radius: var(--radius-pill);
@@ -251,4 +251,31 @@
   .panel {
     border-radius: var(--radius-lg) var(--radius-lg) 0 0;
   }
+}
+
+.panel-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-top: var(--border-width-thin) solid var(--border-subtle);
+  color: var(--text-tertiary);
+  font-size: var(--type-command-caption);
+}
+
+.empty-state.is-locked {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  border: var(--border-width-thin) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: repeating-linear-gradient(
+    135deg,
+    transparent,
+    transparent var(--space-2),
+    var(--hatch-stripe) var(--space-2),
+    var(--hatch-stripe) var(--space-3)
+  );
 }

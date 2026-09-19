@@ -101,7 +101,10 @@ export class ProcessingQueueComponent implements OnInit {
 
   readonly selectedCount = computed(() => this.selectedIds().size);
   readonly actionsDisabled = computed(
-    () => this.store.mutating() || this.recorder.isRecording(),
+    () =>
+      this.store.mutating() ||
+      this.recorder.isRecording() ||
+      this.store.running(),
   );
   readonly selectedRunnableIds = computed(() =>
     this.store

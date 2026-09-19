@@ -1,4 +1,4 @@
-import { DestroyRef, Injectable, inject, signal } from "@angular/core";
+import { DestroyRef, Injectable, computed, inject, signal } from "@angular/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { AskHistoryPrivacyBarrierService } from "../core/ask-history-privacy-barrier.service";
 import { ErrorCopyService } from "../core/copy/error-copy.service";
@@ -25,6 +25,9 @@ export class ProcessingQueueStore {
   private initPromise: Promise<void> | null = null;
 
   readonly items = this._items.asReadonly();
+  readonly running = computed(() =>
+    this._items().some((item) => item.queueRunning === true || item.state === "processing"),
+  );
   readonly loading = this._loading.asReadonly();
   readonly mutating = this._mutating.asReadonly();
   readonly error = this._error.asReadonly();
@@ -101,7 +104,8 @@ export class ProcessingQueueStore {
   private async initialize(): Promise<void> {
     try {
       this.unlisten = await this.ipc.onProcessingQueueChanged(() => {
-        if (this._mutating()) return;
+        // The worker can release its permit while a mutation's refresh is pending.
+        // Never discard that last event; loadGeneration rejects stale responses.
         void this.load();
       });
     } catch {

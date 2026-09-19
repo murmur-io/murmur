@@ -30,6 +30,29 @@ pub struct LiveCaptionPayload {
     pub(crate) confirmed: bool,
 }
 
+/// Content-free state of the resident captions worker. Decode failures retry on its next tick;
+/// model/worker failures require fixing the local model and starting another recording.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptionsState {
+    #[default]
+    Starting,
+    Ready,
+    Retrying,
+    ModelError,
+    Unavailable,
+    Paused,
+    Stopped,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionsHealth {
+    pub captions_state: CaptionsState,
+    pub model_label: Option<String>,
+    pub tick_interval_ms: Option<u64>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveTranscriptPage {
@@ -37,6 +60,8 @@ pub struct LiveTranscriptPage {
     pub truncated: bool,
     pub next_before_seq: Option<u64>,
     pub others_state: String,
+    #[serde(flatten)]
+    pub health: CaptionsHealth,
 }
 
 #[derive(Default)]
@@ -48,10 +73,30 @@ pub struct LiveTranscriptHistory {
     bytes: usize,
     truncated: bool,
     others_state: String,
+    health: CaptionsHealth,
 }
 impl LiveTranscriptHistory {
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+    pub(crate) fn restart_allowed(&self, meeting_id: &str) -> bool {
+        self.meeting_id == meeting_id
+            && matches!(
+                self.health.captions_state,
+                CaptionsState::ModelError | CaptionsState::Stopped | CaptionsState::Unavailable
+            )
+    }
+
+    fn update_health(&mut self, others: Option<&str>, health: Option<CaptionsHealth>) -> bool {
+        let changed = others.is_some_and(|s| s != self.others_state)
+            || health.as_ref().is_some_and(|h| h != &self.health);
+        if let Some(others) = others {
+            self.others_state = others.into();
+        }
+        if let Some(health) = health {
+            self.health = health;
+        }
+        changed
     }
     fn confirmed_tail(&self) -> Vec<LiveCaptionPayload> {
         self.partials
@@ -110,6 +155,7 @@ impl LiveTranscriptHistory {
                 truncated: false,
                 next_before_seq: None,
                 others_state: "starting".into(),
+                health: CaptionsHealth::default(),
             };
         }
         let limit = limit.clamp(1, 200);
@@ -138,6 +184,7 @@ impl LiveTranscriptHistory {
             truncated: self.truncated,
             next_before_seq,
             others_state: self.others_state.clone(),
+            health: self.health.clone(),
         }
     }
 }
@@ -179,7 +226,12 @@ pub(crate) fn clear_hidden_history(state: &AppState) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Never clear a newer recording installed between the visibility probe and this lock.
         if history.meeting_id == meeting_id {
-            history.clear();
+            // Erase all content, retaining only content-free worker health and the session
+            // sequence counter. A failed worker cannot republish its status after unlock.
+            history.lines.clear();
+            history.partials.clear();
+            history.bytes = 0;
+            history.truncated = false;
         }
     }
 }
@@ -283,8 +335,22 @@ pub(crate) struct StreamCaptionAssembler {
     generation: u64,
     last_partial: String,
     last_window_end: u64,
+    restart_namespace: String,
+    resume_floor_ms: u64,
 }
 impl StreamCaptionAssembler {
+    /// A recovered worker starts with new speech. Preserve historical identities, and never
+    /// recycle a line id when the old worker's rolling window is decoded again.
+    pub(crate) fn resumed(resume_floor_ms: u64) -> Self {
+        Self {
+            restart_namespace: uuid::Uuid::new_v4().to_string(),
+            resume_floor_ms,
+            committed_end: resume_floor_ms,
+            last_window_end: resume_floor_ms,
+            ..Self::default()
+        }
+    }
+
     pub fn update(
         &mut self,
         transcript: &super::types::Transcript,
@@ -315,24 +381,56 @@ impl StreamCaptionAssembler {
         for mut candidate in candidates {
             if candidate.text.is_empty()
                 || candidate.text.len() > 16_384
+                || candidate.start < self.resume_floor_ms
                 || candidate.end <= self.committed_end
             {
                 continue;
             }
-            // A growing segment can include a prefix already committed on the preceding tick.
+            // A growing segment can contain several already-committed chunks. Preserve a
+            // bounded suffix across commits and use it as an anchor inside long hypotheses.
+            let mut overlap_unresolved = false;
             if candidate.start < self.committed_end && !self.committed_tail.is_empty() {
                 let words: Vec<_> = candidate.text.split_whitespace().collect();
                 let committed: Vec<_> = self.committed_tail.split_whitespace().collect();
+                let normalized_words: Vec<_> = words.iter().map(|word| normalize(word)).collect();
                 let overlap = (1..=words.len().min(committed.len()))
                     .rev()
-                    .find(|n| {
-                        normalize(&words[..*n].join(" "))
-                            == committed[committed.len() - *n..].join(" ")
+                    .find_map(|n| {
+                        let suffix = &committed[committed.len() - n..];
+                        if n == 64
+                            && committed.len() == 64
+                            && normalized_words
+                                .windows(n)
+                                .filter(|window| *window == suffix)
+                                .take(2)
+                                .count()
+                                > 1
+                        {
+                            // A repeated full anchor cannot locate the old/new boundary safely.
+                            // Stop matching (Some(0)), rather than falling back to a shorter repeat.
+                            return Some(0);
+                        }
+                        if normalized_words[..n] == *suffix {
+                            Some(n)
+                        } else if n == committed.len() {
+                            // Beyond the 64-word bound, the retained FULL tail may start inside
+                            // the growing segment. Never anchor an interior match on a short suffix.
+                            normalized_words
+                                .windows(n)
+                                .position(|window| window == suffix)
+                                .map(|start| start + n)
+                        } else {
+                            None
+                        }
                     })
                     .unwrap_or(0);
                 if overlap > 0 {
                     candidate.text = words[overlap..].join(" ");
                     candidate.start = self.committed_end;
+                } else {
+                    // Keep uncertain novel content visible as a partial, but never recommit
+                    // an unanchored hypothesis which overlaps already-finalized history.
+                    overlap_unresolved = true;
                 }
             }
             if candidate.text.is_empty() {
@@ -343,6 +441,7 @@ impl StreamCaptionAssembler {
                 .find(|old| old.start.abs_diff(candidate.start) < 2_000);
             let words: Vec<_> = candidate.text.split_whitespace().collect();
             let shared = old
+                .filter(|_| !overlap_unresolved)
                 .map(|old| {
                     old.text
                         .split_whitespace()
@@ -354,15 +453,25 @@ impl StreamCaptionAssembler {
             candidate.confirmed = shared == words.len();
             // All complete matching segments are considered on EVERY tick. An unstable first
             // segment cannot starve later turns until the 14-second window has rolled past them.
-            let aged = now_ms.saturating_sub(candidate.end) >= 3_000;
-            let commit_words = if aged && (shared == words.len() || shared >= 3) {
-                shared
-            } else {
-                0
-            };
+            let current_aged = now_ms.saturating_sub(candidate.end) >= 3_000;
+            // Whisper can return one growing segment ending exactly at the window edge.
+            // Its repeated prefix was already present at the PREVIOUS segment end; requiring
+            // the latest growing end to age would retain no scrollback until speech stops.
+            let previous_end = old.map(|old| old.end.min(candidate.end));
+            let prefix_aged = previous_end.is_some_and(|end| now_ms.saturating_sub(end) >= 3_000);
+            let commit_words =
+                if (current_aged || prefix_aged) && (shared == words.len() || shared >= 3) {
+                    shared
+                } else {
+                    0
+                };
             if commit_words > 0 && !blocked {
                 let text = words[..commit_words].join(" ");
-                let end = if commit_words == words.len() {
+                let end = if !current_aged && prefix_aged {
+                    // Only advance through the earlier observation, never through fresh words
+                    // which merely share the growing segment's new end timestamp.
+                    previous_end.unwrap_or(candidate.start).max(candidate.start)
+                } else if commit_words == words.len() {
                     candidate.end
                 } else {
                     candidate.start
@@ -372,7 +481,14 @@ impl StreamCaptionAssembler {
                 out.push(self.payload(text.clone(), candidate.start, true, meeting_id, speaker));
                 self.generation += 1;
                 self.committed_end = self.committed_end.max(end);
-                self.committed_tail = normalize(&text);
+                let normalized = normalize(&text);
+                let committed_words: Vec<_> = self
+                    .committed_tail
+                    .split_whitespace()
+                    .chain(normalized.split_whitespace())
+                    .collect();
+                self.committed_tail =
+                    committed_words[committed_words.len().saturating_sub(64)..].join(" ");
                 self.last_partial.clear();
                 if commit_words < words.len() {
                     blocked = true;
@@ -429,7 +545,14 @@ impl StreamCaptionAssembler {
                 ))
             .to_rfc3339(),
             offset_ms,
-            line_id: format!("{meeting_id}:{speaker}:{}", self.generation),
+            line_id: if self.restart_namespace.is_empty() {
+                format!("{meeting_id}:{speaker}:{}", self.generation)
+            } else {
+                format!(
+                    "{meeting_id}:{speaker}:{}:{}",
+                    self.restart_namespace, self.generation
+                )
+            },
             seq: None,
             finalized,
             is_question,
@@ -538,6 +661,171 @@ mod tests {
             .is_empty());
     }
     #[test]
+    fn growing_window_segment_commits_twice_observed_prefix_before_stop() {
+        let mut assembler = StreamCaptionAssembler::default();
+        let first = assembler.update(
+            &transcript(&[("one two three", 0.0, 3.0)]),
+            0,
+            3000,
+            "m",
+            "others",
+        );
+        assert!(first.iter().all(|line| !line.finalized));
+        let second = assembler.update(
+            &transcript(&[("one two three four five six", 0.0, 6.0)]),
+            0,
+            6000,
+            "m",
+            "others",
+        );
+        assert_eq!(
+            second.iter().filter(|line| line.finalized).count(),
+            1,
+            "a growing segment end cannot indefinitely postpone stable words"
+        );
+        assert_eq!(second[0].text, "one two three");
+        let third = assembler.update(
+            &transcript(&[("one two three four five six seven eight nine", 0.0, 9.0)]),
+            0,
+            9000,
+            "m",
+            "others",
+        );
+        assert_eq!(third.iter().filter(|line| line.finalized).count(), 1);
+        assert_eq!(third[0].text, "four five six");
+    }
+
+    #[test]
+    fn growing_segment_keeps_all_committed_prefixes_without_duplicates_past_tail_bound() {
+        let mut assembler = StreamCaptionAssembler::default();
+        let words: Vec<_> = (0..150).map(|n| format!("word{n}")).collect();
+        let mut final_words = Vec::new();
+        for tick in 1..=50 {
+            let text = words[..tick * 3].join(" ");
+            for line in assembler.update(
+                &transcript(&[(&text, 0.0, (tick * 3) as f64)]),
+                0,
+                (tick * 3000) as u64,
+                "m",
+                "others",
+            ) {
+                if line.finalized {
+                    final_words.extend(line.text.split_whitespace().map(str::to_owned));
+                }
+            }
+            assert_eq!(
+                final_words,
+                words[..tick.saturating_sub(1) * 3],
+                "every stable word appears once, tick {tick}"
+            );
+            assert!(assembler.committed_tail.split_whitespace().count() <= 64);
+        }
+    }
+
+    #[test]
+    fn ambiguous_old_overlap_stays_visible_but_cannot_recommit() {
+        let mut assembler = StreamCaptionAssembler {
+            committed_end: 3000,
+            committed_tail: "already committed words".into(),
+            ..Default::default()
+        };
+        let input = transcript(&[("revised old words and novel speech", 0.0, 6.0)]);
+        for now in [9000, 12000, 15000] {
+            let output = assembler.update(&input, 0, now, "m", "others");
+            assert!(output.iter().all(|line| !line.finalized));
+            assert!(assembler
+                .pending
+                .iter()
+                .any(|line| line.text.contains("novel speech")));
+        }
+    }
+
+    #[test]
+    fn repeated_long_anchor_remains_partial_instead_of_duplicating_history() {
+        let mut assembler = StreamCaptionAssembler {
+            committed_end: 90000,
+            committed_tail: vec!["again"; 64].join(" "),
+            ..Default::default()
+        };
+        let repeated = vec!["again"; 100].join(" ");
+        let input = transcript(&[(&repeated, 0.0, 100.0)]);
+        for now in [103000, 106000, 109000] {
+            let output = assembler.update(&input, 0, now, "m", "others");
+            assert!(output.iter().all(|line| !line.finalized));
+            assert!(!assembler.pending.is_empty());
+        }
+    }
+
+    /// Opt-in real local Whisper replay; input must be operator-owned synthetic speech.
+    /// Prints only counts/timestamps, never transcript content.
+    #[test]
+    #[ignore = "requires MURMUR_LIVE_PROBE_WAV and MURMUR_LIVE_PROBE_MODEL synthetic fixtures"]
+    fn native_live_window_probe_finalizes_synthetic_speech() {
+        use crate::transcribe::live_asr::LiveAsr;
+        let wav = std::env::var("MURMUR_LIVE_PROBE_WAV").unwrap();
+        let model = std::env::var("MURMUR_LIVE_PROBE_MODEL").unwrap();
+        let (samples, rate) = crate::audio::wav::read_wav_mono(std::path::Path::new(&wav)).unwrap();
+        let mut samples = crate::audio::resample_to_16k(&samples, rate).unwrap();
+        samples.extend(vec![0.0; 18 * 16000]);
+        let asr =
+            crate::transcribe::whisper::Transcriber::load(std::path::Path::new(&model)).unwrap();
+        let mut assembler = StreamCaptionAssembler::default();
+        let mut finals = 0;
+        for end_s in (3..samples.len() / 16000).step_by(3) {
+            let begin_s = end_s.saturating_sub(14);
+            let transcript = asr
+                .transcribe_live(&samples[begin_s * 16000..end_s * 16000], Some("en"))
+                .unwrap();
+            let output = assembler.update(
+                &transcript,
+                begin_s as u64 * 1000,
+                end_s as u64 * 1000,
+                "probe",
+                "others",
+            );
+            finals += output.iter().filter(|line| line.finalized).count();
+            eprintln!(
+                "live_probe end_s={end_s} segments={} emitted={} finals={finals} spans={:?}",
+                transcript.segments.len(),
+                output.len(),
+                transcript
+                    .segments
+                    .iter()
+                    .map(|s| (s.start_s, s.end_s, s.text.split_whitespace().count()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            finals >= 2,
+            "real rolling speech must produce scrollback before Stop"
+        );
+    }
+
+    #[test]
+    fn restarted_assembler_preserves_history_and_never_reuses_line_identity() {
+        let mut history = LiveTranscriptHistory::default();
+        let old = history.insert(line("Earlier committed speech"));
+        let mut first = StreamCaptionAssembler::resumed(5000);
+        let mut second = StreamCaptionAssembler::resumed(5000);
+        let next = transcript(&[("Old speech", 0.0, 1.0), ("New speech", 6.0, 7.0)]);
+        let initial = first.update(&next, 0, 10000, "m", "me");
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].text, "New speech");
+        let distinct = second.update(&next, 0, 10000, "m", "me");
+        assert_ne!(initial[0].line_id, distinct[0].line_id);
+        let finalized = first.update(&next, 0, 13000, "m", "me");
+        assert_eq!(finalized.len(), 1);
+        assert!(finalized[0].finalized);
+        assert_eq!(initial[0].line_id, finalized[0].line_id);
+        history.insert(finalized[0].clone());
+        let page = history.page("m", None, 200);
+        assert_eq!(page.lines.len(), 2);
+        assert_eq!(page.lines[0].text, "Earlier committed speech");
+        assert_eq!(page.lines[0].seq, old.seq);
+        assert_eq!(page.lines[1].seq, Some(2));
+    }
+
+    #[test]
     fn sealed_live_page_and_emission_are_denied_and_privacy_clears_cache() {
         use crate::storage::{
             models::{Folder, Meeting, MeetingStatus},
@@ -591,6 +879,30 @@ mod tests {
                 .len(),
             1
         );
+        state
+            .live_transcript_lines
+            .lock()
+            .unwrap()
+            .health
+            .captions_state = CaptionsState::Stopped;
+        assert!(crate::commands::ensure_caption_restart_allowed(&state, &id.to_string()).is_ok());
+        state
+            .live_transcript_lines
+            .lock()
+            .unwrap()
+            .health
+            .captions_state = CaptionsState::Starting;
+        assert!(crate::commands::ensure_caption_restart_allowed(&state, &id.to_string()).is_err());
+        state
+            .live_transcript_lines
+            .lock()
+            .unwrap()
+            .health
+            .captions_state = CaptionsState::ModelError;
+        *state.current_meeting.lock().unwrap() = None;
+        assert!(crate::commands::ensure_caption_restart_allowed(&state, &id.to_string()).is_err());
+        *state.current_meeting.lock().unwrap() = Some(id);
+        assert!(crate::commands::ensure_caption_restart_allowed(&state, &id.to_string()).is_ok());
         // Unrelated deletion follows the same epoch + invalidation seams as document/note
         // deletion. It must revoke late work WITHOUT destroying this meeting's scrollback.
         let other_id = uuid::Uuid::new_v4().to_string();
@@ -629,6 +941,10 @@ mod tests {
         let visibility = crate::commands::capture_content_visibility_snapshot(&state);
         state.db.set_folder_locked("private", true, None).unwrap();
         assert!(matches!(
+            crate::commands::ensure_caption_restart_allowed(&state, &id.to_string()),
+            Err(AppError::Locked(_))
+        ));
+        assert!(matches!(
             require_visible_under_lifecycle(&state, &caption, visibility),
             Err(AppError::Locked(_))
         ));
@@ -638,6 +954,15 @@ mod tests {
         ));
         crate::commands::bump_seal_epoch(&state);
         clear_hidden_history(&state);
+        assert_eq!(
+            state
+                .live_transcript_lines
+                .lock()
+                .unwrap()
+                .health
+                .captions_state,
+            CaptionsState::ModelError
+        );
         assert!(state
             .live_transcript_lines
             .lock()
@@ -764,11 +1089,40 @@ mod tests {
 #[serde(rename_all = "camelCase")]
 struct LiveTranscriptHealth<'a> {
     meeting_id: &'a str,
-    others: &'a str,
+    others: String,
+    #[serde(flatten)]
+    health: CaptionsHealth,
 }
+
 pub(crate) fn health(app: &AppHandle, meeting_id: &str, others: &str) {
     let state = app.state::<AppState>();
     let _lifecycle = crate::commands::lifecycle_guard(&state);
+    update_health_under_lifecycle(app, &state, meeting_id, Some(others), None);
+}
+
+pub(crate) fn captions_health(app: &AppHandle, meeting_id: &str, health: CaptionsHealth) {
+    let state = app.state::<AppState>();
+    let _lifecycle = crate::commands::lifecycle_guard(&state);
+    captions_health_under_lifecycle(app, &state, meeting_id, health);
+}
+
+/// The recording start owner already holds lifecycle; never acquire it recursively.
+pub(crate) fn captions_health_under_lifecycle(
+    app: &AppHandle,
+    state: &AppState,
+    meeting_id: &str,
+    health: CaptionsHealth,
+) {
+    update_health_under_lifecycle(app, state, meeting_id, None, Some(health));
+}
+
+fn update_health_under_lifecycle(
+    app: &AppHandle,
+    state: &AppState,
+    meeting_id: &str,
+    others: Option<&str>,
+    health: Option<CaptionsHealth>,
+) {
     if state
         .current_meeting
         .lock()
@@ -779,18 +1133,105 @@ pub(crate) fn health(app: &AppHandle, meeting_id: &str, others: &str) {
     {
         return;
     }
-    if let Ok(mut history) = state.live_transcript_lines.lock() {
-        if history.meeting_id != meeting_id {
-            history.clear();
-            history.meeting_id = meeting_id.into();
+    let payload = match state.live_transcript_lines.lock() {
+        Ok(mut history) => {
+            if history.meeting_id != meeting_id {
+                history.clear();
+                history.meeting_id = meeting_id.into();
+                history.others_state = "starting".into();
+            }
+            if !history.update_health(others, health) {
+                return;
+            }
+            LiveTranscriptHealth {
+                meeting_id,
+                others: history.others_state.clone(),
+                health: history.health.clone(),
+            }
         }
-        if history.others_state == others {
-            return;
+        Err(_) => return,
+    };
+    // No content or paths are included. Replay of transcript content retains its lock gate.
+    let _ = app.emit(crate::events::EVENT_LIVE_TRANSCRIPT_HEALTH, payload);
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn others_health_cannot_clear_worker_error_or_stopped_state() {
+        let mut history = LiveTranscriptHistory::default();
+        for status in [
+            CaptionsState::ModelError,
+            CaptionsState::Retrying,
+            CaptionsState::Stopped,
+        ] {
+            history.update_health(
+                None,
+                Some(CaptionsHealth {
+                    captions_state: status,
+                    ..Default::default()
+                }),
+            );
+            history.update_health(Some("ready"), None);
+            assert_eq!(history.health.captions_state, status);
+            assert_eq!(history.others_state, "ready");
+            assert!(
+                !history.update_health(Some("ready"), None),
+                "unchanged health emits no event"
+            );
         }
-        history.others_state = others.into();
     }
-    let _ = app.emit(
-        crate::events::EVENT_LIVE_TRANSCRIPT_HEALTH,
-        LiveTranscriptHealth { meeting_id, others },
-    );
+
+    #[test]
+    fn captions_model_failure_is_replayed_without_exposing_paths_or_losing_scrollback() {
+        let mut history = LiveTranscriptHistory::default();
+        history.insert(LiveCaptionPayload {
+            text: "The earlier utterance".into(),
+            meeting_id: "m".into(),
+            speaker: "me".into(),
+            captured_at: "2026-09-19T12:00:00Z".into(),
+            offset_ms: 1000,
+            line_id: "me-1".into(),
+            seq: None,
+            finalized: true,
+            is_question: false,
+            possible_question: false,
+            confirmed: true,
+        });
+        history.health = CaptionsHealth {
+            captions_state: CaptionsState::ModelError,
+            model_label: Some("whisper:small".into()),
+            tick_interval_ms: Some(3000),
+        };
+        let page = serde_json::to_value(history.page("m", None, 200)).unwrap();
+        assert_eq!(page["captionsState"], "model-error");
+        assert_eq!(page["modelLabel"], "whisper:small");
+        assert_eq!(page["tickIntervalMs"], 3000);
+        assert_eq!(page["lines"][0]["text"], "The earlier utterance");
+        assert_eq!(page["lines"][0]["seq"], 1);
+        let event = serde_json::to_value(LiveTranscriptHealth {
+            meeting_id: "m",
+            others: "degraded".into(),
+            health: history.health.clone(),
+        })
+        .unwrap();
+        assert_eq!(event["meetingId"], "m");
+        assert_eq!(event["captionsState"], "model-error");
+        assert_eq!(event.as_object().unwrap().len(), 5);
+        assert!(event.get("text").is_none());
+        assert!(event.get("lines").is_none());
+        history.health.captions_state = CaptionsState::Retrying;
+        assert_eq!(history.page("m", None, 200).lines[0].seq, Some(1));
+        assert_eq!(
+            history.page("m", None, 200).health.captions_state,
+            CaptionsState::Retrying
+        );
+        assert!(history
+            .page("another", None, 200)
+            .health
+            .model_label
+            .is_none());
+    }
 }

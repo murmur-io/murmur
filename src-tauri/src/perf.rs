@@ -1063,6 +1063,25 @@ mod tests {
     }
 
     #[test]
+    fn caption_restart_cannot_claim_model_until_previous_owner_drops() {
+        let (_serial, _reset) = session_test();
+        let mut owner = begin_recording_session().unwrap();
+        owner.transition_to_live().unwrap();
+        let token = owner.token();
+        let old = acquire_recording_model_generation(&token, ResidentModelKind::Whisper).unwrap();
+        assert!(acquire_recording_model_generation(&token, ResidentModelKind::Whisper).is_err());
+        drop(old);
+        let replacement =
+            acquire_recording_model_generation(&token, ResidentModelKind::Whisper).unwrap();
+        assert!(acquire_recording_model_generation(&token, ResidentModelKind::Whisper).is_err());
+        drop(replacement);
+        owner.transition_to_draining().unwrap();
+        assert!(acquire_recording_model_generation(&token, ResidentModelKind::Whisper).is_err());
+        owner.transition_to_postprocess().unwrap();
+        owner.finish().unwrap();
+    }
+
+    #[test]
     fn stale_token_cannot_enter_a_later_recording() {
         let (_serial, _reset) = session_test();
         let mut first = begin_recording_session().unwrap();

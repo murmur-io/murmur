@@ -237,37 +237,13 @@
     </div>
   }
 
-  <!-- ── Ambient footer HUD — the recording controls, receded (Calm-Notepad, 2026-07-19):
-       mic-mute · the LIVE caption ticker (mic-only, honesty-noted) · Ask (summons the
-       panel) · Stop. Only while recording, so the note owns the surface otherwise. ── -->
+  <!-- Recording controls. Conversation text and caption health live in the side panel. -->
   @if (store.isRecording()) {
     <div class="rec-foot" role="group" aria-label="Recording controls">
       <!-- Mic-mute: silences only the local mic; system audio keeps recording. -->
       <app-mic-mute-toggle [compact]="true" #micToggle />
 
-      <!-- Compact compatibility caption. When no live-safe model is on this Mac the
-           tick never runs, so an eternal "Listening…" would be a lie: say captions are off. -->
-      @if (liveCaptionsOff()) {
-        <p
-          class="cc-line cc-off"
-          role="note"
-          title="No small live-caption model is available on this Mac, and Murmur never runs a large model on the live tick (it would heat your Mac for the whole meeting). Everything is still being recorded — the full Me / Others transcript runs after you stop."
-        >
-          <span class="cc-off-text">
-            Captions off — full transcript after Stop
-          </span>
-        </p>
-      } @else {
-        <p class="cc-line" aria-live="off">
-          @if (liveCaption(); as cc) {
-            @for (rev of [cc]; track rev) {
-              <span class="cc-text">{{ cc }}</span>
-            }
-          } @else {
-            <span class="cc-idle">Listening…</span>
-          }
-        </p>
-      }
+      <span class="rec-foot-spacer" aria-hidden="true"></span>
 
       <!-- Ask — SUMMONS the Brain panel over the notepad (voice + text + presets live
            in the panel). A quiet dot marks an ongoing thread while the panel is closed. -->

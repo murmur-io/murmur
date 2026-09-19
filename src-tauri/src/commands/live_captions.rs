@@ -779,13 +779,16 @@ mod tests {
 
 /// Session replay is a content read: the same lock gate applies as on the detail surface.
 #[tauri::command]
-pub fn get_live_transcript_page(
-    state: tauri::State<'_, crate::state::AppState>,
+pub async fn get_live_transcript_page(
+    app: tauri::AppHandle,
     meeting_id: String,
     before_seq: Option<u64>,
     limit: Option<usize>,
 ) -> crate::error::Result<crate::transcribe::live_history::LiveTranscriptPage> {
-    get_live_transcript_page_inner(&state, &meeting_id, before_seq, limit)
+    super::offload_read(app, move |state| {
+        get_live_transcript_page_inner(state, &meeting_id, before_seq, limit)
+    })
+    .await
 }
 
 pub(crate) fn get_live_transcript_page_inner(
@@ -807,4 +810,120 @@ pub(crate) fn get_live_transcript_page_inner(
         .lock()
         .map_err(|_| crate::error::AppError::Storage("live transcript unavailable".into()))?;
     Ok(history.page(meeting_id, before_seq, limit.unwrap_or(200)))
+}
+
+/// Restart only a failed captions owner; recording and accumulated caption history stay intact.
+/// The exclusive model-generation lease is acquired BEFORE admitting the replacement thread.
+#[tauri::command]
+pub async fn restart_live_captions(
+    app: tauri::AppHandle,
+    meeting_id: String,
+) -> crate::error::Result<()> {
+    let worker_app = app.clone();
+    super::offload_read(app, move |state| {
+        let _lifecycle = super::lifecycle_guard(state);
+        ensure_caption_restart_allowed(state, &meeting_id)?;
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| {
+                crate::error::AppError::Unavailable("caption configuration unavailable".into())
+            })?
+            .clone();
+        let model_path = resolve(&cfg).model_path().ok_or_else(|| {
+            crate::error::AppError::Unavailable(
+                "download a live caption model in Settings first".into(),
+            )
+        })?;
+        let (token, manual_source, resume_floor_ms) = {
+            let recorder = state
+                .recorder
+                .lock()
+                .map_err(|_| crate::error::AppError::Unavailable("recorder unavailable".into()))?;
+            let active = recorder
+                .as_ref()
+                .filter(|active| active.meeting_id == meeting_id)
+                .ok_or_else(|| {
+                    crate::error::AppError::Unavailable("recording is no longer active".into())
+                })?;
+            (
+                active.live_model_token()?,
+                active.manual_clip_source(),
+                active.total_samples() as u64 * 1000
+                    / u64::from(active.source_sample_rate()).max(1),
+            )
+        };
+        // Fails closed while ANY old generation still exists. The old live worker drops its
+        // status guard/model before its lease; it therefore cannot overwrite the new owner.
+        let lease = crate::perf::acquire_recording_model_generation(
+            &token,
+            crate::perf::ResidentModelKind::Whisper,
+        )?;
+        crate::transcribe::live_history::captions_health_under_lifecycle(
+            &worker_app,
+            state,
+            &meeting_id,
+            crate::transcribe::live_history::CaptionsHealth::default(),
+        );
+        let result = crate::transcribe::live::spawn(
+            worker_app.clone(),
+            meeting_id.clone(),
+            model_path,
+            cfg.language,
+            token,
+            manual_source,
+            Some(crate::transcribe::live::LiveRestart {
+                lease,
+                resume_floor_ms,
+            }),
+        );
+        if result.is_err() {
+            crate::transcribe::live_history::captions_health_under_lifecycle(
+                &worker_app,
+                state,
+                &meeting_id,
+                crate::transcribe::live_history::CaptionsHealth {
+                    captions_state: crate::transcribe::live_history::CaptionsState::Stopped,
+                    ..Default::default()
+                },
+            );
+        }
+        result
+    })
+    .await
+}
+
+pub(crate) fn ensure_caption_restart_allowed(
+    state: &crate::state::AppState,
+    meeting_id: &str,
+) -> crate::error::Result<()> {
+    use crate::error::AppError;
+    if state.db.get_meeting(meeting_id)?.is_none()
+        || !super::meeting_is_unlocked(state, meeting_id)?
+    {
+        return Err(AppError::Locked("live transcript is locked".into()));
+    }
+    if state
+        .current_meeting
+        .lock()
+        .map_err(|_| AppError::Unavailable("recording state unavailable".into()))?
+        .map(|id| id.to_string())
+        .as_deref()
+        != Some(meeting_id)
+    {
+        return Err(AppError::Unavailable(
+            "recording is no longer active".into(),
+        ));
+    }
+    if !state
+        .live_transcript_lines
+        .lock()
+        .map_err(|_| AppError::Unavailable("caption state unavailable".into()))?
+        .restart_allowed(meeting_id)
+    {
+        return Err(AppError::Unavailable(
+            "live captions are already starting or running".into(),
+        ));
+    }
+    Ok(())
 }

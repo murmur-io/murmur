@@ -19,6 +19,8 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "./ipc.service";
 import type {
   LiveCaptionPayload,
+  LiveCaptionsHealthState,
+  LiveTranscriptPage,
   NoteDto,
   Stage,
   StatusPayload,
@@ -77,9 +79,21 @@ export class RecorderStore {
   private readonly _liveTranscriptHasEarlier = signal(false);
   private readonly _liveTranscriptEventRevision = signal(0);
   readonly liveOthersState = signal<"starting" | "ready" | "unavailable" | "degraded">("starting");
+  private readonly _liveCaptionsState = signal<LiveCaptionsHealthState>("starting");
+  private readonly _liveCaptionModel = signal<string | null>(null);
+  private readonly _liveCaptionTickMs = signal<number | null>(null);
+  readonly liveCaptionsState = this._liveCaptionsState.asReadonly();
+  readonly liveCaptionModel = this._liveCaptionModel.asReadonly();
+  readonly liveCaptionTickMs = this._liveCaptionTickMs.asReadonly();
   readonly liveTranscriptPaused = signal(false);
+  readonly liveTranscriptPrivacyReady = this.privacyBarrier.ready;
+  readonly liveTranscriptUnlocking = signal(false);
+  readonly liveTranscriptUnlockError = signal<string | null>(null);
+  readonly liveCaptionsRestarting = signal(false);
+  readonly liveCaptionsRestartError = signal<string | null>(null);
   private readonly _queuedMeetingId = signal<string | null>(null);
   private liveTranscriptPrivacyEpoch = 0;
+  private liveHealthRevision = 0;
   private liveTranscriptReadsAllowed = false;
 
   readonly stage = this._stage.asReadonly();
@@ -288,6 +302,7 @@ export class RecorderStore {
     const unregister = this.privacyBarrier.registerInvalidator(() => {
       this.liveTranscriptReadsAllowed = false;
       this.liveTranscriptPaused.set(true);
+      this.liveTranscriptUnlockError.set(null);
       ++this.liveTranscriptPrivacyEpoch;
       this.invalidateTerminalPrivacy();
       void this.reauthorizeLiveTranscript();
@@ -350,7 +365,9 @@ export class RecorderStore {
     );
     this.unlistenLiveHealth = await this.ipc.onLiveTranscriptHealth((health) => {
       if (health.meetingId === this._meetingId() && this.isRecording()) {
+        ++this.liveHealthRevision;
         this.liveOthersState.set(health.others);
+        this.applyCaptionHealth(health);
       }
     });
     // Echo cleanup notice: recording was made on speakers; echoed lines were removed.
@@ -505,6 +522,7 @@ export class RecorderStore {
     // where _recStartMs would otherwise stay 0 and show an epoch-sized timer.
     if (p.stage === "recording" && !wasRecording) {
       this._recStartMs = Date.now();
+      if (p.meetingId) void this.hydrateLiveTranscript(p.meetingId);
     }
     if (p.stage === "error") {
       this._error.set(p.message);
@@ -526,12 +544,19 @@ export class RecorderStore {
     this.clearLiveTranscript();
     this._queuedMeetingId.set(null);
     this.liveOthersState.set("starting");
+    this._liveCaptionsState.set("starting");
+    this._liveCaptionModel.set(null);
+    this._liveCaptionTickMs.set(null);
+    this.liveTranscriptUnlockError.set(null);
+    this.liveCaptionsRestartError.set(null);
     this._lastNote.set(null);
     try {
       const res = await this.ipc.startRecording(folderId);
+      const needsReplay = this._stage() !== "recording" || this._meetingId() !== res.meetingId;
       this._meetingId.set(res.meetingId);
       this._recStartMs = Date.now();
       this._stage.set("recording");
+      if (needsReplay) void this.hydrateLiveTranscript(res.meetingId);
     } catch (e) {
       this._error.set(String(e));
       this._stage.set("error");
@@ -916,6 +941,7 @@ export class RecorderStore {
   private async hydrateLiveTranscript(meetingId: string): Promise<void> {
     if (!this.liveTranscriptReadsAllowed) return;
     const privacyEpoch = this.liveTranscriptPrivacyEpoch;
+    const healthRevision = this.liveHealthRevision;
     try {
       const page = await this.ipc.getLiveTranscriptPage(meetingId, undefined, 200);
       if (
@@ -945,7 +971,12 @@ export class RecorderStore {
       const mergedLines = orderLiveLines([...merged.values()]).slice(-10_000);
       this._liveTranscriptLines.set(mergedLines);
       this._liveTranscriptTruncated.set(page.truncated);
-      if (page.othersState) this.liveOthersState.set(page.othersState);
+      // A page is a snapshot taken before it crosses IPC. A later health event
+      // wins even when the older page response settles last.
+      if (healthRevision === this.liveHealthRevision) {
+        if (page.othersState) this.liveOthersState.set(page.othersState);
+        this.applyCaptionHealth(page);
+      }
       this.liveTranscriptBeforeSeq = page.nextBeforeSeq ?? null;
       this._liveTranscriptHasEarlier.set(this.liveTranscriptBeforeSeq !== null);
       const last = mergedLines.at(-1);
@@ -955,17 +986,96 @@ export class RecorderStore {
     }
   }
 
+  private applyCaptionHealth(health: Pick<LiveTranscriptPage, "captionsState" | "modelLabel" | "tickIntervalMs">): void {
+    if (health.captionsState) this._liveCaptionsState.set(health.captionsState);
+    if (health.modelLabel !== undefined) this._liveCaptionModel.set(health.modelLabel);
+    if (health.tickIntervalMs !== undefined) this._liveCaptionTickMs.set(health.tickIntervalMs);
+  }
+
+  async restartLiveCaptions(): Promise<void> {
+    const meetingId = this._meetingId();
+    if (!meetingId || !this.isRecording() || this.liveCaptionsRestarting() || this.liveTranscriptPaused()) return;
+    const previous = this._liveCaptionsState();
+    const revision = this.liveHealthRevision;
+    this.liveCaptionsRestarting.set(true);
+    this.liveCaptionsRestartError.set(null);
+    this._liveCaptionsState.set("starting");
+    try {
+      await this.ipc.restartLiveCaptions(meetingId);
+      if (meetingId === this._meetingId() && this.isRecording()) {
+        await this.hydrateLiveTranscript(meetingId);
+      }
+    } catch {
+      if (meetingId === this._meetingId() && this.isRecording()) {
+        if (revision === this.liveHealthRevision) this._liveCaptionsState.set(previous);
+        this.liveCaptionsRestartError.set("Captions could not restart. Try again or check caption settings.");
+      }
+    } finally {
+      this.liveCaptionsRestarting.set(false);
+    }
+  }
+
+  async retryLiveTranscript(): Promise<void> {
+    if (this.liveTranscriptUnlocking()) return;
+    this.liveTranscriptUnlocking.set(true);
+    this.liveTranscriptUnlockError.set(null);
+    try {
+      await this.reauthorizeLiveTranscript();
+      if (!this.liveTranscriptPrivacyReady()) {
+        this.liveTranscriptUnlockError.set("The privacy connection is unavailable. Please try again.");
+      }
+    } finally {
+      this.liveTranscriptUnlocking.set(false);
+    }
+  }
+
+  async unlockLiveTranscript(): Promise<void> {
+    const meetingId = this._meetingId();
+    if (!meetingId || !this.isRecording() || this.liveTranscriptUnlocking()) return;
+    this.liveTranscriptUnlocking.set(true);
+    this.liveTranscriptUnlockError.set(null);
+    try {
+      if (!(await this.privacyBarrier.ensureReady())) return;
+      if (meetingId !== this._meetingId() || !this.isRecording()) return;
+      await this.ipc.unlockMeeting(meetingId);
+      if (meetingId !== this._meetingId() || !this.isRecording()) return;
+      // Unlock completion is not permission to render. Re-enter through a new
+      // gated page read, with the same epoch fencing as privacy invalidation.
+      await this.reauthorizeLiveTranscript();
+      if (meetingId === this._meetingId() && this.liveTranscriptPaused()) {
+        this.liveTranscriptUnlockError.set("Access could not be restored. Try unlocking again.");
+      }
+    } catch {
+      if (meetingId === this._meetingId() && this.isRecording()) {
+        this.liveTranscriptUnlockError.set("Unlock was cancelled or unavailable. Your transcript stays hidden.");
+      }
+    } finally {
+      this.liveTranscriptUnlocking.set(false);
+    }
+  }
+
   private async reauthorizeLiveTranscript(): Promise<void> {
     const meetingId = this._meetingId();
     const epoch = this.liveTranscriptPrivacyEpoch;
+    const healthRevision = this.liveHealthRevision;
     if (!meetingId || this._stage() !== "recording") return;
     try {
+      // A successful content read alone cannot restore the invalidation listeners.
+      // Both gates must hold, including when this method is reached from Retry/Unlock.
+      const ready = await this.privacyBarrier.ensureReady();
+      if (!ready || epoch !== this.liveTranscriptPrivacyEpoch || meetingId !== this._meetingId() || !this.isRecording()) return;
       // An unrelated deletion also invalidates the global barrier. Only a NEW
       // successful backend-gated read may resume this recording's pushed content.
       const page = await this.ipc.getLiveTranscriptPage(meetingId, undefined, 200);
       if (epoch !== this.liveTranscriptPrivacyEpoch || meetingId !== this._meetingId() || this._stage() !== "recording") return;
       this.liveTranscriptReadsAllowed = true;
       this.liveTranscriptPaused.set(false);
+      // A page is a snapshot taken before it crosses IPC. A later health event
+      // wins even when the older page response settles last.
+      if (healthRevision === this.liveHealthRevision) {
+        if (page.othersState) this.liveOthersState.set(page.othersState);
+        this.applyCaptionHealth(page);
+      }
       this._liveTranscriptLines.set(orderLiveLines(page.lines.filter(line =>
         !!line.lineId && line.meetingId === meetingId &&
         (line.speaker === "me" || line.speaker === "others"),

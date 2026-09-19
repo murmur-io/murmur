@@ -1680,13 +1680,36 @@ pub async fn start_recording(
             | live_captions::LiveCaptions::NoModel => {}
         }
         if let Some(model_path) = resolved.model_path() {
-            crate::transcribe::live::spawn(
+            if crate::transcribe::live::spawn(
                 app.clone(),
                 meeting_id.clone(),
                 model_path,
                 cfg.language.clone(),
                 recording_model_token,
                 manual_clip_source,
+                None,
+            )
+            .is_err()
+            {
+                crate::transcribe::live_history::captions_health_under_lifecycle(
+                    &app,
+                    &state,
+                    &meeting_id,
+                    crate::transcribe::live_history::CaptionsHealth {
+                        captions_state: crate::transcribe::live_history::CaptionsState::Stopped,
+                        ..Default::default()
+                    },
+                );
+            }
+        } else {
+            crate::transcribe::live_history::captions_health_under_lifecycle(
+                &app,
+                &state,
+                &meeting_id,
+                crate::transcribe::live_history::CaptionsHealth {
+                    captions_state: crate::transcribe::live_history::CaptionsState::Unavailable,
+                    ..Default::default()
+                },
             );
         }
     }

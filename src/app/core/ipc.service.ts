@@ -77,6 +77,7 @@ import type {
   LinkEdge,
   LinkKind,
   LiveCaptionPayload,
+  LiveTranscriptHealth,
   LiveTranscriptPage,
   LivingAnswerTileData,
   MachineChangeNudge,
@@ -3625,12 +3626,16 @@ export class IpcService {
     return listen<LiveCaptionPayload>(EVENT_LIVE_CAPTION, (e) => cb(e.payload));
   }
 
+  restartLiveCaptions(meetingId: string): Promise<void> {
+    return invoke<void>("restart_live_captions", { meetingId });
+  }
+
   onProcessingQueueChanged(cb: () => void): Promise<UnlistenFn> {
     return listen("murmur://processing-queue-changed", () => cb());
   }
 
-  onLiveTranscriptHealth(cb: (health: { meetingId: string; others: "starting" | "ready" | "unavailable" | "degraded" }) => void): Promise<UnlistenFn> {
-    return listen<{ meetingId: string; others: "starting" | "ready" | "unavailable" | "degraded" }>(
+  onLiveTranscriptHealth(cb: (health: LiveTranscriptHealth) => void): Promise<UnlistenFn> {
+    return listen<LiveTranscriptHealth>(
       "murmur://live-transcript-health", (event) => cb(event.payload),
     );
   }

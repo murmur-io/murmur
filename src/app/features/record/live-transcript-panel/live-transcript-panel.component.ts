@@ -11,6 +11,9 @@ import {
   signal,
   viewChild,
 } from "@angular/core";
+import { RouterLink } from "@angular/router";
+import { MurBannerComponent } from "../../../design-system/banner/banner.component";
+import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import { RecorderStore } from "../../../core/recorder.store";
 
 interface LiveTranscriptRow {
@@ -19,6 +22,7 @@ interface LiveTranscriptRow {
   readonly speaker: "me" | "others";
   readonly speakerLabel: "Me" | "Others";
   readonly timeLabel: string;
+  readonly capturedAt: string | undefined;
   readonly final: boolean;
   readonly possibleQuestion: boolean;
 }
@@ -32,6 +36,7 @@ function offsetLabel(offsetMs: number | undefined): string {
 @Component({
   selector: "app-live-transcript-panel",
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [MurIconComponent, MurBannerComponent, RouterLink],
   host: { "[class.is-collapsed]": "collapsed()" },
   templateUrl: "./live-transcript-panel.component.html",
   styleUrl: "./live-transcript-panel.component.scss",
@@ -74,6 +79,7 @@ export class LiveTranscriptPanelComponent {
         speaker: line.speaker!,
         speakerLabel: line.speaker === "me" ? "Me" : "Others",
         timeLabel: offsetLabel(line.offsetMs),
+        capturedAt: line.capturedAt,
         final: line.final === true,
         possibleQuestion:
           line.final === true &&
@@ -96,10 +102,27 @@ export class LiveTranscriptPanelComponent {
     () => this.hasBufferedOlder() || this.store.liveTranscriptHasEarlier(),
   );
 
+  readonly captionFailure = computed(() =>
+    ["model-error", "stopped"].includes(this.store.liveCaptionsState()),
+  );
+  readonly captionUnavailable = computed(() =>
+    this.captionsOff() || this.store.liveCaptionsState() === "unavailable",
+  );
+  readonly engineLabel = computed(() => {
+    const model = this.store.liveCaptionModel();
+    const tick = this.store.liveCaptionTickMs();
+    if (!model) return "On-device captions";
+    return tick ? `${model} · ${tick / 1000} s tick` : model;
+  });
+
   readonly statusLabel = computed(() => {
     if (this.store.liveTranscriptPaused()) return "Live transcript paused";
-    if (this.captionsOff()) return "Captions off";
+    if (this.captionFailure()) return "Live captions stopped";
+    if (this.store.liveCaptionsState() === "paused") return "Live captions paused to cool down";
+    if (this.store.liveCaptionsState() === "retrying") return "Retrying live captions…";
+    if (this.captionUnavailable()) return "Captions off";
     if (this.systemCaptureNote()) return "Me only";
+    if (this.store.liveCaptionsState() === "starting" && this.store.liveCaptionModel()) return "Starting live captions…";
     if (this.store.liveOthersState() === "starting") return "Starting live captions…";
     if (this.store.liveOthersState() === "unavailable") return "Me only · Others unavailable";
     if (this.store.liveOthersState() === "degraded") return "Me · Others delayed";
@@ -161,7 +184,7 @@ export class LiveTranscriptPanelComponent {
       );
     }
 
-    if (this.pinned()) {
+    if (this.pinned() && !this.collapsed()) {
       this.scrollToLatest();
     } else if (added.length > 0 || questions.length > 0) {
       this.newCount.update((count) => count + added.length);
@@ -181,7 +204,7 @@ export class LiveTranscriptPanelComponent {
       },
       { injector: this.injector },
     );
-    if (!willCollapse) this.scrollToLatest();
+    if (!willCollapse && this.pinned()) this.jumpToLatest();
   }
 
   onScroll(event: Event): void {

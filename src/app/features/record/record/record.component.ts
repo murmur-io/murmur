@@ -104,9 +104,6 @@ export class RecordComponent implements OnInit {
   /** The in-pill mic-mute toggle — its `muted()` signal drives the stage hint. */
   private readonly micToggle = viewChild(MicMuteToggleComponent);
 
-  /** Latest partial transcript, trimmed — drives the ephemeral caption line. */
-  readonly liveCaption = computed(() => this.store.liveCaption().trim());
-
   /** Latest settings snapshot, refreshed on entry — used for the readiness guard. */
   private readonly config = signal<AppConfigDto | null>(null);
 

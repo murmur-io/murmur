@@ -33,9 +33,15 @@ pub struct ProcessingQueueItem {
     updated_at: String,
     last_error_code: Option<String>,
     locked: bool,
+    queue_running: bool,
 }
 
-fn item(job: ProcessingQueueJob, title: Option<String>, unlocked: bool) -> ProcessingQueueItem {
+fn item(
+    job: ProcessingQueueJob,
+    title: Option<String>,
+    unlocked: bool,
+    queue_running: bool,
+) -> ProcessingQueueItem {
     ProcessingQueueItem {
         meeting_id: job.meeting_id,
         title: if unlocked {
@@ -53,26 +59,31 @@ fn item(job: ProcessingQueueJob, title: Option<String>, unlocked: bool) -> Proce
         updated_at: job.updated_at,
         last_error_code: if unlocked { job.error_code } else { None },
         locked: !unlocked,
+        queue_running,
     }
 }
 
 #[tauri::command]
-pub fn list_processing_queue(state: State<'_, AppState>) -> Result<Vec<ProcessingQueueItem>> {
-    let _lifecycle = super::lifecycle_guard(state.inner());
-    state
-        .db
-        .list_processing_queue()?
-        .into_iter()
-        .map(|job| {
-            let unlocked = super::meeting_is_unlocked(state.inner(), &job.meeting_id)?;
-            let title = if unlocked {
-                state.db.get_meeting(&job.meeting_id)?.and_then(|m| m.title)
-            } else {
-                None
-            };
-            Ok(item(job, title, unlocked))
-        })
-        .collect()
+pub async fn list_processing_queue(app: AppHandle) -> Result<Vec<ProcessingQueueItem>> {
+    super::offload_read(app, |state| {
+        let _lifecycle = super::lifecycle_guard(state);
+        let queue_running = state.processing_queue_running.load(Ordering::Acquire);
+        state
+            .db
+            .list_processing_queue()?
+            .into_iter()
+            .map(|job| {
+                let unlocked = super::meeting_is_unlocked(state, &job.meeting_id)?;
+                let title = if unlocked {
+                    state.db.get_meeting(&job.meeting_id)?.and_then(|m| m.title)
+                } else {
+                    None
+                };
+                Ok(item(job, title, unlocked, queue_running))
+            })
+            .collect()
+    })
+    .await
 }
 
 fn validate_selection(state: &AppState, ids: &[String], allow_processing: bool) -> Result<()> {
@@ -104,22 +115,34 @@ fn validate_selection(state: &AppState, ids: &[String], allow_processing: bool) 
     Ok(())
 }
 
-struct WorkerPermit(Arc<AtomicBool>);
+struct WorkerPermit {
+    running: Arc<AtomicBool>,
+    app: Option<AppHandle>,
+}
 impl Drop for WorkerPermit {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.running.store(false, Ordering::Release);
+        // This must follow release: the UI's final read must observe the free lane,
+        // including yields/errors where all remaining rows are still waiting.
+        if let Some(app) = &self.app {
+            emit_processing_queue_changed(app);
+        }
     }
 }
 
-fn reserve_worker(state: &AppState) -> Result<WorkerPermit> {
+fn reserve_worker(state: &AppState, app: Option<AppHandle>) -> Result<WorkerPermit> {
     state
         .processing_queue_running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| AppError::Unavailable("a processing queue run is already active".into()))?;
-    Ok(WorkerPermit(state.processing_queue_running.clone()))
+    Ok(WorkerPermit {
+        running: state.processing_queue_running.clone(),
+        app,
+    })
 }
 
 fn prepare_run(
+    app: &AppHandle,
     state: &AppState,
     ids: &[String],
     retry: bool,
@@ -131,7 +154,7 @@ fn prepare_run(
         ));
     }
     validate_selection(state, ids, false)?;
-    let permit = reserve_worker(state)?;
+    let permit = reserve_worker(state, Some(app.clone()))?;
     let now = chrono::Utc::now().to_rfc3339();
     let selected: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let jobs = state.db.list_processing_queue()?;
@@ -164,7 +187,7 @@ pub fn process_queue_now(
     state: State<'_, AppState>,
     meeting_ids: Vec<String>,
 ) -> Result<()> {
-    let (permit, ordered) = prepare_run(state.inner(), &meeting_ids, false)?;
+    let (permit, ordered) = prepare_run(&app, state.inner(), &meeting_ids, false)?;
     spawn_worker(app, ordered, permit);
     Ok(())
 }
@@ -175,7 +198,7 @@ pub fn retry_processing_queue(
     state: State<'_, AppState>,
     meeting_ids: Vec<String>,
 ) -> Result<()> {
-    let (permit, ordered) = prepare_run(state.inner(), &meeting_ids, true)?;
+    let (permit, ordered) = prepare_run(&app, state.inner(), &meeting_ids, true)?;
     spawn_worker(app, ordered, permit);
     Ok(())
 }
@@ -312,7 +335,20 @@ pub fn reorder_processing_queue(
     state: State<'_, AppState>,
     ordered_meeting_ids: Vec<String>,
 ) -> Result<()> {
-    let _lifecycle = super::lifecycle_guard(state.inner());
+    reorder_processing_queue_inner(state.inner(), &ordered_meeting_ids)?;
+    emit_processing_queue_changed(&app);
+    Ok(())
+}
+
+fn reorder_processing_queue_inner(state: &AppState, ordered_meeting_ids: &[String]) -> Result<()> {
+    let _lifecycle = super::lifecycle_guard(state);
+    // The worker owns a canonical-order snapshot for its whole run, including the
+    // gaps between claims when no row is marked Processing. Match removal's latch.
+    if state.processing_queue_running.load(Ordering::Acquire) {
+        return Err(AppError::Unavailable(
+            "wait for the current queue run to finish".into(),
+        ));
+    }
     if ordered_meeting_ids.is_empty() || ordered_meeting_ids.len() > MAX_SELECTION {
         return Err(AppError::InvalidArg("invalid queue order length".into()));
     }
@@ -324,18 +360,129 @@ pub fn reorder_processing_queue(
         .map(|(_, id)| id.clone())
         .collect();
     if !moved.is_empty() {
-        validate_selection(state.inner(), &moved, false)?;
+        validate_selection(state, &moved, false)?;
     }
     state
         .db
-        .reorder_processing_queue(&ordered_meeting_ids, &chrono::Utc::now().to_rfc3339())?;
-    emit_processing_queue_changed(&app);
+        .reorder_processing_queue(ordered_meeting_ids, &chrono::Utc::now().to_rfc3339())?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::AppConfig;
+    use crate::storage::{Db, Meeting, MeetingStatus};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    fn build_state(tag: &str) -> AppState {
+        crate::commands::dev_kek_fixture::ensure_dev_kek();
+        let db_path =
+            crate::storage::db::unique_temp_path(&format!("murmur-trash-{tag}"), "sqlite");
+        let _ = std::fs::remove_file(&db_path);
+        let db =
+            Db::open_with_key(&db_path, &"0123456789abcdef".repeat(4)).expect("open trash test db");
+        db.migrate().expect("migrate trash test db");
+        AppState {
+            recorder: Mutex::new(None),
+            recording_stop: Mutex::new(None),
+            voice_listener: Mutex::new(None),
+            voice_listener_lifecycle: Mutex::new(()),
+            recording_starting: std::sync::atomic::AtomicBool::new(false),
+            voice_command_capture: Mutex::new(None),
+            pending_manual_command: Mutex::new(None),
+            live_running: std::sync::atomic::AtomicBool::new(false),
+            db: Arc::new(db),
+            config: Arc::new(Mutex::new(AppConfig::default())),
+            reasoner: crate::reason::ReasonerCell::fixed(Arc::new(crate::reason::StubReasoner)),
+            current_meeting: Mutex::new(None),
+            focus_meeting: Mutex::new(None),
+            live_transcript: Mutex::new(String::new()),
+            live_transcript_lines: std::sync::Mutex::new(Default::default()),
+            processing_queue_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            live_bullets: Mutex::new(String::new()),
+            live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
+            capped_notified: std::sync::atomic::AtomicBool::new(false),
+            capture_fault_notified: std::sync::atomic::AtomicBool::new(false),
+            reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
+            reactions_emitted: Mutex::new(HashSet::new()),
+            in_flight_turns: Mutex::new(HashMap::new()),
+            user_turn_in_progress: std::sync::atomic::AtomicBool::new(false),
+            verify_cache: Mutex::new(HashMap::new()),
+            unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
+            master_kek: Mutex::new(None),
+            org_ock_cache: Mutex::new(HashMap::new()),
+            account_session: Mutex::new(None),
+            share_refresh_lock: tokio::sync::Mutex::new(()),
+            org_share_mutation_lock: tokio::sync::Mutex::new(()),
+            lifecycle: Mutex::new(()),
+            active_salvages: Mutex::new(HashSet::new()),
+            seal_epoch: std::sync::atomic::AtomicU64::new(0),
+            heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    #[test]
+    fn active_worker_keeps_its_selected_order_until_permit_release() {
+        let state = build_state("queue-order-permit");
+        for id in ["a", "b", "c"] {
+            state
+                .db
+                .insert_meeting(&Meeting {
+                    id: id.into(),
+                    started_at: "now".into(),
+                    ended_at: Some("now".into()),
+                    title: None,
+                    duration_s: 0,
+                    audio_path: None,
+                    status: MeetingStatus::Draft,
+                    folder_id: None,
+                })
+                .unwrap();
+            state.db.enqueue_processing_job(id, "now").unwrap();
+        }
+        let permit = reserve_worker(&state, None).unwrap();
+        let job = state.db.processing_job("a").unwrap().unwrap();
+        let dto = item(
+            job,
+            None,
+            true,
+            state.processing_queue_running.load(Ordering::Acquire),
+        );
+        assert_eq!(serde_json::to_value(dto).unwrap()["queueRunning"], true);
+        // All rows are waiting between claims; the permit, not a Processing row,
+        // must protect the worker's selected order for its complete lifetime.
+        let changed_order = vec!["a".into(), "c".into(), "b".into()];
+        assert!(
+            matches!(
+                reorder_processing_queue_inner(&state, &changed_order),
+                Err(AppError::Unavailable(_))
+            ),
+            "a worker must never execute a stale snapshot after a successful reorder"
+        );
+        let ids: Vec<_> = state
+            .db
+            .list_processing_queue()
+            .unwrap()
+            .into_iter()
+            .map(|job| job.meeting_id)
+            .collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        drop(permit);
+        assert!(!state.processing_queue_running.load(Ordering::Acquire));
+        reorder_processing_queue_inner(&state, &changed_order).unwrap();
+        let ids: Vec<_> = state
+            .db
+            .list_processing_queue()
+            .unwrap()
+            .into_iter()
+            .map(|job| job.meeting_id)
+            .collect();
+        assert_eq!(ids, changed_order);
+    }
     #[test]
     fn deferred_stop_result_has_frontend_disposition() {
         let value = serde_json::to_value(super::super::StopResult {
@@ -364,10 +511,12 @@ mod tests {
             },
             Some("private meeting title".into()),
             false,
+            false,
         );
         let value = serde_json::to_value(dto).unwrap();
         assert_eq!(value["title"], "Locked recording");
         assert_eq!(value["locked"], true);
+        assert_eq!(value["queueRunning"], false);
         assert!(value["lastErrorCode"].is_null());
         assert!(value["stage"].is_null());
         assert!(value.get("meetingId").is_some());

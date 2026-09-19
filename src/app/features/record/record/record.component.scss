@@ -641,71 +641,8 @@
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
-/* ── Live caption ticker — rides inline in the recording strip ─────── */
-.cc-line {
+.rec-foot-spacer {
   flex: 1 1 auto;
-  min-width: 0;
-  margin: 0;
-  color: var(--text-secondary);
-  font-size: 0.875rem;
-  line-height: 1.4;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.cc-text {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  animation: cc-in 260ms var(--transition) both;
-}
-.cc-idle {
-  color: var(--text-muted);
-  font-style: italic;
-}
-/* No live-safe model on this Mac ⇒ the ticker never fills. Say so plainly instead of
-   showing "Listening…" for the whole meeting (the recording itself is unaffected). */
-.cc-off {
-  color: var(--text-muted);
-  cursor: default;
-}
-.cc-off-text {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-style: italic;
-}
-/* Live-captions honesty hint — muted, non-shrinking (flex:none) so the
-   ticker keeps absorbing the free space. Not part of the ticker itself. */
-.cc-scope {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  color: var(--text-muted);
-  font-size: 0.75rem;
-  white-space: nowrap;
-  cursor: default;
-}
-.cc-scope-ico {
-  flex: none;
-  opacity: 0.8;
-}
-/* On tighter widths drop the label; the ⓘ icon + tooltip still carry it. */
-@media (max-width: 720px) {
-  .cc-scope-text {
-    display: none;
-  }
-}
-@keyframes cc-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
 }
 
 /* ── Minimal stats strip ───────────────────────────────────────────── */

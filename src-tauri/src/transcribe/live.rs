@@ -206,6 +206,29 @@ fn model_size_label(model_path: &std::path::Path) -> String {
     }
 }
 
+/// The UI label never exposes an arbitrary custom filename, even one starting with `ggml-`.
+fn public_model_size_label(model_path: &std::path::Path) -> String {
+    let size = model_size_label(model_path);
+    let plain = size.strip_suffix(".en").unwrap_or(&size);
+    if matches!(
+        plain,
+        "tiny"
+            | "base"
+            | "small"
+            | "medium"
+            | "large"
+            | "large-v1"
+            | "large-v2"
+            | "large-v3"
+            | "large-v3-turbo"
+    ) || super::model::QUANT_MODEL_SIZES.contains(&size.as_str())
+    {
+        size
+    } else {
+        "custom".into()
+    }
+}
+
 /// Normalize a wake command for dedup comparison: lowercase, collapse whitespace, drop surrounding
 /// punctuation. So the SAME utterance transcribed with slightly different trailing punctuation /
 /// spacing / casing across overlapping tails still compares equal and is de-duplicated.
@@ -218,6 +241,11 @@ fn normalize_command(cmd: &str) -> String {
         .join(" ")
 }
 
+pub(crate) struct LiveRestart {
+    pub lease: crate::perf::RecordingModelGenerationLease,
+    pub resume_floor_ms: u64,
+}
+
 /// Spawn the live-caption loop for the current recording. Returns immediately; the loop
 /// runs on its own OS thread and ends on its own when recording stops.
 pub(crate) fn spawn(
@@ -227,8 +255,9 @@ pub(crate) fn spawn(
     lang: Option<String>,
     model_token: crate::perf::RecordingSessionToken,
     manual_clip_source: crate::audio::source::ManualClipSource,
-) {
-    let _ = std::thread::Builder::new()
+    restart: Option<LiveRestart>,
+) -> crate::error::Result<()> {
+    std::thread::Builder::new()
         .name("murmur-live-captions".into())
         .spawn(move || {
             run(
@@ -238,8 +267,13 @@ pub(crate) fn spawn(
                 lang,
                 model_token,
                 manual_clip_source,
+                restart,
             )
-        });
+        })
+        .map(|_| ())
+        .map_err(|_| {
+            crate::error::AppError::Unavailable("live captions worker could not start".into())
+        })
 }
 
 /// Wake/manual capture still consumes Whisper directly, so Parakeet cannot be selected without
@@ -256,20 +290,36 @@ fn run(
     lang: Option<String>,
     model_token: crate::perf::RecordingSessionToken,
     manual_clip_source: crate::audio::source::ManualClipSource,
+    restart: Option<LiveRestart>,
 ) {
+    let resume_floor_ms = restart.as_ref().map(|restart| restart.resume_floor_ms);
+    use super::live_history::{CaptionsHealth, CaptionsState};
+    let mut caption_health = CaptionsHealth {
+        captions_state: CaptionsState::Starting,
+        model_label: Some(format!("whisper:{}", public_model_size_label(&model_path))),
+        tick_interval_ms: Some(3000),
+    };
     // T1.5 — QoS: the caption tick is background inference; tag this thread UTILITY so macOS
     // schedules it onto efficiency cores under contention. Best-effort C call, never fatal.
     crate::thermal::set_utility_qos();
     // TP-F1 — advertise the live-loop as RUNNING only after its resident Whisper model loaded.
     // Begin must refuse during model load: arming earlier could leave a capture with no consumer if
     // load failed. The guard clears the flag on every later exit, including panic.
-    struct LiveRunningGuard(AppHandle);
+    struct LiveRunningGuard(AppHandle, String);
     impl Drop for LiveRunningGuard {
         fn drop(&mut self) {
             self.0
                 .state::<AppState>()
                 .live_running
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+            super::live_history::captions_health(
+                &self.0,
+                &self.1,
+                CaptionsHealth {
+                    captions_state: CaptionsState::Stopped,
+                    ..CaptionsHealth::default()
+                },
+            );
         }
     }
     {
@@ -285,44 +335,64 @@ fn run(
         {
             return;
         }
-        super::live_history::clear_history(&state);
+        if restart.is_none() {
+            super::live_history::clear_history(&state);
+        }
     }
+    super::live_history::captions_health(&app, &meeting_id, caption_health.clone());
     // Fresh transcript per recording: clear any leftover from a previous meeting so the in-meeting
     // assistant can never answer about a stale recording.
-    if let Ok(mut lt) = app.state::<AppState>().live_transcript.lock() {
-        lt.clear();
+    if restart.is_none() {
+        if let Ok(mut lt) = app.state::<AppState>().live_transcript.lock() {
+            lt.clear();
+        }
     }
     // Brain v2 L4: fresh bullets per recording too (belt-and-braces beside the
     // `start_recording`/`stop_recording` clears) — stale running notes must never seed a new
     // meeting's substrate or prompt inject.
-    {
+    if restart.is_none() {
         let state = app.state::<AppState>();
         crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
     }
     // This lease represents the resident Whisper model, not merely one forward pass.
     // Holding it until the thread exits prevents a Brain sidecar/e5 generation from becoming a
     // second resident model between ticks, and makes Stop wait for the Transcriber to actually drop.
-    let _live_model_residency = match crate::perf::acquire_recording_model_generation(
-        &model_token,
-        crate::perf::ResidentModelKind::Whisper,
-    ) {
+    let residency = match restart {
+        Some(restart) => Ok(restart.lease),
+        None => crate::perf::acquire_recording_model_generation(
+            &model_token,
+            crate::perf::ResidentModelKind::Whisper,
+        ),
+    };
+    let _live_model_residency = match residency {
         Ok(lease) => lease,
         Err(e) => {
             tracing::debug!(target: "live", error = %e, "live model load deferred by recording lifecycle");
+            caption_health.captions_state = CaptionsState::Stopped;
+            super::live_history::captions_health(&app, &meeting_id, caption_health);
             return;
         }
     };
+    if model_token.validated_for_live_work().is_err() {
+        caption_health.captions_state = CaptionsState::Stopped;
+        super::live_history::captions_health(&app, &meeting_id, caption_health);
+        return;
+    }
     let transcriber = match Transcriber::load(&model_path) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(target: "live", error = %e, "live captions disabled: model load failed");
+            caption_health.captions_state = CaptionsState::ModelError;
+            super::live_history::captions_health(&app, &meeting_id, caption_health);
             return;
         }
     };
     app.state::<AppState>()
         .live_running
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let _live_running_guard = LiveRunningGuard(app.clone());
+    let _live_running_guard = LiveRunningGuard(app.clone(), meeting_id.clone());
+    caption_health.captions_state = CaptionsState::Ready;
+    super::live_history::captions_health(&app, &meeting_id, caption_health.clone());
     // Wake/manual capture still requires this Whisper handle. Loading Parakeet as the caption engine
     // here would therefore make TWO resident ASR runtimes under one lifecycle lease. Until those
     // optional paths are engine-agnostic, resolve every configured engine to Whisper for the whole
@@ -378,8 +448,14 @@ fn run(
     } else {
         None
     };
-    let mut mic_assembler = super::live_history::StreamCaptionAssembler::default();
-    let mut others_assembler = super::live_history::StreamCaptionAssembler::default();
+    let assembler = || {
+        resume_floor_ms.map_or_else(
+            super::live_history::StreamCaptionAssembler::default,
+            super::live_history::StreamCaptionAssembler::resumed,
+        )
+    };
+    let mut mic_assembler = assembler();
+    let mut others_assembler = assembler();
     let mut others_tail: Option<super::live_tail::LiveWavTail> = None;
     let mut others_last_frame = std::time::Instant::now();
     // Independent VAD state: never share recurrent speech history across speakers.
@@ -443,6 +519,12 @@ fn run(
         }
         // One guarded FFI read per completed tick; degrade-to-Nominal.
         governor.observe(crate::thermal::read_thermal_level());
+        caption_health.tick_interval_ms = Some(governor.effective_tick().as_millis() as u64);
+        if caption_health.captions_state == CaptionsState::Paused && !governor.captions_suspended()
+        {
+            caption_health.captions_state = CaptionsState::Ready;
+        }
+        super::live_history::captions_health(&app, &meeting_id, caption_health.clone());
         // Age out an expired wake-suppression window once per tick (before this tick's wake check).
         wake_dedup.tick();
 
@@ -634,6 +716,8 @@ fn run(
         // native-rate snapshot. Manual capture already progressed above; only the wake-suppression
         // flow bypasses this optional caption throttle.
         if governor.captions_suspended() && !bypass {
+            caption_health.captions_state = CaptionsState::Paused;
+            super::live_history::captions_health(&app, &meeting_id, caption_health.clone());
             tracing::debug!(target: "live", "critical thermal state; caption decode suspended this tick");
             continue;
         }
@@ -694,7 +778,6 @@ fn run(
                             .map_or(0, |d| d.as_millis() as u64);
                         match crate::audio::resample_to_16k(&window.samples, window.sample_rate) {
                             Ok(samples) => {
-                                super::live_history::health(&app, &meeting_id, "ready");
                                 let speech = others_vad
                                     .as_mut()
                                     .and_then(|v| v.speech_regions(&samples).ok())
@@ -710,6 +793,7 @@ fn run(
                                     let decoded = asr.transcribe_live(&samples, lang.as_deref());
                                     tracing::info!(target: "live_perf", speaker = "others", decode_ms = started.elapsed().as_millis() as u64, window_s = samples.len() as f64 / 16000.0, ok = decoded.is_ok(), "live decode tick");
                                     if let Ok(transcript) = decoded {
+                                        super::live_history::health(&app, &meeting_id, "ready");
                                         let start = system_offset
                                             + window.start_frame * 1000 / window.sample_rate as u64;
                                         let end = system_offset
@@ -728,6 +812,9 @@ fn run(
                                     } else {
                                         super::live_history::health(&app, &meeting_id, "degraded");
                                     }
+                                } else if speech == Some(false) {
+                                    // Healthy silence is not a decode failure.
+                                    super::live_history::health(&app, &meeting_id, "ready");
                                 }
                             }
                             Err(_) => super::live_history::health(&app, &meeting_id, "degraded"),
@@ -899,6 +986,8 @@ fn run(
         );
         match decoded {
             Ok(t) => {
+                caption_health.captions_state = CaptionsState::Ready;
+                super::live_history::captions_health(&app, &meeting_id, caption_health.clone());
                 let window_start = snapshot.start_frame as u64 * 1000 / source_rate as u64;
                 let window_end = snapshot.end_frame as u64 * 1000 / source_rate as u64;
                 for line in mic_assembler.update(&t, window_start, window_end, &meeting_id, "me") {
@@ -984,7 +1073,11 @@ fn run(
                     }
                 }
             }
-            Err(e) => tracing::debug!(target: "live", error = %e, "live transcribe tick failed"),
+            Err(e) => {
+                caption_health.captions_state = CaptionsState::Retrying;
+                super::live_history::captions_health(&app, &meeting_id, caption_health.clone());
+                tracing::debug!(target: "live", error = %e, "live transcribe tick failed");
+            }
         }
     }
 
@@ -3262,6 +3355,27 @@ mod tests {
     }
 
     // ── T0.1: the telemetry model label (non-PII: ggml size token or "custom") ───────────────────
+
+    #[test]
+    fn public_live_model_label_never_exposes_custom_filenames() {
+        use std::path::Path;
+        assert_eq!(
+            public_model_size_label(Path::new("/models/ggml-small.bin")),
+            "small"
+        );
+        assert_eq!(
+            public_model_size_label(Path::new("/models/ggml-small.en.bin")),
+            "small.en"
+        );
+        assert_eq!(
+            public_model_size_label(Path::new("/models/ggml-client-secret.bin")),
+            "custom"
+        );
+        assert_eq!(
+            public_model_size_label(Path::new("/private/client-model.bin")),
+            "custom"
+        );
+    }
 
     #[test]
     fn model_size_label_extracts_ggml_size_or_custom() {

@@ -184,6 +184,7 @@ pub fn run() {
             commands::start_recording,
             commands::stop_recording,
             commands::get_live_transcript_page,
+            commands::restart_live_captions,
             commands::list_processing_queue,
             commands::process_queue_now,
             commands::retry_processing_queue,
