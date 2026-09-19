@@ -21,7 +21,6 @@ const LONG_NOTE = {
   folderId: "nf-product",
   markdown: LONG_BODY,
   tags: ["atlas"],
-  properties: {},
   updatedAt: 1770000000000,
   createdAt: 1769000000000,
   exportedPath: "/vault/Notes/Atlas.md",

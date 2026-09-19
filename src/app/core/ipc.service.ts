@@ -3198,7 +3198,7 @@ export class IpcService {
   /**
    * Read ONE note in full for the editor. GATED: a sealed-and-not-session-unlocked
    * note returns a MASKED {@link NoteDoc} (`locked: true`, title "🔒 Locked", empty
-   * markdown/tags/properties) — render the lock gate, not the body.
+   * markdown/tags) — render the lock gate, not the body.
    */
   getNote(id: string): Promise<NoteDoc> {
     return invoke<NoteDoc>("get_note", { id });
@@ -3459,8 +3459,8 @@ export class IpcService {
 
   // ── Feature C — the typed notes list feeding the Table/Board views. GATED
   // backend-side on the folder unlock: a LOCKED folder returns `[]`, so no typed
-  // view is offered for it and no sealed content leaks. `properties` (the
-  // plaintext front-matter map) is untouched.
+  // view is offered for it and no sealed content leaks. The plaintext front-matter
+  // scalars (parsed by the editor out of `NoteDoc.markdown`) are untouched.
   //
   // The folder-SCHEMA wrappers (`get_note_folder_schema`/`set_note_folder_schema`)
   // were dropped here on 2026-09-13 with the note editor's Properties card — the

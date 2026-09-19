@@ -1,0 +1,98 @@
+<article
+  class="note-document"
+  [class.is-embedded]="measure() === 'embedded'"
+  [class.is-wide]="wide()"
+  [attr.data-mode]="mode().view"
+  [attr.data-access]="mode().access"
+>
+  @if (origin().length) {
+    <div class="origin-strip">
+      @for (item of origin(); track $index) {
+        <span>{{ item }}</span>
+      }
+    </div>
+  }
+
+  @if (showTitle()) {
+    @if (mode().access === "editable" && mode().view === "edit") {
+      <input
+        class="document-title-input note-title-input"
+        type="text"
+        placeholder="Untitled"
+        aria-label="Note title"
+        autocapitalize="sentences"
+        autocomplete="off"
+        spellcheck="true"
+        [value]="title() ?? ''"
+        [disabled]="busy()"
+        (input)="titleChange.emit($any($event.target).value)"
+        (blur)="titleBlur.emit()"
+      />
+    } @else {
+      <h1 class="document-title oi-title">{{ title() || "Untitled" }}</h1>
+    }
+  }
+
+  @if (related(); as connection) {
+    <app-connections
+      [kind]="connection.kind"
+      [id]="connection.id"
+      [locked]="connection.locked ?? false"
+      [expandedByDefault]="connection.expandedByDefault ?? false"
+      [prominent]="connection.prominent ?? false"
+      [inlineWikilinkTitles]="connection.inlineWikilinkTitles ?? []"
+    />
+  } @else if (relatedUnavailable()) {
+    <p class="related-unavailable text-muted">{{ relatedUnavailable() }}</p>
+  }
+
+  <div class="document-body">
+    @if (emptyTemplate(); as empty) {
+      <ng-container [ngTemplateOutlet]="empty" />
+    } @else if (mode().access === "editable" && mode().view === "edit") {
+      <div class="document-editing">
+        @if (toolbarTemplate(); as toolbar) {
+          <ng-container [ngTemplateOutlet]="toolbar" />
+        }
+        <div class="document-grow" [attr.data-value]="editingBody()">
+          <textarea
+            #editorArea
+            class="document-editor body-area editor-area"
+            [attr.aria-label]="editorLabel()"
+            [placeholder]="editorPlaceholder()"
+            [spellcheck]="editorSpellcheck()"
+            [attr.autocapitalize]="editorAutocapitalize()"
+            autocomplete="off"
+            [value]="editingBody()"
+            [disabled]="busy()"
+            (input)="onInput($event)"
+            (keydown)="editorKeydown.emit($event)"
+            (paste)="editorPaste.emit($event)"
+            (dragover)="editorDragover.emit($event)"
+            (drop)="editorDrop.emit($event)"
+            (mouseup)="editorSelect.emit()"
+            (keyup)="editorSelect.emit()"
+            (select)="editorSelect.emit()"
+            (blur)="editorBlur.emit()"
+          ></textarea>
+        </div>
+        @if (footerTemplate(); as footer) {
+          <ng-container [ngTemplateOutlet]="footer" />
+        }
+      </div>
+      @if (printMarkdown() !== null) {
+        <div class="document-print note-preview">
+          <app-markdown [markdown]="printBody()" [attachments]="attachments()" />
+        </div>
+      }
+    } @else {
+      <div class="note-preview">
+        <app-markdown [markdown]="document().body" [attachments]="attachments()" />
+      </div>
+    }
+  </div>
+
+  @if (error()) {
+    <p class="document-error" role="alert">{{ error() }}</p>
+  }
+</article>

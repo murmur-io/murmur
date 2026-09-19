@@ -378,7 +378,7 @@ test("the received-item viewer resolves its organization locally", async ({
   await mockDestinationPicker(page);
   await page.goto("/org-item/shared-note");
   await expect(page.locator(".oi-title")).toHaveText("Local viewer item");
-  await expect(page.locator(".oi-org-name")).toHaveText("Acme");
+  await expect(page.locator("app-note-document .origin-strip").getByText("Acme", { exact: true })).toBeVisible();
   expect(runtimeErrors).toEqual([]);
 });
 

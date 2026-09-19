@@ -59,7 +59,6 @@ test("meeting commands share the title row, above the tabs, with padded icon act
     "New reminder",
     "Convert to note",
     "Re-summarize",
-    "Edit",
     "More",
   ]) {
     const action = commands.getByRole("button", { name, exact: true });
@@ -72,6 +71,8 @@ test("meeting commands share the title row, above the tabs, with padded icon act
     expect(padding[0]).toBeGreaterThan(0);
     expect(padding[1]).toBeGreaterThan(0);
   }
+  await expect(commands.getByRole("button", { name: "Edit", exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("Note markdown")).toBeVisible();
 
   await expect(page.getByRole("button", { name: "New reminder" })).toHaveCount(1);
   // Both follow-up surfaces are drawers now, so neither is in the note flow and
@@ -124,7 +125,7 @@ test("Edit keeps its command-bar slot but is accessibly disabled without a note"
   await expect(edit).toHaveAttribute("title", "No note to edit");
 });
 
-test("Edit remains visible and active-disabled while editing without restarting the editor", async ({
+test("direct edit omits the redundant Edit control without restarting the editor", async ({
   page,
 }) => {
   await mockTauri(
@@ -161,21 +162,10 @@ test("Edit remains visible and active-disabled while editing without restarting 
 
   const commands = page.getByTestId("meeting-command-bar");
   const edit = commands.getByRole("button", { name: "Edit", exact: true });
-  await expect(edit).toBeEnabled({ timeout: 10_000 });
-  await edit.click();
-
   const editor = page.getByLabel("Note markdown");
-  await expect(editor).toBeVisible();
+  await expect(editor).toBeVisible({ timeout: 10_000 });
   await editor.fill("UNSAVED DRAFT");
-  await expect(edit).toHaveCount(1);
-  await expect(edit).toBeVisible();
-  await expect(edit).toBeDisabled();
-  await expect(edit).toHaveAttribute("aria-pressed", "true");
-  await expect(edit).toHaveClass(/command-btn-active/);
-
-  // Even a synthetic event on the disabled control cannot re-run startEdit
-  // and overwrite the in-progress draft.
-  await edit.dispatchEvent("click");
+  await expect(edit).toHaveCount(0);
   await expect(editor).toHaveValue("UNSAVED DRAFT");
 });
 
@@ -225,7 +215,9 @@ A **clear decision** with [supporting context](https://example.com/context) and 
   );
   await page.goto("/meeting/m-atlas-roadmap");
 
-  const note = page.locator("app-note-panel .meeting-markdown-note");
+  await expect(page.getByRole("textbox", { name: "Note markdown" })).toBeVisible();
+  await page.getByRole("button", { name: "Preview", exact: true }).click();
+  const note = page.locator("app-note-panel .note-preview");
   await expect(note).toHaveCount(1);
   await expect(note.getByRole("heading", { name: "Summary" })).toBeVisible();
   await expect(note.locator("strong")).toHaveText("clear decision");

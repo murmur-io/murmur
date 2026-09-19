@@ -190,6 +190,7 @@
             [converting]="converting()"
             [renaming]="renaming()"
             [editing]="editing()"
+            [dirty]="noteDirty()"
             [exporting]="exporting()"
             [exportingCanvas]="exportingCanvas()"
             [linking]="linking()"
@@ -351,6 +352,12 @@
            reason for the split) + hosts the reused sub-components. -->
       @switch (activeTab()) {
         @case ("note") {
+          @if (attachmentLoadFailed()) {
+            <div role="alert" class="card">
+              <p>Couldn’t load note attachments. Retry before editing to keep existing images safe.</p>
+              <button type="button" class="btn btn-ghost" (click)="retryNoteAttachments()">Retry attachments</button>
+            </div>
+          }
           <app-note-panel
             [meetingId]="d.meeting.id"
             [meetingTitle]="d.meeting.title"
@@ -365,7 +372,7 @@
             [busy]="busy()"
             [renaming]="renaming()"
             [editing]="editing()"
-            [saving]="saving()"
+            [saving]="saving() || meetingAttachmentBusy()"
             [exporting]="exporting()"
             [exportingCanvas]="exportingCanvas()"
             [linking]="linking()"
@@ -401,6 +408,7 @@
             (linkGraph)="linkGraph()"
             (edit)="startEdit()"
             (cancelEdit)="cancelEdit()"
+            (preview)="showNotePreview()"
             (saveNote)="saveNote()"
             (draftInput)="draft.set($event)"
             (attachmentAdded)="onMeetingAttachmentAdded($event)"
@@ -447,7 +455,7 @@
           <app-share-panel
             [meetingId]="d.meeting.id"
             [active]="activeTab() === 'share'"
-            [editing]="editing()"
+            [editing]="noteDirty()"
             [locked]="locked()"
             [attachments]="referencedAttachments()"
             (setupSharing)="goToSharingSettings()"

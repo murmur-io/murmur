@@ -1,19 +1,83 @@
 <div class="note-panel">
-  <!-- RELATED — the meeting's explicit context belongs at the top of the Note tab.
-       Keep it outside the analysis block so Re-summarize never disables linking.
-       Meeting detail starts expanded and uses the stronger hierarchy; standalone
-       notes keep the shared component's compact, collapsed default. -->
-  <section class="related-primary" aria-label="Related items">
-    <app-connections
-      kind="meeting"
-      [id]="meetingId()"
-      [expandedByDefault]="true"
-      [prominent]="true"
-    />
-  </section>
-
   <!-- ANALYSIS: commands live in the page-level bar above the tabs. -->
-  <section class="block print-keep" [class.is-resummarizing]="busy()">
+  <section class="block print-keep">
+    <ng-template #meetingToolbar>
+      <div class="editor-insert-bar">
+        <button
+          type="button"
+          class="btn btn-ghost editor-image-btn"
+          (pointerdown)="rememberImageInsertion()"
+          (click)="openImagePicker()"
+          [disabled]="saving() || importingImages() > 0"
+          aria-label="Add image at cursor"
+        >
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+            <rect x="2" y="2.5" width="12" height="11" rx="2" stroke="currentColor" stroke-width="1.2" />
+            <circle cx="5.25" cy="5.75" r="1" fill="currentColor" />
+            <path d="m3.75 11 2.7-2.7 1.9 1.85 1.45-1.4L12.4 11" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          {{ importingImages() > 0 ? "Adding image…" : "Add image" }}
+        </button>
+        <span class="editor-image-hint">Paste a screenshot with ⌘V or drop it here</span>
+      </div>
+      <input
+        #imageFileInput
+        class="editor-image-input"
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        multiple
+        tabindex="-1"
+        aria-hidden="true"
+        (change)="onImageFilesSelected($event)"
+      />
+    </ng-template>
+    <ng-template #meetingFooter>
+      @if (saveError(); as err) {
+        <p class="editor-error" role="alert">{{ err }}</p>
+      }
+      <div class="editor-foot">
+        <span class="editor-hint">Markdown · saved to your vault</span>
+        <div class="editor-actions">
+          <button type="button" class="btn btn-ghost" (click)="cancelEdit.emit()" [disabled]="saving() || importingImages() > 0">
+            Revert
+          </button>
+          <button type="button" class="btn btn-ghost" (click)="preview.emit()" [disabled]="draftDirty() || saving() || importingImages() > 0">
+            Preview
+          </button>
+          <button type="button" class="btn btn-primary" (click)="saveNote.emit()" [disabled]="saving() || importingImages() > 0">
+            {{ saving() ? "Saving…" : "Save" }}
+          </button>
+        </div>
+      </div>
+    </ng-template>
+    <ng-template #emptyNote>
+      <div class="card empty-card empty-state">
+        <span class="empty-mark" aria-hidden="true"></span>
+        <p class="empty-title">No analysis yet</p>
+        <p class="empty">Re-summarize this meeting to generate a structured note.</p>
+      </div>
+    </ng-template>
+    <!-- Related stays first and usable while generation updates the document. -->
+    <app-note-document
+      [mode]="{ access: 'editable', view: noteRaw() !== null && editing() ? 'edit' : 'preview' }"
+      [showTitle]="false"
+      [markdown]="editing() ? draft() : (noteRaw() ?? '')"
+      [attachments]="attachments()"
+      [printMarkdown]="noteRaw()"
+      [toolbarTemplate]="meetingToolbar"
+      [footerTemplate]="meetingFooter"
+      [emptyTemplate]="noteRaw() === null ? emptyNote : null"
+      [related]="{ kind: 'meeting', id: meetingId(), expandedByDefault: true, prominent: true }"
+      measure="page"
+      editorLabel="Note markdown"
+      [editorSpellcheck]="false"
+      editorAutocapitalize="off"
+      [busy]="saving() || busy()"
+      (markdownChange)="draftInput.emit($event)"
+      (editorPaste)="onEditorPaste($event)"
+      (editorDragover)="onEditorDragOver($event)"
+      (editorDrop)="onEditorDrop($event)"
+    />
     <!-- Note-tab status lines (unchanged handlers). -->
     @if (canvasMsg(); as path) {
       <div class="saved-toast canvas-toast" role="status">
@@ -92,121 +156,53 @@
       </div>
     }
 
-    <!-- The note body. -->
     @if (note(); as n) {
-      @if (editing()) {
-        <article class="card editor">
-          <div class="editor-insert-bar">
-            <button
-              type="button"
-              class="btn btn-ghost editor-image-btn"
-              (pointerdown)="rememberImageInsertion()"
-              (click)="openImagePicker()"
-              [disabled]="saving() || importingImages() > 0"
-              aria-label="Add image at cursor"
-            >
-              <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
-                <rect x="2" y="2.5" width="12" height="11" rx="2" stroke="currentColor" stroke-width="1.2" />
-                <circle cx="5.25" cy="5.75" r="1" fill="currentColor" />
-                <path d="m3.75 11 2.7-2.7 1.9 1.85 1.45-1.4L12.4 11" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-              {{ importingImages() > 0 ? "Adding image…" : "Add image" }}
-            </button>
-            <span class="editor-image-hint">Paste a screenshot with ⌘V or drop it here</span>
+      @if (n.participants.length) {
+        <div class="card meta-card">
+          <span class="section-label">Participants</span>
+          <div class="people">
+            @for (p of n.participants; track p) {
+              <span class="person">{{ p }}</span>
+            }
           </div>
-          <input
-            #imageFileInput
-            class="editor-image-input"
-            type="file"
-            accept="image/png,image/jpeg,image/webp"
-            multiple
-            tabindex="-1"
-            aria-hidden="true"
-            (change)="onImageFilesSelected($event)"
-          />
-          <textarea
-            #editorArea
-            class="editor-area"
-            spellcheck="false"
-            autocapitalize="off"
-            autocomplete="off"
-            aria-label="Note markdown"
-            [value]="draft()"
-            [disabled]="saving()"
-            (input)="draftInput.emit($any($event.target).value)"
-            (paste)="onEditorPaste($event)"
-            (dragover)="onEditorDragOver($event)"
-            (drop)="onEditorDrop($event)"
-          ></textarea>
-          @if (saveError(); as err) {
-            <p class="editor-error" role="alert">{{ err }}</p>
-          }
-          <div class="editor-foot">
-            <span class="editor-hint">Markdown · saved to your vault</span>
-            <div class="editor-actions">
-              <button type="button" class="btn btn-ghost" (click)="cancelEdit.emit()" [disabled]="saving() || importingImages() > 0">
-                Cancel
-              </button>
-              <button type="button" class="btn btn-primary" (click)="saveNote.emit()" [disabled]="saving() || importingImages() > 0">
-                {{ saving() ? "Saving…" : "Save" }}
-              </button>
-            </div>
+        </div>
+      }
+      <!-- RECEIPTS (Brain v3 PR-5): every claim the transcript likely
+           supports → a chip that seeks the Audio tab to that second +
+           flashes the segment. The alignment is a token-overlap HEURISTIC,
+           so the copy says "likely source", never "proof". Empty (nothing
+           rendered) for a locked meeting (the backend returns no receipts)
+           or a note with no aligned claim. -->
+      @if (receiptChips().length) {
+        <article class="card receipts" aria-label="Audio receipts">
+          <div class="receipts-head">
+            <span class="section-label">Receipts</span>
+            <span class="count">{{ receiptChips().length }}</span>
+            <span class="receipts-hint">Jump to the likely source in the audio</span>
           </div>
+          <ul class="receipt-list">
+            @for (r of receiptChips(); track r.claimIndex) {
+              <li>
+                <button
+                  type="button"
+                  class="receipt-chip"
+                  [attr.title]="r.title"
+                  (click)="onReceipt(r)"
+                >
+                  <span class="receipt-play" aria-hidden="true">▸</span>
+                  <span class="receipt-claim">{{ r.claim }}</span>
+                  @if (r.speaker) {
+                    <span class="receipt-speaker">{{ r.speaker }}</span>
+                  }
+                  <span class="receipt-time">{{ r.time }}</span>
+                </button>
+              </li>
+            }
+          </ul>
         </article>
-      } @else {
-        @if (n.participants.length) {
-          <div class="card meta-card">
-            <span class="section-label">Participants</span>
-            <div class="people">
-              @for (p of n.participants; track p) {
-                <span class="person">{{ p }}</span>
-              }
-            </div>
-          </div>
-        }
+      }
 
-        <article class="card section meeting-markdown-note">
-          <app-markdown
-            [markdown]="noteRaw() ?? ''"
-            [attachments]="attachments()"
-          />
-        </article>
-
-        <!-- RECEIPTS (Brain v3 PR-5): every claim the transcript likely
-             supports → a chip that seeks the Audio tab to that second +
-             flashes the segment. The alignment is a token-overlap HEURISTIC,
-             so the copy says "likely source", never "proof". Empty (nothing
-             rendered) for a locked meeting (the backend returns no receipts)
-             or a note with no aligned claim. -->
-        @if (receiptChips().length) {
-          <article class="card receipts" aria-label="Audio receipts">
-            <div class="receipts-head">
-              <span class="section-label">Receipts</span>
-              <span class="count">{{ receiptChips().length }}</span>
-              <span class="receipts-hint">Jump to the likely source in the audio</span>
-            </div>
-            <ul class="receipt-list">
-              @for (r of receiptChips(); track r.claimIndex) {
-                <li>
-                  <button
-                    type="button"
-                    class="receipt-chip"
-                    [attr.title]="r.title"
-                    (click)="onReceipt(r)"
-                  >
-                    <span class="receipt-play" aria-hidden="true">▸</span>
-                    <span class="receipt-claim">{{ r.claim }}</span>
-                    @if (r.speaker) {
-                      <span class="receipt-speaker">{{ r.speaker }}</span>
-                    }
-                    <span class="receipt-time">{{ r.time }}</span>
-                  </button>
-                </li>
-              }
-            </ul>
-          </article>
-        }
-
+      @if (!editing()) {
         @if (justSaved()) {
           <div class="saved-toast" role="status">
             <span class="saved-toast-check" aria-hidden="true"></span>
@@ -227,12 +223,6 @@
           </div>
         }
       }
-    } @else {
-      <div class="card empty-card empty-state">
-        <span class="empty-mark" aria-hidden="true"></span>
-        <p class="empty-title">No analysis yet</p>
-        <p class="empty">Re-summarize this meeting to generate a structured note.</p>
-      </div>
     }
   </section>
 

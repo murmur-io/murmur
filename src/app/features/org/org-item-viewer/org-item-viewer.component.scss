@@ -7,6 +7,9 @@
      Ask Brain pane isn't cut off short. Total still nets to 100vh ⇒ the page never scrolls. */
   height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
   margin-bottom: calc(-1 * var(--space-8));
+  /* Match the private note host: the shared document owns its horizontal measure.
+     Leaving app-main's side padding here narrows only received notes by 48px. */
+  margin-inline: calc(-1 * var(--space-5));
   min-height: 0;
 }
 .org-item {
@@ -126,7 +129,7 @@
   align-items: center;
   gap: var(--space-2);
   padding: var(--space-6);
-  max-width: 52rem;
+  max-width: var(--editor-max);
   margin: 0 auto;
   text-align: center;
 }
@@ -144,8 +147,8 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  padding: var(--space-6);
-  max-width: 52rem;
+  padding: 0;
+  max-width: none;
   margin: 0 auto;
   width: 100%;
 }
@@ -156,20 +159,12 @@
   padding-bottom: var(--space-4);
   border-bottom: 1px solid var(--border-subtle);
 }
-/* Title row: the heading (or its edit input) + the author's edit/save actions. */
+/* Document mode and author actions; the shared surface owns title and prose. */
 .oi-head-top {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--space-3);
-}
-.oi-title {
-  margin: 0;
-  font-size: 1.55rem;
-  font-weight: 700;
-  letter-spacing: -0.01em;
-  color: var(--text-primary);
-  line-height: 1.25;
 }
 .oi-actions {
   display: inline-flex;
@@ -189,43 +184,6 @@
 }
 
 /* --- Edit-in-place (server-authorized author/owner/editor) --------------- */
-.oi-title-input {
-  flex: 1 1 auto;
-  min-width: 0;
-  margin: 0;
-  padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--surface-input);
-  color: var(--text-primary);
-  font-size: 1.55rem;
-  font-weight: 700;
-  letter-spacing: -0.01em;
-  line-height: 1.25;
-}
-.oi-title-input:focus-visible {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.oi-editor {
-  width: 100%;
-  min-height: 60vh;
-  padding: var(--space-3);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: var(--surface-input);
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 0.9rem;
-  line-height: 1.6;
-  resize: vertical;
-}
-.oi-editor:focus-visible {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
 .oi-edit-conflict {
   display: flex;
   align-items: center;
@@ -253,49 +211,14 @@
 .oi-edit-conflict-open {
   flex: none;
 }
-/* Metadata strip: Org Brain badge + org name + author + date + revision. */
-.oi-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 0.85rem;
-}
-.oi-org-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 2px var(--space-3);
+/* Access stays in the header; origin belongs to the shared document column. */
+.oi-view-only {
+  padding: var(--space-1) var(--space-2);
+  border: var(--note-state-border-width) solid var(--border-subtle);
   border-radius: var(--radius-pill);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-ring);
-  color: var(--accent-hover);
-  font-size: 0.68rem;
-  font-weight: 650;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-.oi-org-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: var(--radius-pill);
-  background: var(--accent);
-}
-.oi-org-name {
   color: var(--text-secondary);
-  font-weight: 600;
-}
-.oi-author {
-  color: var(--text-secondary);
-}
-.oi-meta-sep {
-  color: var(--border-strong);
-}
-.oi-access-label {
-  color: var(--text-secondary);
-  font-weight: 600;
+  font-size: var(--note-meta-size);
+  font-weight: var(--note-state-weight);
 }
 .oi-permissions {
   display: flex;
@@ -346,14 +269,4 @@
 .oi-permissions-note {
   color: var(--text-muted);
   font-size: 0.75rem;
-}
-.oi-body {
-  color: var(--text-secondary);
-  line-height: 1.65;
-}
-.oi-link-unavailable {
-  margin: 0;
-  padding-top: var(--space-3);
-  border-top: 1px solid var(--border-subtle);
-  font-size: 0.78rem;
 }

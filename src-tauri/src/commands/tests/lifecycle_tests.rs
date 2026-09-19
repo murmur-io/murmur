@@ -11779,7 +11779,8 @@
     }
 
     /// WP0 gate — a note in a SEALED-and-not-session-unlocked folder MUST be MASKED: `get_note`
-    /// returns locked:true, title "🔒 Locked", NO markdown/tags/properties; `list_notes` EXCLUDES it
+    /// returns locked:true, title "🔒 Locked", NO markdown/tags (and therefore none of the
+    /// front-matter scalars, which now travel ONLY inside `markdown`); `list_notes` EXCLUDES it
     /// entirely (the title/topic never leaks through the list). Session-unlock reveals both.
     #[test]
     fn sealed_note_is_masked_in_get_and_absent_in_list() {
@@ -11792,16 +11793,12 @@
         // Seal the folder (production seal blanks text → blob).
         lock_folder_inner(&state, fid.clone()).unwrap();
 
-        // get_note MASKED — no body, no tags, no properties, title hidden.
+        // get_note MASKED — no body, no tags (hence no front-matter scalars), title hidden.
         let masked = get_note_inner(&state, &id).unwrap();
         assert!(masked.locked, "sealed note reports locked");
         assert_eq!(masked.title, "🔒 Locked", "sealed note title masked");
         assert_eq!(masked.markdown, "", "sealed note body never leaks");
         assert!(masked.tags.is_empty(), "sealed note tags never leak");
-        assert!(
-            masked.properties.is_empty(),
-            "sealed note properties never leak"
-        );
 
         // list_notes EXCLUDES the sealed note (title never leaks through the list).
         assert!(
@@ -11832,11 +11829,63 @@
             unlocked.tags,
             vec!["secret".to_string(), "launch".to_string()]
         );
-        assert_eq!(
-            unlocked.properties.get("status"),
-            Some(&"draft".to_string())
+        // The front-matter scalars are NOT a separate DTO map any more — they ride inside the
+        // FULL `markdown` (raw YAML prefix preserved verbatim), which is what the editor parses and
+        // writes back, so the owned `.md` round-trips byte-exact.
+        assert!(
+            unlocked.markdown.contains("status: draft"),
+            "front-matter scalars survive inside the full markdown: {:?}",
+            unlocked.markdown
         );
         assert_eq!(list_notes_inner(&state, None).unwrap().len(), 1);
+    }
+
+    /// T2 (Properties close-out, 2026-09-19) — the editor DTO no longer carries a parsed
+    /// `properties` map. The ONLY preservation contract left is that `markdown` travels VERBATIM,
+    /// so an exotic owned-file front-matter block (comment, quoted value, nested map, block list,
+    /// empty value, blank line) must survive `update_note_doc` → `get_note` BYTE-EXACT. The
+    /// serialized DTO must also no longer expose a `properties` key for a client to re-depend on.
+    /// (RED before the change only for the serde half; the byte-exact half guards the removal.)
+    #[test]
+    fn note_doc_round_trips_front_matter_verbatim_without_a_properties_map() {
+        let state = build_state("note-frontmatter-verbatim");
+        make_open_folder(&state.db, "f-open", "Project");
+        let md = concat!(
+            "---\n",
+            "# a YAML comment the user typed\n",
+            "tags: [alpha, beta]\n",
+            "status: \"In progress\"\n",
+            "empty:\n",
+            "nested:\n",
+            "  owner: ada\n",
+            "  reviewers:\n",
+            "    - bob\n",
+            "\n",
+            "aliases:\n",
+            "  - Old name\n",
+            "---\n",
+            "\n# Heading\n\nBody prose.\n",
+        );
+        let id = create_note_inner(&state, Some("f-open"), "Round trip").unwrap();
+        update_note_doc_inner(&state, &id, "Round trip", md).unwrap();
+
+        let doc = get_note_inner(&state, &id).unwrap();
+        assert_eq!(
+            doc.markdown, md,
+            "the stored front-matter + body come back byte-exact (owned .md is never rewritten)"
+        );
+        // The list projection of `tags:` stays — the Notes list renders tag pills from it.
+        assert_eq!(doc.tags, vec!["alpha".to_string(), "beta".to_string()]);
+
+        let wire = serde_json::to_value(&doc).unwrap();
+        assert!(
+            wire.get("properties").is_none(),
+            "the removed DTO field must not reappear on the wire: {wire}"
+        );
+        assert!(
+            wire.get("markdown").and_then(|m| m.as_str()) == Some(md),
+            "front-matter survives ON THE WIRE inside markdown, not in a parsed side-channel"
+        );
     }
 
     /// Part B — `get_note` STRIPS a legacy machine-managed `murmur:links` block from the VISIBLE
@@ -25228,6 +25277,77 @@
             "a re-pull upsert must NOT wipe the stamped author"
         );
         assert_eq!(ctx2.rev, 3, "the re-pull DID update rev");
+    }
+
+    /// T2 (one note view, 2026-09-19) — the capability the note surface renders its MODE from must
+    /// agree with the write gate, and must never arrive CONTRADICTORY (the fail-closed FE reads
+    /// `canEdit ?? editable ?? false`, so a `canEdit:false` + `editable:true` pair would be the one
+    /// shape that could open a non-writable note in EDIT). For an item authored by someone else and
+    /// shared view-only, `org_get_item` must report BOTH flags false — with a live session for a
+    /// DIFFERENT user, so this proves the permission check and not a missing session — and the write
+    /// path must still refuse, keeping the backend the final authority.
+    #[test]
+    fn a_view_only_org_item_reports_both_capability_flags_false() {
+        let state = build_state("org-viewonly-capability");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                "item-theirs",
+                "org-1",
+                1,
+                "bob",
+                "Bob's note",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[7u8; 32],
+                Some("document"),
+                None,
+                None,
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_item_author("item-theirs", "bob-user-id")
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let detail = org_get_item_inner(&state, "item-theirs")
+            .unwrap()
+            .expect("the item is visible — it is READABLE, just not writable");
+        assert!(!detail.can_edit, "a non-author gets no edit capability");
+        assert!(
+            !detail.editable,
+            "the legacy mirror never contradicts can_edit (a contradictory pair is what would open \
+             a non-writable note in edit mode)"
+        );
+        assert!(!detail.can_manage, "a non-author manages nothing either");
+
+        // The write path is the final authority regardless of what any client renders.
+        let err = block_on(org_update_own_item_inner(
+            &state,
+            "item-theirs",
+            "hacked",
+            "# pwned",
+        ))
+        .expect_err("view-only must stay view-only at the write gate");
+        assert!(
+            matches!(err, AppError::Auth(_)),
+            "expected an Auth refusal, got {err:?}"
+        );
     }
 
     /// SECURITY GATE (F-org-editable): `org_update_own_item_inner` refuses to re-publish an item the

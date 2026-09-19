@@ -25,7 +25,6 @@ test("clicking a rendered [[wikilink]] pill in Preview opens the target as a tra
       folderId: "nf1",
       markdown: args.id === "n1" ? "See [[Weekly plan]] for details." : "The plan body.",
       tags: [],
-      properties: {},
       updatedAt: 1_720_000_000_000,
       createdAt: 1_719_000_000_000,
       exportedPath: null,

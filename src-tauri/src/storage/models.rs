@@ -915,7 +915,12 @@ pub struct NoteSummary {
 
 /// A standalone authored note — the FULL DTO for the editor. Same masking contract as
 /// [`NoteSummary`]: when locked the COMMAND layer returns `markdown: ""`, `title: "🔒 Locked"`,
-/// empty `tags`/`properties`, so the sealed body never crosses the IPC boundary.
+/// empty `tags`, so the sealed body never crosses the IPC boundary.
+///
+/// NO `properties` MAP (2026-09-19): the editor derives the front-matter key/values from
+/// `markdown` itself (it must, to round-trip the raw YAML prefix byte-exact), so a second parsed
+/// copy on the wire was a redundant projection. The vault `.md` front-matter is untouched —
+/// `markdown` still carries it verbatim; only the duplicated DTO field is gone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteDoc {
@@ -926,8 +931,6 @@ pub struct NoteDoc {
     pub markdown: String,
     /// Parsed from the front-matter `tags:` list; [] when masked.
     pub tags: Vec<String>,
-    /// Other scalar front-matter keys (excl. `tags`); {} when masked.
-    pub properties: std::collections::BTreeMap<String, String>,
     pub updated_at: i64,
     pub created_at: i64,
     /// The vault `.md` path, or null when never exported / sealed.

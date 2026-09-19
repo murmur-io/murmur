@@ -17,7 +17,8 @@ import type {
 } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
-import { ConnectionsComponent } from "../../../shared/connections/connections.component";
+import { NoteDocumentComponent } from "../../../shared/note-document/note-document.component";
+import { joinNoteDocument, splitNoteDocument } from "../../../shared/note-document/front-matter";
 import { RelatedMeetingsComponent } from "../related-meetings/related-meetings.component";
 import { ToastService } from "../../../services/toast.service";
 import {
@@ -127,9 +128,9 @@ export interface AssistantQa {
   selector: "app-note-panel",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
+    NoteDocumentComponent,
     MarkdownComponent,
     AssistantSourcesComponent,
-    ConnectionsComponent,
     RelatedMeetingsComponent,
   ],
   templateUrl: "./note-panel.component.html",
@@ -202,6 +203,8 @@ export class NotePanelComponent {
   // --- Editor / delete state ----------------------------------------------
   readonly draft = input("");
   readonly saveError = input("");
+  readonly draftDirty = computed(() => this.draft() !== (this.noteRaw() ?? ""));
+  private readonly draftDocument = computed(() => splitNoteDocument(this.draft()));
   readonly confirmingDelete = input(false);
   readonly deleting = input(false);
   readonly deleteError = input("");
@@ -233,6 +236,7 @@ export class NotePanelComponent {
   readonly noteChanged = output<void>();
   readonly edit = output<void>();
   readonly cancelEdit = output<void>();
+  readonly preview = output<void>();
   readonly saveNote = output<void>();
   readonly draftInput = output<string>();
   readonly attachmentAdded = output<NoteAttachmentDto>();
@@ -246,8 +250,8 @@ export class NotePanelComponent {
    */
   readonly seekReceipt = output<{ startS: number; segId: number; seq: number }>();
 
-  private readonly editorArea =
-    viewChild<ElementRef<HTMLTextAreaElement>>("editorArea");
+  private readonly document = viewChild(NoteDocumentComponent);
+  private readonly editorArea = computed(() => this.document()?.editorArea());
   private readonly imageFileInput =
     viewChild<ElementRef<HTMLInputElement>>("imageFileInput");
   readonly importingImages = signal(0);
@@ -281,8 +285,8 @@ export class NotePanelComponent {
     this.notifyAttachmentWarnings(plan);
     const el = this.editorArea()?.nativeElement;
     const selection = this.imageInsertion ?? {
-      start: el?.selectionStart ?? this.draft().length,
-      end: el?.selectionEnd ?? this.draft().length,
+      start: el?.selectionStart ?? this.draftDocument().body.length,
+      end: el?.selectionEnd ?? this.draftDocument().body.length,
     };
     this.imageInsertion = null;
     this.startAttachmentImport(plan, selection.start, selection.end);
@@ -339,7 +343,7 @@ export class NotePanelComponent {
       return;
     }
     this.applyDraftEdit(
-      insertMarkdownBlock(this.draft(), selectionStart, selectionEnd, pending.markdown),
+      insertMarkdownBlock(this.draftDocument().body, selectionStart, selectionEnd, pending.markdown),
       true,
     );
     this.importingImages.update((count) => count + pending.images.length);
@@ -401,11 +405,11 @@ export class NotePanelComponent {
   private replacePendingAttachment(pendingId: string, replacement: string): boolean {
     const el = this.editorArea()?.nativeElement;
     const edit = replacePendingAttachmentUri(
-      this.draft(),
+      this.draftDocument().body,
       pendingId,
       replacement,
-      el?.selectionStart ?? this.draft().length,
-      el?.selectionEnd ?? this.draft().length,
+      el?.selectionStart ?? this.draftDocument().body.length,
+      el?.selectionEnd ?? this.draftDocument().body.length,
     );
     if (!edit) {
       return false;
@@ -422,7 +426,7 @@ export class NotePanelComponent {
   }
 
   private applyDraftEdit(edit: MarkdownEdit, focus: boolean): void {
-    this.draftInput.emit(edit.value);
+    this.draftInput.emit(joinNoteDocument(this.draftDocument().frontMatterPrefix, edit.value));
     const el = this.editorArea()?.nativeElement;
     if (el) {
       el.value = edit.value;
