@@ -326,3 +326,99 @@ test.describe("Detail — meeting note attachments", () => {
   });
 
 });
+
+test("partial image Revert preserves opaque YAML before the next save", async ({ page }) => {
+  await mockCanvasWebpEncoder(page);
+  await mockTauri(page, {
+    get_meeting_detail: () => ({
+      meeting: {
+        id: "m-partial-revert", title: "Partial image Revert", status: "EXPORTED",
+        startedAt: "2026-07-21T09:00:00Z", endedAt: "2026-07-21T09:30:00Z",
+        durationS: 1800, audioPath: null, folderId: null,
+      },
+      note: {
+        meetingId: "m-partial-revert", providerId: "claude_code", exportedPath: null,
+        markdown: '---\ncustom: "001"\n\n\n# Preserve these blank lines\naliases: ["Alpha"]\n---\n\n# Note\n\nBody',
+      },
+      segments: [], assistantInteractions: [], locked: false,
+      aiProvider: "claude_code", aiModel: null, modelServed: null,
+    }),
+    get_note_receipts: () => [],
+    list_note_attachments: () => [],
+    add_note_attachment: (args: any) => ({
+      id: crypto.randomUUID(), ownerKind: args.ownerKind, ownerId: args.ownerId,
+      mimeType: "image/webp", extension: "webp", byteLen: 4,
+      width: 1, height: 1, sha256: "fixture", dataUrl: "data:image/webp;base64,UklGRg==",
+    }),
+    delete_note_attachment: (args: any) => {
+      const state = window as any;
+      state.__partialDeleteIds ??= [];
+      state.__partialDeleteIds.push(args.attachmentId);
+      if (state.__partialDeleteIds.length === 2) throw new Error("Fixture: second deletion failed");
+    },
+    update_note: (args: any) => {
+      (window as any).__partialSaved = args.markdown;
+      return { meetingId: args.meetingId, providerId: "claude_code", markdown: args.markdown, exportedPath: null };
+    },
+  });
+  await page.goto("/meeting/m-partial-revert");
+  const editor = page.getByRole("textbox", { name: "Note markdown" });
+  await expect(editor).toBeEnabled();
+  await editor.evaluate((element: HTMLTextAreaElement) => {
+    element.focus();
+    element.setSelectionRange(element.value.length, element.value.length);
+    const bytes = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="), char => char.charCodeAt(0));
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([bytes], "first.png", { type: "image/png" }));
+    transfer.items.add(new File([bytes], "second.png", { type: "image/png" }));
+    element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer }));
+  });
+  await expect(editor).toHaveValue(/murmur-attachment:\/\/[0-9a-f-]{36}[\s\S]*murmur-attachment:\/\//i);
+  await page.getByRole("button", { name: "Revert", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("Couldn’t discard 1 added image");
+  expect((await editor.inputValue()).match(/murmur-attachment:\/\//g)).toHaveLength(1);
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__partialSaved as string | undefined)).toBeTruthy();
+  const saved = await page.evaluate(() => (window as any).__partialSaved as string);
+  expect(saved.slice(0, saved.indexOf("# Note"))).toBe('---\ncustom: "001"\n\n\n# Preserve these blank lines\naliases: ["Alpha"]\n---\n\n');
+});
+
+test("unlock opens the gated meeting note directly in edit and baselines attachments", async ({ page }) => {
+  await mockTauri(page, {
+    get_meeting_detail: () => {
+      const unlocked = (window as any).__meetingUnlocked === true;
+      return {
+        meeting: {
+          id: "m-unlock-edit", title: unlocked ? "Unlocked note" : "🔒 Locked", status: "EXPORTED",
+          startedAt: "2026-07-21T09:00:00Z", endedAt: "2026-07-21T09:30:00Z",
+          durationS: 1800, audioPath: null, folderId: null,
+        },
+        note: unlocked ? { meetingId: "m-unlock-edit", providerId: "claude_code", markdown: "# Gated note", exportedPath: null } : null,
+        segments: [], assistantInteractions: [], locked: !unlocked,
+        aiProvider: "claude_code", aiModel: null, modelServed: null,
+      };
+    },
+    unlock_meeting: () => { (window as any).__meetingUnlocked = true; },
+    get_note_receipts: () => [],
+    list_note_attachments: () => {
+      (window as any).__attachmentReadCount = ((window as any).__attachmentReadCount ?? 0) + 1;
+      return new Promise(resolve => { (window as any).__releaseUnlockAttachments = resolve; });
+    },
+  });
+  await page.goto("/meeting/m-unlock-edit");
+  const unlock = page.getByRole("button", { name: "🔒 Unlock (Touch ID)", exact: true });
+  await expect(unlock).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Note markdown" })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__attachmentReadCount ?? 0)).toBe(0);
+  await unlock.click();
+  const editor = page.getByRole("textbox", { name: "Note markdown" });
+  await expect(editor).toBeVisible();
+  await expect(editor).toHaveValue("# Gated note");
+  await expect(editor).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Revert", exact: true })).toBeDisabled();
+  await page.evaluate(() => (window as any).__releaseUnlockAttachments([]));
+  await expect(editor).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Revert", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Preview", exact: true }).click();
+  await expect(editor).toHaveCount(0);
+});

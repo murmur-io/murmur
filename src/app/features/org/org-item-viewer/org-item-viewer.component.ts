@@ -213,6 +213,8 @@ export class OrgItemViewerComponent {
   /** Released on destroy so the org-feed listener never outlives this view. */
   private feedUnlisten: (() => void) | null = null;
   private feedDestroyed = false;
+  private revalidationSequence = 0;
+  private revalidationPending = false;
 
   constructor() {
     // Resolve + fetch the org item whenever the route id changes. Async IPC
@@ -261,9 +263,14 @@ export class OrgItemViewerComponent {
    * can never silently overwrite an in-progress draft. Any IPC failure is
    * ignored: a transient error must never be mistaken for "withdrawn".
    */
-  private async revalidate(): Promise<void> {
+  private async revalidate(duringLoad = false): Promise<void> {
     const routeId = this.itemId();
-    if (!routeId || this._removed() || this.loading()) {
+    if (!routeId || this._removed()) return;
+    const sequence = ++this.revalidationSequence;
+    if (this.loading() && !duringLoad) {
+      // Initial attachment loading must not swallow a withdrawal notification.
+      // Keep the loading gate closed until the newest replica has been checked.
+      this.revalidationPending = true;
       return;
     }
     // A successful edit replaces the immutable feed item id. During conflict
@@ -277,7 +284,7 @@ export class OrgItemViewerComponent {
     } catch {
       return;
     }
-    if (this.itemId() !== routeId || this._removed()) {
+    if (sequence !== this.revalidationSequence || this.itemId() !== routeId || this._removed()) {
       return;
     }
     if (!detail) {
@@ -314,6 +321,8 @@ export class OrgItemViewerComponent {
    * A deep-linked view with no tab simply stays on the "no longer shared" state.
    */
   private markRemoved(id: string): void {
+    ++this.revalidationSequence;
+    this.revalidationPending = false;
     this._removed.set(true);
     this._item.set(null);
     this.attachments.set([]);
@@ -360,6 +369,10 @@ export class OrgItemViewerComponent {
    * read-only load rather than blocking the view. Stale-guarded on `id`.
    */
   private async resolveThenLoad(id: string | null): Promise<void> {
+    ++this.revalidationSequence;
+    this.revalidationPending = false;
+    this.titleDraft.set("");
+    this.markdownDraft.set("");
     if (!id) {
       this.loading.set(false);
       this.error.set("No item id.");
@@ -443,6 +456,10 @@ export class OrgItemViewerComponent {
       this._item.set(null);
       this.attachments.set([]);
     } finally {
+      while (this.itemId() === id && this.revalidationPending && !this._removed()) {
+        this.revalidationPending = false;
+        await this.revalidate(true);
+      }
       if (this.itemId() === id) {
         this.loading.set(false);
       }

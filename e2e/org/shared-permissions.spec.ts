@@ -721,3 +721,59 @@ for (const [label, capability, mode] of [
     await expect(document.locator("textarea")).toHaveCount(mode === "edit" ? 1 : 0);
   });
 }
+
+test("a stale editable response cannot undo a newer permission revocation", async ({ page }) => {
+  await mockNotes(page, {
+    org_resolve_source: () => null,
+    org_get_item: () => {
+      const w = window as any;
+      const item = { itemId: "race-item", title: "Original", markdown: "# Body", authorHint: "Sam", createdAt: "2026-08-12T10:00:00Z", rev: 1, canEdit: true, editable: true, canManage: false };
+      if (!w.__holdOrgReads) return item;
+      return new Promise(resolve => (w.__orgResolvers ??= []).push((canEdit: boolean) => resolve({ ...item, canEdit, editable: canEdit, title: canEdit ? "Stale title" : "Current title" })));
+    },
+    org_list_statuses: ORG,
+    list_note_attachments: () => [],
+  });
+  await page.goto("/org-item/race-item");
+  const document = page.locator("app-note-document");
+  await expect(document).toHaveAttribute("data-mode", "edit");
+  await page.getByRole("textbox", { name: "Note content (markdown)" }).fill("Unsent draft");
+  await page.evaluate(() => {
+    const w = window as any;
+    w.__holdOrgReads = true;
+    w.__demoEmit("murmur://org-feed-updated", { orgsChanged: 1 });
+    w.__demoEmit("murmur://org-feed-updated", { orgsChanged: 1 });
+  });
+  await expect.poll(() => page.evaluate(() => (window as any).__orgResolvers?.length ?? 0)).toBe(2);
+  await page.evaluate(() => (window as any).__orgResolvers[1](false));
+  await expect(document).toHaveAttribute("data-access", "view-only");
+  await page.evaluate(() => (window as any).__orgResolvers[0](true));
+  await expect(document.getByRole("heading", { name: "Current title", exact: true })).toBeVisible();
+  await expect(document).toHaveAttribute("data-access", "view-only");
+  await expect(page.getByRole("button", { name: "Edit", exact: true })).toHaveCount(0);
+  await expect(document.locator("textarea")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Copy draft", exact: true })).toBeVisible();
+});
+
+test("withdrawal during initial attachment loading never reveals stale Org content", async ({ page }) => {
+  await mockNotes(page, {
+    org_resolve_source: () => null,
+    org_get_item: () => (window as any).__withdrawnDuringLoad ? null : ({
+      itemId: "withdraw-loading", title: "Withdrawn private title", markdown: "Never reveal this old replica", authorHint: "Sam", createdAt: "2026-08-12T10:00:00Z", rev: 1, canEdit: true, editable: true,
+    }),
+    list_note_attachments: () => new Promise(resolve => { (window as any).__finishOrgAttachmentLoad = resolve; }),
+    org_list_statuses: ORG,
+  });
+  await page.goto("/org-item/withdraw-loading");
+  await page.waitForFunction(() => typeof (window as any).__finishOrgAttachmentLoad === "function");
+  await page.evaluate(() => {
+    const w = window as any;
+    w.__withdrawnDuringLoad = true;
+    w.__demoEmit("murmur://org-feed-updated", { orgsChanged: 1 });
+    w.__finishOrgAttachmentLoad([]);
+  });
+  await expect(page.locator("app-note-document")).toHaveCount(0);
+  await expect(page.getByText("This shared note is no longer available", { exact: true })).toBeVisible();
+  await expect(page.getByText("Never reveal this old replica")).toHaveCount(0);
+  await expect(page.getByRole("textbox")).toHaveCount(0);
+});

@@ -42,6 +42,7 @@ import {
 } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
 import { referencedNoteAttachments } from "../../../services/note-attachment.service";
+import { joinNoteDocument, splitNoteDocument } from "../../../shared/note-document/front-matter";
 import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
 import { AudioPanelComponent } from "../audio-panel/audio-panel.component";
 import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
@@ -460,6 +461,22 @@ export class DetailComponent implements OnInit {
     if (!id || this.locked() || !this.attachmentLoadFailed()) return;
     this.attachmentLoadFailed.set(false);
     void this.fetchAttachments(id, ++this.attachmentSeq);
+  }
+
+  /** Seed editing only when a gated read first makes note content available. */
+  private prepareDirectEdit(
+    fresh: MeetingDetail | null,
+    previous: MeetingDetail | null = this.detail(),
+  ): void {
+    if (!fresh || fresh.locked || !fresh.note) return;
+    if (previous?.meeting.id === fresh.meeting.id && !previous.locked && previous.note) return;
+    this.draft.set(fresh.note.markdown);
+    this.editAttachmentSnapshot = [];
+    this.directEditAwaitingAttachmentsFor = fresh.meeting.id;
+    this.attachmentLoadFailed.set(false);
+    // Permission is known; writes wait for the separate gated attachment baseline.
+    this.meetingAttachmentBusy.set(true);
+    this.editing.set(true);
   }
 
   private finishDirectEditAttachmentSnapshot(
@@ -953,6 +970,7 @@ export class DetailComponent implements OnInit {
           // resident behind the lock gate.
           this.maskLocally(fresh);
         } else {
+          this.prepareDirectEdit(fresh);
           this.detail.set(fresh);
         }
         // Keep the tab strip + persisted tab title truthful (F3): after a
@@ -1157,15 +1175,7 @@ export class DetailComponent implements OnInit {
     // re-instantiated per active tab, so there is nothing to reset here.)
     try {
       const loaded = await this.ipc.getMeetingDetail(id);
-      if (loaded && !loaded.locked && loaded.note) {
-        this.draft.set(loaded.note.markdown);
-        this.directEditAwaitingAttachmentsFor = loaded.meeting.id;
-        // Permission mode is known from the gated detail read. Enter it immediately so
-        // commands cannot observe a transient preview state while attachment baselining runs;
-        // editor writes stay disabled until that second gated read completes.
-        this.meetingAttachmentBusy.set(true);
-        this.editing.set(true);
-      }
+      this.prepareDirectEdit(loaded, null);
       this.detail.set(loaded);
     } finally {
       this.loading.set(false);
@@ -1387,6 +1397,7 @@ export class DetailComponent implements OnInit {
       // Re-fetch the now-unmasked detail and swap it in place. A null detail
       // (deleted out from under us) keeps the not-found state honest.
       const fresh = await this.ipc.getMeetingDetail(id);
+      this.prepareDirectEdit(fresh);
       this.detail.set(fresh);
       if (fresh && !fresh.locked) {
         // Refresh the folder tree so the header lock badge reflects the unlock,
@@ -1922,7 +1933,11 @@ export class DetailComponent implements OnInit {
       `!\\[[^\\]\\r\\n]*\\]\\(murmur-attachment:\\/\\/${attachmentId}\\)`,
       "gi",
     );
-    return markdown.replace(marker, "").replace(/\n{3,}/g, "\n\n");
+    const { frontMatterPrefix, body } = splitNoteDocument(markdown);
+    return joinNoteDocument(
+      frontMatterPrefix,
+      body.replace(marker, "").replace(/\n{3,}/g, "\n\n"),
+    );
   }
 
   /**

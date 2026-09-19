@@ -156,20 +156,12 @@
   padding-bottom: var(--space-4);
   border-bottom: 1px solid var(--border-subtle);
 }
-/* Title row: the heading (or its edit input) + the author's edit/save actions. */
+/* Document mode and author actions; the shared surface owns title and prose. */
 .oi-head-top {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--space-3);
-}
-.oi-title {
-  margin: 0;
-  font-size: 1.55rem;
-  font-weight: 700;
-  letter-spacing: -0.01em;
-  color: var(--text-primary);
-  line-height: 1.25;
 }
 .oi-actions {
   display: inline-flex;
@@ -189,43 +181,6 @@
 }
 
 /* --- Edit-in-place (server-authorized author/owner/editor) --------------- */
-.oi-title-input {
-  flex: 1 1 auto;
-  min-width: 0;
-  margin: 0;
-  padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--surface-input);
-  color: var(--text-primary);
-  font-size: 1.55rem;
-  font-weight: 700;
-  letter-spacing: -0.01em;
-  line-height: 1.25;
-}
-.oi-title-input:focus-visible {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.oi-editor {
-  width: 100%;
-  min-height: 60vh;
-  padding: var(--space-3);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: var(--surface-input);
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 0.9rem;
-  line-height: 1.6;
-  resize: vertical;
-}
-.oi-editor:focus-visible {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
 .oi-edit-conflict {
   display: flex;
   align-items: center;
@@ -346,14 +301,4 @@
 .oi-permissions-note {
   color: var(--text-muted);
   font-size: 0.75rem;
-}
-.oi-body {
-  color: var(--text-secondary);
-  line-height: 1.65;
-}
-.oi-link-unavailable {
-  margin: 0;
-  padding-top: var(--space-3);
-  border-top: 1px solid var(--border-subtle);
-  font-size: 0.78rem;
 }

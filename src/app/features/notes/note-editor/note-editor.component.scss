@@ -536,8 +536,7 @@
    1920px gives ≈1496px, both genuinely wider than the default). Transition is
    `max-width` only (layout, not paint) so the toggle reads as an intentional
    resize, not a jump-cut. */
-/* Properties bar. */
-/* Body textarea (document surface) with CSS auto-grow. */
+/* Host-owned attachment toolbar and slash-menu chrome. */
 .body-wrap {
   position: relative;
 }
@@ -593,12 +592,6 @@
   color: var(--accent-hover);
 }
 
-/* Preview. */
-.note-preview {
-  min-height: 40vh;
-  font-size: 1rem;
-  line-height: 1.7;
-}
 
 @media (prefers-reduced-motion: reduce) {
   .save-spin {
