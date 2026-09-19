@@ -383,8 +383,14 @@ test("opens on the centred current path, pages with anchor-gated args, searches 
     dialog.getByText("Current deep note", { exact: true }),
   ).toBeVisible();
   await expect(dialog.getByText("Current", { exact: true })).toBeVisible();
-  await expect(dialog.locator('[data-row="i:note:n1"] .rhp-row-main')).toHaveAttribute("aria-posinset", "51");
-  await expect(dialog.locator('[data-row="i:note:n1"] .rhp-row-main')).toHaveAttribute("aria-setsize", "100");
+  await expect(dialog.locator('[data-row="i:note:n1"]')).toHaveAttribute(
+    "aria-posinset",
+    "51",
+  );
+  await expect(dialog.locator('[data-row="i:note:n1"]')).toHaveAttribute(
+    "aria-setsize",
+    "100",
+  );
   await expect(dialog.getByText("Tasks", { exact: true })).toHaveCount(0);
   await expect(dialog.getByText("Dashboards", { exact: true })).toHaveCount(0);
   await expect(dialog.getByText("Private", { exact: true })).toBeVisible();
@@ -436,7 +442,7 @@ test("opens on the centred current path, pages with anchor-gated args, searches 
   );
   expect(calls).toContainEqual({
     cmd: "get_related_picker_bootstrap",
-    args: { anchorKind: "note", anchorId: "n1", mode: "link" },
+    args: { anchorKind: "note", anchorId: "n1" },
   });
   expect(calls).toContainEqual({
     cmd: "list_related_picker_items",
@@ -447,7 +453,6 @@ test("opens on the centred current path, pages with anchor-gated args, searches 
       kind: "note",
       offset: 16,
       limit: 24,
-      mode: "link",
     },
   });
   expect(calls).toContainEqual({
@@ -458,7 +463,6 @@ test("opens on the centred current path, pages with anchor-gated args, searches 
       query: "roadmap",
       offset: 0,
       limit: 30,
-      mode: "link",
     },
   });
 });

@@ -2991,8 +2991,8 @@ export class IpcService {
     return invoke<RelatedPickerBootstrap>("get_related_picker_bootstrap", {
       anchorKind,
       anchorId,
-      mode,
-      orgId,
+      ...(mode === "destination" ? { mode } : {}),
+      ...(orgId !== undefined ? { orgId } : {}),
     });
   }
 
@@ -3020,8 +3020,8 @@ export class IpcService {
       kind,
       offset,
       limit,
-      mode,
-      orgId,
+      ...(mode === "destination" ? { mode } : {}),
+      ...(orgId !== undefined ? { orgId } : {}),
     });
   }
 
@@ -3045,8 +3045,8 @@ export class IpcService {
       query,
       offset,
       limit,
-      mode,
-      orgId,
+      ...(mode === "destination" ? { mode } : {}),
+      ...(orgId !== undefined ? { orgId } : {}),
     });
   }
 

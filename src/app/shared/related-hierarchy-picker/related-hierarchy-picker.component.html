@@ -132,6 +132,37 @@
           <div
             class="rhp-row"
             [attr.data-row]="line.key"
+            [attr.role]="
+              mode() !== 'destination'
+                ? searching()
+                  ? 'option'
+                  : 'treeitem'
+                : null
+            "
+            [attr.aria-level]="
+              mode() !== 'destination' && !searching() ? line.level : null
+            "
+            [attr.aria-expanded]="
+              mode() !== 'destination' && line.expandable ? line.expanded : null
+            "
+            [attr.aria-selected]="
+              mode() !== 'destination' && searching()
+                ? line.key === tabbableKey()
+                : null
+            "
+            [attr.aria-current]="
+              mode() !== 'destination' && line.isCurrent ? 'true' : null
+            "
+            [attr.aria-posinset]="
+              mode() !== 'destination'
+                ? (rowPositions().get(line.key)?.position ?? null)
+                : null
+            "
+            [attr.aria-setsize]="
+              mode() !== 'destination'
+                ? (rowPositions().get(line.key)?.size ?? null)
+                : null
+            "
             [class.is-current]="line.isCurrent"
             [class.is-linked]="line.status === 'linked'"
             [class.is-locked]="line.status === 'locked'"
@@ -168,9 +199,23 @@
             <button
               type="button"
               class="rhp-row-main"
-              [attr.role]="line.page ? null : searching() ? 'option' : 'treeitem'"
-              [attr.aria-level]="searching() || line.page ? null : line.level"
-              [attr.aria-expanded]="line.expandable ? line.expanded : null"
+              [attr.role]="
+                mode() === 'destination' && !line.page
+                  ? searching()
+                    ? 'option'
+                    : 'treeitem'
+                  : null
+              "
+              [attr.aria-level]="
+                mode() === 'destination' && !searching() && !line.page
+                  ? line.level
+                  : null
+              "
+              [attr.aria-expanded]="
+                mode() === 'destination' && line.expandable
+                  ? line.expanded
+                  : null
+              "
               [attr.aria-selected]="
                 mode() === 'destination'
                   ? stagedDestination()
@@ -179,13 +224,21 @@
                         ? (line.target.rootContainerId ?? null)
                         : line.target?.id)
                     : false
-                  : searching()
-                    ? line.key === tabbableKey()
-                    : null
+                  : null
               "
-              [attr.aria-current]="line.isCurrent ? 'location' : null"
-              [attr.aria-posinset]="rowPositions().get(line.key)?.position ?? null"
-              [attr.aria-setsize]="rowPositions().get(line.key)?.size ?? null"
+              [attr.aria-current]="
+                mode() === 'destination' && line.isCurrent ? 'location' : null
+              "
+              [attr.aria-posinset]="
+                mode() === 'destination'
+                  ? (rowPositions().get(line.key)?.position ?? null)
+                  : null
+              "
+              [attr.aria-setsize]="
+                mode() === 'destination'
+                  ? (rowPositions().get(line.key)?.size ?? null)
+                  : null
+              "
               [tabindex]="line.key === tabbableKey() ? 0 : -1"
               [attr.aria-disabled]="
                 (mode() === 'destination' &&
