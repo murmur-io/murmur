@@ -7,6 +7,9 @@
      Ask Brain pane isn't cut off short. Total still nets to 100vh ⇒ the page never scrolls. */
   height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
   margin-bottom: calc(-1 * var(--space-8));
+  /* Match the private note host: the shared document owns its horizontal measure.
+     Leaving app-main's side padding here narrows only received notes by 48px. */
+  margin-inline: calc(-1 * var(--space-5));
   min-height: 0;
 }
 .org-item {
@@ -208,49 +211,14 @@
 .oi-edit-conflict-open {
   flex: none;
 }
-/* Metadata strip: Org Brain badge + org name + author + date + revision. */
-.oi-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 0.85rem;
-}
-.oi-org-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 2px var(--space-3);
+/* Access stays in the header; origin belongs to the shared document column. */
+.oi-view-only {
+  padding: var(--space-1) var(--space-2);
+  border: var(--note-state-border-width) solid var(--border-subtle);
   border-radius: var(--radius-pill);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-ring);
-  color: var(--accent-hover);
-  font-size: 0.68rem;
-  font-weight: 650;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-.oi-org-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: var(--radius-pill);
-  background: var(--accent);
-}
-.oi-org-name {
   color: var(--text-secondary);
-  font-weight: 600;
-}
-.oi-author {
-  color: var(--text-secondary);
-}
-.oi-meta-sep {
-  color: var(--border-strong);
-}
-.oi-access-label {
-  color: var(--text-secondary);
-  font-weight: 600;
+  font-size: var(--note-meta-size);
+  font-weight: var(--note-state-weight);
 }
 .oi-permissions {
   display: flex;

@@ -128,28 +128,10 @@
               }
             </div>
           } @else if (notEditableReason(); as reason) {
-            <span class="oi-readonly-reason text-muted">{{ reason }}</span>
+            <span class="oi-view-only" role="status" [attr.aria-label]="reason" [attr.title]="reason">View only</span>
           }
         </div>
 
-        <div class="oi-meta">
-          <span class="oi-org-chip">
-            <span class="oi-org-dot" aria-hidden="true"></span>
-            Org Brain
-          </span>
-          @if (orgName(); as name) {
-            <span class="oi-meta-sep" aria-hidden="true">·</span>
-            <span class="oi-org-name">{{ name }}</span>
-          }
-          @if (it.authorHint) {
-            <span class="oi-meta-sep" aria-hidden="true">·</span>
-            <span class="oi-author">Shared by {{ it.authorHint }}</span>
-          }
-          <span class="oi-meta-sep" aria-hidden="true">·</span>
-          <span class="oi-date">{{ formatDate(it.createdAt) }}</span>
-          <span class="oi-meta-sep" aria-hidden="true">·</span>
-          <span class="oi-rev">revision {{ it.rev }}</span>
-        </div>
         @if (canManage(it)) {
           <div class="oi-permissions" aria-label="Member access">
             <span class="oi-permissions-label">Member access</span>
@@ -217,7 +199,7 @@
         [markdown]="editing() ? markdownDraft() : it.markdown"
         [attachments]="attachments()"
         [busy]="saving() || openingLatest()"
-        [origin]="[]"
+        [origin]="documentOrigin()"
         [related]="it.linkId ? { kind: 'org', id: it.linkId, expandedByDefault: true, prominent: true } : null"
         relatedUnavailable="Related links become available after this older shared note is republished."
         (titleChange)="titleDraft.set($event)"

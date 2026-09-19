@@ -64,10 +64,10 @@ function stableLinkIdOf(item: OrgItemDetail | null): string | null {
  * redirects (replaceUrl) to their editable original — a `/notes/:id` note or a
  * `/meeting/:id` detail (whose edits re-publish) — so they land on the thing they
  * can change, not a read-only replica. A non-author (no local source ⇒ `null`)
- * falls through to the rich READ-ONLY document view: an "Org Brain" badge + the
- * org name + author hint + date + revision, the decrypted `OrgItemDetail.markdown`
- * rendered inside a frosted document card. Org items are deliberately-disclosed
- * org content (no lock gate applies), so the read view has no edit/share affordance.
+ * falls through to the shared document surface. Backend capabilities decide
+ * edit versus preview; origin metadata stays above the title and view-only
+ * access is explicit in the header. Org reads remain gated by the backend's
+ * disclosed-replica policy and writes by its session/role authorization.
  *
  * The route param drives the load via an IPC-on-signal-change effect (T1) with a
  * stale-result guard, so navigating between org items in place re-fetches
@@ -154,7 +154,7 @@ export class OrgItemViewerComponent {
     }
     return this._loggedIn()
       ? "View only — the author or Org Owner can enable editing."
-      : "Sign in to use the permissions granted to your account.";
+      : "View only — sign in to use the permissions granted to your account.";
   });
 
   /** The only permission-to-mode mapping for received org documents. */
@@ -168,6 +168,18 @@ export class OrgItemViewerComponent {
       view: "preview",
       reason: this.notEditableReason() ?? "You do not have permission to edit this note.",
     };
+  });
+
+  readonly documentOrigin = computed<readonly string[]>(() => {
+    const item = this.item();
+    if (!item) return [];
+    return [
+      "Org Brain",
+      this.orgName(),
+      item.authorHint ? `Shared by ${item.authorHint}` : "",
+      this.formatDate(item.createdAt),
+      `revision ${item.rev}`,
+    ].filter(Boolean);
   });
 
   // --- Edit-in-place (server-authorized author/owner/editor) ----------------

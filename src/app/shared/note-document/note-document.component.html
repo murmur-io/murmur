@@ -5,13 +5,10 @@
   [attr.data-mode]="mode().view"
   [attr.data-access]="mode().access"
 >
-  @if (origin().length || mode().access === "view-only") {
+  @if (origin().length) {
     <div class="origin-strip">
-      @for (item of origin(); track item) {
+      @for (item of origin(); track $index) {
         <span>{{ item }}</span>
-      }
-      @if (mode().access === "view-only") {
-        <span class="view-only" role="status" [attr.title]="viewOnlyReason()">View only</span>
       }
     </div>
   }

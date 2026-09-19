@@ -33,16 +33,16 @@
   font-size: var(--note-meta-size);
 }
 
-.origin-strip > span:not(:last-child)::after {
-  content: " ·";
+.origin-strip > span {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.view-only {
-  padding: var(--space-1) var(--space-2);
-  border: var(--note-state-border-width) solid var(--border-subtle);
-  border-radius: var(--radius-pill);
-  color: var(--text-secondary);
-  font-weight: var(--note-state-weight);
+.origin-strip > span:not(:last-child)::after {
+  content: " ·";
 }
 
 .document-title,

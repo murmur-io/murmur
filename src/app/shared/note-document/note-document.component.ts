@@ -81,9 +81,4 @@ export class NoteDocumentComponent {
   readonly titleChange = output<string>();
   readonly titleBlur = output<void>();
   readonly markdownChange = output<string>();
-  readonly modeChange = output<"edit" | "preview">();
-  readonly viewOnlyReason = computed(() => {
-    const mode = this.mode();
-    return mode.access === "view-only" ? mode.reason : "";
-  });
 }

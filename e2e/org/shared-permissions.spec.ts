@@ -155,9 +155,31 @@ test("view-only received item has reverse Related but no edit or management cont
     account_status: () => ({ loggedIn: true }),
   });
 
+  await page.setViewportSize({ width: 1170, height: 884 });
+  await page.goto("/notes/n1");
+  const privateDocument = page.locator("app-note-document .note-document");
+  await expect(privateDocument).toBeVisible();
+  const privateFace = await privateDocument.evaluate((node) => ({
+    width: node.getBoundingClientRect().width,
+    font: getComputedStyle(node).fontFamily,
+  }));
   await page.goto("/org-item/item-1");
   await expect(page.locator(".oi-title")).toHaveText("Shared roadmap");
-  await expect(page.getByText("View only", { exact: true })).toBeVisible();
+  const sharedDocument = page.locator("app-note-document .note-document");
+  await expect.poll(() => sharedDocument.evaluate((node) => ({
+    width: node.getBoundingClientRect().width,
+    font: getComputedStyle(node).fontFamily,
+  }))).toEqual(privateFace);
+  const viewOnly = page.getByRole("status").filter({ hasText: "View only" });
+  await expect(viewOnly).toHaveCount(1);
+  await expect(page.locator(".oi-head-top").getByRole("status")).toHaveText("View only");
+  await expect(viewOnly).toHaveAccessibleName("View only — the author or Org Owner can enable editing.");
+  await expect(viewOnly).not.toHaveAttribute("tabindex", "0");
+  const origin = page.locator("app-note-document .origin-strip");
+  await expect(origin).toContainText("Org Brain");
+  await expect(origin).toContainText("Acme");
+  await expect(origin).toContainText("Shared by kasia");
+  await expect(origin).toContainText("revision 2");
   await expect(page.getByRole("button", { name: "Edit", exact: true })).toHaveCount(0);
   await expect(page.locator(".oi-permissions")).toHaveCount(0);
   await expect(page.locator("app-connections")).toBeVisible();
@@ -244,7 +266,7 @@ test("explicit canEdit false wins over legacy editable true and never mounts an 
   const document = page.locator("app-note-document");
   await expect(document).toHaveAttribute("data-mode", "preview");
   await expect(document).toHaveAttribute("data-access", "view-only");
-  await expect(document.getByText("View only", { exact: true })).toBeVisible();
+  await expect(page.locator(".oi-head-top").getByRole("status")).toHaveText("View only");
   await expect(document.getByRole("textbox")).toHaveCount(0);
   await expect(document.getByText("Rendered, never editable.")).toBeVisible();
   expect(
@@ -500,7 +522,7 @@ test("edit conflict opens the stable latest head across an in-flight sync event"
 
   await expect(page).toHaveURL(/\/org-item\/item-latest$/);
   await expect(page.getByRole("textbox", { name: "Note title" })).toHaveValue("Authoritative plan");
-  await expect(page.locator(".oi-rev")).toHaveText("revision 4");
+  await expect(page.locator("app-note-document .origin-strip").getByText("revision 4", { exact: true })).toBeVisible();
   await expect(page.getByRole("textbox", { name: "Note content (markdown)" })).toHaveValue("# Authoritative body");
   await expect.poll(async () =>
     page.evaluate(
