@@ -134,16 +134,51 @@ impl Drop for ScratchWav {
     }
 }
 
-/// Emit a `StatusPayload` on `EVENT_STATUS`. Best-effort: a failed emit is logged but
-/// never aborts the pipeline.
-fn emit_status(app: &AppHandle, stage: &str, message: &str, meeting_id: &str) {
-    let payload = StatusPayload {
-        stage: stage.to_string(),
-        message: message.to_string(),
-        meeting_id: Some(meeting_id.to_string()),
+/// Route only a proven queue owner away from foreground recorder status. Lookup failure must
+/// still terminate the foreground UI, but its message is fixed rather than a raw provider error.
+fn foreground_pipeline_status(
+    queue_lookup: Result<bool>,
+    stage: &str,
+    message: &str,
+    meeting_id: &str,
+) -> Option<StatusPayload> {
+    let safe_message = match queue_lookup {
+        Ok(true) => return None,
+        Ok(false) => message,
+        Err(_) => {
+            tracing::warn!(target: "pipeline", meeting_id, "queue ownership lookup failed; emitting content-free foreground status");
+            "Processing status could not be read."
+        }
     };
-    if let Err(e) = app.emit(EVENT_STATUS, payload) {
-        tracing::warn!(target: "pipeline", error = %e, "failed to emit status event");
+    Some(StatusPayload {
+        stage: stage.into(),
+        message: safe_message.into(),
+        meeting_id: Some(meeting_id.into()),
+    })
+}
+
+/// Emit foreground status or queue progress. A best-effort queue lookup must never suppress a
+/// foreground terminal event: otherwise a storage error would strand every recorder WebView.
+fn emit_status(app: &AppHandle, stage: &str, message: &str, meeting_id: &str) {
+    let queue_lookup = app.try_state::<AppState>().map_or(Ok(false), |state| {
+        state.db.processing_job(meeting_id).map(|job| job.is_some())
+    });
+    match foreground_pipeline_status(queue_lookup, stage, message, meeting_id) {
+        Some(payload) => {
+            if let Err(e) = app.emit(EVENT_STATUS, payload) {
+                tracing::warn!(target: "pipeline", error = %e, "failed to emit status event");
+            }
+        }
+        None => {
+            if let Some(state) = app.try_state::<AppState>() {
+                let _ = state.db.set_processing_job_stage(
+                    meeting_id,
+                    stage,
+                    &chrono::Utc::now().to_rfc3339(),
+                );
+            }
+            crate::commands::emit_processing_queue_changed(app);
+        }
     }
 }
 
@@ -210,13 +245,18 @@ impl Drop for TerminalStatusGuard {
             if let Some(app) = &self.app {
                 let state = app.state::<AppState>();
                 if let Ok(mut current) = state.current_meeting.lock() {
-                    *current = None;
-                }
-                crate::transcribe::live::clear_live_transcript(&state.live_transcript);
-                crate::transcribe::bullets::clear_ram(
-                    &state.live_bullets,
-                    &state.live_bullets_tracker,
-                );
+                    if current.as_ref().map(uuid::Uuid::to_string).as_deref()
+                        == Some(self.meeting_id.as_str())
+                    {
+                        *current = None;
+                        crate::transcribe::live::clear_live_transcript(&state.live_transcript);
+                        crate::transcribe::live_history::clear_history(&state);
+                        crate::transcribe::bullets::clear_ram(
+                            &state.live_bullets,
+                            &state.live_bullets_tracker,
+                        );
+                    }
+                };
             }
             // STATUS-AWARE (2026-07-16): if the row ALREADY reached a terminal status
             // (Summarized/Exported/Error), skip the write AND the emit — a tail panic after
@@ -492,6 +532,37 @@ pub(crate) async fn run_file_backed(
     duration_s: i64,
     recording_model_token: Option<crate::perf::RecordingSessionToken>,
 ) -> Result<PipelineResult> {
+    run_file_backed_mode(
+        app,
+        state,
+        meeting_id,
+        recording,
+        duration_s,
+        recording_model_token,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn defer_file_backed(
+    app: &AppHandle,
+    state: &AppState,
+    meeting_id: &str,
+    recording: FinalizedRecording,
+    duration_s: i64,
+) -> Result<PipelineResult> {
+    run_file_backed_mode(app, state, meeting_id, recording, duration_s, None, true).await
+}
+
+async fn run_file_backed_mode(
+    app: &AppHandle,
+    state: &AppState,
+    meeting_id: &str,
+    recording: FinalizedRecording,
+    duration_s: i64,
+    recording_model_token: Option<crate::perf::RecordingSessionToken>,
+    defer: bool,
+) -> Result<PipelineResult> {
     let mut generation_guard = PipelineGenerationGuard::arm(&state.db, recording);
     ensure_pipeline_meeting_unlocked(state, meeting_id)?;
     match run_file_backed_inner(
@@ -501,17 +572,32 @@ pub(crate) async fn run_file_backed(
         generation_guard.recording()?,
         duration_s,
         recording_model_token,
+        defer,
     )
     .await
     {
         Ok(result) => {
-            generation_guard.disarm();
+            if !defer
+                || state
+                    .db
+                    .get_recording_generation_snapshot(&generation_guard.recording()?.key)?
+                    .is_some_and(|row| {
+                        row.state == crate::storage::models::RecordingGenerationState::Retired
+                    })
+            {
+                generation_guard.disarm();
+            }
             Ok(result)
         }
         Err(error @ AppError::Locked(_)) => {
             // A lock-state refusal is not a failed recording and must not invoke the ordinary
             // failure cleanup/status path. Dropping the armed generation guard releases the affine
             // lease while preserving every raw/transient/archive artifact for an unlocked retry.
+            Err(error)
+        }
+        Err(error) if defer => {
+            // A failed mandatory master/archive/queue commit must retain every raw generation
+            // artifact. Best-effort failure cleanup below is valid only for immediate processing.
             Err(error)
         }
         Err(error) => {
@@ -620,7 +706,10 @@ fn ensure_pipeline_meeting_unlocked(state: &AppState, meeting_id: &str) -> Resul
 /// from the mono archive exactly as it did before this existed. It must never convert a failed
 /// pipeline into a failed cleanup.
 fn promote_stream_masters(state: &AppState, meeting_id: &str, guard: &PipelineGenerationGuard<'_>) {
-    if let Err(error) = promote_stream_masters_inner(state, meeting_id, guard) {
+    if let Err(error) = guard
+        .recording()
+        .and_then(|recording| promote_stream_masters_inner(state, meeting_id, recording))
+    {
         // NO PII: the error text is filesystem/DB structure, never note or transcript content.
         tracing::warn!(
             target: "pipeline",
@@ -634,9 +723,9 @@ fn promote_stream_masters(state: &AppState, meeting_id: &str, guard: &PipelineGe
 fn promote_stream_masters_inner(
     state: &AppState,
     meeting_id: &str,
-    guard: &PipelineGenerationGuard<'_>,
+    recording: &FinalizedRecording,
 ) -> Result<()> {
-    let key = &guard.recording()?.key;
+    let key = &recording.key;
     let snapshot = state
         .db
         .get_recording_generation_snapshot(key)?
@@ -1010,6 +1099,7 @@ async fn run_file_backed_inner(
     recording: &FinalizedRecording,
     duration_s: i64,
     recording_model_token: Option<crate::perf::RecordingSessionToken>,
+    defer: bool,
 ) -> Result<PipelineResult> {
     if recording.key.meeting_id() != meeting_id {
         return Err(AppError::Audio(
@@ -1195,6 +1285,50 @@ async fn run_file_backed_inner(
         }
     }
 
+    if defer {
+        // Promotion is mandatory: without durable masters deferred Me/Others would collapse.
+        promote_stream_masters_inner(state, meeting_id, recording)?;
+        {
+            let _lifecycle = crate::commands::lifecycle_guard(state);
+            ensure_pipeline_meeting_unlocked(state, meeting_id)?;
+            let (mic, sys) = state.db.get_meeting_master_paths(meeting_id)?;
+            for path in [
+                mic.as_deref(),
+                if recording.system_wav.is_some() {
+                    sys.as_deref()
+                } else {
+                    mic.as_deref()
+                },
+            ] {
+                let path = path.ok_or_else(|| {
+                    AppError::Storage("deferred recording master is missing".into())
+                })?;
+                verify_existing_file(Path::new(path))?;
+            }
+            state.db.enqueue_processing_job(meeting_id, &ended_at)?;
+        }
+        // Once committed, every cleanup failure preserves the user's scheduling decision.
+        let cleanup = pipeline_heartbeat.stop_and_join().and_then(|()| {
+            crate::audio::source::cleanup_completed_archived_generation(
+                &state.db,
+                &inflight_dir,
+                &snapshot,
+                &recording.lease,
+                &archive,
+            )
+        });
+        if cleanup.is_err() {
+            tracing::warn!(target: "pipeline", meeting_id, "queued recording cleanup deferred");
+        }
+        crate::commands::emit_processing_queue_changed(app);
+        return Ok(PipelineResult {
+            note_markdown: String::new(),
+            exported_path: None,
+            meeting_id: meeting_id.to_owned(),
+            deferred_seal_folder_id: None,
+        });
+    }
+
     if recording.capture_fault.is_some() {
         emit_status(
             app,
@@ -1339,8 +1473,12 @@ fn transcribe_raw_windows(
         let offset_s = offset as f64 / audio::TARGET_RATE_HZ as f64;
         // Carry the pinned language ACROSS outer windows too, or each 120 s window would start
         // detection over and the flip this prevents would simply move up a level.
-        let (mut segments, detected) =
-            transcribe_stream(transcriber, vad.as_mut(), &window, pinned_language.as_deref())?;
+        let (mut segments, detected) = transcribe_stream(
+            transcriber,
+            vad.as_mut(),
+            &window,
+            pinned_language.as_deref(),
+        )?;
         if pinned_language.is_none() {
             pinned_language = detected;
         }
@@ -1388,12 +1526,48 @@ fn transcribe_raw_windows(
 ///
 /// A PRE-pipeline failure (unreadable/empty WAV) persists `Error` + emits the terminal `error`
 /// stage itself, mirroring `run_after_stop`'s Err arm, so the row never wedges non-terminal.
+const QUEUE_YIELDED_TO_RECORDING: &str = "processing_queue_yielded_to_recording";
+
+/// A queued job finishes its current ASR stage but must not start provider work while a new
+/// foreground capture owns priority. Ordinary foreground and recovery pipelines keep their
+/// existing admission behavior. This is scheduling, not a replacement for provider consent.
+fn queue_provider_admission(is_queue: bool, recording_has_priority: bool) -> Result<()> {
+    if is_queue && recording_has_priority {
+        Err(AppError::Unavailable(QUEUE_YIELDED_TO_RECORDING.into()))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn is_queue_yield(error: &AppError) -> bool {
+    matches!(error, AppError::Unavailable(code) if code == QUEUE_YIELDED_TO_RECORDING || code == crate::perf::BACKGROUND_RECORDING_PAUSE)
+}
+
 pub async fn run_salvage_from_disk(
     app: &AppHandle,
     state: &AppState,
     meeting_id: &str,
     wav_path: &Path,
 ) -> Result<PipelineResult> {
+    // Reconcile the fresh output with the folder's CURRENT lock state on EVERY exit — Ok, Err, a
+    // panic unwinding through the detached task, or this future being dropped mid-await. A plain
+    // sequential call after the await left a crash window (2026-07-16 review): a kill between the
+    // segment insert and the finalizer skipped the re-seal/purge, stranding fresh plaintext behind
+    // a lock (the relock-side sweep in `reblank_folder_extras` is the second, universal net).
+    // Best-effort by contract: a finalizer failure is logged inside and never masks the result.
+    // Register before taking the folder/CK snapshot. The permit blocks only operations that would
+    // rotate/orphan that key (fresh lock, permanent unlock, move/delete); session relock remains
+    // free to revoke visibility immediately. Declaration order is intentional: the finalizer below
+    // drops first, then the permit releases key-changing operations.
+    let _salvage_permit = crate::commands::begin_active_salvage(state, meeting_id)?;
+    let seal_context = crate::commands::capture_salvage_seal_context(state, meeting_id)?;
+    let _finalizer = SalvageLockFinalizer {
+        app: Some(app),
+        state,
+        meeting_id,
+        seal_context,
+    };
+    ensure_pipeline_meeting_unlocked(state, meeting_id)?;
     let mut archive = match WavMonoSource::open(wav_path) {
         Ok(source) if source.frames() > 0 && source.sample_rate() > 0 => source,
         Ok(_) => {
@@ -1415,24 +1589,6 @@ pub async fn run_salvage_from_disk(
         }
     };
     let duration_s = (archive.frames() as f64 / archive.sample_rate() as f64).round() as i64;
-    // Reconcile the fresh output with the folder's CURRENT lock state on EVERY exit — Ok, Err, a
-    // panic unwinding through the detached task, or this future being dropped mid-await. A plain
-    // sequential call after the await left a crash window (2026-07-16 review): a kill between the
-    // segment insert and the finalizer skipped the re-seal/purge, stranding fresh plaintext behind
-    // a lock (the relock-side sweep in `reblank_folder_extras` is the second, universal net).
-    // Best-effort by contract: a finalizer failure is logged inside and never masks the result.
-    // Register before taking the folder/CK snapshot. The permit blocks only operations that would
-    // rotate/orphan that key (fresh lock, permanent unlock, move/delete); session relock remains
-    // free to revoke visibility immediately. Declaration order is intentional: the finalizer below
-    // drops first, then the permit releases key-changing operations.
-    let _salvage_permit = crate::commands::begin_active_salvage(state, meeting_id)?;
-    let seal_context = crate::commands::capture_salvage_seal_context(state, meeting_id)?;
-    let _finalizer = SalvageLockFinalizer {
-        app: Some(app),
-        state,
-        meeting_id,
-        seal_context,
-    };
     // T31 — prefer the per-stream masters when the failed run kept them: transcribing them
     // SEPARATELY is the only way a retry reproduces the live `Me`/`Others` split, because the
     // archive is a mono SUM of both streams. Absent (or unreadable) masters fall back to the
@@ -1530,6 +1686,12 @@ pub async fn run_salvage_from_disk(
             "No speech detected in the recording — nothing to transcribe.".into(),
         ));
     }
+    // Recheck AFTER ASR, not just when the worker claimed the job: capture may have begun while
+    // the safe ASR stage was finishing. The worker parks this exact row at its existing position.
+    queue_provider_admission(
+        state.db.processing_job(meeting_id)?.is_some(),
+        crate::perf::recording_has_priority(),
+    )?;
     let now = chrono::Utc::now();
     let result = summarize_and_export(
         app,
@@ -1551,6 +1713,9 @@ pub async fn run_salvage_from_disk(
         release_stream_masters(state, meeting_id);
     }
     if let Err(error) = &result {
+        if is_queue_yield(error) && state.db.processing_job(meeting_id)?.is_some() {
+            return result;
+        }
         let _ = state
             .db
             .update_meeting_status(meeting_id, MeetingStatus::Error);
@@ -1610,13 +1775,19 @@ fn release_stream_masters(state: &AppState, meeting_id: &str) {
         Err(_) => return,
     }
     // And abort if a relock landed mid-retry and closed the session gate.
-    if !matches!(crate::commands::meeting_is_unlocked(state, meeting_id), Ok(true)) {
+    if !matches!(
+        crate::commands::meeting_is_unlocked(state, meeting_id),
+        Ok(true)
+    ) {
         return;
     }
     let Ok((mic, sys)) = state.db.get_meeting_master_paths(meeting_id) else {
         return;
     };
-    for (raw, kind) in [(mic, MasterPointerKind::Mic), (sys, MasterPointerKind::System)] {
+    for (raw, kind) in [
+        (mic, MasterPointerKind::Mic),
+        (sys, MasterPointerKind::System),
+    ] {
         let Some(raw) = raw else { continue };
         if raw.trim().is_empty() || raw.ends_with(crate::commands::ENC_SUFFIX) {
             continue; // sealed — owned by the lock model, never by this path
@@ -3849,12 +4020,7 @@ mod tests {
             .collect();
         assert_eq!(
             texts,
-            vec![
-                "well inside",
-                "inside the overlap",
-                "straddling",
-                "after"
-            ],
+            vec!["well inside", "inside the overlap", "straddling", "after"],
             "the straddling word must appear ONCE and in its whole form, and the overlap must not \
              duplicate the segment both windows heard"
         );
@@ -3863,7 +4029,11 @@ mod tests {
             "the truncated half must never reach the transcript"
         );
         let idxs: Vec<i64> = first.iter().chain(second.iter()).map(|s| s.idx).collect();
-        assert_eq!(idxs, vec![0, 1, 2, 3], "indices stay contiguous across windows");
+        assert_eq!(
+            idxs,
+            vec![0, 1, 2, 3],
+            "indices stay contiguous across windows"
+        );
     }
 
     /// The LAST window keeps its tail — it has no successor to hand the boundary to.
@@ -3882,7 +4052,11 @@ mod tests {
             true,
             &mut idx,
         );
-        assert_eq!(tail.len(), 2, "the last window has no successor and drops nothing");
+        assert_eq!(
+            tail.len(),
+            2,
+            "the last window has no successor and drops nothing"
+        );
         assert_eq!(tail[1].text, "the very last words");
     }
 
@@ -5660,3 +5834,74 @@ mod tests {
 #[cfg(test)]
 #[path = "pipeline_repro_stop.rs"]
 mod repro_stop;
+
+#[cfg(test)]
+mod queue_admission_tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_queue_ownership_preserves_foreground_terminal_status_without_content() {
+        let payload = foreground_pipeline_status(
+            Err(AppError::Storage("private filesystem details".into())),
+            "error",
+            "provider response with private text",
+            "meeting-42",
+        )
+        .expect("storage failure must not suppress foreground terminal notification");
+        let wire = serde_json::to_value(payload).unwrap();
+        assert_eq!(wire["stage"], "error");
+        assert_eq!(wire["meetingId"], "meeting-42");
+        assert_eq!(wire["message"], "Processing status could not be read.");
+        assert!(!wire.to_string().contains("private"));
+        assert!(
+            foreground_pipeline_status(Ok(true), "error", "secret", "queued").is_none(),
+            "proven background queue progress must stay off the foreground bus"
+        );
+        assert_eq!(
+            foreground_pipeline_status(Ok(false), "done", "done", "foreground")
+                .unwrap()
+                .stage,
+            "done"
+        );
+    }
+
+    #[test]
+    fn only_the_exact_recording_resource_pause_parks_queue_work() {
+        let paused = AppError::Unavailable(crate::perf::BACKGROUND_RECORDING_PAUSE.into());
+        assert!(
+            is_queue_yield(&paused),
+            "ASR can lose recording priority between queue claim and model admission"
+        );
+        assert!(!is_queue_yield(&AppError::Unavailable(
+            "local-model residency is quarantined".into()
+        )));
+        assert!(!is_queue_yield(&AppError::Unavailable(
+            "model download missing".into()
+        )));
+        assert!(!is_queue_yield(&AppError::Transcribe(
+            crate::perf::BACKGROUND_RECORDING_PAUSE.into()
+        )));
+    }
+
+    #[test]
+    fn queue_does_not_begin_provider_after_recording_takes_priority() {
+        let mut provider_calls = 0;
+        // Queue was admitted while idle, then a foreground recording began during ASR.
+        queue_provider_admission(true, false).unwrap();
+        let stage_result = queue_provider_admission(true, true).map(|()| {
+            provider_calls += 1;
+        });
+        assert!(stage_result.as_ref().is_err_and(is_queue_yield));
+        assert_eq!(
+            provider_calls, 0,
+            "queued provider stage must not start after foreground admission"
+        );
+        // Existing immediate/recovery behavior and idle queue work stay unchanged.
+        assert!(queue_provider_admission(false, true).is_ok());
+        assert!(queue_provider_admission(false, false).is_ok());
+        assert!(queue_provider_admission(true, false).is_ok());
+        assert!(!is_queue_yield(&AppError::Unavailable(
+            "unrelated failure".into()
+        )));
+    }
+}

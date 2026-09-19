@@ -1,0 +1,98 @@
+@if (collapsed()) {
+  <button
+    #railToggle
+    type="button"
+    class="rail-toggle"
+    (click)="toggle()"
+    aria-label="Open live transcript"
+    title="Open live transcript"
+  >
+    <span aria-hidden="true">▤</span>
+    <span class="rail-count">{{ rows().length }}</span>
+  </button>
+} @else {
+  <aside class="panel" aria-label="Live transcript">
+    <header class="panel-head">
+      <div>
+        <h2>Live transcript</h2>
+        <p>{{ statusLabel() }}</p>
+      </div>
+      <button
+        #collapseButton
+        type="button"
+        class="collapse-btn"
+        (click)="toggle()"
+        aria-label="Collapse live transcript"
+        title="Collapse"
+      >
+        <span aria-hidden="true">›</span>
+      </button>
+    </header>
+
+    @if (store.liveTranscriptTruncated()) {
+      <p class="truncated" role="note">Earlier live captions were truncated.</p>
+    }
+
+    <div
+      #scroller
+      class="transcript"
+      role="log"
+      aria-live="off"
+      tabindex="0"
+      aria-label="Live transcript history"
+      (scroll)="onScroll($event)"
+    >
+      @if (canShowOlder()) {
+        <button type="button" class="older-btn" (click)="showOlder()">
+          Show earlier transcript
+        </button>
+      }
+      @for (row of rows(); track row.id) {
+        <article
+          class="bubble-row"
+          [class.is-me]="row.speaker === 'me'"
+          [class.is-question]="row.possibleQuestion"
+          [class.is-partial]="!row.final"
+        >
+          <div class="bubble-meta">
+            <span class="speaker">{{ row.speakerLabel }}</span>
+            <span>{{ row.timeLabel }}</span>
+            @if (!row.final) {
+              <span>Listening…</span>
+            }
+          </div>
+          <p class="bubble">{{ row.text }}</p>
+          @if (row.possibleQuestion) {
+            <span class="question-label">Possible question</span>
+          }
+        </article>
+      } @empty {
+        <div class="empty-state">
+          @if (store.liveTranscriptPaused()) {
+            <strong>Live transcript is hidden</strong>
+            <span>Captions resume when access to this recording is restored.</span>
+          } @else if (captionsOff()) {
+            <strong>Live captions are off</strong>
+            <span>The complete transcript will be created after Stop.</span>
+          } @else {
+            @if (systemCaptureNote()) {
+              <strong>Listening to your microphone…</strong>
+              <span>Others live is unavailable for this recording.</span>
+            } @else {
+              <strong>Listening to the conversation…</strong>
+              <span>Me and Others will appear here automatically.</span>
+            }
+          }
+        </div>
+      }
+    </div>
+
+    @if (!pinned()) {
+      <button type="button" class="jump-btn" (click)="jumpToLatest()">
+        {{ jumpLabel() }} · Jump to latest
+      </button>
+    }
+  </aside>
+}
+
+<span class="sr-only" role="status">{{ questionAnnouncement() }}</span>

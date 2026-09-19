@@ -76,6 +76,8 @@ import type {
   ItemPage,
   LinkEdge,
   LinkKind,
+  LiveCaptionPayload,
+  LiveTranscriptPage,
   LivingAnswerTileData,
   MachineChangeNudge,
   ManualLinkEdge,
@@ -129,6 +131,7 @@ import type {
   ProactiveHintPayload,
   ProviderStatus,
   PruneSummary,
+  ProcessingQueueItem,
   RecipientPreview,
   RecordingCappedPayload,
   RecordingCaptureFaultPayload,
@@ -295,8 +298,46 @@ export class IpcService {
     return invoke<StartResult>("start_recording", { folderId });
   }
 
-  stopRecording(companionFlushCompleted?: boolean): Promise<StopResult> {
-    return invoke<StopResult>("stop_recording", { companionFlushCompleted });
+  stopRecording(
+    companionFlushCompleted?: boolean,
+    deferProcessing?: boolean,
+  ): Promise<StopResult> {
+    return invoke<StopResult>("stop_recording", {
+      companionFlushCompleted,
+      deferProcessing,
+    });
+  }
+
+  getLiveTranscriptPage(
+    meetingId: string,
+    beforeSeq?: number,
+    limit = 200,
+  ): Promise<LiveTranscriptPage> {
+    return invoke<LiveTranscriptPage>("get_live_transcript_page", {
+      meetingId,
+      beforeSeq,
+      limit,
+    });
+  }
+
+  listProcessingQueue(): Promise<ProcessingQueueItem[]> {
+    return invoke<ProcessingQueueItem[]>("list_processing_queue");
+  }
+
+  processQueueNow(meetingIds: string[]): Promise<void> {
+    return invoke<void>("process_queue_now", { meetingIds });
+  }
+
+  retryProcessingQueue(meetingIds: string[]): Promise<void> {
+    return invoke<void>("retry_processing_queue", { meetingIds });
+  }
+
+  removeProcessingQueue(meetingIds: string[]): Promise<void> {
+    return invoke<void>("remove_processing_queue", { meetingIds });
+  }
+
+  reorderProcessingQueue(orderedMeetingIds: string[]): Promise<void> {
+    return invoke<void>("reorder_processing_queue", { orderedMeetingIds });
   }
 
   recordingLevel(): Promise<number> {
@@ -3579,10 +3620,18 @@ export class IpcService {
     return listen(EVENT_TOGGLE_RECORD, () => cb());
   }
 
-  /** Fires with the latest live-transcription caption during recording. */
-  onLiveCaption(cb: (text: string) => void): Promise<UnlistenFn> {
-    return listen<{ text: string }>(EVENT_LIVE_CAPTION, (e) =>
-      cb(e.payload.text),
+  /** Rich payload when available; legacy `{text}` stays valid for the floating bar. */
+  onLiveCaption(cb: (payload: LiveCaptionPayload) => void): Promise<UnlistenFn> {
+    return listen<LiveCaptionPayload>(EVENT_LIVE_CAPTION, (e) => cb(e.payload));
+  }
+
+  onProcessingQueueChanged(cb: () => void): Promise<UnlistenFn> {
+    return listen("murmur://processing-queue-changed", () => cb());
+  }
+
+  onLiveTranscriptHealth(cb: (health: { meetingId: string; others: "starting" | "ready" | "unavailable" | "degraded" }) => void): Promise<UnlistenFn> {
+    return listen<{ meetingId: string; others: "starting" | "ready" | "unavailable" | "degraded" }>(
+      "murmur://live-transcript-health", (event) => cb(event.payload),
     );
   }
 

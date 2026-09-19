@@ -42,6 +42,13 @@ export const routes: Routes = [
           ),
       },
       {
+        path: "queue",
+        loadComponent: () =>
+          import(
+            "./features/processing-queue/processing-queue/processing-queue.component"
+          ).then((m) => m.ProcessingQueueComponent),
+      },
+      {
         path: "meeting/:id",
         loadComponent: () =>
           import("./features/detail/detail/detail.component").then(

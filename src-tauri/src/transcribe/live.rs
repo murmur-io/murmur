@@ -10,10 +10,8 @@
 //!   and the authoritative final transcript produced at stop are unaffected.
 //! - Live quality/latency depends on the chosen model (use a small model for snappy
 //!   captions); a slow tick just means less frequent captions, never a broken recording.
-//! - MIC-ONLY until Stop: this loop transcribes the LOCAL MIC tail alone. The system-audio
-//!   (far-side / other participants) stream is captured separately and is batch-transcribed only
-//!   in the post-Stop `pipeline.rs` dual-stream merge — so the live captions AND the live `@brain`
-//!   context reflect what YOU say during the call; the other side is folded in only after Stop.
+//! - Mic and the read-only growing system WAV share ONE loaded LiveAsr instance, decoded
+//!   sequentially. Only mic text enters the pre-existing Brain context. The panel is local-only.
 
 use std::path::PathBuf;
 
@@ -41,11 +39,6 @@ const WINDOW_SECS: usize = 14;
 /// dispatch, while a fresh "Klaudku" later — or the same command after the window lapses — DOES
 /// fire again. Recall is preserved (a NEW ask always catches); only the duplicate echo is dropped.
 const WAKE_DEDUP_TICKS: u32 = 5;
-
-#[derive(serde::Serialize, Clone)]
-struct LiveCaption {
-    text: String,
-}
 
 /// DEDUP state for the in-meeting wake trigger (the #23 fix). [`detect_wake`] now fires ANYWHERE in
 /// the rolling, OVERLAPPING ~14s tail, so the SAME spoken "Klaudku zrób research" would otherwise
@@ -279,6 +272,21 @@ fn run(
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
+    {
+        let state = app.state::<AppState>();
+        let _lifecycle = crate::commands::lifecycle_guard(&state);
+        if state
+            .current_meeting
+            .lock()
+            .ok()
+            .and_then(|id| id.map(|id| id.to_string()))
+            .as_deref()
+            != Some(meeting_id.as_str())
+        {
+            return;
+        }
+        super::live_history::clear_history(&state);
+    }
     // Fresh transcript per recording: clear any leftover from a previous meeting so the in-meeting
     // assistant can never answer about a stale recording.
     if let Ok(mut lt) = app.state::<AppState>().live_transcript.lock() {
@@ -370,6 +378,19 @@ fn run(
     } else {
         None
     };
+    let mut mic_assembler = super::live_history::StreamCaptionAssembler::default();
+    let mut others_assembler = super::live_history::StreamCaptionAssembler::default();
+    let mut others_tail: Option<super::live_tail::LiveWavTail> = None;
+    let mut others_last_frame = std::time::Instant::now();
+    // Independent VAD state: never share recurrent speech history across speakers.
+    let mut others_vad = if vad_gate_enabled {
+        crate::transcribe::model::models_dir().ok().and_then(|dir| {
+            super::vad::VadSegmenter::load(&dir.join(crate::transcribe::model::VAD_MODEL_FILE)).ok()
+        })
+    } else {
+        None
+    };
+    let mut others_gate = LiveVadGate::default();
     let mut vad_gate = LiveVadGate::default();
     // Absolute native-rate end of the last successfully VAD-scanned or fully decoded snapshot.
     // `None` deliberately forces the FIRST post-model-load scan over the whole available 14 s.
@@ -647,6 +668,93 @@ fn run(
             }
         }
 
+        // Decode Others before the MIC VAD decision: a silent local microphone must never
+        // suppress the question arriving from the far side. Same model, sequential calls.
+        let system_source = app.state::<AppState>().recorder.lock().ok().and_then(|r| {
+            r.as_ref().and_then(|r| {
+                r.system.as_ref().map(|sys| {
+                    (
+                        sys.live_path().to_path_buf(),
+                        sys.started_at(),
+                        r.started_at(),
+                    )
+                })
+            })
+        });
+        if let Some((path, system_started, mic_started)) = system_source {
+            if others_tail.is_none() {
+                others_tail = super::live_tail::LiveWavTail::open(&path).ok();
+            }
+            if let Some(tail) = others_tail.as_mut() {
+                match tail.window(WINDOW_SECS) {
+                    Ok(Some(window)) => {
+                        others_last_frame = std::time::Instant::now();
+                        let system_offset = system_started
+                            .checked_duration_since(mic_started)
+                            .map_or(0, |d| d.as_millis() as u64);
+                        match crate::audio::resample_to_16k(&window.samples, window.sample_rate) {
+                            Ok(samples) => {
+                                super::live_history::health(&app, &meeting_id, "ready");
+                                let speech = others_vad
+                                    .as_mut()
+                                    .and_then(|v| v.speech_regions(&samples).ok())
+                                    .map(|r| !r.is_empty());
+                                if others_gate.should_decode(speech, false)
+                                    && model_token.validated_for_live_work().is_ok()
+                                {
+                                    let visibility =
+                                        crate::commands::capture_content_visibility_snapshot(
+                                            app.state::<AppState>().inner(),
+                                        );
+                                    let started = std::time::Instant::now();
+                                    let decoded = asr.transcribe_live(&samples, lang.as_deref());
+                                    tracing::info!(target: "live_perf", speaker = "others", decode_ms = started.elapsed().as_millis() as u64, window_s = samples.len() as f64 / 16000.0, ok = decoded.is_ok(), "live decode tick");
+                                    if let Ok(transcript) = decoded {
+                                        let start = system_offset
+                                            + window.start_frame * 1000 / window.sample_rate as u64;
+                                        let end = system_offset
+                                            + window.end_frame * 1000 / window.sample_rate as u64;
+                                        for line in others_assembler.update(
+                                            &transcript,
+                                            start,
+                                            end,
+                                            &meeting_id,
+                                            "others",
+                                        ) {
+                                            let _ = super::live_history::publish(
+                                                &app, line, visibility,
+                                            );
+                                        }
+                                    } else {
+                                        super::live_history::health(&app, &meeting_id, "degraded");
+                                    }
+                                }
+                            }
+                            Err(_) => super::live_history::health(&app, &meeting_id, "degraded"),
+                        }
+                    }
+                    Ok(None) => {
+                        if others_last_frame.elapsed().as_secs() >= 10 {
+                            super::live_history::health(&app, &meeting_id, "degraded");
+                        }
+                    }
+                    Err(_) => super::live_history::health(&app, &meeting_id, "degraded"),
+                }
+            } else {
+                super::live_history::health(
+                    &app,
+                    &meeting_id,
+                    if others_last_frame.elapsed().as_secs() >= 10 {
+                        "degraded"
+                    } else {
+                        "starting"
+                    },
+                );
+            }
+        } else {
+            super::live_history::health(&app, &meeting_id, "unavailable");
+        }
+
         // TWO-PHASE VAD TICK GATE (T1.4): first copy + resample only the exact unseen native-rate
         // span plus bounded overlap. The SampleReader was cloned under the recorder mutex above,
         // but every O(window) atomic copy happens OUTSIDE it so Stop is never blocked by a 14 s
@@ -771,6 +879,8 @@ fn run(
         // beam-search path. Captions tick every few seconds on overlapping windows, so latency must
         // dominate. The authoritative high-quality transcript is produced once at Stop (pipeline.rs)
         // — ALWAYS by whisper (parakeet is live-only), so the seam here never affects note quality.
+        let caption_visibility =
+            crate::commands::capture_content_visibility_snapshot(app.state::<AppState>().inner());
         let decode_started = std::time::Instant::now();
         let decoded = asr.transcribe_live(&samples_16k, lang.as_deref());
         // T0.1 — per-tick decode telemetry (target `live_perf`): durations / window length /
@@ -779,6 +889,7 @@ fn run(
         // parakeet); `whisper_size` = the loaded whisper batch size (unchanged coarse label).
         tracing::info!(
             target: "live_perf",
+            speaker = "me",
             decode_ms = decode_started.elapsed().as_millis() as u64,
             window_s = samples_16k.len() as f64 / 16_000.0,
             model = %asr_label,
@@ -788,6 +899,11 @@ fn run(
         );
         match decoded {
             Ok(t) => {
+                let window_start = snapshot.start_frame as u64 * 1000 / source_rate as u64;
+                let window_end = snapshot.end_frame as u64 * 1000 / source_rate as u64;
+                for line in mic_assembler.update(&t, window_start, window_end, &meeting_id, "me") {
+                    let _ = super::live_history::publish(&app, line, caption_visibility);
+                }
                 let text = t
                     .segments
                     .iter()
@@ -866,7 +982,6 @@ fn run(
                         }
                         let _ = app.emit(crate::events::EVENT_WAKE_DETECTED, payload);
                     }
-                    let _ = app.emit(crate::events::EVENT_LIVE_CAPTION, LiveCaption { text });
                 }
             }
             Err(e) => tracing::debug!(target: "live", error = %e, "live transcribe tick failed"),

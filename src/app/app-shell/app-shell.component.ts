@@ -80,6 +80,7 @@ type BrowseGroup = (typeof BROWSE_GROUPS)[number];
 
 const BROWSE_ITEMS: readonly BrowseItem[] = [
   { path: "/library", label: "Meetings", icon: "meetings", group: "Work" },
+  { path: "/queue", label: "Processing queue", icon: "history", group: "Work" },
   { path: "/notes", label: "Notes", icon: "notes", group: "Work" },
   { path: "/tasks", label: "Tasks", icon: "tasks", group: "Work" },
   {

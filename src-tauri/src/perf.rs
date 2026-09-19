@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 
 use crate::error::{AppError, Result};
 
+/// Exact scheduling refusal recognized by deferred work; other unavailable errors remain failures.
+pub(crate) const BACKGROUND_RECORDING_PAUSE: &str = "background local AI is paused for recording";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RecordingSessionPhase {
     Starting,
@@ -832,7 +835,7 @@ fn acquire_model_generation(
         }
         (Some(_), None) => {
             return Err(AppError::Unavailable(
-                "background local AI is paused for recording".into(),
+                BACKGROUND_RECORDING_PAUSE.into(),
             ));
         }
         (Some(active), Some(token)) => {

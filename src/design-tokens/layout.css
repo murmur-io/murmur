@@ -213,6 +213,15 @@
      strip must keep clear so a tab can never scroll underneath it. */
   --note-drawer-w: clamp(320px, 30vw, 400px);
 
+  /* Live meeting transcript: desktop rail, collapsed affordance, bubble measure. */
+  --live-panel-w: clamp(288px, 24vw, 360px);
+  --live-panel-compact-w: 288px;
+  --border-width-thin: 1px;
+  --meeting-focus-ring: 0 0 0 3px var(--accent-ring);
+  --stop-menu-min-w: 15rem;
+  --live-panel-rail-w: 44px;
+  --live-bubble-max: 88%;
+
   /* The three footer controls — Capture, New note, and the create menu's
      chevron. One token because they must stay identical squares: the moment
      they differ, the row reads as two sizes of button rather than one action

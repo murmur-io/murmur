@@ -9,7 +9,7 @@ import {
   signal,
   viewChild,
 } from "@angular/core";
-import { RouterLink } from "@angular/router";
+import { Router, RouterLink } from "@angular/router";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { RecorderStore } from "../../../core/recorder.store";
 import { IpcService } from "../../../core/ipc.service";
@@ -17,9 +17,11 @@ import type { Analytics, AppConfigDto } from "../../../core/models";
 import { MicMuteToggleComponent } from "../mic-mute-toggle/mic-mute-toggle.component";
 import { MeetingConversationComponent } from "../meeting-conversation/meeting-conversation.component";
 import { ReTruthCardComponent } from "../re-truth-card/re-truth-card.component";
+import { LiveTranscriptPanelComponent } from "../live-transcript-panel/live-transcript-panel.component";
 import { RecordingPlacementComponent } from "../recording-placement/recording-placement.component";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { ProcessingQueueStore } from "../../../services/processing-queue.store";
 import {
   cloudDestinationLabel,
   connectionLabel,
@@ -55,6 +57,7 @@ type LiveCaptionsState =
     MeetingConversationComponent,
     RecordingPlacementComponent,
     ReTruthCardComponent,
+    LiveTranscriptPanelComponent,
   ],
   host: { "(document:keydown)": "onKey($event)" },
   templateUrl: "./record.component.html",
@@ -67,6 +70,8 @@ export class RecordComponent implements OnInit {
    * the surface) so it subscribes to the wake/result streams even before the surface shows. */
   readonly assistant = inject(MeetingConversationStore);
   private readonly ipc = inject(IpcService);
+  private readonly router = inject(Router);
+  private readonly processingQueue = inject(ProcessingQueueStore);
   private readonly destroyRef = inject(DestroyRef);
 
   /**
@@ -322,6 +327,8 @@ export class RecordComponent implements OnInit {
   readonly modelPresent = signal<boolean | null>(null);
   readonly downloadingModel = signal(false);
   readonly modelDownloadError = signal<string | null>(null);
+  readonly stopMenuOpen = signal(false);
+  readonly stopDisposition = signal<"now" | "later">("now");
 
   /** Busy but not capturing audio → transcribing / summarizing / exporting / saved reconciliation. */
   readonly isProcessing = computed(
@@ -579,6 +586,8 @@ export class RecordComponent implements OnInit {
   /** Every main Record-screen start is explicit Unfiled. */
   async startRecording(): Promise<void> {
     if (this.canRecord()) {
+      this.stopDisposition.set("now");
+      this.stopMenuOpen.set(false);
       await this.store.start(null);
     }
   }
@@ -619,7 +628,7 @@ export class RecordComponent implements OnInit {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "r") {
       e.preventDefault();
       if (this.store.isRecording()) {
-        void this.store.stop();
+        this.stopWithDisposition();
       } else if (this.canRecord()) {
         void this.startRecording();
       }
@@ -634,14 +643,44 @@ export class RecordComponent implements OnInit {
    */
   onStopPointerDown(event: PointerEvent): void {
     if (event.button === 0 && this.store.isRecording()) {
-      void this.store.stop();
+      this.stopWithDisposition();
     }
   }
 
   /** Keyboard/synthetic activation fallback; pointer activation is handled above. */
   onStopClick(): void {
     if (this.store.isRecording()) {
-      void this.store.stop();
+      this.stopWithDisposition();
+    }
+  }
+
+  private stopWithDisposition(): void {
+    const deferProcessing = this.stopDisposition() === "later";
+    this.stopDisposition.set("now");
+    this.stopMenuOpen.set(false);
+    void this.store.stop(true, deferProcessing);
+  }
+
+  toggleStopMenu(): void {
+    this.stopMenuOpen.update((open) => !open);
+  }
+
+  chooseStopDisposition(disposition: "now" | "later"): void {
+    this.stopDisposition.set(disposition);
+    this.stopMenuOpen.set(false);
+  }
+
+  openQueue(): void {
+    this.store.clearQueuedConfirmation();
+    void this.router.navigateByUrl("/queue");
+  }
+
+  async processQueuedNow(): Promise<void> {
+    const meetingId = this.store.queuedMeetingId();
+    if (!meetingId) return;
+    if (await this.processingQueue.processNow([meetingId])) {
+      this.store.clearQueuedConfirmation();
+      await this.router.navigateByUrl("/queue");
     }
   }
 

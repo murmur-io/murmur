@@ -142,7 +142,19 @@ test.describe("Record — the no-live-captions notice", () => {
 
     await expect(page.locator("app-record .rec-foot .cc-line")).toBeVisible();
     await expect(page.locator("app-record .rec-foot .cc-off")).toHaveCount(0);
-    await expect(page.locator("app-record .rec-foot .cc-scope")).toBeVisible();
+    // Model readiness alone cannot promise far-side capture. Wait for the
+    // backend's actual source-health event before claiming both sides.
+    await expect(page.locator("app-live-transcript-panel")).toContainText(
+      "Starting live captions…",
+    );
+    await page.evaluate(() => {
+      const api = window as unknown as { __demoEmit: (event: string, payload: unknown) => void };
+      api.__demoEmit("meetnotes://status", { stage: "recording", meetingId: "health-test", message: "" });
+      api.__demoEmit("murmur://live-transcript-health", { meetingId: "health-test", others: "ready" });
+    });
+    await expect(page.locator("app-live-transcript-panel")).toContainText(
+      "Me + Others",
+    );
   });
 
   test("(g) the companion retry never blocks Start", async ({ page }) => {

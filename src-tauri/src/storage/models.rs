@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum MeetingStatus {
     Draft,
     Recording,
+    Queued,
     Transcribed,
     Summarized,
     Exported,
@@ -2949,4 +2950,58 @@ mod tests {
         assert!(ctx.text.contains("When: 2026-06-28T10:00:00Z"));
         assert!(!ctx.text.contains(" – "));
     }
+}
+
+/// Where one deferred ("process later") recording stands in the processing queue.
+///
+/// `Held` is deliberately NOT stored: a locked job is still `Queued` in SQLite and is masked and
+/// refused at the command layer, so unlocking cannot resurrect a lost row.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessingQueueState {
+    /// Waiting for the user to run it — the queue never drains itself.
+    Queued,
+    /// Claimed by this process's worker right now.
+    Processing,
+    /// The last attempt failed; retryable, keeps its position.
+    Failed,
+}
+
+impl ProcessingQueueState {
+    /// Stable lowercase value stored in `processing_queue.state` (matches the CHECK constraint).
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Processing => "processing",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parse a stored value; `None` for anything the CHECK constraint should have refused.
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "processing" => Some(Self::Processing),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One row of the deferred-processing queue. Scheduling metadata ONLY — no title, no transcript,
+/// no file path, and no raw provider error (see `storage::processing_queue_store`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessingQueueJob {
+    pub meeting_id: String,
+    pub state: ProcessingQueueState,
+    /// Dense, non-negative user-visible order.
+    pub position: i64,
+    /// Honest, content-free progress label for a running job (e.g. `"transcribing"`).
+    pub stage: Option<String>,
+    pub attempts: i64,
+    /// Stable, non-sensitive failure code.
+    pub error_code: Option<String>,
+    pub enqueued_at: String,
+    pub updated_at: String,
 }

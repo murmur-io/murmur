@@ -1096,10 +1096,57 @@ export interface StartResult {
 
 export interface StopResult {
   meetingId: string;
+  /** Additive stop disposition; absent is the legacy process-now path. */
+  processingDisposition?: "processed" | "queued";
+}
+
+/** Additive payload for `murmur://live-caption`; `{ text }` remains valid. */
+export interface LiveCaptionPayload {
+  text: string;
+  meetingId?: string;
+  speaker?: "me" | "others";
+  capturedAt?: string;
+  offsetMs?: number;
+  lineId?: string;
+  /** Monotonic within one recording, and present only for committed lines. */
+  seq?: number;
+  final?: boolean;
+  isQuestion?: boolean;
+  possibleQuestion?: boolean;
+}
+
+export interface LiveTranscriptPage {
+  lines: LiveCaptionPayload[];
+  truncated: boolean;
+  nextBeforeSeq?: number | null;
+  othersState?: "starting" | "ready" | "unavailable" | "degraded";
+}
+
+export type ProcessingQueueState = "queued" | "processing" | "failed";
+
+/** Scheduling metadata only. Transcript/audio never crosses this list seam. */
+export interface ProcessingQueueItem {
+  meetingId: string;
+  title: string;
+  state: ProcessingQueueState;
+  position: number;
+  stage: string | null;
+  attempts: number;
+  enqueuedAt: string;
+  updatedAt: string;
+  lastErrorCode: string | null;
+  /** Derived by the backend's visibility gate; locked rows are already masked. */
+  locked: boolean;
 }
 
 export type MeetingStatus =
-  "DRAFT" | "RECORDING" | "TRANSCRIBED" | "SUMMARIZED" | "EXPORTED" | "ERROR";
+  | "DRAFT"
+  | "RECORDING"
+  | "QUEUED"
+  | "TRANSCRIBED"
+  | "SUMMARIZED"
+  | "EXPORTED"
+  | "ERROR";
 
 export interface Meeting {
   id: string;

@@ -3,6 +3,8 @@ pub mod catalog;
 pub mod diarize;
 pub mod live;
 pub mod live_asr;
+pub mod live_history;
+pub mod live_tail;
 pub mod model;
 pub mod novelty;
 pub mod parakeet;

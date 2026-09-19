@@ -26,6 +26,7 @@ export function meetingStatusPillClass(status: string): string {
       return "is-danger";
     case "TRANSCRIBED":
     case "SUMMARIZED":
+    case "QUEUED":
       return "is-accent";
     case "EXPORTED":
       return "is-success";

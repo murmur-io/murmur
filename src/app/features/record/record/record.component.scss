@@ -31,6 +31,17 @@
   min-height: 0;
 }
 
+.meeting-surface {
+  display: flex;
+  flex: 1 1 auto;
+  gap: var(--space-3);
+  min-height: 0;
+}
+
+.meeting-surface .conversation {
+  min-width: 0;
+}
+
 /* --- Model-download banner --- */
 .banner-icon {
   display: inline-flex;
@@ -373,6 +384,59 @@
   height: 17px;
   border-radius: 5px;
   background: var(--text-on-accent);
+}
+
+.stop-split {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.stop-menu-btn {
+  width: var(--space-7);
+  height: var(--space-7);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+  background: var(--surface-hover);
+  cursor: pointer;
+}
+
+.stop-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + var(--space-2));
+  z-index: var(--z-overlay);
+  min-width: var(--stop-menu-min-w);
+  background: var(--surface-overlay);
+  backdrop-filter: none;
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+}
+
+.stop-menu .menu-item {
+  align-items: flex-start;
+}
+
+.stop-menu .menu-item span:last-child {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.stop-menu small {
+  color: var(--text-tertiary);
+}
+
+.queued-confirmation {
+  align-items: center;
+}
+
+.queued-actions {
+  display: inline-flex;
+  gap: var(--space-2);
+  margin-left: auto;
 }
 
 /* ── Ambient footer HUD — receded recording controls (Calm-Notepad, 2026-07-19).

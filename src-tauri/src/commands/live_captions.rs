@@ -655,18 +655,26 @@ mod tests {
 
         // (b) a live-SAFE batch size ⇒ one download covers both roles, nothing to disclose.
         let dir2 = tmp_models_dir("pending-small");
-        assert!(!companion_pending_in(&dir2, None, "small", "", "small", false));
+        assert!(!companion_pending_in(
+            &dir2, None, "small", "", "small", false
+        ));
 
         // (c) a heavy batch size but a live-safe model already on disk ⇒ no second transfer.
         let dir3 = tmp_models_dir("pending-have-tiny");
         touch(&dir3, "ggml-tiny.bin");
-        assert!(!companion_pending_in(&dir3, None, "large-v3", "", "small", false));
+        assert!(!companion_pending_in(
+            &dir3, None, "large-v3", "", "small", false
+        ));
 
         // (d) the pin is DISABLED, and (e) the pin is itself heavy ⇒ never an auto-fetch, so the
         //     wizard must not promise one even though the batch size is heavy.
         let dir4 = tmp_models_dir("pending-pin");
-        assert!(!companion_pending_in(&dir4, None, "large-v3", "", "", false));
-        assert!(!companion_pending_in(&dir4, None, "large-v3", "", "medium", false));
+        assert!(!companion_pending_in(
+            &dir4, None, "large-v3", "", "", false
+        ));
+        assert!(!companion_pending_in(
+            &dir4, None, "large-v3", "", "medium", false
+        ));
 
         // (f) a CUSTOM `whisper_model_path`: an unrecognizable name is live-safe ⇒ nothing to
         //     disclose; a heavy custom file still leaves the live tick with nothing ⇒ disclose.
@@ -767,4 +775,36 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+}
+
+/// Session replay is a content read: the same lock gate applies as on the detail surface.
+#[tauri::command]
+pub fn get_live_transcript_page(
+    state: tauri::State<'_, crate::state::AppState>,
+    meeting_id: String,
+    before_seq: Option<u64>,
+    limit: Option<usize>,
+) -> crate::error::Result<crate::transcribe::live_history::LiveTranscriptPage> {
+    get_live_transcript_page_inner(&state, &meeting_id, before_seq, limit)
+}
+
+pub(crate) fn get_live_transcript_page_inner(
+    state: &crate::state::AppState,
+    meeting_id: &str,
+    before_seq: Option<u64>,
+    limit: Option<usize>,
+) -> crate::error::Result<crate::transcribe::live_history::LiveTranscriptPage> {
+    let _lifecycle = super::lifecycle_guard(state);
+    if state.db.get_meeting(meeting_id)?.is_none()
+        || !super::meeting_is_unlocked(state, meeting_id)?
+    {
+        return Err(crate::error::AppError::Locked(
+            "live transcript is locked".into(),
+        ));
+    }
+    let history = state
+        .live_transcript_lines
+        .lock()
+        .map_err(|_| crate::error::AppError::Storage("live transcript unavailable".into()))?;
+    Ok(history.page(meeting_id, before_seq, limit.unwrap_or(200)))
 }
