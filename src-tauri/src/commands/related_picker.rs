@@ -183,6 +183,27 @@ pub enum PickerMode {
     Destination,
 }
 
+/// The seven inputs of ONE picker search, behind the Tauri boundary.
+///
+/// Internal only: the shipped `search_related_picker` command keeps its flat argument contract, so
+/// this struct changes no wire shape. It borrows every string, so passing it allocates nothing.
+pub(crate) struct PickerSearchQuery<'a> {
+    /// Kind of the anchor the picker was opened from — gated before any row is read.
+    pub(crate) anchor_kind: &'a str,
+    /// Id of that anchor.
+    pub(crate) anchor_id: &'a str,
+    /// Raw user query; trimmed and lowercased inside, never pre-normalized by the caller.
+    pub(crate) query: &'a str,
+    /// Page offset, counted over containers + leaves together in destination mode.
+    pub(crate) offset: u32,
+    /// Requested page size, clamped to [`MAX_SEARCH_PAGE`] inside.
+    pub(crate) limit: u32,
+    /// Which job the picker is doing; [`PickerMode::Link`] is the default on the wire.
+    pub(crate) mode: PickerMode,
+    /// Org scope for a shared anchor, or `None` for a local one.
+    pub(crate) org_id: Option<&'a str>,
+}
+
 /// Destination identities are deliberately separate from link endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DestinationAnchorKind {
@@ -1450,55 +1471,45 @@ pub async fn search_related_picker(
         related_picker_search_with_org(
             &state.db,
             &unlocked,
-            &anchor_kind,
-            &anchor_id,
-            &query,
-            offset,
-            limit,
-            mode.unwrap_or_default(),
-            org_id.as_deref(),
+            PickerSearchQuery {
+                anchor_kind: &anchor_kind,
+                anchor_id: &anchor_id,
+                query: &query,
+                offset,
+                limit,
+                mode: mode.unwrap_or_default(),
+                org_id: org_id.as_deref(),
+            },
         )
     })
     .await
 }
 
-/// Inner of [`search_related_picker`].
+/// Inner of [`search_related_picker`] — the same helper the command calls, minus the app handle,
+/// so the anchor gate and the page clamp stay directly testable.
 #[cfg(test)]
 pub(crate) fn related_picker_search_inner(
     db: &crate::storage::db::Db,
     unlocked: &std::collections::HashSet<String>,
-    anchor_kind: &str,
-    anchor_id: &str,
-    query: &str,
-    offset: u32,
-    limit: u32,
-    mode: PickerMode,
+    request: PickerSearchQuery<'_>,
 ) -> Result<RelatedPickerSearchPage, AppError> {
-    related_picker_search_with_org(
-        db,
-        unlocked,
+    related_picker_search_with_org(db, unlocked, request)
+}
+
+fn related_picker_search_with_org(
+    db: &crate::storage::db::Db,
+    unlocked: &std::collections::HashSet<String>,
+    request: PickerSearchQuery<'_>,
+) -> Result<RelatedPickerSearchPage, AppError> {
+    let PickerSearchQuery {
         anchor_kind,
         anchor_id,
         query,
         offset,
         limit,
         mode,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn related_picker_search_with_org(
-    db: &crate::storage::db::Db,
-    unlocked: &std::collections::HashSet<String>,
-    anchor_kind: &str,
-    anchor_id: &str,
-    query: &str,
-    offset: u32,
-    limit: u32,
-    mode: PickerMode,
-    org_id: Option<&str>,
-) -> Result<RelatedPickerSearchPage, AppError> {
+        org_id,
+    } = request;
     // ── ANCHOR GATE, FIRST — before the query is even escaped, so a refusal costs no read at all. ──
     let destination_kind = if mode == PickerMode::Destination {
         Some(require_destination_anchor(

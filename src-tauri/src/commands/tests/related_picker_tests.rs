@@ -522,12 +522,15 @@ fn hierarchy_models_both_unclassified_sources_and_hides_system_containers() {
     let hits = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-filed",
-        "l",
-        0,
-        50,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-filed",
+            query: "l",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     let found: Vec<(&str, Vec<&str>)> = hits
@@ -556,12 +559,15 @@ fn hierarchy_models_both_unclassified_sources_and_hides_system_containers() {
     let hidden = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-filed",
-        "Hidden",
-        0,
-        50,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-filed",
+            query: "Hidden",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(
@@ -666,23 +672,29 @@ fn search_matches_space_and_folder_breadcrumbs_without_leaking_locked_descendant
     let atlas_first = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "  aTlAs  ",
-        0,
-        2,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "  aTlAs  ",
+            offset: 0,
+            limit: 2,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     let atlas_rest = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "atlas",
-        2,
-        2,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "atlas",
+            offset: 2,
+            limit: 2,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(atlas_first.total, 3);
@@ -713,12 +725,15 @@ fn search_matches_space_and_folder_breadcrumbs_without_leaking_locked_descendant
     let restricted = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "Restricted",
-        0,
-        50,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "Restricted",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert!(restricted.hits.is_empty());
@@ -730,12 +745,15 @@ fn search_matches_space_and_folder_breadcrumbs_without_leaking_locked_descendant
     let product = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "product",
-        0,
-        50,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "product",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(product.total, 4);
@@ -757,12 +775,15 @@ fn search_matches_space_and_folder_breadcrumbs_without_leaking_locked_descendant
     let unclassified = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "NOT CLASSIFIED",
-        0,
-        50,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "NOT CLASSIFIED",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(unclassified.total, 2);
@@ -783,12 +804,15 @@ fn search_matches_space_and_folder_breadcrumbs_without_leaking_locked_descendant
     let title = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "evidence",
-        0,
-        50,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "evidence",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(title.total, 1);
@@ -932,12 +956,15 @@ fn parentless_canonical_notes_root_hoists_only_its_reachable_children() {
     let search = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "note",
-        "n-anchor",
-        "Legacy launch",
-        0,
-        20,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "note",
+            anchor_id: "n-anchor",
+            query: "Legacy launch",
+            offset: 0,
+            limit: 20,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(search.hits.len(), 1);
@@ -946,12 +973,15 @@ fn parentless_canonical_notes_root_hoists_only_its_reachable_children() {
     let fake_search = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "note",
-        "n-anchor",
-        "Fake",
-        0,
-        20,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "note",
+            anchor_id: "n-anchor",
+            query: "Fake",
+            offset: 0,
+            limit: 20,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert!(fake_search.hits.is_empty());
@@ -1013,12 +1043,15 @@ fn a_sealed_or_unknown_anchor_fails_closed_indistinguishably_until_unlock() {
     let search_err = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-secret",
-        "pay",
-        0,
-        50,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-secret",
+            query: "pay",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap_err();
     assert_eq!(search_err.to_string(), sealed_err.to_string());
@@ -1099,12 +1132,15 @@ fn a_sealed_or_unknown_anchor_fails_closed_indistinguishably_until_unlock() {
     let hits = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-open",
-        "pay",
-        0,
-        50,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-open",
+            query: "pay",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(
@@ -1140,12 +1176,15 @@ fn a_sealed_or_unknown_anchor_fails_closed_indistinguishably_until_unlock() {
     let hits = related_picker_search_inner(
         &db,
         &session,
-        "meeting",
-        "m-open",
-        "pay",
-        0,
-        50,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-open",
+            query: "pay",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(hits.total, 1);
@@ -1856,12 +1895,15 @@ fn a_sealed_or_unknown_container_source_refuses_indistinguishably() {
     let search_sealed = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "container",
-        "f1",
-        "pay",
-        0,
-        50,
-        PickerMode::Destination,
+        PickerSearchQuery {
+            anchor_kind: "container",
+            anchor_id: "f1",
+            query: "pay",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Destination,
+            org_id: None,
+        },
     )
     .unwrap_err();
     assert_eq!(search_sealed.to_string(), unknown.to_string());
@@ -1895,12 +1937,15 @@ fn destination_search_pages_every_matching_container_exactly_once() {
         let reply = related_picker_search_inner(
             &db,
             &HashSet::new(),
-            "meeting",
-            "m1",
-            "Atlas",
-            page * 25,
-            25,
-            PickerMode::Destination,
+            PickerSearchQuery {
+                anchor_kind: "meeting",
+                anchor_id: "m1",
+                query: "Atlas",
+                offset: page * 25,
+                limit: 25,
+                mode: PickerMode::Destination,
+                org_id: None,
+            },
         )
         .unwrap();
         total = reply.total;
@@ -1931,12 +1976,15 @@ fn destination_search_pages_every_matching_container_exactly_once() {
     let link = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m1",
-        "Atlas",
-        0,
-        25,
-        PickerMode::Link,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m1",
+            query: "Atlas",
+            offset: 0,
+            limit: 25,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert!(link.containers.is_none());
@@ -1984,12 +2032,15 @@ fn destination_refuses_durably_sealed_sources_even_when_session_unlocked_on_ever
         let search = related_picker_search_inner(
             &db,
             &session,
-            kind,
-            id,
-            "Space",
-            0,
-            10,
-            PickerMode::Destination,
+            PickerSearchQuery {
+                anchor_kind: kind,
+                anchor_id: id,
+                query: "Space",
+                offset: 0,
+                limit: 10,
+                mode: PickerMode::Destination,
+                org_id: None,
+            },
         )
         .unwrap_err();
         let page = related_picker_items_with_org(
@@ -2065,12 +2116,15 @@ fn destination_hides_all_metadata_and_leaves_below_a_sealed_parent() {
     let search = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "open",
-        "Secret",
-        0,
-        50,
-        PickerMode::Destination,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "open",
+            query: "Secret",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Destination,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(search.total, 0);
