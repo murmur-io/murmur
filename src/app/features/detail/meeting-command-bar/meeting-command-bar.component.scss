@@ -122,8 +122,7 @@
 }
 
 .template-menu,
-.more-menu,
-.move-menu {
+.more-menu {
   position: absolute;
   z-index: var(--z-overlay);
   top: calc(100% + var(--space-2));
@@ -212,11 +211,6 @@
   position: relative;
 }
 
-.more-menu,
-.move-menu {
+.more-menu {
   right: 0;
-}
-
-.move-menu {
-  min-width: var(--meeting-move-menu-min-width);
 }

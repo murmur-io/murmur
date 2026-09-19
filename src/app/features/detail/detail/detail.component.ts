@@ -230,10 +230,6 @@ export class DetailComponent implements OnInit {
   readonly smartDrawerOpen = computed(() => this._openDrawer() === "smart");
   readonly liveDrawerOpen = computed(() => this._openDrawer() === "live");
 
-  // --- Move-to-folder popover ---------------------------------------------
-  /** True while the folder-picker popover is open. */
-  readonly moveOpen = signal(false);
-
   /**
    * Read-only folder badge for the header: the owning folder's name + exposure
    * (open / locked / session), or null when the note is at the vault root or the
@@ -252,6 +248,15 @@ export class DetailComponent implements OnInit {
     return node
       ? { name: node.name, exposure: this.folders.exposureOf(node) }
       : null;
+  });
+  /** Moving out stays unavailable while the owning folder is still sealed. */
+  readonly moveAllowed = computed(() => {
+    const folderId = this.detail()?.meeting.folderId ?? null;
+    if (folderId === null) {
+      return true;
+    }
+    const folder = this.findFolder(this.folders.tree(), folderId);
+    return folder ? !folder.locked : false;
   });
 
   // --- Inline title rename state ------------------------------------------
@@ -1161,7 +1166,6 @@ export class DetailComponent implements OnInit {
     this.meetingAttachmentBusy.set(false);
     this.editing.set(false);
     this.renaming.set(false);
-    this.moveOpen.set(false);
     this.confirmingDelete.set(false);
     // Receipts (PR-5): drop the previous meeting's chips + any pending seek so a
     // same-route reload never carries a stale claim→audio mapping (the `_loadReceipts`
@@ -1332,31 +1336,16 @@ export class DetailComponent implements OnInit {
     }
   }
 
-  // --- Move to folder ------------------------------------------------------
-
-  /** Open/close the folder-picker popover (closed while the detail is busy). */
-  toggleMove(): void {
-    if (this.busy()) {
-      return;
-    }
-    this.moveOpen.update((v) => !v);
-  }
-
-  /** Dismiss the folder-picker popover. */
-  closeMove(): void {
-    this.moveOpen.set(false);
-  }
-
   /**
-   * Apply a completed move locally: patch the in-memory meeting's `folderId` so
-   * the header badge updates immediately (the picker already moved it via the
-   * service + reloaded the tree). Then close the popover.
+   * Apply a completed shared-picker move locally so the header badge updates
+   * immediately. The destination host owns the write and folder-tree reload.
    */
   onMoved(folderId: string | null): void {
-    this.detail.update((d) =>
-      d ? { ...d, meeting: { ...d.meeting, folderId } } : d,
+    this.detail.update((current) =>
+      current
+        ? { ...current, meeting: { ...current.meeting, folderId } }
+        : current,
     );
-    this.closeMove();
   }
 
   /** Depth-first search for a folder node by id across the forest. */

@@ -1,3 +1,4 @@
+import { mockDestinationPicker } from "../notes/destination-picker-mock";
 import { expect, test, type Page } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
@@ -110,8 +111,16 @@ async function openRecord(
       list_workspace_tree: FOREST,
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/record");
   await expect(page.locator("button.start-btn")).toBeVisible();
+}
+
+async function chooseDestination(page: Page, label: string): Promise<void> {
+  const dialog = page.getByRole("dialog", { name: /^Move / });
+  await dialog.getByRole("searchbox", { name: "Search destinations" }).fill(label);
+  await dialog.getByRole("button", { name: `Choose ${label}`, exact: true }).click();
+  await dialog.getByRole("button", { name: "Move here", exact: true }).click();
 }
 
 async function finishRecording(page: Page): Promise<void> {
@@ -171,43 +180,29 @@ test.describe("Record — one final result and route-scoped presentation", () =>
 
     const location = page.getByTestId("recording-location-toggle");
     await expect(location).toHaveText(/Unfiled/);
-    await expect(page.getByTestId("recording-location-menu")).toHaveCount(0);
+    await expect(page.getByRole("dialog", { name: /^Move / })).toHaveCount(0);
     await location.click();
-    await expect(page.getByTestId("recording-location-menu")).toBeVisible();
+    await expect(page.getByRole("dialog", { name: /^Move / })).toBeVisible();
 
-    await expect(
-      page.getByTestId("placement-destination-f-session-locked"),
-    ).toBeDisabled();
-    await expect(
-      page.getByTestId("placement-destination-f-below-lock"),
-    ).toBeDisabled();
-    await expect(
-      page.getByTestId("placement-destination-f-sealed"),
-    ).toBeDisabled();
-    await expect(
-      page.getByTestId("placement-destination-f-hidden"),
-    ).toHaveCount(0);
-    await expect(
-      page.getByTestId("placement-destination-notes-root"),
-    ).toHaveCount(0);
-    await expect(
-      page.getByTestId("placement-destination-f-ideas"),
-    ).toBeEnabled();
-
+    const picker = page.getByRole("dialog", { name: /^Move / });
+    await picker.getByRole("button", { name: "Expand Acme" }).click();
+    await expect(picker.locator('[data-row="c:f-sealed"] .rhp-row-main')).toHaveAttribute("aria-disabled", "true");
+    await expect(picker).not.toContainText("Must not render");
+    await expect(picker.getByRole("button", { name: "Choose Unlocked for viewing", exact: true })).toBeEnabled();
     await page.keyboard.press("Escape");
-    await expect(page.getByTestId("recording-location-menu")).toHaveCount(0);
+    await expect(page.getByRole("dialog", { name: /^Move / })).toHaveCount(0);
     await location.click();
-    await page.getByTestId("placement-destination-f-weekly").click();
+    await chooseDestination(page, "Weekly");
     await expect(location).toHaveText(/Acme \/ Weekly/);
-    await expect(page.getByTestId("recording-location-menu")).toHaveCount(0);
+    await expect(page.getByRole("dialog", { name: /^Move / })).toHaveCount(0);
 
     const moves = await page.evaluate(
       () => (window as unknown as { __moves?: unknown[] }).__moves ?? [],
     );
-    expect(moves).toEqual([{ meetingId: "m-rec", folderId: "f-weekly" }]);
+    expect(moves).toEqual([{ meetingId: "m-rec", folderId: "f-weekly", confirmedEncryptionBoundary: false }]);
   });
 
-  test("a filing failure stays inside the final card and retries the exact target", async ({
+  test("a filing failure stays in the picker and retries the exact target", async ({
     page,
   }) => {
     await openRecord(page, {
@@ -231,12 +226,13 @@ test.describe("Record — one final result and route-scoped presentation", () =>
     await finishRecording(page);
 
     await page.getByTestId("recording-location-toggle").click();
-    await page.getByTestId("placement-destination-f-weekly").click();
-    const localError = page.getByTestId("recording-location-error");
-    await expect(localError).toContainText(/couldn.t move/i);
+    await chooseDestination(page, "Weekly");
+    const dialog = page.getByRole("dialog", { name: /^Move / });
+    const localError = dialog.getByRole("alert");
+    await expect(localError).toContainText("temporary move failure");
     await expect(page.getByTestId("recording-result")).toBeVisible();
 
-    await localError.getByRole("button", { name: /Try again/i }).click();
+    await dialog.getByRole("button", { name: "Move here", exact: true }).click();
     await expect(page.getByTestId("recording-location-toggle")).toHaveText(
       /Acme \/ Weekly/,
     );
@@ -244,8 +240,8 @@ test.describe("Record — one final result and route-scoped presentation", () =>
       () => (window as unknown as { __moves?: unknown[] }).__moves ?? [],
     );
     expect(moves).toEqual([
-      { meetingId: "m-rec", folderId: "f-weekly" },
-      { meetingId: "m-rec", folderId: "f-weekly" },
+      { meetingId: "m-rec", folderId: "f-weekly", confirmedEncryptionBoundary: false },
+      { meetingId: "m-rec", folderId: "f-weekly", confirmedEncryptionBoundary: false },
     ]);
   });
 
@@ -297,7 +293,6 @@ test.describe("Record — one final result and route-scoped presentation", () =>
     await expect(location).toContainText("Location unavailable");
     await expect(location).not.toContainText("Unfiled");
 
-    await location.click();
     await page.getByRole("button", { name: "Try again" }).click();
     await expect(location).toContainText("Unfiled");
   });
@@ -337,10 +332,7 @@ test.describe("Record — one final result and route-scoped presentation", () =>
     await expect(result).not.toContainText("Unfiled");
     await expect(result).not.toContainText("Filed in");
     await expect(page.getByTestId("recording-location-toggle")).toHaveCount(0);
-    await expect(page.getByTestId("recording-location-menu")).toHaveCount(0);
-    await expect(
-      page.locator("[data-testid^='placement-destination-']"),
-    ).toHaveCount(0);
+    await expect(page.getByRole("dialog", { name: /^Move / })).toHaveCount(0);
 
     const moves = await page.evaluate(
       () => (window as unknown as { __moves?: unknown[] }).__moves ?? [],
@@ -400,7 +392,7 @@ test.describe("Record — one final result and route-scoped presentation", () =>
     const location = page.getByTestId("recording-location-toggle");
     await expect(location).toContainText("Acme / Weekly");
     await location.click();
-    await page.getByTestId("placement-destination-f-ideas").click();
+    await chooseDestination(page, "Ideas");
     await expect
       .poll(() =>
         page.evaluate(
@@ -439,10 +431,7 @@ test.describe("Record — one final result and route-scoped presentation", () =>
     const result = page.getByTestId("recording-result");
     await expect(result).not.toContainText("Acme / Weekly");
     await expect(result).not.toContainText("Acme / Ideas");
-    await expect(page.getByTestId("recording-location-menu")).toHaveCount(0);
-    await expect(
-      page.locator("[data-testid^='placement-destination-']"),
-    ).toHaveCount(0);
+    await expect(page.getByRole("dialog", { name: /^Move / })).toHaveCount(0);
   });
 
   test("privacy invalidation scrubs the terminal note, vault receipt, and Re-Truth synchronously", async ({
@@ -811,7 +800,7 @@ test.describe("Record — one final result and route-scoped presentation", () =>
     await finishRecording(page);
 
     await page.getByTestId("recording-location-toggle").click();
-    await page.getByTestId("placement-destination-f-ideas").click();
+    await chooseDestination(page, "Ideas");
     await expect
       .poll(() =>
         page.evaluate(
@@ -837,53 +826,20 @@ test.describe("Record — one final result and route-scoped presentation", () =>
     await expect(result).not.toContainText("Ideas");
     await expect(result).not.toContainText("Couldn’t move");
     await expect(page.getByTestId("recording-location-error")).toHaveCount(0);
-    await expect(page.getByTestId("recording-location-menu")).toHaveCount(0);
+    await expect(page.getByRole("dialog", { name: /^Move / })).toHaveCount(0);
   });
 
-  test("an empty destination forest loads once, stays calm, and retries only on request", async ({
-    page,
-  }) => {
-    await openRecord(page, {
-      list_workspace_tree: () => {
-        const target = window as unknown as { __treeReads?: number };
-        target.__treeReads = (target.__treeReads ?? 0) + 1;
-        return [];
-      },
-    });
-
+  test("an empty destination forest keeps the root visible and inert when already Here", async ({ page }) => {
+    await openRecord(page, { list_workspace_tree: () => [] });
     await finishRecording(page);
-    await expect
-      .poll(() =>
-        page.evaluate(
-          () =>
-            (window as unknown as { __treeReads?: number }).__treeReads ?? 0,
-        ),
-      )
-      .toBe(1);
-    await page.waitForTimeout(350);
-    expect(
-      await page.evaluate(
-        () => (window as unknown as { __treeReads?: number }).__treeReads ?? 0,
-      ),
-    ).toBe(1);
-
     await page.getByTestId("recording-location-toggle").click();
-    await expect(page.getByText("No open locations match.")).toBeVisible();
-    await page.getByRole("button", { name: "Refresh locations" }).click();
-    await expect
-      .poll(() =>
-        page.evaluate(
-          () =>
-            (window as unknown as { __treeReads?: number }).__treeReads ?? 0,
-        ),
-      )
-      .toBe(2);
-    await page.waitForTimeout(350);
-    expect(
-      await page.evaluate(
-        () => (window as unknown as { __treeReads?: number }).__treeReads ?? 0,
-      ),
-    ).toBe(2);
+    const dialog = page.getByRole("dialog", { name: /^Move / });
+    const root = dialog.getByRole("treeitem", { name: /All notes/ });
+    await expect(root).toContainText("Here");
+    await expect(root).toHaveAttribute("aria-disabled", "true");
+    await expect(dialog.getByRole("button", { name: "Move here", exact: true })).toBeDisabled();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
   });
 
   test("a status-only completion stays busy at saved and hydrates the exact meeting only after finalized", async ({
@@ -937,7 +893,8 @@ test.describe("Record — one final result and route-scoped presentation", () =>
         return target.__terminalDetail;
       },
     });
-    await page.goto("/record");
+    await mockDestinationPicker(page);
+  await page.goto("/record");
     await expect(page.locator("button.start-btn")).toBeVisible();
 
     await page.evaluate(() => {
@@ -1185,7 +1142,8 @@ test.describe("Record — one final result and route-scoped presentation", () =>
         captureSystemAudio: true,
       };
     });
-    await page.goto("/record");
+    await mockDestinationPicker(page);
+  await page.goto("/record");
     await expect(page.locator(".vault-notice")).toBeVisible();
     await expect(page.locator(".cc-notice")).toBeVisible();
     await expect(page.getByText(/Capturing system audio/)).toBeVisible();

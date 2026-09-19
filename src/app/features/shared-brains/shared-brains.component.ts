@@ -6,16 +6,13 @@ import {
   signal,
 } from "@angular/core";
 
-import type { ItemKind, OrgItemHeader } from "../../core/models";
+import type { OrgItemHeader } from "../../core/models";
 import { IpcService } from "../../core/ipc.service";
 import { TabsService } from "../../core/tabs.service";
 import { MurIconComponent } from "../../design-system/icon/icon.component";
 import { MurRowMenuComponent } from "../../design-system/row-menu/row-menu.component";
 import { OrgBrainService } from "../../services/org-brain.service";
-import { ToastService } from "../../services/toast.service";
-import { workspaceDestinations } from "../workspace/workspace-destination";
-import type { WorkspaceDestination } from "../workspace/workspace-destination";
-import { WorkspaceMoveSheetComponent } from "../workspace/workspace-move-sheet/workspace-move-sheet.component";
+import { DestinationMoveService } from "../../shared/destination-move/destination-move.service";
 import { WorkspaceService } from "../workspace/workspace.service";
 
 type SharedKindFilter = "all" | "meeting" | "note";
@@ -34,42 +31,19 @@ interface SharedBrainRow {
 @Component({
   selector: "app-shared-brains",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurIconComponent, MurRowMenuComponent, WorkspaceMoveSheetComponent],
+  imports: [MurIconComponent, MurRowMenuComponent],
   templateUrl: "./shared-brains.component.html",
   styleUrl: "./shared-brains.component.scss",
 })
 export class SharedBrainsComponent {
   private readonly ipc = inject(IpcService);
   private readonly tabs = inject(TabsService);
-  private readonly toast = inject(ToastService);
   protected readonly orgBrain = inject(OrgBrainService);
   protected readonly workspace = inject(WorkspaceService);
+  private readonly destinationMove = inject(DestinationMoveService);
 
   readonly activeOrgId = signal<string>("all");
   readonly kindFilter = signal<SharedKindFilter>("all");
-  readonly addRequest = signal<SharedBrainRow | null>(null);
-  readonly addBusy = signal(false);
-  readonly addError = signal<string | null>(null);
-
-  readonly targets = computed(() => {
-    const destinations = workspaceDestinations(this.workspace.forest());
-    return this.addRequest()?.item.ownedSource
-      ? destinations
-      : destinations.filter(({ container }) => !container.locked);
-  });
-  readonly addRequestItem = computed(() => {
-    const row = this.addRequest();
-    return row
-      ? {
-          kind: row.kind,
-          title: row.item.title || "Untitled",
-        }
-      : null;
-  });
-  readonly addActionVerb = computed<"Move" | "Add a copy">(() =>
-    this.addRequest()?.item.ownedSource ? "Move" : "Add a copy",
-  );
-
   readonly rows = computed<SharedBrainRow[]>(() => {
     const activeOrgId = this.activeOrgId();
     const kindFilter = this.kindFilter();
@@ -133,63 +107,58 @@ export class SharedBrainsComponent {
     }
   }
 
-  async openAddToSpace(row: SharedBrainRow): Promise<void> {
+  async openAddToSpace(row: SharedBrainRow, event?: Event): Promise<void> {
     // Legacy org rows without a trusted source kind can still be opened in
     // their read-only viewer, but the backend intentionally refuses to invent
     // whether they should become a local meeting or note.
     if (row.kind === "unclassified") {
       return;
     }
-    if (this.workspace.forestEmpty()) {
-      await this.workspace.reload();
-    }
-    this.addError.set(null);
-    this.addRequest.set(row);
-  }
-
-  closeAddToSpace(): void {
-    if (!this.addBusy()) {
-      this.addRequest.set(null);
-      this.addError.set(null);
-    }
-  }
-
-  async addToSpace(target: WorkspaceDestination): Promise<void> {
-    const row = this.addRequest();
-    if (!row || this.addBusy()) {
-      return;
-    }
-    this.addBusy.set(true);
-    this.addError.set(null);
-    try {
-      const owned = row.item.ownedSource;
-      let result: { kind: "meeting" | "note"; id: string };
-      if (owned) {
-        const kind: ItemKind = owned.kind === "document" ? "note" : "meeting";
-        await this.workspace.moveItem(kind, owned.id, target.container.id);
-        result = { kind, id: owned.id };
-      } else {
-        result = await this.ipc.addOrgItemToContainer(
-          row.item.itemId,
-          target.container.id,
-        );
-        await this.workspace.reload();
-      }
-      this.addRequest.set(null);
-      const completedVerb = owned ? "Moved" : "Added a copy of";
-      this.toast.success(
-        `${completedVerb} “${row.item.title || "Untitled"}” to ${target.label}`,
-      );
-      if (result.kind === "meeting") {
-        await this.tabs.openMeeting(result.id, row.item.title || "Meeting");
-      } else {
-        await this.tabs.openNote(result.id, row.item.title || "Note");
-      }
-    } catch (error) {
-      this.addError.set(this.readableError(error));
-    } finally {
-      this.addBusy.set(false);
-    }
+    const owned = row.item.ownedSource;
+    if (owned && owned.movable !== true) return;
+    let movedItem: { kind: "meeting" | "note"; id: string } | undefined;
+    void this.destinationMove.open({
+      kind: owned ? (owned.kind === "document" ? "note" : "meeting") : "shared",
+      anchorKind: owned?.kind === "document" ? "note" : (owned?.kind ?? "org"),
+      id: owned?.id ?? row.item.itemId,
+      title: row.item.title || "Untitled",
+      actionLabel: owned ? "Move" : "Add a copy",
+      execute: async (containerId, confirmedEncryptionBoundary) => {
+        const owned = row.item.ownedSource;
+        if (owned) {
+          const kind = owned.kind === "document" ? "note" : "meeting";
+          if (kind === "meeting") {
+            await this.ipc.moveNote(
+              owned.id,
+              containerId,
+              confirmedEncryptionBoundary,
+            );
+          } else {
+            if (!containerId) throw new Error("The Notes root is unavailable.");
+            await this.ipc.moveNoteDoc(
+              owned.id,
+              containerId,
+              confirmedEncryptionBoundary,
+            );
+          }
+          movedItem = { kind, id: owned.id };
+        } else {
+          if (!containerId) throw new Error("Choose a Workspace or folder for this shared item.");
+          movedItem = await this.ipc.addOrgItemToContainer(
+            row.item.itemId,
+            containerId,
+          );
+        }
+      },
+      afterMove: async () => {
+        if (!movedItem) return;
+        if (movedItem.kind === "meeting") {
+          await this.tabs.openMeeting(movedItem.id, row.item.title || "Meeting");
+        } else {
+          await this.tabs.openNote(movedItem.id, row.item.title || "Note");
+        }
+      },
+    }, event);
   }
 
   private formatDate(value: string): string {
@@ -201,18 +170,5 @@ export class SharedBrainsComponent {
       dateStyle: "medium",
       timeStyle: "short",
     }).format(date);
-  }
-
-  private readableError(error: unknown): string {
-    const raw =
-      typeof error === "string"
-        ? error
-        : error && typeof error === "object" && "message" in error
-          ? String((error as { message: unknown }).message)
-          : "";
-    const normalized = raw.replace(/^invalid argument:\s*/i, "").trim();
-    return normalized
-      ? normalized.slice(0, 240)
-      : "Couldn’t add this shared item to the selected Workspace. Please try again.";
   }
 }

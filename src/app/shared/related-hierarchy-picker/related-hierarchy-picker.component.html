@@ -11,6 +11,7 @@
   <section
     #dialog
     class="rhp"
+    [class.rhp--destination]="mode() === 'destination'"
     role="dialog"
     aria-modal="true"
     aria-labelledby="rhp-title"
@@ -19,12 +20,22 @@
   >
     <header class="rhp-head">
       <span class="rhp-mark" aria-hidden="true">
-        <mur-icon icon="link" />
+        <mur-icon [icon]="mode() === 'destination' ? 'move' : 'link'" />
       </span>
       <div class="rhp-heading">
-        <h2 id="rhp-title">Add related</h2>
+        <h2 id="rhp-title">
+          {{
+            mode() === "destination"
+              ? actionLabel() + " “" + anchorTitle() + "”"
+              : "Add related"
+          }}
+        </h2>
         <p id="rhp-subtitle">
-          Choose a Space, folder, recording, note, or document.
+          @if (mode() === "destination") {
+            Choose All notes, a Workspace, or a folder.
+          } @else {
+            Choose a Space, folder, recording, note, or document.
+          }
         </p>
       </div>
       <button
@@ -48,8 +59,16 @@
         class="rhp-search-field"
         autocomplete="off"
         spellcheck="false"
-        placeholder="Search every Space…"
-        aria-label="Search items to link"
+        [placeholder]="
+          mode() === 'destination'
+            ? 'Search every destination…'
+            : 'Search every Space…'
+        "
+        [attr.aria-label]="
+          mode() === 'destination'
+            ? 'Search destinations'
+            : 'Search items to link'
+        "
         [value]="query()"
         (input)="onQueryInput($event)"
         (keydown)="onSearchKeydown($event)"
@@ -87,30 +106,63 @@
         searching() ? 'Search results' : 'Spaces, folders and items'
       "
     >
-      @if (loading()) {
+      @if (loading() || (searchBusy() && lines().length === 0)) {
         <p class="rhp-state">Loading…</p>
       } @else if (error(); as message) {
         <p class="rhp-state rhp-state--error">{{ message }}</p>
       } @else if (empty()) {
         <p class="rhp-state">
           @if (searching()) {
-            No matching items. Try a title, folder, or Space name.
+            No matching
+            {{ mode() === "destination" ? "destinations" : "items" }}. Try a
+            folder or Workspace name.
           } @else {
-            Nothing to link yet.
+            {{
+              mode() === "destination"
+                ? "No destination is available."
+                : "Nothing to link yet."
+            }}
           }
         </p>
       } @else {
-        @for (line of lines(); track line.key) {
+        @for (
+          line of lines();
+          track line.key
+        ) {
           <div
             class="rhp-row"
             [attr.data-row]="line.key"
-            [attr.role]="searching() ? 'option' : 'treeitem'"
-            [attr.aria-level]="searching() ? null : line.level"
-            [attr.aria-expanded]="line.expandable ? line.expanded : null"
-            [attr.aria-selected]="
-              searching() ? line.key === tabbableKey() : null
+            [attr.role]="
+              mode() !== 'destination'
+                ? searching()
+                  ? 'option'
+                  : 'treeitem'
+                : null
             "
-            [attr.aria-current]="line.isCurrent ? 'true' : null"
+            [attr.aria-level]="
+              mode() !== 'destination' && !searching() ? line.level : null
+            "
+            [attr.aria-expanded]="
+              mode() !== 'destination' && line.expandable ? line.expanded : null
+            "
+            [attr.aria-selected]="
+              mode() !== 'destination' && searching()
+                ? line.key === tabbableKey()
+                : null
+            "
+            [attr.aria-current]="
+              mode() !== 'destination' && line.isCurrent ? 'true' : null
+            "
+            [attr.aria-posinset]="
+              mode() !== 'destination'
+                ? (rowPositions().get(line.key)?.position ?? null)
+                : null
+            "
+            [attr.aria-setsize]="
+              mode() !== 'destination'
+                ? (rowPositions().get(line.key)?.size ?? null)
+                : null
+            "
             [class.is-current]="line.isCurrent"
             [class.is-linked]="line.status === 'linked'"
             [class.is-locked]="line.status === 'locked'"
@@ -147,8 +199,51 @@
             <button
               type="button"
               class="rhp-row-main"
+              [attr.role]="
+                mode() === 'destination' && !line.page
+                  ? searching()
+                    ? 'option'
+                    : 'treeitem'
+                  : null
+              "
+              [attr.aria-level]="
+                mode() === 'destination' && !searching() && !line.page
+                  ? line.level
+                  : null
+              "
+              [attr.aria-expanded]="
+                mode() === 'destination' && line.expandable
+                  ? line.expanded
+                  : null
+              "
+              [attr.aria-selected]="
+                mode() === 'destination'
+                  ? stagedDestination()
+                    ? stagedDestination()?.containerId ===
+                      (line.target?.id === '__destination_root__'
+                        ? (line.target.rootContainerId ?? null)
+                        : line.target?.id)
+                    : false
+                  : null
+              "
+              [attr.aria-current]="
+                mode() === 'destination' && line.isCurrent ? 'location' : null
+              "
+              [attr.aria-posinset]="
+                mode() === 'destination'
+                  ? (rowPositions().get(line.key)?.position ?? null)
+                  : null
+              "
+              [attr.aria-setsize]="
+                mode() === 'destination'
+                  ? (rowPositions().get(line.key)?.size ?? null)
+                  : null
+              "
               [tabindex]="line.key === tabbableKey() ? 0 : -1"
               [attr.aria-disabled]="
+                (mode() === 'destination' &&
+                  line.action === 'none' &&
+                  !line.expandable) ||
                 line.isCurrent ||
                 line.status === 'locked' ||
                 (line.status === 'linked' && !line.expandable)
@@ -163,15 +258,26 @@
                 <span class="rhp-label">{{ line.label }}</span>
                 @switch (line.status) {
                   @case ("current") {
-                    <span class="rhp-tag rhp-tag--current">Current</span>
+                    <span class="rhp-tag rhp-tag--current">{{
+                      mode() === "destination" ? "Here" : "Current"
+                    }}</span>
                   }
                   @case ("linked") {
                     <span class="rhp-tag rhp-tag--linked">Linked</span>
                   }
                   @case ("contains") {
                     <span class="rhp-tag rhp-tag--contains">
-                      Contains current item
+                      {{
+                        mode() === "destination"
+                          ? "Moving"
+                          : "Contains current item"
+                      }}
                     </span>
+                  }
+                  @case ("inside") {
+                    <span class="rhp-tag rhp-tag--contains"
+                      >Inside what you're moving</span
+                    >
                   }
                   @case ("locked") {
                     <span class="rhp-tag rhp-tag--locked">Locked</span>
@@ -204,6 +310,18 @@
                     : "Link folder"
                 }}</span>
               </button>
+            } @else if (line.action === "selectDestination") {
+              <button
+                type="button"
+                class="rhp-action"
+                tabindex="-1"
+                [disabled]="busy()"
+                [attr.aria-label]="'Choose ' + line.label"
+                (click)="activate(line)"
+              >
+                <mur-icon icon="move" />
+                <span>Choose</span>
+              </button>
             } @else if (line.action === "linkLeaf") {
               <button
                 type="button"
@@ -225,14 +343,44 @@
       }
     </div>
 
+    @if (externalError(); as message) {
+      <p class="rhp-state rhp-state--error" role="alert">{{ message }}</p>
+    }
+    @if (searching() && (hasMoreSearch() || searchError())) {
+      @if (searchError(); as message) { <p class="rhp-state rhp-state--error" role="alert">{{ message }}</p> }
+      <button type="button" class="btn" [disabled]="searchBusy()" (click)="loadMoreSearch()">
+        {{ searchBusy() ? "Loading…" : searchError() ? "Retry search" : "Load more results" }}
+      </button>
+    }
     <footer class="rhp-foot">
-      <span class="rhp-foot-copy">
-        <strong>A Space or folder creates one relation.</strong>
-        Its contents are not added.
-      </span>
+      @if (mode() === "destination") {
+        <span class="rhp-foot-copy">
+          @if (stagedDestination(); as target) {
+            <strong>{{ target.breadcrumb }}</strong>
+            @if (target.locked) { <span class="rhp-encryption-hint">Encrypt &amp; move requires confirmation</span> }
+          } @else {
+            Choose a destination above.
+          }
+        </span>
+      } @else {
+        <span class="rhp-foot-copy">
+          <strong>A Space or folder creates one relation.</strong>
+          Its contents are not added.
+        </span>
+      }
       <button type="button" class="btn btn-ghost rhp-cancel" (click)="close()">
         Cancel
       </button>
+      @if (mode() === "destination") {
+        <button
+          type="button"
+          class="btn btn-primary"
+          [disabled]="!stagedDestination() || busy()"
+          (click)="commitDestination()"
+        >
+          {{ busy() ? "Moving…" : actionLabel() + " here" }}
+        </button>
+      }
     </footer>
 
     <!-- CONFIRMATION — the copy has to say what the relation IS, because "link a folder" reads like

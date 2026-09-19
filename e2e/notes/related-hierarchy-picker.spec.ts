@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
+import { mockDestinationPicker } from "./destination-picker-mock";
+
 import { mockNotes } from "./mock-invoke";
 
 const picker = (page: Page) =>
@@ -225,9 +227,47 @@ test("roving keyboard traverses Current, Linked, and locked rows to the next lin
   ).toHaveCount(0);
   await later.press("ArrowRight");
   await expect(later).toBeFocused();
-  await expect(
-    dialog.getByRole("button", { name: "Link Space Later Space" }),
-  ).toBeVisible();
+  const linkSpace = dialog.getByRole("button", {
+    name: "Link Space Later Space",
+  });
+  await expect(linkSpace).toBeVisible();
+
+  // WCAG 2.1.1 — the revealed trailing action must also be KEYBOARD-reachable, not
+  // just present. T1 (b51f7258) set tabindex="-1" on the linkContainer branch, which
+  // left "Link Space" mouse-only; every role-based query above still passed, so the
+  // regression reached CI green and was caught only by hand. Pin the focus, not the
+  // role. `linkLeaf` and the destination-mode `selectDestination` stay at -1 by
+  // design — roving focus owns those rows — so this asserts the one branch that the
+  // base at origin/murmur shipped as tabbable.
+  await expect(linkSpace).toHaveAttribute("tabindex", "0");
+  await later.press("Tab");
+  await expect(linkSpace).toBeFocused();
+});
+
+test("destination mode searches every hierarchy page beyond the old 30-row cap", async ({ page }) => {
+  await mockNotes(page);
+  await mockDestinationPicker(page, Array.from({ length: 35 }, (_, index) => ({
+      id: `space-${index + 1}`, name: `Workspace ${String(index + 1).padStart(2, "0")}`,
+      kind: "note", level: "project", emoji: null, tint: null, locked: false,
+      unlocked: false, isRoot: false, groups: [],
+      folders: index === 34 ? [{id: "deep-destination", name: "Deep destination",
+        kind: "note", level: "folder", emoji: null, tint: null, locked: false,
+        unlocked: false, isRoot: false, groups: [], folders: []}] : [],
+    })));
+  await page.goto("/notes/n1");
+  await page.locator(".crumb-btn[aria-haspopup='dialog']").click();
+  const dialog = page.getByRole("dialog", { name: /Move/ });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator('[data-row="c:space-35"] .rhp-row-main')).toBeVisible();
+  await dialog.getByRole("searchbox", { name: "Search destinations" }).fill("Workspace");
+  await expect(dialog.getByText("36 results", { exact: true })).toBeVisible();
+  await dialog.getByRole("button", { name: "Load more results" }).click();
+  await expect(dialog.locator('.rhp-label', { hasText: "Workspace 35" })).toBeVisible();
+  await dialog.getByRole("searchbox", { name: "Search destinations" }).fill("Deep destination");
+  await expect(dialog.getByText("Workspace 35 / Deep destination", { exact: true })).toBeVisible();
+  await dialog.locator('[data-row="h:container:deep-destination"] .rhp-row-main').click();
+  await dialog.getByRole("button", { name: "Move here", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
 });
 
 test("opens on the centred current path, pages with anchor-gated args, searches breadcrumbs, and restores hierarchy scroll", async ({
@@ -355,6 +395,14 @@ test("opens on the centred current path, pages with anchor-gated args, searches 
     dialog.getByText("Current deep note", { exact: true }),
   ).toBeVisible();
   await expect(dialog.getByText("Current", { exact: true })).toBeVisible();
+  await expect(dialog.locator('[data-row="i:note:n1"]')).toHaveAttribute(
+    "aria-posinset",
+    "51",
+  );
+  await expect(dialog.locator('[data-row="i:note:n1"]')).toHaveAttribute(
+    "aria-setsize",
+    "100",
+  );
   await expect(dialog.getByText("Tasks", { exact: true })).toHaveCount(0);
   await expect(dialog.getByText("Dashboards", { exact: true })).toHaveCount(0);
   await expect(dialog.getByText("Private", { exact: true })).toBeVisible();
@@ -806,9 +854,9 @@ test("waits for its org-feed listener before reading Shared and drops a late rep
           .__pickerSharedReadCalls ?? 0,
     ),
   ).toBe(sharedReadsBeforeOpen);
-  await expect(picker(page).getByText("Shared Atlas", { exact: true })).toHaveCount(
-    0,
-  );
+  await expect(
+    picker(page).getByText("Shared Atlas", { exact: true }),
+  ).toHaveCount(0);
 
   await page.evaluate(() => {
     (
@@ -840,9 +888,8 @@ test("waits for its org-feed listener before reading Shared and drops a late rep
     .poll(() =>
       page.evaluate(
         () =>
-          typeof (
-            window as unknown as { __resolvePickerSharedReply?: unknown }
-          ).__resolvePickerSharedReply,
+          typeof (window as unknown as { __resolvePickerSharedReply?: unknown })
+            .__resolvePickerSharedReply,
       ),
     )
     .toBe("function");
@@ -897,13 +944,12 @@ test("waits for its org-feed listener before reading Shared and drops a late rep
   });
   await expect
     .poll(() =>
-      page.evaluate(
-        () =>
-          (
-            window as unknown as {
-              __demoEventListenerUnregisterCount: (event: string) => number;
-            }
-          ).__demoEventListenerUnregisterCount("murmur://org-feed-updated"),
+      page.evaluate(() =>
+        (
+          window as unknown as {
+            __demoEventListenerUnregisterCount: (event: string) => number;
+          }
+        ).__demoEventListenerUnregisterCount("murmur://org-feed-updated"),
       ),
     )
     .toBeGreaterThan(unregistersBeforeDestroyRace);
@@ -973,9 +1019,9 @@ test("keeps local hierarchy usable but never reads Shared when org-feed listener
           .__pickerSharedReadCalls ?? 0,
     ),
   ).toBe(sharedReadsBeforeOpen);
-  await expect(picker(page).getByText("Shared Atlas", { exact: true })).toHaveCount(
-    0,
-  );
+  await expect(
+    picker(page).getByText("Shared Atlas", { exact: true }),
+  ).toHaveCount(0);
 });
 
 test("privacy invalidation closes and scrubs a pending search, while the modal stays inside short and narrow viewports", async ({
@@ -1065,8 +1111,7 @@ test("Connections waits for its org-feed listener before reading relationships, 
   await mockNotes(page, {
     list_links: () => {
       const target = window as unknown as { __connectionsLinkReads?: number };
-      target.__connectionsLinkReads =
-        (target.__connectionsLinkReads ?? 0) + 1;
+      target.__connectionsLinkReads = (target.__connectionsLinkReads ?? 0) + 1;
       return [
         {
           id: 951,
@@ -1160,8 +1205,7 @@ test("Connections fails closed without relationship reads when its org-feed list
   await mockNotes(page, {
     list_links: () => {
       const target = window as unknown as { __connectionsLinkReads?: number };
-      target.__connectionsLinkReads =
-        (target.__connectionsLinkReads ?? 0) + 1;
+      target.__connectionsLinkReads = (target.__connectionsLinkReads ?? 0) + 1;
       return [
         {
           id: 952,

@@ -19,11 +19,14 @@ import { IpcService } from "../../core/ipc.service";
 import { TabRouteReuseStrategy } from "../../core/tab-route-reuse.strategy";
 import type {
   ContainerLevel,
+  DestinationPickerAnchorKind,
+  PickerAvailability,
   LinkKind,
   PickerContainerNode,
   PickerGroup,
   PickerItemKind,
   PickerRow,
+  RelatedPickerBootstrap,
   SharedContainerNode,
   SharedWorkspace,
 } from "../../core/models";
@@ -48,6 +51,7 @@ const SEARCH_DEBOUNCE_KEY = "related-hierarchy-picker:search";
 const UNCLASSIFIED_KEY = "u";
 /** Backend-side label for the synthetic node; kept identical so breadcrumbs match the tree. */
 const UNCLASSIFIED_LABEL = "Not classified";
+const DESTINATION_ROOT_ID = "__destination_root__";
 
 /** What a row's primary/trailing action does when activated. */
 type PickerLineAction =
@@ -57,11 +61,14 @@ type PickerLineAction =
   | "linkLeaf"
   /** Open the confirmation for linking this whole Space/folder as ONE relation. */
   | "linkContainer"
+  /** Stage this container as the move destination; writing remains the host's job. */
+  | "selectDestination"
   /** Load an earlier / further page of the enclosing group. */
   | "page";
 
 /** The small trailing tag a row can carry. */
-type PickerLineStatus = "current" | "linked" | "contains" | "locked" | null;
+type PickerLineStatus =
+  "current" | "linked" | "contains" | "inside" | "locked" | null;
 
 /**
  * ONE rendered row of the picker, fully resolved in a `computed` so the template binds FIELDS only
@@ -93,6 +100,8 @@ interface PickerLine {
   readonly page: PickerPageRequest | null;
   /** True for the anchor's own row — never linkable, always the scroll target. */
   readonly isCurrent: boolean;
+  readonly position?: number;
+  readonly setSize?: number;
 }
 
 /** One endpoint the picker can link to. */
@@ -100,6 +109,17 @@ export interface PickerTarget {
   readonly kind: LinkKind;
   readonly id: string;
   readonly title: string;
+  readonly locked?: boolean;
+  readonly breadcrumb?: string;
+  readonly rootContainerId?: string | null;
+}
+
+export interface DestinationPickerTarget {
+  readonly containerId: string | null;
+  readonly label: string;
+  readonly breadcrumb: string;
+  /** Sealed on disk but unlocked for this session; the host must confirm encryption. */
+  readonly locked: boolean;
 }
 
 /** A lazy page fetch a `Load earlier` / `Load more` row triggers. */
@@ -131,6 +151,7 @@ interface PickerSearchResult {
   readonly title: string;
   readonly breadcrumb: readonly string[];
   readonly shared: boolean;
+  readonly availability?: PickerAvailability;
   /** Present only for local Space/folder hits. Shared containers are never search results. */
   readonly containerLevel: ContainerLevel | null;
 }
@@ -191,8 +212,10 @@ export class RelatedHierarchyPickerComponent {
   private readonly destroyRef = inject(DestroyRef);
 
   /** The item the new relation starts FROM. */
-  readonly anchorKind = input.required<LinkKind>();
+  readonly mode = input<"link" | "destination">("link");
+  readonly anchorKind = input.required<DestinationPickerAnchorKind>();
   readonly anchorId = input.required<string>();
+  readonly orgId = input<string>();
   /** The anchor's own title, for the modal's subtitle. */
   readonly anchorTitle = input("");
   /**
@@ -203,11 +226,16 @@ export class RelatedHierarchyPickerComponent {
   readonly linkedKeys = input<ReadonlySet<string>>(new Set<string>());
   /** True while the parent's `link_items` call is in flight. */
   readonly busy = input(false);
+  readonly currentContainerId = input<string | null>(null);
+  readonly actionLabel = input<"Move" | "Add a copy" | "Keep">("Move");
+  readonly externalError = input<string | null>(null);
 
   /** A target was picked. The PARENT owns the write, the toast and the reload. */
   readonly picked = output<PickerTarget>();
+  readonly destinationPicked = output<DestinationPickerTarget>();
   /** The modal wants to close (Escape / backdrop / Cancel / after a pick). */
   readonly closed = output<void>();
+  readonly invalidated = output<void>();
 
   private readonly dialogRef = viewChild<ElementRef<HTMLElement>>("dialog");
   private readonly searchRef =
@@ -232,6 +260,9 @@ export class RelatedHierarchyPickerComponent {
   private readonly anchorGroupKey = signal<string | null>(null);
   /** Breadcrumb for an org anchor, whose location is outside the local bootstrap. */
   private readonly sharedAnchorBreadcrumb = signal<readonly string[]>([]);
+  private readonly destinationContext = signal<
+    RelatedPickerBootstrap["destination"] | null
+  >(null);
   /** Expanded row keys. Only the anchor's own path starts expanded. */
   private readonly expandedKeys = signal<ReadonlySet<string>>(
     new Set<string>(),
@@ -255,6 +286,7 @@ export class RelatedHierarchyPickerComponent {
   readonly activeKey = signal<string | null>(null);
   /** The pending container confirmation, or `null`. */
   readonly pendingContainer = signal<PendingContainer | null>(null);
+  readonly stagedDestination = signal<DestinationPickerTarget | null>(null);
 
   /**
    * Monotonic invalidation token. Every async reply carries the epoch it was issued under and is
@@ -277,13 +309,13 @@ export class RelatedHierarchyPickerComponent {
     // ── Invalidation wiring. Each of these is a moment at which the content on screen may no
     //    longer be the user's to see, and none of them is a component destroy. ──
     const unregisterPrivacy = this.privacyBarrier.registerInvalidator(() =>
-      this.scrubAndClose(),
+      this.invalidate(),
     );
     // A cached tab (`/notes/:id`, `/meeting/:id`, `/org-item/:id`) is DETACHED, not destroyed, when
     // the user navigates away — no lifecycle hook fires. Without this the body-teleported modal
     // would survive its own tab going into the background.
     const unregisterDetach = this.tabRouteReuse.onDetach(() =>
-      this.scrubAndClose(),
+      this.invalidate(),
     );
     this.destroyRef.onDestroy(() => {
       this.destroyed = true;
@@ -304,7 +336,7 @@ export class RelatedHierarchyPickerComponent {
   private async installOrgFeedListener(): Promise<boolean> {
     try {
       const unlisten = await this.ipc.onOrgFeedUpdated(() =>
-        this.scrubAndClose(),
+        this.invalidate(),
       );
       if (this.destroyed) {
         unlisten();
@@ -330,6 +362,8 @@ export class RelatedHierarchyPickerComponent {
     // Establish the lock-tree dependency; the backend is the authority on visibility, we just
     // re-ask when it may have changed.
     this.folders.tree();
+    this.mode();
+    this.orgId();
     // A new anchor (or a lock transition) invalidates everything already on screen BEFORE the
     // replacement read starts — never a frame of the old vault under the new title.
     this.scrub();
@@ -338,7 +372,11 @@ export class RelatedHierarchyPickerComponent {
     void this.load(kind, id, epoch);
   });
 
-  private async load(kind: LinkKind, id: string, epoch: number): Promise<void> {
+  private async load(
+    kind: DestinationPickerAnchorKind,
+    id: string,
+    epoch: number,
+  ): Promise<void> {
     // The process privacy barrier before any content-bearing IPC: a read must never race ahead of
     // the invalidation listeners that would scrub it.
     const ready = await this.privacyBarrier.ensureReady();
@@ -352,16 +390,40 @@ export class RelatedHierarchyPickerComponent {
     }
     try {
       const [bootstrap, shared] = await Promise.all([
-        this.ipc.getRelatedPickerBootstrap(kind, id),
-        this.loadSharedWorkspace(epoch),
+        this.ipc.getRelatedPickerBootstrap(kind, id, this.mode(), this.orgId()),
+        this.mode() === "link"
+          ? this.loadSharedWorkspace(epoch)
+          : Promise.resolve(null),
       ]);
       if (epoch !== this.epoch) {
         return;
       }
       this.spaces.set(bootstrap.spaces);
       this.unclassified.set(bootstrap.unclassified);
+      this.destinationContext.set(bootstrap.destination ?? null);
+      if (this.mode() === "destination" && !bootstrap.destination) {
+        this.spaces.set([]);
+        this.unclassified.set([]);
+        this.loading.set(false);
+        this.error.set("Destinations aren’t available securely right now.");
+        return;
+      }
+      if (
+        this.mode() === "destination" &&
+        bootstrap.destination?.sourceLocked
+      ) {
+        this.spaces.set([]);
+        this.unclassified.set([]);
+        this.loading.set(false);
+        this.error.set("Remove the folder lock first.");
+        return;
+      }
       this.sharedWorkspace.set(shared);
       const expanded = new Set<string>();
+      if (this.mode() === "destination" && bootstrap.destination) {
+        this.anchorPath.set(bootstrap.destination.currentPath);
+        for (const id of bootstrap.destination.currentPath) expanded.add(`c:${id}`);
+      }
       const anchor = bootstrap.anchor;
       if (anchor) {
         const scopeKey = anchor.containerId ?? UNCLASSIFIED_KEY;
@@ -455,21 +517,32 @@ export class RelatedHierarchyPickerComponent {
     this.anchorScopeKey.set(null);
     this.anchorGroupKey.set(null);
     this.sharedAnchorBreadcrumb.set([]);
+    this.destinationContext.set(null);
     this.expandedKeys.set(new Set<string>());
     this.loaded.set(new Map());
     this.inFlight.set(new Set<string>());
+    this.searchBusy.set(false);
+    this.searchError.set(null);
     this.hits.set(null);
     this.hitsTotal.set(0);
     this.query.set("");
     this.pendingContainer.set(null);
+    this.stagedDestination.set(null);
     this.pendingOriginKey = null;
     this.activeKey.set(null);
     this.error.set(null);
     this.centredForKey = null;
   }
 
+  private invalidate(): void {
+    this.scrub();
+    this.invalidated.emit();
+    this.closed.emit();
+  }
+
   /** Scrub, then ask the host to unmount us. */
   private scrubAndClose(): void {
+    if (this.busy()) return;
     this.scrub();
     this.closed.emit();
   }
@@ -489,6 +562,12 @@ export class RelatedHierarchyPickerComponent {
 
   /** The already-related keys, resolved once per render. */
   private readonly linked = computed(() => this.linkedKeys());
+  private readonly effectiveCurrentContainerId = computed(
+    () =>
+      this.destinationContext()
+      ? this.destinationContext()!.currentContainerId
+      : this.currentContainerId(),
+  );
 
   /** `${kind}:${id}` — the identity the Related panel and this picker agree on. */
   private endpointKey(kind: LinkKind, id: string): string {
@@ -496,7 +575,7 @@ export class RelatedHierarchyPickerComponent {
   }
 
   /** Is this row the anchor itself? */
-  private isAnchor(kind: LinkKind, id: string): boolean {
+  private isAnchor(kind: DestinationPickerAnchorKind, id: string): boolean {
     return kind === this.anchorKind() && id === this.anchorId();
   }
 
@@ -517,10 +596,31 @@ export class RelatedHierarchyPickerComponent {
     for (const space of this.spaces()) {
       this.pushContainer(out, space, null, 1);
     }
-    for (const root of this.sharedRoots()) {
-      this.pushShared(out, root, null, 1);
+    if (this.mode() === "link") {
+      for (const root of this.sharedRoots()) {
+        this.pushShared(out, root, null, 1);
+      }
     }
     return out;
+  });
+
+  readonly rowPositions = computed(() => {
+    const lines = this.lines();
+    const result = new Map<string, { position: number; size: number }>();
+    const siblings = new Map<string | null, PickerLine[]>();
+    for (const line of lines) {
+      if (line.page) continue;
+      const group = siblings.get(line.parentKey) ?? [];
+      group.push(line);
+      siblings.set(line.parentKey, group);
+    }
+    for (const group of siblings.values()) {
+      group.forEach((line, index) => result.set(line.key, {
+        position: line.position ?? index + 1,
+        size: this.searching() ? this.hitsTotal() : (line.setSize ?? group.length),
+      }));
+    }
+    return result;
   });
 
   /** The search-result rows. */
@@ -535,8 +635,26 @@ export class RelatedHierarchyPickerComponent {
       const isAnchor = this.isAnchor(kind, hit.id);
       const isLinked = linked.has(this.endpointKey(kind, hit.id));
       const isContainer = kind === "container" && hit.containerLevel !== null;
-      const containsCurrent =
-        isContainer && this.anchorPath().includes(hit.id);
+      const destinationNode = isContainer
+        ? this.findPickerContainer(hit.id)
+        : null;
+      const availability = hit.availability ?? destinationNode?.availability;
+      const destinationSelectable =
+        availability?.selectable === true;
+      const containsCurrent = isContainer && this.anchorPath().includes(hit.id);
+      const isHere =
+        this.mode() === "destination" &&
+        isContainer &&
+        (availability?.here === true ||
+          hit.id === this.effectiveCurrentContainerId());
+      const isMoving =
+        this.mode() === "destination" &&
+        isContainer &&
+        (availability?.self === true ||
+          (hit.id === this.anchorId() && this.anchorKind() === "container"));
+      const isInsideMoving =
+        this.mode() === "destination" &&
+        availability?.descendant === true;
       return {
         key: `h:${hit.kind}:${hit.id}`,
         parentKey: null,
@@ -559,21 +677,43 @@ export class RelatedHierarchyPickerComponent {
             : hit.kind,
         expandable: false,
         expanded: false,
-        status: isAnchor
-          ? "current"
-          : isLinked
-            ? "linked"
-            : containsCurrent
+        status:
+          isHere || (this.mode() === "link" && isAnchor)
+            ? "current"
+            : isMoving
               ? "contains"
-              : null,
+              : isInsideMoving
+                ? "inside"
+                : isLinked
+                  ? "linked"
+                  : containsCurrent
+                    ? "contains"
+                    : null,
         action:
-          isAnchor || isLinked
-            ? "none"
-            : isContainer
-              ? "linkContainer"
-              : "linkLeaf",
+          this.mode() === "destination"
+            ? isContainer && destinationSelectable && !isHere && !isMoving
+              ? "selectDestination"
+              : "none"
+            : isAnchor || isLinked
+              ? "none"
+              : isContainer
+                ? "linkContainer"
+                : "linkLeaf",
         target:
-          isAnchor || isLinked ? null : { kind, id: hit.id, title: hit.title },
+          this.mode() === "destination"
+            ? isContainer && destinationSelectable && !isHere && !isMoving
+              ? {
+                  kind: "container",
+                  id: hit.id,
+                  title: hit.title,
+                  breadcrumb: hit.availability ? hit.breadcrumb.join(" / ") : [...hit.breadcrumb, hit.title].join(" / "),
+                  locked:
+                    availability?.confirm === true,
+                }
+              : null
+            : isAnchor || isLinked
+              ? null
+              : { kind, id: hit.id, title: hit.title },
         containerLevel: hit.containerLevel,
         page: null,
         isCurrent: isAnchor,
@@ -584,27 +724,45 @@ export class RelatedHierarchyPickerComponent {
   /** The synthetic "Not classified" node + its groups. Disclosure-only: never a link target. */
   private pushUnclassified(out: PickerLine[]): void {
     const groups = this.unclassified();
-    if (groups.length === 0) {
+    if (groups.length === 0 && this.mode() === "link") {
       return;
     }
+    const destination = this.mode() === "destination";
+    const root = this.destinationContext()?.root;
+    const here =
+      destination &&
+      (root?.availability.here ?? this.effectiveCurrentContainerId() === null);
     const expanded = this.expandedKeys().has(UNCLASSIFIED_KEY);
     out.push({
       key: UNCLASSIFIED_KEY,
       parentKey: null,
       level: 1,
-      label: UNCLASSIFIED_LABEL,
+      label: destination ? (root?.label ?? "All notes") : UNCLASSIFIED_LABEL,
       meta: "",
       glyph: "browse",
       tone: "unclassified",
-      expandable: true,
+      expandable: groups.length > 0,
       expanded,
-      status: null,
+      status: here ? "current" : null,
       // A synthetic node is not a place: there is no stable id to point a relation at.
-      action: "none",
-      target: null,
+      action:
+        destination && !here && root?.availability.selectable === true
+          ? "selectDestination"
+          : "none",
+      target:
+        destination && !here && root?.availability.selectable === true
+          ? {
+              kind: "container",
+              id: DESTINATION_ROOT_ID,
+              title: root?.label ?? "All notes",
+              breadcrumb: root?.label ?? "All notes",
+              rootContainerId: root?.containerId ?? null,
+              locked: root?.availability.confirm === true,
+            }
+          : null,
       containerLevel: null,
       page: null,
-      isCurrent: false,
+      isCurrent: here,
     });
     if (!expanded) {
       return;
@@ -627,12 +785,35 @@ export class RelatedHierarchyPickerComponent {
       node.groups.length > 0 || node.folders.length > 0;
     const isLinked = this.linked().has(this.endpointKey("container", node.id));
     const containsCurrent = this.anchorPath().includes(node.id);
+    const destination = this.mode() === "destination";
+    const here =
+      destination &&
+      (node.availability?.here === true ||
+        node.id === this.effectiveCurrentContainerId());
+    const moving =
+      destination &&
+      this.anchorKind() === "container" &&
+      (node.availability?.self === true || node.id === this.anchorId());
+    const insideMoving =
+      destination &&
+      this.anchorKind() === "container" &&
+      (node.availability?.descendant === true ||
+        this.pathToContainer(node.id).includes(this.anchorId()));
+    const lockedTargetUnsupported =
+      destination &&
+      node.locked &&
+      node.unlocked &&
+      !["meeting", "note", "document"].includes(this.anchorKind());
     out.push({
       key,
       parentKey,
       level,
       label: node.name,
-      meta: sealed ? "Unlock it in the sidebar to browse or link" : "",
+      meta: sealed
+        ? "Unlock it in the sidebar to browse"
+        : lockedTargetUnsupported
+          ? "This item type can’t move into an encrypted folder"
+          : "",
       glyph: node.level === "project" ? "spaces" : "folder",
       tone: node.level === "project" ? "space" : "folder",
       // A sealed container discloses its NAME and nothing else — so it has no disclosure either.
@@ -640,16 +821,47 @@ export class RelatedHierarchyPickerComponent {
       expanded: this.expandedKeys().has(key),
       status: sealed
         ? "locked"
-        : isLinked
-          ? "linked"
-          : containsCurrent
+        : here
+          ? "current"
+          : moving
             ? "contains"
-            : null,
-      action: sealed || isLinked || !node.linkable ? "none" : "linkContainer",
+            : insideMoving
+              ? "inside"
+              : isLinked
+                ? "linked"
+                : containsCurrent
+                  ? "contains"
+                  : null,
+      action: destination
+        ? sealed ||
+          here ||
+          moving ||
+          insideMoving ||
+          lockedTargetUnsupported ||
+          node.availability?.selectable !== true
+          ? "none"
+          : "selectDestination"
+        : sealed || isLinked || !node.linkable
+          ? "none"
+          : "linkContainer",
       target:
-        sealed || isLinked || !node.linkable
+        sealed ||
+        here ||
+        moving ||
+        insideMoving ||
+        lockedTargetUnsupported ||
+        (destination && node.availability?.selectable !== true) ||
+        (!destination && (isLinked || !node.linkable))
           ? null
-          : { kind: "container", id: node.id, title: node.name },
+          : {
+              kind: "container",
+              id: node.id,
+              title: node.name,
+              locked: destination ? node.availability?.confirm === true : node.locked && node.unlocked,
+              breadcrumb: this.containerNamesFor(
+                this.pathToContainer(node.id),
+              ).join(" / "),
+            },
       containerLevel: node.level,
       page: null,
       isCurrent: false,
@@ -714,12 +926,14 @@ export class RelatedHierarchyPickerComponent {
       );
     }
     const linked = this.linked();
-    for (const item of window.items) {
+    for (const [index, item] of window.items.entries()) {
       const kind = item.kind as LinkKind;
       const isAnchor = this.isAnchor(kind, item.id);
       const isLinked = linked.has(this.endpointKey(kind, item.id));
       out.push({
         key: `i:${item.kind}:${item.id}`,
+        position: window.offset + index + 1,
+        setSize: window.total,
         parentKey: key,
         level: level + 1,
         label: item.title,
@@ -729,9 +943,12 @@ export class RelatedHierarchyPickerComponent {
         expandable: false,
         expanded: false,
         status: isAnchor ? "current" : isLinked ? "linked" : null,
-        action: isAnchor || isLinked ? "none" : "linkLeaf",
+        action:
+          this.mode() === "destination" || isAnchor || isLinked
+            ? "none"
+            : "linkLeaf",
         target:
-          isAnchor || isLinked
+          this.mode() === "destination" || isAnchor || isLinked
             ? null
             : { kind, id: item.id, title: item.title },
         containerLevel: null,
@@ -1035,6 +1252,24 @@ export class RelatedHierarchyPickerComponent {
     return ids.map((id) => names.get(id) ?? "");
   }
 
+  private findPickerContainer(id: string): PickerContainerNode | null {
+    const walk = (
+      nodes: readonly PickerContainerNode[],
+    ): PickerContainerNode | null => {
+      for (const node of nodes) {
+        if (node.id === id) {
+          return node;
+        }
+        const child = walk(node.folders);
+        if (child) {
+          return child;
+        }
+      }
+      return null;
+    };
+    return walk(this.spaces());
+  }
+
   /** Nothing to show at all — an empty vault, or a search with no matches. */
   readonly empty = computed(
     () => !this.loading() && !this.error() && this.lines().length === 0,
@@ -1159,6 +1394,8 @@ export class RelatedHierarchyPickerComponent {
         kind,
         offset,
         PAGE_SIZE,
+        this.mode(),
+        this.orgId(),
       );
       if (epoch !== this.epoch) {
         return;
@@ -1216,12 +1453,18 @@ export class RelatedHierarchyPickerComponent {
     }
     if (!value.trim()) {
       this.debounce.cancel(SEARCH_DEBOUNCE_KEY);
+      this.searchBusy.set(false);
+      this.searchError.set(null);
       this.hits.set(null);
       this.hitsTotal.set(0);
       this.activeKey.set(null);
       this.restoreTreeScroll();
       return;
     }
+    this.hits.set(null);
+    this.hitsTotal.set(0);
+    this.searchError.set(null);
+    this.searchBusy.set(true);
     const epoch = this.epoch;
     this.debounce.schedule(
       SEARCH_DEBOUNCE_KEY,
@@ -1230,19 +1473,40 @@ export class RelatedHierarchyPickerComponent {
     );
   }
 
-  private async runSearch(value: string, epoch: number): Promise<void> {
+  readonly searchBusy = signal(false);
+  readonly searchError = signal<string | null>(null);
+  readonly hasMoreSearch = computed(() => this.mode() === "destination" && (this.hits()?.length ?? 0) < this.hitsTotal());
+
+  loadMoreSearch(): void {
+    if (!this.searchBusy()) void this.runSearch(this.query(), this.epoch, this.hits()?.length ?? 0);
+  }
+
+  private async runSearch(value: string, epoch: number, offset = 0): Promise<void> {
     if (epoch !== this.epoch) {
       return;
     }
     try {
+      this.searchBusy.set(true);
+      this.searchError.set(null);
       const page = await this.ipc.searchRelatedPicker(
-        this.anchorKind(),
-        this.anchorId(),
-        value,
-        0,
-        SEARCH_PAGE,
+        this.anchorKind(), this.anchorId(), value, offset, SEARCH_PAGE, this.mode(), this.orgId(),
       );
-      if (epoch !== this.epoch || this.query().trim() !== value.trim()) {
+      if (epoch !== this.epoch || this.query().trim() !== value.trim()) return;
+      if (this.mode() === "destination") {
+        const results: PickerSearchResult[] = [
+          ...(page.containers ?? []).map(hit => ({
+            kind: "container" as const, id: hit.id, title: hit.name,
+            breadcrumb: hit.breadcrumb, containerLevel: hit.level,
+            availability: hit.availability, shared: false,
+          })),
+          ...page.hits.map(hit => ({ ...hit, shared: false, containerLevel: null })),
+        ];
+        this.hits.update(previous => offset ? [...(previous ?? []), ...results] : results);
+        this.hitsTotal.set(page.total);
+        if (!offset) {
+          const tree = this.treeRef()?.nativeElement;
+          if (tree) tree.scrollTop = 0;
+        }
         return;
       }
       const containers = this.localContainerSearchResults(value);
@@ -1281,10 +1545,11 @@ export class RelatedHierarchyPickerComponent {
         tree.scrollTop = 0;
       }
     } catch {
-      if (epoch === this.epoch) {
-        this.hits.set([]);
-        this.hitsTotal.set(0);
+      if (epoch === this.epoch && this.query().trim() === value.trim()) {
+        this.searchError.set("Couldn’t search destinations. Try again.");
       }
+    } finally {
+      if (epoch === this.epoch && this.query().trim() === value.trim()) this.searchBusy.set(false);
     }
   }
 
@@ -1292,6 +1557,8 @@ export class RelatedHierarchyPickerComponent {
   clearSearch(): void {
     this.debounce.cancel(SEARCH_DEBOUNCE_KEY);
     this.query.set("");
+    this.searchBusy.set(false);
+    this.searchError.set(null);
     this.hits.set(null);
     this.hitsTotal.set(0);
     this.activeKey.set(null);
@@ -1336,6 +1603,20 @@ export class RelatedHierarchyPickerComponent {
           this.toggle(line);
         }
         break;
+      case "selectDestination":
+        if (line.target) {
+          const containerId =
+            line.target.id === DESTINATION_ROOT_ID
+              ? (line.target.rootContainerId ?? null)
+              : line.target.id;
+          this.stagedDestination.set({
+            containerId,
+            label: line.target.title,
+            breadcrumb: line.target.breadcrumb || line.target.title,
+            locked: line.target.locked === true,
+          });
+        }
+        break;
       case "page":
         this.loadPage(line);
         break;
@@ -1343,6 +1624,30 @@ export class RelatedHierarchyPickerComponent {
         // A container/group row's BODY discloses; only its trailing button links.
         this.toggle(line);
         break;
+    }
+  }
+
+  commitDestination(): void {
+    const target = this.stagedDestination();
+    if (target && !this.busy()) {
+      this.destinationPicked.emit(target);
+    }
+  }
+
+  focusDestinationSelection(): void {
+    const selected = this.stagedDestination();
+    const line = selected
+      ? this.lines().find((candidate) => {
+          const id = candidate.target?.id;
+          return selected.containerId === null
+            ? id === DESTINATION_ROOT_ID
+            : id === selected.containerId;
+        })
+      : null;
+    if (line) {
+      this.focusRow(line.key);
+    } else {
+      this.searchRef()?.nativeElement.focus({ preventScroll: true });
     }
   }
 
@@ -1446,6 +1751,15 @@ export class RelatedHierarchyPickerComponent {
    * Tab/Shift+Tab are trapped between the first and last focusable control.
    */
   onDialogKeydown(event: KeyboardEvent): void {
+    if (
+      event.key === "Enter" &&
+      (event.metaKey || event.ctrlKey) &&
+      this.mode() === "destination"
+    ) {
+      event.preventDefault();
+      this.commitDestination();
+      return;
+    }
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();

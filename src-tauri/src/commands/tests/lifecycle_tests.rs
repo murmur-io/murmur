@@ -15990,7 +15990,7 @@
             "the conversation starts visible"
         );
 
-        move_note_public_inner_impl(&state, MID.into(), Some(TARGET.into())).unwrap();
+        move_note_public_inner_impl(&state, MID.into(), Some(TARGET.into()), true).unwrap();
 
         assert_eq!(
             state.db.folder_for_meeting(MID).unwrap().as_deref(),
@@ -16006,6 +16006,35 @@
             surviving.is_empty(),
             "a conversation that drew on the SOURCE folder must not outlive the meeting's move into              a locked one — it can paraphrase content that is now sealed. Got {surviving:?}"
         );
+    }
+
+    #[test]
+    fn public_move_imported_document_preserves_kind_and_requires_encryption_confirmation() {
+        let state = build_state("document-destination-move");
+        make_open_folder(&state.db, "document-source", "Document-source");
+        make_open_folder(&state.db, "document-target", "Document-target");
+        state.db.insert_document("imported-move", "document-source", "report.pdf", "exact imported bytes", "document", 1).unwrap();
+        move_note_doc_confirmed_inner(&state, "imported-move", "document-target", false).unwrap();
+        assert_eq!(state.db.folder_for_document("imported-move").unwrap().as_deref(), Some("document-target"));
+        assert_eq!(state.db.documents_in_folder("document-target").unwrap()[0].kind, "document");
+        assert_eq!(state.db.movable_document_row("imported-move").unwrap().unwrap().text, "exact imported bytes");
+        assert!(state.db.get_note_row("imported-move").unwrap().is_none(), "moving does not turn an import into an authored note");
+
+        make_open_folder(&state.db, "document-locked", "Document-locked");
+        lock_folder_inner(&state, "document-locked".into()).unwrap();
+        state.unlocked_folders.lock().unwrap().insert("document-locked".into());
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        let refused = move_note_doc_confirmed_inner(&state, "imported-move", "document-locked", false).unwrap_err();
+        assert!(matches!(refused, AppError::Locked(_)));
+        assert_eq!(state.db.folder_for_document("imported-move").unwrap().as_deref(), Some("document-target"));
+        move_note_doc_confirmed_inner(&state, "imported-move", "document-locked", true).unwrap();
+        let row = state.db.movable_document_row("imported-move").unwrap().unwrap();
+        assert!(row.sealed);
+        assert_eq!(row.text, "exact imported bytes");
+        assert_eq!(state.db.documents_in_folder("document-locked").unwrap()[0].kind, "document");
+        remove_lock_inner(&state, "document-locked".into()).unwrap();
+        assert_eq!(state.db.movable_document_row("imported-move").unwrap().unwrap().text, "exact imported bytes");
     }
 
     /// BLK-2 (seal half): moving a note INTO a locked + SESSION-UNLOCKED folder seals it AT REST
@@ -16037,7 +16066,14 @@
         let kek = secrets::get_or_create_master_kek().unwrap();
         *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
 
-        move_note_public_inner_impl(&state, MID.into(), Some(TARGET.into())).unwrap();
+        let refused = move_note_public_inner_impl(&state, MID.into(), Some(TARGET.into()), false)
+            .expect_err("an omitted confirmation must never seal plaintext");
+        assert!(matches!(refused, AppError::Locked(_)));
+        assert_eq!(state.db.folder_for_meeting(MID).unwrap(), None);
+        assert_eq!(state.db.sealable_notes_for_meeting(MID).unwrap()[0].markdown, MD);
+        assert!(state.db.sealable_notes_for_meeting(MID).unwrap()[0].content_blob.is_none());
+
+        move_note_public_inner_impl(&state, MID.into(), Some(TARGET.into()), true).unwrap();
 
         // Reassigned into the target, sealed AT REST (blob set) but READABLE IN-SESSION (plaintext
         // restored — the folder is session-unlocked, so it must read like its folder-mates).
@@ -16134,7 +16170,7 @@
             .collect::<Vec<_>>()
             .join(" ");
 
-        let error = move_note_public_inner_impl(&state, MID.into(), None)
+        let error = move_note_public_inner_impl(&state, MID.into(), None, true)
             .expect_err("session unlock must not become a partial permanent unseal");
 
         assert!(matches!(error, AppError::Unavailable(_)), "{error:?}");
@@ -16200,7 +16236,7 @@
 
         lock_folder_inner(&state, TARGET.to_string()).unwrap();
         session_unlock(&state, TARGET);
-        let error = move_note_public_inner_impl(&state, MID.into(), Some(TARGET.into()))
+        let error = move_note_public_inner_impl(&state, MID.into(), Some(TARGET.into()), true)
             .expect_err("a partial meeting-only seal must be refused");
 
         assert!(matches!(error, AppError::Unavailable(_)), "{error:?}");
@@ -26329,6 +26365,13 @@
             it.title, "Old Snapshot",
             "falls back to the frozen replica snapshot"
         );
+        state.unlocked_folders.lock().unwrap().insert("f-lock".into());
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let owned = items.iter().find(|item| item.item_id == "item-lock").unwrap().owned_source.as_ref().unwrap();
+        assert!(!owned.movable, "session unlock must not offer moving a still-sealed original");
+        let wire = serde_json::to_value(owned).unwrap();
+        assert_eq!(wire["movable"], false);
+
     }
 
     /// FIX A (command gate): `list_org_items_inner` refuses an org the caller isn't a local member of
@@ -44341,4 +44384,58 @@ fn recording_filing_attachment_rollback_preserves_replacement_symlink_and_unknow
             original,
             "and the pin still holds the ORIGINAL key — a refusal must never quietly re-pin"
         );
+    }
+
+    /// A later real seal must remove the moved export, not a stale pre-move path.
+    #[test]
+    fn container_move_then_lock_removes_actual_plaintext_and_preserves_sealed_bytes() {
+        let vault = tmp_vault("container-move-then-lock");
+        let state = build_state_with_vault("container-move-then-lock", &vault);
+        make_open_folder(&state.db, "moving", "Łódź");
+        make_open_folder(&state.db, "target", "Space");
+        let old = vault.join("Łódź");
+        std::fs::create_dir_all(&old).unwrap();
+        let markdown = "# Przeniesiona notatka\n\nByte-identical contents.\n";
+        seed_meeting(&state.db, "moved-note", markdown, Some("moving"));
+        seed_exported_note(&state, "moved-note", &old.join("note.md"), markdown);
+        move_container_inner(&state, "moving", Some("target")).unwrap();
+        let moved = vault.join("Space/Łódź/note.md");
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), markdown);
+        lock_folder_inner(&state, "moving".into()).unwrap();
+        assert!(!moved.exists(), "seal must delete the real moved plaintext export");
+        assert!(!old.join("note.md").exists());
+        assert!(!meeting_is_unlocked(&state,"moved-note").unwrap());
+        remove_lock_inner(&state, "moving".into()).unwrap();
+        assert_eq!(state.db.get_latest_note_for_meeting("moved-note").unwrap().unwrap().markdown, markdown);
+        std::fs::remove_dir_all(vault).unwrap();
+    }
+
+    #[test]
+    fn container_move_failed_inverse_quarantines_lock_until_recovery() {
+        let vault = tmp_vault("container-move-failed-inverse");
+        let state = build_state_with_vault("container-move-failed-inverse", &vault);
+        make_open_folder(&state.db, "moving", "Before");
+        make_open_folder(&state.db, "target", "After");
+        std::fs::create_dir_all(vault.join("Before")).unwrap();
+        let markdown = "# Plaintext must stay governed\n";
+        seed_meeting(&state.db, "quarantined-note", markdown, Some("moving"));
+        seed_exported_note(&state,"quarantined-note",&vault.join("Before/note.md"),markdown);
+        state.db.lock().execute_batch("CREATE TRIGGER fail_container_commit BEFORE UPDATE OF path ON folders BEGIN SELECT RAISE(ABORT,'injected commit failure'); END").unwrap();
+        assert!(state.db.move_container_fail_inverse_for_test("moving","target",&vault).is_err());
+        let moved = vault.join("After/Before/note.md");
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), markdown);
+        assert!(!vault.join("Before/note.md").exists());
+        assert!(matches!(lock_folder_inner(&state,"moving".into()),Err(AppError::Locked(_))));
+        assert!(!state.db.folder_by_id("moving").unwrap().unwrap().locked);
+        state.unlocked_folders.lock().unwrap().insert("other-session-folder".into());
+        assert!(relock_all_inner(&state).is_err());
+        assert!(state.unlocked_folders.lock().unwrap().is_empty(), "screen-share still revokes session visibility before refusing physical cleanup");
+        assert!(rename_folder_inner(&state,"moving".into(),"Other".into()).is_err());
+        assert!(overwrite_exported_note_guarded(&state,"quarantined-note","claude_code",vault.join("Before/note.md").to_str().unwrap(),markdown).is_err());
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), markdown);
+        state.db.lock().execute_batch("DROP TRIGGER fail_container_commit").unwrap();
+        state.db.recover_container_moves().unwrap();
+        lock_folder_inner(&state,"moving".into()).unwrap();
+        assert!(!moved.exists(),"after recovery the seal removes the real plaintext");
+        std::fs::remove_dir_all(vault).unwrap();
     }

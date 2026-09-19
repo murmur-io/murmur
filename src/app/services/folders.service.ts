@@ -193,10 +193,18 @@ export class FoldersService {
   }
 
   /** Move a note into `folderId` (null = vault root); refreshes per-folder counts. */
-  async moveNote(meetingId: string, folderId: string | null): Promise<void> {
+  async moveNote(
+    meetingId: string,
+    folderId: string | null,
+    confirmedEncryptionBoundary = false,
+  ): Promise<void> {
     this._error.set(null);
     try {
-      await this.ipc.moveNote(meetingId, folderId);
+      await this.ipc.moveNote(
+        meetingId,
+        folderId,
+        confirmedEncryptionBoundary,
+      );
       await this.load();
     } catch (e) {
       this._error.set(this.errorCopy.humanize(e));

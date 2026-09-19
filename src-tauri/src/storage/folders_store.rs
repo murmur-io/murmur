@@ -639,6 +639,28 @@ impl Db {
     /// whole adoption inherits `Db::migrate`'s transaction, so a crash leaves a database either
     /// wholly adopted or untouched.
     pub(crate) fn migrate_hierarchy_v1(conn: &rusqlite::Connection) -> Result<()> {
+        // Db::open runs migrations before AppState drains filesystem journals. Adoption must
+        // not change an interrupted move's old/new parent identity before that recovery runs.
+        // On pre-journal databases the table does not exist yet; retain the original adoption.
+        let move_journal_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='container_move_journal')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        if move_journal_exists {
+            let recovery_pending: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM container_move_journal)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(map_err)?;
+            if recovery_pending {
+                return Ok(());
+            }
+        }
         // Same exclusion the adoption itself uses: a machine-owned container is never adopted, so it
         // must not count as an orphan either — otherwise its mere presence would make every database
         // look incomplete forever.
@@ -904,30 +926,6 @@ impl Db {
             ));
         }
         Ok(())
-    }
-
-    /// Is any container at `path`, or beneath it, sealed?
-    ///
-    /// By PATH PREFIX, deliberately — the same rule the re-parent's own rewrite uses
-    /// (`reparent_note_folder_paths` matches `path LIKE '<old>/%'`). A guard that
-    /// enumerated by parent link instead would disagree with the operation it guards on
-    /// exactly the rows this step exists to repair: every note container a shipped
-    /// build created has a correct path and a NULL parent link, so a locked descendant
-    /// would be invisible to the guard and still moved by the rewrite.
-    pub(crate) fn subtree_has_sealed_container(&self, path: &str) -> Result<bool> {
-        let conn = self.lock();
-        let like = format!(
-            "{}/%",
-            path.replace('!', "!!").replace('%', "!%").replace('_', "!_")
-        );
-        conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM folders
-                  WHERE locked = 1 AND (path = ?1 OR path LIKE ?2 ESCAPE '!'))",
-            rusqlite::params![path, like],
-            |r| Ok(r.get::<_, i64>(0)? != 0),
-        )
-        .map_err(map_err)
     }
 
     /// The container a creation with NO explicit parent belongs to: the project at the vault root.

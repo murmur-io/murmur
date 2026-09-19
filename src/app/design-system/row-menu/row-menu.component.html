@@ -6,6 +6,7 @@
   [disabled]="disabled()"
   [attr.aria-haspopup]="true"
   [attr.aria-expanded]="isOpen()"
+  [attr.aria-controls]="panelId"
   [attr.aria-label]="label()"
   [title]="label()"
   (click)="onTriggerClick($event)"
@@ -30,7 +31,7 @@
        (T3: never the frosted `.card`). Items are entirely content-projected. -->
   <div
     #panel
-    class="menu row-menu-panel"
+    [id]="panelId"    class="menu row-menu-panel"
     [class.is-positioned]="panelPositioned()"
     [style.left.px]="panelLeft()"
     [style.top.px]="panelTop()"

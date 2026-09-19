@@ -1,3 +1,4 @@
+import { mockDestinationPicker } from "../notes/destination-picker-mock";
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
 import { mockTauri } from "../settings-ai/mock-invoke";
@@ -200,6 +201,7 @@ async function expectMenuItemAtHitPoint(
 
 async function openWorkspace(page: Page): Promise<void> {
   await mockTauri(page, {}, { list_workspace_tree: FOREST });
+  await mockDestinationPicker(page);
   await page.goto("/");
   await expect(
     page.getByRole("navigation", { name: "Primary navigation" }),
@@ -240,7 +242,8 @@ test("audits the complete sidebar at tall and short viewports", async ({
     { name: "short", width: 1280, height: 480 },
   ] as const) {
     await page.setViewportSize(viewport);
-    await page.goto("/meeting/m-standup");
+    await mockDestinationPicker(page);
+  await page.goto("/meeting/m-standup");
 
     const sidebar = page.getByRole("navigation", { name: "Primary navigation" });
     const body = sidebar.locator(".sb-scroll");
@@ -492,6 +495,7 @@ test("rename and delete use explicit contextual confirmation instead of native p
     },
     { list_workspace_tree: FOREST },
   );
+  await mockDestinationPicker(page);
   await page.goto("/");
 
   await page.getByRole("button", { name: "Actions for Acme" }).click();
@@ -562,6 +566,7 @@ test("shows unfiled recordings as a real inbox and opens the complete meetings l
     },
     { list_workspace_tree: FOREST },
   );
+  await mockDestinationPicker(page);
   await page.goto("/");
 
   const inbox = page.getByRole("treeitem", { name: /Unfiled recordings/ });
@@ -592,14 +597,14 @@ test("shows unfiled recordings as a real inbox and opens the complete meetings l
   await expect(moveNewest).toBeVisible();
   await moveNewest.click();
   await page
-    .getByRole("menuitem", { name: "Move to Workspace or folder…" })
+    .getByRole("menuitem", { name: "Move…" })
     .click();
   await expect(
     page
       .getByRole("dialog", {
-        name: "Move recording “Unfiled recording 12” to Workspace",
+        name: "Move “Unfiled recording 12”",
       })
-      .getByRole("button", { name: "Move to Acme", exact: true }),
+      .getByRole("button", { name: "Choose Acme", exact: true }),
   ).toBeVisible();
   await page.keyboard.press("Escape");
 
@@ -690,6 +695,7 @@ test("scrubs unfiled titles synchronously and drops a late pre-invalidation page
     },
     { list_workspace_tree: FOREST },
   );
+  await mockDestinationPicker(page);
   await page.goto("/");
   await expect(
     page.getByText("Mounted private recording", { exact: true }),
@@ -795,6 +801,7 @@ test("renders distinct, type-colored Workspace and content glyphs without washin
       list_workspace_tree: [{ ...FOREST[0], emoji: null }, FOREST[1]],
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/meeting/m-standup");
 
   const spaceIcon = page
@@ -856,6 +863,7 @@ test("keeps an older selected leaf within the eight-row cap", async ({
   page,
 }) => {
   await mockTauri(page, {}, { list_workspace_tree: FOREST });
+  await mockDestinationPicker(page);
   await page.goto("/meeting/m-old");
 
   const tree = page.getByRole("tree", { name: "Workspaces" });
@@ -951,6 +959,7 @@ test("treats a sealed container as an intrinsic leaf even when a stale payload i
       ],
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/container/p-sealed-stale");
 
   const sealed = page.getByRole("treeitem", { name: "Private" });
@@ -1078,6 +1087,7 @@ test("scrubs cached hierarchy titles when relock succeeds even if every refresh 
       ],
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/meeting/m-secret");
 
   await expect(

@@ -134,6 +134,7 @@ fn picker_dtos_are_camel_case_and_path_free_on_the_wire() {
             locked: false,
             unlocked: false,
             linkable: true,
+            availability: None,
             groups: vec![PickerGroup {
                 kind: PickerItemKind::Meeting,
                 total: 3,
@@ -148,6 +149,7 @@ fn picker_dtos_are_camel_case_and_path_free_on_the_wire() {
                 linkable: false,
                 groups: vec![],
                 folders: vec![],
+                availability: None,
             }],
         }],
         unclassified: vec![PickerGroup {
@@ -167,6 +169,7 @@ fn picker_dtos_are_camel_case_and_path_free_on_the_wire() {
             }],
             total: 400,
         }),
+        destination: None,
     };
     let json = serde_json::to_value(&bootstrap).unwrap();
     assert!(json["spaces"][0].get("linkable").is_some());
@@ -190,6 +193,7 @@ fn picker_dtos_are_camel_case_and_path_free_on_the_wire() {
             breadcrumb: vec!["Product".into(), "Atlas".into()],
         }],
         total: 1,
+        containers: None,
     };
 
     // Every serialized key across the three payloads is lowerCamelCase — no `_`, ever.
@@ -247,7 +251,9 @@ fn an_anchor_beyond_page_one_yields_its_path_and_a_bounded_centred_window() {
     // `started_at` DESC ⇒ m199 is row 0 and m049 is row 150.
     let anchor = "m049";
 
-    let boot = related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", anchor).unwrap();
+    let boot =
+        related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", anchor, PickerMode::Link)
+            .unwrap();
     let location = boot.anchor.expect("a local anchor must resolve a location");
 
     assert_eq!(location.index, 150, "the anchor's stable position");
@@ -282,7 +288,9 @@ fn an_anchor_beyond_page_one_yields_its_path_and_a_bounded_centred_window() {
     );
 
     // Stable: the same call twice gives the same window.
-    let again = related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", anchor).unwrap();
+    let again =
+        related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", anchor, PickerMode::Link)
+            .unwrap();
     assert_eq!(again.anchor.unwrap().items, location.items);
 
     // `Load earlier` and `Load more` are ordinary pages of the SAME ordering.
@@ -406,7 +414,14 @@ fn hierarchy_models_both_unclassified_sources_and_hides_system_containers() {
         1_700_000_300_000,
     );
 
-    let boot = related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", "m-filed").unwrap();
+    let boot = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "meeting",
+        "m-filed",
+        PickerMode::Link,
+    )
+    .unwrap();
 
     // Exactly one top-level Space; the machine container is absent.
     assert_eq!(boot.spaces.len(), 1);
@@ -504,8 +519,20 @@ fn hierarchy_models_both_unclassified_sources_and_hides_system_containers() {
     }
 
     // Search spans every kind and carries a full breadcrumb.
-    let hits = related_picker_search_inner(&db, &HashSet::new(), "meeting", "m-filed", "l", 0, 50)
-        .unwrap();
+    let hits = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-filed",
+            query: "l",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
+    )
+    .unwrap();
     let found: Vec<(&str, Vec<&str>)> = hits
         .hits
         .iter()
@@ -529,9 +556,20 @@ fn hierarchy_models_both_unclassified_sources_and_hides_system_containers() {
         "a reserved-root note reads as Not classified; got {found:?}"
     );
 
-    let hidden =
-        related_picker_search_inner(&db, &HashSet::new(), "meeting", "m-filed", "Hidden", 0, 50)
-            .unwrap();
+    let hidden = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-filed",
+            query: "Hidden",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
+    )
+    .unwrap();
     assert_eq!(
         hidden.total, 0,
         "items owned by orphan/arbitrary-level containers must not become search hits"
@@ -634,21 +672,29 @@ fn search_matches_space_and_folder_breadcrumbs_without_leaking_locked_descendant
     let atlas_first = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "  aTlAs  ",
-        0,
-        2,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "  aTlAs  ",
+            offset: 0,
+            limit: 2,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     let atlas_rest = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "atlas",
-        2,
-        2,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "atlas",
+            offset: 2,
+            limit: 2,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(atlas_first.total, 3);
@@ -679,11 +725,15 @@ fn search_matches_space_and_folder_breadcrumbs_without_leaking_locked_descendant
     let restricted = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "Restricted",
-        0,
-        50,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "Restricted",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert!(restricted.hits.is_empty());
@@ -695,11 +745,15 @@ fn search_matches_space_and_folder_breadcrumbs_without_leaking_locked_descendant
     let product = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "product",
-        0,
-        50,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "product",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(product.total, 4);
@@ -721,11 +775,15 @@ fn search_matches_space_and_folder_breadcrumbs_without_leaking_locked_descendant
     let unclassified = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "NOT CLASSIFIED",
-        0,
-        50,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "NOT CLASSIFIED",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(unclassified.total, 2);
@@ -737,22 +795,24 @@ fn search_matches_space_and_folder_breadcrumbs_without_leaking_locked_descendant
             .collect::<Vec<_>>(),
         vec!["m-loose", "n-loose"]
     );
-    assert!(
-        unclassified
-            .hits
-            .iter()
-            .all(|hit| hit.breadcrumb == vec!["Not classified"])
-    );
+    assert!(unclassified
+        .hits
+        .iter()
+        .all(|hit| hit.breadcrumb == vec!["Not classified"]));
 
     // Existing title substring behavior is unchanged and still carries the resolved breadcrumb.
     let title = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "meeting",
-        "m-anchor",
-        "evidence",
-        0,
-        50,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-anchor",
+            query: "evidence",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(title.total, 1);
@@ -828,7 +888,9 @@ fn parentless_canonical_notes_root_hoists_only_its_reachable_children() {
         1_700_000_100_000,
     );
 
-    let boot = related_picker_bootstrap_inner(&db, &HashSet::new(), "note", "n-anchor").unwrap();
+    let boot =
+        related_picker_bootstrap_inner(&db, &HashSet::new(), "note", "n-anchor", PickerMode::Link)
+            .unwrap();
     assert_eq!(
         boot.spaces
             .iter()
@@ -894,19 +956,34 @@ fn parentless_canonical_notes_root_hoists_only_its_reachable_children() {
     let search = related_picker_search_inner(
         &db,
         &HashSet::new(),
-        "note",
-        "n-anchor",
-        "Legacy launch",
-        0,
-        20,
+        PickerSearchQuery {
+            anchor_kind: "note",
+            anchor_id: "n-anchor",
+            query: "Legacy launch",
+            offset: 0,
+            limit: 20,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
     )
     .unwrap();
     assert_eq!(search.hits.len(), 1);
     assert_eq!(search.hits[0].id, "n-anchor");
     assert_eq!(search.hits[0].breadcrumb, vec!["Legacy ideas"]);
-    let fake_search =
-        related_picker_search_inner(&db, &HashSet::new(), "note", "n-anchor", "Fake", 0, 20)
-            .unwrap();
+    let fake_search = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "note",
+            anchor_id: "n-anchor",
+            query: "Fake",
+            offset: 0,
+            limit: 20,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
+    )
+    .unwrap();
     assert!(fake_search.hits.is_empty());
 
     let _ = std::fs::remove_file(path);
@@ -946,23 +1023,43 @@ fn a_sealed_or_unknown_anchor_fails_closed_indistinguishably_until_unlock() {
     seal(&db, "secret");
 
     // SEALED anchor → refused, with nothing at all in the payload.
-    let sealed_err =
-        related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", "m-secret").unwrap_err();
+    let sealed_err = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "meeting",
+        "m-secret",
+        PickerMode::Link,
+    )
+    .unwrap_err();
     // UNKNOWN anchor → the SAME variant and the SAME message, so the modal is not an oracle.
     let unknown_err =
-        related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", "nope").unwrap_err();
+        related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", "nope", PickerMode::Link)
+            .unwrap_err();
     assert!(matches!(sealed_err, AppError::Locked(_)));
     assert!(matches!(unknown_err, AppError::Locked(_)));
     assert_eq!(sealed_err.to_string(), unknown_err.to_string());
 
     // Search refuses the same way — an unlocked sibling surface cannot walk around the gate.
-    let search_err =
-        related_picker_search_inner(&db, &HashSet::new(), "meeting", "m-secret", "pay", 0, 50)
-            .unwrap_err();
+    let search_err = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-secret",
+            query: "pay",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
+    )
+    .unwrap_err();
     assert_eq!(search_err.to_string(), sealed_err.to_string());
 
     // From an OPEN anchor, the sealed container discloses its NAME and nothing else.
-    let boot = related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", "m-open").unwrap();
+    let boot =
+        related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", "m-open", PickerMode::Link)
+            .unwrap();
     let payload = wire(&boot);
     assert!(
         payload.contains("Secret"),
@@ -1032,8 +1129,20 @@ fn a_sealed_or_unknown_anchor_fails_closed_indistinguishably_until_unlock() {
     .unwrap_err();
     assert_eq!(unknown_page_err.to_string(), sealed_err.to_string());
     // And a search from an open anchor cannot surface a sealed hit.
-    let hits = related_picker_search_inner(&db, &HashSet::new(), "meeting", "m-open", "pay", 0, 50)
-        .unwrap();
+    let hits = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-open",
+            query: "pay",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
+    )
+    .unwrap();
     assert_eq!(
         hits.total, 0,
         "a sealed hit must not even inflate the total"
@@ -1042,7 +1151,9 @@ fn a_sealed_or_unknown_anchor_fails_closed_indistinguishably_until_unlock() {
 
     // SESSION UNLOCK restores every one of those.
     let session = unlocked(&["secret"]);
-    let boot = related_picker_bootstrap_inner(&db, &session, "meeting", "m-secret").unwrap();
+    let boot =
+        related_picker_bootstrap_inner(&db, &session, "meeting", "m-secret", PickerMode::Link)
+            .unwrap();
     assert!(boot.anchor.is_some(), "an unlocked anchor resolves again");
     let secret = boot.spaces[0]
         .folders
@@ -1062,8 +1173,20 @@ fn a_sealed_or_unknown_anchor_fails_closed_indistinguishably_until_unlock() {
     )
     .unwrap();
     assert_eq!(titles(&page.items), vec!["Board pay review"]);
-    let hits =
-        related_picker_search_inner(&db, &session, "meeting", "m-open", "pay", 0, 50).unwrap();
+    let hits = related_picker_search_inner(
+        &db,
+        &session,
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m-open",
+            query: "pay",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
+    )
+    .unwrap();
     assert_eq!(hits.total, 1);
 
     let _ = std::fs::remove_file(path);
@@ -1502,4 +1625,852 @@ fn existing_content_link_behaviour_is_unchanged_beside_a_container_relation() {
     );
 
     let _ = std::fs::remove_file(path);
+}
+
+// ── 5. DESTINATION MODE ──────────────────────────────────────────────────────────────────────────
+
+/// Find one container's availability anywhere in the rendered forest.
+fn availability_of(spaces: &[PickerContainerNode], id: &str) -> PickerAvailability {
+    fn walk(nodes: &[PickerContainerNode], id: &str) -> Option<PickerAvailability> {
+        for node in nodes {
+            if node.id == id {
+                return node.availability.clone();
+            }
+            if let Some(found) = walk(&node.folders, id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(spaces, id).unwrap_or_else(|| panic!("{id} is not in the rendered destination tree"))
+}
+
+/// A container SOURCE knows where it is, and can never be moved into itself or its own subtree.
+///
+/// This is the rule that makes a folder move safe: without it the write would reparent a container
+/// under its own descendant and orphan the whole branch.
+#[test]
+fn a_container_source_marks_here_and_refuses_itself_and_its_subtree() {
+    let (db, _path) = fresh_db("destination-container-anchor");
+    container(&db, "p1", "Product", "Product", None, "project");
+    container(&db, "f1", "Atlas", "Product/Atlas", Some("p1"), "folder");
+    container(
+        &db,
+        "f2",
+        "Deep",
+        "Product/Atlas/Deep",
+        Some("f1"),
+        "folder",
+    );
+    container(&db, "p2", "Ops", "Ops", None, "project");
+
+    let boot = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "container",
+        "f1",
+        PickerMode::Destination,
+    )
+    .unwrap();
+    let dest = boot.destination.expect("destination context");
+    assert_eq!(dest.source_kind, "container");
+    assert_eq!(dest.current_container_id.as_deref(), Some("p1"));
+    assert_eq!(dest.current_path, vec!["p1".to_string()]);
+    // A meeting container's root target is the top level of the Workspace, not the Notes root.
+    assert_eq!(dest.root.kind, "workspace");
+    assert_eq!(dest.root.label, WORKSPACE_ROOT_LABEL);
+    assert_eq!(dest.root.container_id, None);
+    assert!(
+        dest.root.availability.selectable,
+        "top level is a legal target"
+    );
+    let anchor = dest.container.expect("container coordinates");
+    assert_eq!(anchor.path_ids, vec!["p1".to_string(), "f1".to_string()]);
+    assert_eq!(anchor.subtree_ids, vec!["f1".to_string(), "f2".to_string()]);
+
+    let here = availability_of(&boot.spaces, "p1");
+    assert!(
+        here.here && !here.selectable,
+        "the current parent is `Here`, not a target"
+    );
+    let itself = availability_of(&boot.spaces, "f1");
+    assert!(itself.is_self && !itself.selectable);
+    let inside = availability_of(&boot.spaces, "f2");
+    assert!(
+        inside.descendant && !inside.selectable,
+        "no move into your own subtree"
+    );
+    assert!(availability_of(&boot.spaces, "p2").selectable);
+}
+
+/// The root row is TYPED BY THE BACKEND, because each writer wants a different argument for "the
+/// top": `move_note(null)` for a recording, the reserved Notes root id for a note or document.
+#[test]
+fn the_root_target_is_typed_by_the_source_kind() {
+    let (db, _path) = fresh_db("destination-root-kind");
+    container(&db, "notes-root", "Notes", "Notes", None, "project");
+    set_flag(&db, "notes-root", "is_root", "1");
+    set_flag(&db, "notes-root", "kind", "'note'");
+    container(
+        &db,
+        "nf",
+        "Ideas",
+        "Notes/Ideas",
+        Some("notes-root"),
+        "folder",
+    );
+    set_flag(&db, "nf", "kind", "'note'");
+    container(&db, "p1", "Product", "Product", None, "project");
+    meeting_in(&db, "m1", "Kickoff", "2026-08-20T09:00:00Z", Some("p1"));
+    note_in(&db, "n1", "Idea", "nf", 10);
+
+    let meeting = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "meeting",
+        "m1",
+        PickerMode::Destination,
+    )
+    .unwrap()
+    .destination
+    .expect("destination context");
+    assert_eq!(meeting.root.kind, "unfiled");
+    assert_eq!(meeting.root.label, UNCLASSIFIED_LABEL);
+    assert_eq!(meeting.root.container_id, None);
+    assert_eq!(meeting.current_container_id.as_deref(), Some("p1"));
+
+    let note =
+        related_picker_bootstrap_inner(&db, &HashSet::new(), "note", "n1", PickerMode::Destination)
+            .unwrap()
+            .destination
+            .expect("destination context");
+    assert_eq!(note.root.kind, "notesRoot");
+    assert_eq!(note.root.label, NOTES_ROOT_LABEL);
+    assert_eq!(
+        note.root.container_id.as_deref(),
+        Some("notes-root"),
+        "move_note_doc is not nullable, so the root must be a real id"
+    );
+    assert!(
+        !note.root.availability.here,
+        "the note lives in a folder, not at the root"
+    );
+}
+
+/// LINK mode's reply keeps its exact shape: no `destination`, no `availability`, not even a null.
+#[test]
+fn link_mode_gains_no_destination_keys_on_the_wire() {
+    let (db, _path) = fresh_db("destination-link-shape");
+    container(&db, "p1", "Product", "Product", None, "project");
+    meeting_in(&db, "m1", "Kickoff", "2026-08-20T09:00:00Z", Some("p1"));
+
+    let link =
+        related_picker_bootstrap_inner(&db, &HashSet::new(), "meeting", "m1", PickerMode::Link)
+            .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&wire(&link)).unwrap();
+    assert!(
+        json.get("destination").is_none(),
+        "link mode must not grow a key"
+    );
+    assert!(json["spaces"][0].get("availability").is_none());
+
+    let dest = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "meeting",
+        "m1",
+        PickerMode::Destination,
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&wire(&dest)).unwrap();
+    assert!(json.get("destination").is_some());
+    assert!(json["spaces"][0]["availability"]
+        .get("selectable")
+        .is_some());
+    assert_no_snake_case_keys(&json);
+}
+
+/// A SEALED container is still a named row — you must see a place to unlock it — but it is never a
+/// target and still discloses nothing about what is inside.
+#[test]
+fn a_sealed_container_is_named_but_never_a_destination() {
+    let (db, _path) = fresh_db("destination-sealed-target");
+    container(&db, "p1", "Product", "Product", None, "project");
+    container(
+        &db,
+        "f1",
+        "Payroll",
+        "Product/Payroll",
+        Some("p1"),
+        "folder",
+    );
+    meeting_in(
+        &db,
+        "m-secret",
+        "Salaries",
+        "2026-08-20T09:00:00Z",
+        Some("f1"),
+    );
+    meeting_in(&db, "m-open", "Kickoff", "2026-08-21T09:00:00Z", Some("p1"));
+    seal(&db, "f1");
+
+    let boot = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "meeting",
+        "m-open",
+        PickerMode::Destination,
+    )
+    .unwrap();
+    let sealed = availability_of(&boot.spaces, "f1");
+    assert!(sealed.locked && !sealed.selectable && !sealed.confirm);
+    let payload = wire(&boot);
+    assert!(
+        payload.contains("Payroll"),
+        "the name is disclosed, as the sidebar already does"
+    );
+    assert!(!payload.contains("Salaries"), "nothing behind the seal is");
+
+    // Session-unlocked: a legal target for a recording, but ONLY behind the confirmation, because
+    // the write encrypts the item and removes its plaintext Markdown from the vault.
+    let boot = related_picker_bootstrap_inner(
+        &db,
+        &unlocked(&["f1"]),
+        "meeting",
+        "m-open",
+        PickerMode::Destination,
+    )
+    .unwrap();
+    let open = availability_of(&boot.spaces, "f1");
+    assert!(open.selectable && open.confirm && !open.locked);
+
+    // A CONTAINER source is not offered that target at all: no shipped writer seals a subtree.
+    container(&db, "f2", "Atlas", "Product/Atlas", Some("p1"), "folder");
+    let boot = related_picker_bootstrap_inner(
+        &db,
+        &unlocked(&["f1"]),
+        "container",
+        "f2",
+        PickerMode::Destination,
+    )
+    .unwrap();
+    let open = availability_of(&boot.spaces, "f1");
+    assert!(!open.selectable && !open.confirm);
+}
+
+/// A sealed container source and an unknown one refuse IDENTICALLY, so the move modal is not an
+/// existence oracle for a folder behind a lock.
+#[test]
+fn a_sealed_or_unknown_container_source_refuses_indistinguishably() {
+    let (db, _path) = fresh_db("destination-anchor-gate");
+    container(&db, "p1", "Product", "Product", None, "project");
+    container(
+        &db,
+        "f1",
+        "Payroll",
+        "Product/Payroll",
+        Some("p1"),
+        "folder",
+    );
+    seal(&db, "f1");
+
+    let sealed = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "container",
+        "f1",
+        PickerMode::Destination,
+    )
+    .unwrap_err();
+    let unknown = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "container",
+        "nope",
+        PickerMode::Destination,
+    )
+    .unwrap_err();
+    assert!(matches!(sealed, AppError::Locked(_)));
+    assert_eq!(sealed.to_string(), unknown.to_string());
+    let search_sealed = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "container",
+            anchor_id: "f1",
+            query: "pay",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Destination,
+            org_id: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(search_sealed.to_string(), unknown.to_string());
+}
+
+/// TRACK B REGRESSION ORACLE — "the picker only shows part of the tree".
+///
+/// The reported defect: a flat, capped list. Destination search must page over the COMPLETE set of
+/// matching containers — including EMPTY ones, which no leaf query can ever return — with every
+/// container appearing exactly once across pages and nothing dropping past the old 30-row cap.
+#[test]
+fn destination_search_pages_every_matching_container_exactly_once() {
+    let (db, _path) = fresh_db("destination-search-paging");
+    container(&db, "p1", "Product", "Product", None, "project");
+    for i in 0..70 {
+        let id = format!("f{i:02}");
+        container(
+            &db,
+            &id,
+            &format!("Atlas {i:02}"),
+            &format!("Product/Atlas {i:02}"),
+            Some("p1"),
+            "folder",
+        );
+    }
+    meeting_in(&db, "m1", "Kickoff", "2026-08-20T09:00:00Z", Some("p1"));
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut total = 0;
+    for page in 0..3u32 {
+        let reply = related_picker_search_inner(
+            &db,
+            &HashSet::new(),
+            PickerSearchQuery {
+                anchor_kind: "meeting",
+                anchor_id: "m1",
+                query: "Atlas",
+                offset: page * 25,
+                limit: 25,
+                mode: PickerMode::Destination,
+                org_id: None,
+            },
+        )
+        .unwrap();
+        total = reply.total;
+        seen.extend(
+            reply
+                .containers
+                .expect("destination search returns containers")
+                .into_iter()
+                .map(|hit| {
+                    assert_eq!(hit.breadcrumb.first().map(String::as_str), Some("Product"));
+                    assert!(
+                        hit.availability.selectable,
+                        "an empty folder is still a target"
+                    );
+                    hit.id
+                }),
+        );
+    }
+    assert_eq!(
+        total, 70,
+        "the backend owns the total, not a 30-row FE slice"
+    );
+    let unique: HashSet<&String> = seen.iter().collect();
+    assert_eq!(seen.len(), 70, "no container is dropped between pages");
+    assert_eq!(unique.len(), 70, "and none is returned twice");
+
+    // LINK mode is untouched: it still returns leaves only, with no `containers` key.
+    let link = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "m1",
+            query: "Atlas",
+            offset: 0,
+            limit: 25,
+            mode: PickerMode::Link,
+            org_id: None,
+        },
+    )
+    .unwrap();
+    assert!(link.containers.is_none());
+}
+
+#[test]
+fn destination_refuses_durably_sealed_sources_even_when_session_unlocked_on_every_read() {
+    let (db, _) = fresh_db("dest-durable-source");
+    container(&db, "space", "Space", "Space", None, "project");
+    container(
+        &db,
+        "source",
+        "Source",
+        "Space/Source",
+        Some("space"),
+        "folder",
+    );
+    meeting_in(&db, "meeting", "Secret", "2026-09-18", Some("source"));
+    note_in(&db, "note", "Secret note", "source", 1);
+    document_in(&db, "doc", "Secret document", "source", 1);
+    db.insert_dashboard_in_folder(
+        "board",
+        "Secret board",
+        None,
+        None,
+        Some("source"),
+        "2026-09-18",
+    )
+    .unwrap();
+    seal(&db, "source");
+    let session = unlocked(&["source"]);
+    for (kind, id) in [
+        ("meeting", "meeting"),
+        ("note", "note"),
+        ("document", "doc"),
+        ("dashboard", "board"),
+        ("container", "source"),
+    ] {
+        let unknown =
+            related_picker_bootstrap_inner(&db, &session, kind, "missing", PickerMode::Destination)
+                .unwrap_err();
+        let bootstrap =
+            related_picker_bootstrap_inner(&db, &session, kind, id, PickerMode::Destination)
+                .unwrap_err();
+        let search = related_picker_search_inner(
+            &db,
+            &session,
+            PickerSearchQuery {
+                anchor_kind: kind,
+                anchor_id: id,
+                query: "Space",
+                offset: 0,
+                limit: 10,
+                mode: PickerMode::Destination,
+                org_id: None,
+            },
+        )
+        .unwrap_err();
+        let page = related_picker_items_with_org(
+            &db,
+            &session,
+            kind,
+            id,
+            Some("space"),
+            "meeting",
+            0,
+            10,
+            PickerMode::Destination,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(bootstrap, AppError::Locked(_)));
+        assert_eq!(
+            bootstrap.to_string(),
+            unknown.to_string(),
+            "{kind} bootstrap"
+        );
+        assert_eq!(search.to_string(), unknown.to_string(), "{kind} search");
+        assert_eq!(page.to_string(), unknown.to_string(), "{kind} page");
+    }
+    // Link behavior is deliberately unchanged: unlocked content remains linkable.
+    assert!(
+        related_picker_bootstrap_inner(&db, &session, "meeting", "meeting", PickerMode::Link)
+            .is_ok()
+    );
+}
+
+#[test]
+fn destination_hides_all_metadata_and_leaves_below_a_sealed_parent() {
+    let (db, _) = fresh_db("dest-hidden-descendants");
+    container(&db, "space", "Space", "Space", None, "project");
+    container(
+        &db,
+        "sealed",
+        "Named seal",
+        "Space/Seal",
+        Some("space"),
+        "folder",
+    );
+    container(
+        &db,
+        "hidden-child",
+        "Secret child",
+        "Space/Seal/Child",
+        Some("sealed"),
+        "folder",
+    );
+    meeting_in(&db, "open", "Open", "2026-09-18", Some("space"));
+    meeting_in(
+        &db,
+        "hidden-meeting",
+        "Secret content",
+        "2026-09-18",
+        Some("hidden-child"),
+    );
+    seal(&db, "sealed");
+    let bootstrap = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "meeting",
+        "open",
+        PickerMode::Destination,
+    )
+    .unwrap();
+    let encoded = wire(&bootstrap);
+    assert!(encoded.contains("Named seal"));
+    assert!(!encoded.contains("hidden-child"));
+    assert!(!encoded.contains("Secret"));
+    let search = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "meeting",
+            anchor_id: "open",
+            query: "Secret",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Destination,
+            org_id: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(search.total, 0);
+    assert!(related_picker_items_with_org(
+        &db,
+        &HashSet::new(),
+        "meeting",
+        "open",
+        Some("hidden-child"),
+        "meeting",
+        0,
+        10,
+        PickerMode::Destination,
+        None
+    )
+    .is_err());
+}
+
+#[test]
+fn destination_task_and_dashboard_roots_and_unsupported_lock_targets_are_backend_owned() {
+    let (db, _) = fresh_db("dest-task-board");
+    container(&db, "space", "Space", "Space", None, "project");
+    container(&db, "locked", "Lock", "Lock", None, "project");
+    seal(&db, "locked");
+    db.insert_dashboard_in_folder("board", "Board", None, None, Some("space"), "2026-09-18")
+        .unwrap();
+    db.lock().execute_batch("INSERT INTO org_state(org_id,name,role,joined_at) VALUES ('org','Org','member','now');
+      INSERT INTO org_tasks(id,org_id,doc_id,item_id,envelope_json,status,access,rev,generation,seq,updated_at,container_id)
+      VALUES ('task','org','doc','item','{}','todo','view',1,1,1,'now','space');").unwrap();
+    for (kind, id) in [("task", "task"), ("dashboard", "board")] {
+        let boot = related_picker_bootstrap_inner(
+            &db,
+            &unlocked(&["locked"]),
+            kind,
+            id,
+            PickerMode::Destination,
+        )
+        .unwrap();
+        let dest = boot.destination.unwrap();
+        assert_eq!(dest.source_kind, kind);
+        assert_eq!(dest.root.kind, "unfiled");
+        assert!(dest.root.container_id.is_none());
+        assert!(dest.root.availability.selectable);
+        assert!(availability_of(&boot.spaces, "space").here);
+        let locked = availability_of(&boot.spaces, "locked");
+        assert!(!locked.selectable && !locked.confirm);
+    }
+    db.lock()
+        .execute(
+            "UPDATE org_state SET context_enabled=0 WHERE org_id='org'",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        related_picker_bootstrap_inner(
+            &db,
+            &HashSet::new(),
+            "task",
+            "task",
+            PickerMode::Destination
+        ),
+        Err(AppError::Locked(_))
+    ));
+}
+
+#[test]
+fn destination_producer_wire_contract_contains_every_frontend_decision() {
+    let (db, _) = fresh_db("dest-producer-contract");
+    container(
+        &db,
+        "space",
+        "Space",
+        "DO_NOT_EXPOSE_STORAGE_PATH",
+        None,
+        "project",
+    );
+    container(
+        &db,
+        "child",
+        "Child",
+        "DO_NOT_EXPOSE_STORAGE_PATH/Child",
+        Some("space"),
+        "folder",
+    );
+    let boot = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "container",
+        "child",
+        PickerMode::Destination,
+    )
+    .unwrap();
+    let json = serde_json::to_value(boot).unwrap();
+    assert_eq!(json["destination"]["sourceKind"], "container");
+    assert_eq!(
+        json["destination"]["currentPath"],
+        serde_json::json!(["space"])
+    );
+    assert_eq!(
+        json["destination"]["container"]["pathIds"],
+        serde_json::json!(["space", "child"])
+    );
+    assert_eq!(
+        json["destination"]["container"]["subtreeIds"],
+        serde_json::json!(["child"])
+    );
+    assert!(json["destination"]["root"]["availability"]["selectable"].is_boolean());
+    for key in [
+        "selectable",
+        "here",
+        "self",
+        "descendant",
+        "locked",
+        "confirm",
+        "incompatible",
+    ] {
+        assert!(
+            json["spaces"][0]["availability"][key].is_boolean(),
+            "missing {key}"
+        );
+    }
+    assert_no_snake_case_keys(&json);
+    assert!(!json.to_string().contains("DO_NOT_EXPOSE_STORAGE_PATH"));
+}
+
+#[test]
+fn destination_notes_root_obeys_the_same_lock_matrix_as_tree_targets() {
+    let (db, _) = fresh_db("dest-root-seal");
+    container(&db, "root", "Notes", "Notes", None, "project");
+    set_flag(&db, "root", "kind", "'note'");
+    set_flag(&db, "root", "is_root", "1");
+    container(&db, "space", "Space", "Space", None, "project");
+    note_in(&db, "note", "Note", "space", 1);
+    seal(&db, "root");
+    let sealed = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "note",
+        "note",
+        PickerMode::Destination,
+    )
+    .unwrap()
+    .destination
+    .unwrap()
+    .root;
+    assert!(
+        sealed.availability.locked
+            && !sealed.availability.selectable
+            && !sealed.availability.confirm
+    );
+    let opened = related_picker_bootstrap_inner(
+        &db,
+        &unlocked(&["root"]),
+        "note",
+        "note",
+        PickerMode::Destination,
+    )
+    .unwrap()
+    .destination
+    .unwrap()
+    .root;
+    assert!(
+        opened.availability.selectable
+            && opened.availability.confirm
+            && !opened.availability.locked
+    );
+}
+
+#[test]
+fn destination_received_anchors_are_distinct_from_links_and_resolve_shared_root() {
+    let (db, _) = fresh_db("dest-shared-anchors");
+    const ORG: &str = "00000000-0000-4000-8000-000000000001";
+    const DOC: &str = "00000000-0000-4000-8000-000000000002";
+    container(&db, "space", "Space", "Space", None, "project");
+    container(&db, "root", "Notes", "Notes", None, "project");
+    set_flag(&db, "root", "kind", "'note'");
+    set_flag(&db, "root", "is_root", "1");
+    db.lock()
+        .execute(
+            "INSERT INTO org_state(org_id,name,role,joined_at) VALUES (?1,'Org','member','now')",
+            [ORG],
+        )
+        .unwrap();
+    db.lock().execute("INSERT INTO org_items(item_id,org_id,doc_id,seq,is_current,source_kind) VALUES ('item',?1,?2,1,1,'document')", rusqlite::params![ORG,DOC]).unwrap();
+    db.upsert_org_container(&crate::storage::models::OrgContainerRow {
+        org_id: ORG.into(),
+        container_id: "received".into(),
+        item_id: "container-item".into(),
+        level: "folder".into(),
+        name: "Received".into(),
+        emoji: None,
+        tint: None,
+        parent_container_id: None,
+        position: 0,
+        access: "view".into(),
+        author_hint: String::new(),
+        author_user_id: None,
+        document_owner_user_id: None,
+        seq: 1,
+        rev: 1,
+        generation: 1,
+        created_at: "now".into(),
+    })
+    .unwrap();
+    for (kind, id, placement_kind) in [
+        ("sharedDoc", DOC, "doc"),
+        ("sharedContainer", "received", "container"),
+    ] {
+        db.set_local_placement(ORG, placement_kind, id, Some("space"), 0, "now")
+            .unwrap();
+        let boot = related_picker_bootstrap_with_org(
+            &db,
+            &HashSet::new(),
+            kind,
+            id,
+            PickerMode::Destination,
+            Some(ORG),
+        )
+        .unwrap();
+        let context = boot.destination.unwrap();
+        assert_eq!(context.root.kind, "shared");
+        assert_eq!(context.root.label, "Shared");
+        assert!(context.root.container_id.is_none() && context.root.availability.selectable);
+        assert_eq!(context.current_container_id.as_deref(), Some("space"));
+        assert!(related_picker_bootstrap_with_org(
+            &db,
+            &HashSet::new(),
+            kind,
+            id,
+            PickerMode::Destination,
+            None
+        )
+        .is_err());
+    }
+    // A target sealed AFTER the picker opened must be revalidated by the writer, and a
+    // failed write must retain the source placement. Session unlock cannot bypass this refusal.
+    container(&db, "late-lock", "Late lock", "Late", None, "project");
+    container(
+        &db,
+        "late-child",
+        "Child",
+        "Late/Child",
+        Some("late-lock"),
+        "folder",
+    );
+    seal(&db, "late-lock");
+    for (id, target_kind) in [(DOC, "doc"), ("received", "container")] {
+        for target in ["late-lock", "late-child", "missing"] {
+            assert!(super::super::org_containers::set_shared_placement_checked(
+                &db,
+                ORG,
+                target_kind,
+                id,
+                Some(target),
+                0,
+            )
+            .is_err());
+        }
+        let placement = db
+            .list_local_placements()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.target_id == id)
+            .unwrap();
+        assert_eq!(placement.local_parent_id.as_deref(), Some("space"));
+        super::super::org_containers::set_shared_placement_checked(
+            &db,
+            ORG,
+            target_kind,
+            id,
+            None,
+            0,
+        )
+        .unwrap();
+        let placement = db
+            .list_local_placements()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.target_id == id)
+            .unwrap();
+        assert!(placement.local_parent_id.is_none());
+    }
+    // Copying uses the item revision id; link mode continues to require the stable org:doc id.
+    let copy = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "org",
+        "item",
+        PickerMode::Destination,
+    )
+    .unwrap()
+    .destination
+    .unwrap();
+    assert_eq!(copy.root.kind, "notesRoot");
+    assert_eq!(copy.root.container_id.as_deref(), Some("root"));
+    assert!(copy.root.availability.selectable && !copy.root.availability.here);
+    assert!(
+        related_picker_bootstrap_inner(&db, &HashSet::new(), "org", "item", PickerMode::Link)
+            .is_err()
+    );
+    db.lock()
+        .execute(
+            "UPDATE org_items SET source_kind='meeting' WHERE item_id='item'",
+            [],
+        )
+        .unwrap();
+    let copy = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "org",
+        "item",
+        PickerMode::Destination,
+    )
+    .unwrap()
+    .destination
+    .unwrap();
+    assert_eq!(copy.root.kind, "unfiled");
+    assert!(!copy.root.availability.selectable && copy.root.availability.incompatible);
+    // Disabling membership removes every received anchor uniformly.
+    db.lock()
+        .execute("UPDATE org_state SET context_enabled=0", [])
+        .unwrap();
+    for (kind, id) in [
+        ("sharedDoc", DOC),
+        ("sharedContainer", "received"),
+        ("org", "item"),
+    ] {
+        let error = related_picker_bootstrap_with_org(
+            &db,
+            &HashSet::new(),
+            kind,
+            id,
+            PickerMode::Destination,
+            Some(ORG),
+        )
+        .unwrap_err();
+        let unknown = related_picker_bootstrap_with_org(
+            &db,
+            &HashSet::new(),
+            kind,
+            "unknown",
+            PickerMode::Destination,
+            Some(ORG),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)));
+        assert_eq!(error.to_string(), unknown.to_string());
+    }
 }

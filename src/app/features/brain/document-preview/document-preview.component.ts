@@ -16,6 +16,8 @@ import { IpcService } from "../../../core/ipc.service";
 import type { DocumentPreviewTarget, NoteRecipe } from "../../../core/models";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { DestinationMoveService } from "../../../shared/destination-move/destination-move.service";
+import { WorkspaceService } from "../../workspace/workspace.service";
 
 /**
  * A read-only CONTENT PREVIEW for one brain document/note — presented as an
@@ -45,7 +47,7 @@ import { ErrorCopyService } from "../../../core/copy/error-copy.service";
   changeDetection: ChangeDetectionStrategy.OnPush,
   // Esc lives at DOCUMENT level on purpose: after clicking non-focusable text
   // (the preview body) focus falls to <body>, so a panel-scoped
-  // (keydown.escape) would go dead. Mirrors LibraryComponent / MoveToMenu.
+  // (keydown.escape) would go dead. Mirrors the LibraryComponent overlay.
   host: {
     "(document:keydown.escape)": "onEscape()",
   },
@@ -57,6 +59,8 @@ export class DocumentPreviewComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly destinationMove = inject(DestinationMoveService);
+  private readonly workspace = inject(WorkspaceService);
 
   /**
    * The document/note to preview; null = the modal is closed (renders nothing).
@@ -81,6 +85,8 @@ export class DocumentPreviewComponent {
   readonly noteCreated = output<string>();
 
   /** The fetched clean text ("" when sealed-masked or genuinely empty). */
+  private fetchEpoch = 0;
+  private readonly sourceMovable = signal(false);
   protected readonly content = signal<string>("");
   /** True while `getDocument` is in flight. */
   protected readonly loading = signal(false);
@@ -93,6 +99,8 @@ export class DocumentPreviewComponent {
   protected readonly genError = signal<string | null>(null);
   /** True once a note was successfully generated from this document. */
   protected readonly genCreated = signal(false);
+  /** The shared destination dialog is open for this previewed item. */
+  protected readonly moving = signal(false);
 
   private readonly closeBtn =
     viewChild<ElementRef<HTMLButtonElement>>("closeBtn");
@@ -169,6 +177,17 @@ export class DocumentPreviewComponent {
     );
   });
 
+  /** A sealed source must not offer a move-out path. */
+  protected readonly canMove = computed<boolean>(() => {
+    return (
+      !!this.doc() &&
+      this.sourceMovable() &&
+      !this.loading() &&
+      !this.error() &&
+      !this.masked()
+    );
+  });
+
   constructor() {
     // Focus the close button when the modal OPENS. This host is now MOUNTED ONCE
     // in the app shell (globally reachable) with `doc` toggled null↔target — so
@@ -193,6 +212,8 @@ export class DocumentPreviewComponent {
     // effect genuinely orchestrates an async IPC fetch, the sanctioned case.
     effect(() => {
       const d = this.doc();
+      const epoch = ++this.fetchEpoch;
+      this.sourceMovable.set(false);
       // Reset the "Make a note" state on every open / target change so a prior
       // success or error never bleeds into a different document.
       this.generating.set(false);
@@ -208,7 +229,7 @@ export class DocumentPreviewComponent {
       this.loading.set(true);
       this.error.set(null);
       this.content.set("");
-      void this.fetch(id);
+      void this.fetch(id, d.kind, epoch);
     });
   }
 
@@ -246,28 +267,54 @@ export class DocumentPreviewComponent {
   }
 
   /** Await the gated read; drop the response if the open doc changed since. */
-  private async fetch(id: string): Promise<void> {
+  private async fetch(id: string, kind: "note" | "document", epoch: number): Promise<void> {
     try {
       const text = await this.ipc.getDocument(id);
-      if (this.doc()?.id !== id) {
-        return;
-      }
+      if (this.fetchEpoch !== epoch) return;
       this.content.set(text);
-    } catch (e) {
-      if (this.doc()?.id !== id) {
-        return;
+      if (text) {
+        // The destination source gate distinguishes durable-open from session-unlocked.
+        // Do not infer Move authority from readable content or a cached sidebar forest.
+        try {
+          const bootstrap = await this.ipc.getRelatedPickerBootstrap(kind, id, "destination");
+          if (this.fetchEpoch === epoch) {
+            this.sourceMovable.set(!!bootstrap.destination && !bootstrap.destination.sourceLocked);
+          }
+        } catch {
+          // A sealed/unknown source has no Move affordance; preview remains readable if authorized.
+        }
       }
+    } catch (e) {
+      if (this.fetchEpoch !== epoch) return;
       this.error.set(this.errorCopy.humanize(e));
     } finally {
-      if (this.doc()?.id === id) {
-        this.loading.set(false);
-      }
+      if (this.fetchEpoch === epoch) this.loading.set(false);
     }
   }
 
   protected onEscape(): void {
-    if (this.doc()) {
+    if (this.doc() && !this.destinationMove.active()) {
       this.dismiss.emit();
+    }
+  }
+
+  /** Route imported documents and standalone notes through the universal picker. */
+  protected async moveDocument(event?: Event): Promise<void> {
+    const doc = this.doc();
+    if (!doc || !this.canMove() || this.moving()) {
+      return;
+    }
+    this.moving.set(true);
+    try {
+      await this.destinationMove.open({
+        kind: doc.kind,
+        id: doc.id,
+        title: doc.name,
+        actionLabel: "Move",
+        afterMove: () => this.workspace.reload(),
+      }, event);
+    } finally {
+      this.moving.set(false);
     }
   }
 

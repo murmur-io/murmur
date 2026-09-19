@@ -1398,7 +1398,7 @@ fn build_shared_node(
 /// File a received container or document somewhere in this user's own tree. Device-local; nothing
 /// is published and no one else sees it.
 #[tauri::command]
-pub fn set_shared_placement(
+pub async fn set_shared_placement(
     state: State<'_, AppState>,
     org_id: String,
     target_kind: String,
@@ -1406,11 +1406,51 @@ pub fn set_shared_placement(
     local_parent_id: Option<String>,
     position: i64,
 ) -> Result<()> {
-    state.inner().db.set_local_placement(
+    let state = state.inner();
+    let _mutation = state.lock_org_mutation().await;
+    let _lifecycle = super::lifecycle_guard(state);
+    let anchor_kind = match target_kind.as_str() {
+        "container" => "sharedContainer",
+        "doc" => "sharedDoc",
+        _ => return Err(AppError::InvalidArg("unknown placement target".into())),
+    };
+    super::related_picker_commands::require_destination_session(
+        state,
+        anchor_kind,
+        &target_id,
+        Some(&org_id),
+    )?;
+    set_shared_placement_checked(
+        &state.db,
         &org_id,
         &target_kind,
         &target_id,
         local_parent_id.as_deref(),
+        position,
+    )
+}
+
+/// Caller owns the org mutation and lifecycle interval across this admission + write.
+pub(crate) fn set_shared_placement_checked(
+    db: &crate::storage::db::Db,
+    org_id: &str,
+    target_kind: &str,
+    target_id: &str,
+    local_parent_id: Option<&str>,
+    position: i64,
+) -> Result<()> {
+    super::related_picker_commands::validate_shared_destination(
+        db,
+        org_id,
+        target_kind,
+        target_id,
+        local_parent_id,
+    )?;
+    db.set_local_placement(
+        org_id,
+        target_kind,
+        target_id,
+        local_parent_id,
         position,
         &chrono::Utc::now().to_rfc3339(),
     )
