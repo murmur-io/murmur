@@ -1,0 +1,143 @@
+@if (collapsed()) {
+  <button
+    #railToggle
+    type="button"
+    class="rail-toggle"
+    (click)="toggle()"
+    aria-label="Open live transcript"
+    title="Open live transcript"
+  >
+    <span aria-hidden="true">▤</span>
+    @if (newQuestionCount()) {
+      <span class="rail-count" [attr.aria-label]="newQuestionCount() + ' unread possible questions'">{{ newQuestionCount() }}</span>
+    }
+  </button>
+} @else {
+  <aside class="panel" aria-label="Live transcript">
+    <header class="panel-head">
+      <div>
+        <h2>Live transcript</h2>
+        <p>{{ statusLabel() }}</p>
+      </div>
+      <button
+        #collapseButton
+        type="button"
+        class="collapse-btn"
+        (click)="toggle()"
+        aria-label="Collapse live transcript"
+        title="Collapse"
+      >
+        <span aria-hidden="true">›</span>
+      </button>
+    </header>
+
+    @if (!store.liveTranscriptPaused() && captionFailure()) {
+      <mur-banner kind="warning">
+        <strong>Live captions stopped.</strong>
+        Recording continues — the full transcript still runs after Stop.
+        <button type="button" class="btn btn-ghost" (click)="store.restartLiveCaptions()" [disabled]="store.liveCaptionsRestarting()">Restart captions</button>
+        <a routerLink="/settings">Check caption settings</a>
+      </mur-banner>
+    } @else if (!store.liveTranscriptPaused() && store.liveCaptionsState() === 'paused') {
+      <p class="truncated" role="status">Live captions will resume when your Mac cools down. Recording continues.</p>
+    } @else if (!store.liveTranscriptPaused() && store.liveCaptionsState() === 'retrying') {
+      <p class="truncated" role="status">Live captions are retrying. Recording continues.</p>
+    }
+
+    @if (!store.liveTranscriptPaused() && store.liveCaptionsRestartError(); as error) {
+      <p class="truncated" role="alert">{{ error }}</p>
+    }
+
+    @if (store.liveTranscriptTruncated()) {
+      <p class="truncated" role="note">Earlier live captions were truncated.</p>
+    }
+
+    <div
+      #scroller
+      class="transcript"
+      role="log"
+      aria-live="off"
+      tabindex="0"
+      aria-label="Live transcript history"
+      (scroll)="onScroll($event)"
+    >
+      @if (canShowOlder()) {
+        <button type="button" class="older-btn" (click)="showOlder()">
+          Show earlier transcript
+        </button>
+      }
+      @for (row of rows(); track row.id) {
+        <article
+          class="bubble-row"
+          [class.is-me]="row.speaker === 'me'"
+          [class.is-question]="row.possibleQuestion"
+          [class.is-partial]="!row.final"
+        >
+          <div class="bubble-meta">
+            <span class="speaker">{{ row.speakerLabel }}</span>
+            <time [attr.datetime]="row.capturedAt" [attr.title]="row.capturedAt">{{ row.timeLabel }}</time>
+            @if (!row.final) {
+              <span>Listening…</span>
+            }
+          </div>
+          <p class="bubble">{{ row.text }}</p>
+          @if (row.possibleQuestion) {
+            <span class="question-label">Possible question</span>
+          }
+        </article>
+      } @empty {
+        <div class="empty-state" [class.is-locked]="store.liveTranscriptPaused()">
+          @if (store.liveTranscriptPaused()) {
+            <mur-icon icon="lock" />
+            @if (!store.liveTranscriptPrivacyReady()) {
+              <strong>Live transcript unavailable securely</strong>
+              <span>Reconnect privacy protection to show live captions. Audio is still being recorded.</span>
+              <button type="button" class="btn btn-primary" (click)="store.retryLiveTranscript()" [disabled]="store.liveTranscriptUnlocking()">
+                {{ store.liveTranscriptUnlocking() ? 'Reconnecting…' : 'Retry live transcript' }}
+              </button>
+            } @else {
+              <strong>Live transcript is hidden</strong>
+              <span>Unlock to resume live captions. Audio is still being recorded.</span>
+              <button type="button" class="btn btn-primary" (click)="store.unlockLiveTranscript()" [disabled]="store.liveTranscriptUnlocking()">
+                {{ store.liveTranscriptUnlocking() ? 'Unlocking…' : 'Unlock' }}
+              </button>
+            }
+            @if (store.liveTranscriptUnlockError(); as error) {
+              <p role="alert">{{ error }}</p>
+            }
+          } @else if (captionFailure()) {
+            <strong>Recording continues</strong>
+            <span>Earlier captions stay here. The complete transcript will be created after Stop.</span>
+          } @else if (store.liveCaptionsState() === 'retrying') {
+            <strong>Retrying live captions…</strong>
+            <span>The next local decode will retry automatically. Recording continues.</span>
+          } @else if (captionUnavailable()) {
+            <strong>Live captions are off</strong>
+            <span>The complete transcript will be created after Stop.</span>
+          } @else {
+            @if (systemCaptureNote()) {
+              <strong>Listening to your microphone…</strong>
+              <span>Others live is unavailable for this recording.</span>
+            } @else {
+              <strong>Listening to the conversation…</strong>
+              <span>Me and Others will appear here automatically.</span>
+            }
+          }
+        </div>
+      }
+    </div>
+
+    <footer class="panel-foot">
+      <span>{{ engineLabel() }}</span>
+      <span>{{ store.liveTranscriptLines().length }} lines</span>
+    </footer>
+
+    @if (!pinned()) {
+      <button type="button" class="jump-btn" (click)="jumpToLatest()">
+        {{ jumpLabel() }} · Jump to latest
+      </button>
+    }
+  </aside>
+}
+
+<span class="sr-only" role="status">{{ questionAnnouncement() }}</span>

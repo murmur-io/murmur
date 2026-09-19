@@ -31,6 +31,17 @@
   min-height: 0;
 }
 
+.meeting-surface {
+  display: flex;
+  flex: 1 1 auto;
+  gap: var(--space-3);
+  min-height: 0;
+}
+
+.meeting-surface .conversation {
+  min-width: 0;
+}
+
 /* --- Model-download banner --- */
 .banner-icon {
   display: inline-flex;
@@ -375,6 +386,59 @@
   background: var(--text-on-accent);
 }
 
+.stop-split {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.stop-menu-btn {
+  width: var(--space-7);
+  height: var(--space-7);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+  background: var(--surface-hover);
+  cursor: pointer;
+}
+
+.stop-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + var(--space-2));
+  z-index: var(--z-overlay);
+  min-width: var(--stop-menu-min-w);
+  background: var(--surface-overlay);
+  backdrop-filter: none;
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+}
+
+.stop-menu .menu-item {
+  align-items: flex-start;
+}
+
+.stop-menu .menu-item span:last-child {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.stop-menu small {
+  color: var(--text-tertiary);
+}
+
+.queued-confirmation {
+  align-items: center;
+}
+
+.queued-actions {
+  display: inline-flex;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
 /* ── Ambient footer HUD — receded recording controls (Calm-Notepad, 2026-07-19).
    A quiet glass bar pinned below the notepad: mic-mute · caption ticker · Ask · Stop.
    Chrome that supports the content, never competes with it. ── */
@@ -577,71 +641,8 @@
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
-/* ── Live caption ticker — rides inline in the recording strip ─────── */
-.cc-line {
+.rec-foot-spacer {
   flex: 1 1 auto;
-  min-width: 0;
-  margin: 0;
-  color: var(--text-secondary);
-  font-size: 0.875rem;
-  line-height: 1.4;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.cc-text {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  animation: cc-in 260ms var(--transition) both;
-}
-.cc-idle {
-  color: var(--text-muted);
-  font-style: italic;
-}
-/* No live-safe model on this Mac ⇒ the ticker never fills. Say so plainly instead of
-   showing "Listening…" for the whole meeting (the recording itself is unaffected). */
-.cc-off {
-  color: var(--text-muted);
-  cursor: default;
-}
-.cc-off-text {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-style: italic;
-}
-/* Live-captions honesty hint — muted, non-shrinking (flex:none) so the
-   ticker keeps absorbing the free space. Not part of the ticker itself. */
-.cc-scope {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  color: var(--text-muted);
-  font-size: 0.75rem;
-  white-space: nowrap;
-  cursor: default;
-}
-.cc-scope-ico {
-  flex: none;
-  opacity: 0.8;
-}
-/* On tighter widths drop the label; the ⓘ icon + tooltip still carry it. */
-@media (max-width: 720px) {
-  .cc-scope-text {
-    display: none;
-  }
-}
-@keyframes cc-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
 }
 
 /* ── Minimal stats strip ───────────────────────────────────────────── */

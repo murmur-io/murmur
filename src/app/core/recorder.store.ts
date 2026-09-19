@@ -17,7 +17,14 @@ import {
 } from "rxjs";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "./ipc.service";
-import type { NoteDto, Stage, StatusPayload } from "./models";
+import type {
+  LiveCaptionPayload,
+  LiveCaptionsHealthState,
+  LiveTranscriptPage,
+  NoteDto,
+  Stage,
+  StatusPayload,
+} from "./models";
 import { RecordingFlushService } from "./recording-flush.service";
 import { ToastService } from "../services/toast.service";
 import { ErrorCopyService } from "./copy/error-copy.service";
@@ -32,6 +39,20 @@ function humanBytes(bytes: number): string {
   if (bytes >= 1024 * 1024 * 1024)
     return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
   return Math.round(bytes / (1024 * 1024)) + " MB";
+}
+
+/** Committed lines cannot be downgraded by a delayed provisional event/page. */
+function mergeLiveLine(current: LiveCaptionPayload, incoming: LiveCaptionPayload): LiveCaptionPayload {
+  if (current.final === true) return current;
+  return { ...current, ...incoming };
+}
+
+function orderLiveLines(lines: LiveCaptionPayload[]): LiveCaptionPayload[] {
+  return lines.sort((a, b) => {
+    if (a.final && b.final) return (a.seq ?? 0) - (b.seq ?? 0);
+    if (a.final !== b.final) return a.final ? -1 : 1;
+    return (a.offsetMs ?? 0) - (b.offsetMs ?? 0);
+  });
 }
 
 /**
@@ -53,6 +74,27 @@ export class RecorderStore {
   private readonly _error = signal<string | null>(null);
   private readonly _meetingId = signal<string | null>(null);
   private readonly _liveCaption = signal<string>("");
+  private readonly _liveTranscriptLines = signal<LiveCaptionPayload[]>([]);
+  private readonly _liveTranscriptTruncated = signal(false);
+  private readonly _liveTranscriptHasEarlier = signal(false);
+  private readonly _liveTranscriptEventRevision = signal(0);
+  readonly liveOthersState = signal<"starting" | "ready" | "unavailable" | "degraded">("starting");
+  private readonly _liveCaptionsState = signal<LiveCaptionsHealthState>("starting");
+  private readonly _liveCaptionModel = signal<string | null>(null);
+  private readonly _liveCaptionTickMs = signal<number | null>(null);
+  readonly liveCaptionsState = this._liveCaptionsState.asReadonly();
+  readonly liveCaptionModel = this._liveCaptionModel.asReadonly();
+  readonly liveCaptionTickMs = this._liveCaptionTickMs.asReadonly();
+  readonly liveTranscriptPaused = signal(false);
+  readonly liveTranscriptPrivacyReady = this.privacyBarrier.ready;
+  readonly liveTranscriptUnlocking = signal(false);
+  readonly liveTranscriptUnlockError = signal<string | null>(null);
+  readonly liveCaptionsRestarting = signal(false);
+  readonly liveCaptionsRestartError = signal<string | null>(null);
+  private readonly _queuedMeetingId = signal<string | null>(null);
+  private liveTranscriptPrivacyEpoch = 0;
+  private liveHealthRevision = 0;
+  private liveTranscriptReadsAllowed = false;
 
   readonly stage = this._stage.asReadonly();
   readonly message = this._message.asReadonly();
@@ -82,6 +124,14 @@ export class RecorderStore {
   readonly meetingId = this._meetingId.asReadonly();
   /** Latest live-transcription caption (best-effort, only during recording). */
   readonly liveCaption = this._liveCaption.asReadonly();
+  /** Rich, append/upsert session history. Legacy `{text}` captions never enter it. */
+  readonly liveTranscriptLines = this._liveTranscriptLines.asReadonly();
+  readonly liveTranscriptTruncated = this._liveTranscriptTruncated.asReadonly();
+  readonly liveTranscriptHasEarlier = this._liveTranscriptHasEarlier.asReadonly();
+  readonly liveTranscriptEventRevision =
+    this._liveTranscriptEventRevision.asReadonly();
+  /** Last meeting explicitly deferred from this record flow. */
+  readonly queuedMeetingId = this._queuedMeetingId.asReadonly();
 
   readonly isRecording = computed(() => this._stage() === "recording");
   readonly isBusy = computed(() =>
@@ -128,7 +178,7 @@ export class RecorderStore {
     this._lastNote.set(null);
     this._error.set(null);
     this._meetingId.set(null);
-    this._liveCaption.set("");
+    this.clearLiveTranscript();
     this._recStartMs = 0;
     return true;
   }
@@ -238,6 +288,7 @@ export class RecorderStore {
   private unlistenVoice: UnlistenFn | null = null;
   private unlistenToggle: UnlistenFn | null = null;
   private unlistenLive: UnlistenFn | null = null;
+  private unlistenLiveHealth: UnlistenFn | null = null;
   private unlistenEcho: UnlistenFn | null = null;
   private unlistenStoragePruned: UnlistenFn | null = null;
   private unlistenCapped: UnlistenFn | null = null;
@@ -248,10 +299,16 @@ export class RecorderStore {
     // exported path. Scrub it at the same synchronous process-wide privacy
     // boundary used by mounted content readers, before any later render can
     // expose a stale vault receipt or keep Re-Truth active.
-    const unregister = this.privacyBarrier.registerInvalidator(() =>
-      this.invalidateTerminalPrivacy(),
-    );
+    const unregister = this.privacyBarrier.registerInvalidator(() => {
+      this.liveTranscriptReadsAllowed = false;
+      this.liveTranscriptPaused.set(true);
+      this.liveTranscriptUnlockError.set(null);
+      ++this.liveTranscriptPrivacyEpoch;
+      this.invalidateTerminalPrivacy();
+      void this.reauthorizeLiveTranscript();
+    });
     this.destroyRef.onDestroy(unregister);
+    this.destroyRef.onDestroy(() => this.unlistenLiveHealth?.());
   }
 
   /** Start a fresh `/record` presentation epoch. */
@@ -286,6 +343,13 @@ export class RecorderStore {
 
   async init(): Promise<void> {
     if (this.unlisten) return;
+    // Install the synchronous privacy barrier before subscribing to, or paging,
+    // any live transcript content. A failed barrier leaves captions fail-closed.
+    const privacyEpoch = this.liveTranscriptPrivacyEpoch;
+    const privacyReady = await this.privacyBarrier.ensureReady();
+    this.liveTranscriptReadsAllowed =
+      privacyReady && privacyEpoch === this.liveTranscriptPrivacyEpoch;
+    this.liveTranscriptPaused.set(!this.liveTranscriptReadsAllowed);
     this.unlisten = await this.ipc.onStatus((p) => this.applyStatus(p));
     // Voice trigger: when the backend hears the wake phrase, start a recording.
     this.unlistenVoice = await this.ipc.onVoiceStart(() => {
@@ -296,9 +360,16 @@ export class RecorderStore {
       this.toggleRecord(),
     );
     // Live captions during recording (best-effort; backend emits partial transcripts).
-    this.unlistenLive = await this.ipc.onLiveCaption((t) =>
-      this._liveCaption.set(t),
+    this.unlistenLive = await this.ipc.onLiveCaption((payload) =>
+      this.applyLiveCaption(payload),
     );
+    this.unlistenLiveHealth = await this.ipc.onLiveTranscriptHealth((health) => {
+      if (health.meetingId === this._meetingId() && this.isRecording()) {
+        ++this.liveHealthRevision;
+        this.liveOthersState.set(health.others);
+        this.applyCaptionHealth(health);
+      }
+    });
     // Echo cleanup notice: recording was made on speakers; echoed lines were removed.
     this.unlistenEcho = await this.ipc.onEchoSuppressed((p) => {
       const s = p.suppressed;
@@ -371,6 +442,7 @@ export class RecorderStore {
         const startedMs = st.startedAt ? Date.parse(st.startedAt) : NaN;
         this._recStartMs = Number.isFinite(startedMs) ? startedMs : Date.now();
         this._stage.set("recording");
+        if (st.meetingId) await this.hydrateLiveTranscript(st.meetingId);
       } else if (
         [
           "recording",
@@ -418,7 +490,7 @@ export class RecorderStore {
       // then filing must remain unavailable in every WebView.
       this._lastNote.set(null);
       this._stage.set("saved");
-      this._liveCaption.set("");
+      this.clearLiveTranscript();
       this._error.set(null);
       ++this.terminalStatusRequest;
       this.terminalHydration = null;
@@ -429,7 +501,7 @@ export class RecorderStore {
       // meeting before exposing its final result; never reuse get_last_note.
       this._lastNote.set(null);
       this._stage.set("saved");
-      this._liveCaption.set("");
+      this.clearLiveTranscript();
       this._error.set(null);
       if (p.meetingId) this.beginTerminalHydration(p.meetingId);
       return;
@@ -443,13 +515,14 @@ export class RecorderStore {
       this._lastNote.set(null);
     }
     if (p.stage !== "recording") {
-      this._liveCaption.set("");
+      this.clearLiveTranscript();
     }
     // Anchor the elapsed timer when THIS window first observes recording — covers windows
     // that didn't call start() themselves (the floating bar, or a voice-triggered start),
     // where _recStartMs would otherwise stay 0 and show an epoch-sized timer.
     if (p.stage === "recording" && !wasRecording) {
       this._recStartMs = Date.now();
+      if (p.meetingId) void this.hydrateLiveTranscript(p.meetingId);
     }
     if (p.stage === "error") {
       this._error.set(p.message);
@@ -459,24 +532,38 @@ export class RecorderStore {
   }
 
   async start(folderId: string | null = null): Promise<void> {
+    const privacyEpoch = ++this.liveTranscriptPrivacyEpoch;
+    const privacyReady = await this.privacyBarrier.ensureReady();
+    this.liveTranscriptReadsAllowed =
+      privacyReady && privacyEpoch === this.liveTranscriptPrivacyEpoch;
+    this.liveTranscriptPaused.set(!this.liveTranscriptReadsAllowed);
     ++this.terminalStatusRequest;
     this.terminalHydration = null;
     this.ignoredTerminalMeetingId = null;
     this._error.set(null);
-    this._liveCaption.set("");
+    this.clearLiveTranscript();
+    this._queuedMeetingId.set(null);
+    this.liveOthersState.set("starting");
+    this._liveCaptionsState.set("starting");
+    this._liveCaptionModel.set(null);
+    this._liveCaptionTickMs.set(null);
+    this.liveTranscriptUnlockError.set(null);
+    this.liveCaptionsRestartError.set(null);
     this._lastNote.set(null);
     try {
       const res = await this.ipc.startRecording(folderId);
+      const needsReplay = this._stage() !== "recording" || this._meetingId() !== res.meetingId;
       this._meetingId.set(res.meetingId);
       this._recStartMs = Date.now();
       this._stage.set("recording");
+      if (needsReplay) void this.hydrateLiveTranscript(res.meetingId);
     } catch (e) {
       this._error.set(String(e));
       this._stage.set("error");
     }
   }
 
-  async stop(flushCompanion = true): Promise<void> {
+  async stop(flushCompanion = true, deferProcessing = false): Promise<void> {
     // OPTIMISTIC flip BEFORE the await: `stopRecording` runs the WHOLE pipeline inline (transcribe
     // the entire recording + generate the note), which for a long meeting takes minutes. Without
     // this, `_stage` stays "recording" for that whole time — the Stop button keeps rendering
@@ -485,6 +572,7 @@ export class RecorderStore {
     // swaps the recording strip for the processing view; the backend's status events + the resolved
     // StopResult then reconcile the exact stage.
     this._error.set(null);
+    this._message.set(deferProcessing ? "Saving recording…" : "");
     this._stage.set("transcribing");
     const stoppingMeetingId = this._meetingId();
     ++this.terminalStatusRequest;
@@ -505,7 +593,10 @@ export class RecorderStore {
       const companionFlushCompleted = flushCompanion
         ? await this.flushService.flush()
         : false;
-      const res = await this.ipc.stopRecording(companionFlushCompleted);
+      const res = await this.ipc.stopRecording(
+        companionFlushCompleted,
+        deferProcessing,
+      );
       if (res.meetingId === this.ignoredTerminalMeetingId) {
         return;
       }
@@ -521,6 +612,15 @@ export class RecorderStore {
       }
       this._meetingId.set(res.meetingId);
       this._lastNote.set(null);
+      this.clearLiveTranscript();
+      if (res.processingDisposition === "queued") {
+        this._queuedMeetingId.set(res.meetingId);
+        this._meetingId.set(null);
+        this._message.set("");
+        this._stage.set("idle");
+        return;
+      }
+      this._queuedMeetingId.set(null);
       this._stage.set("saved");
       await this.beginTerminalHydration(res.meetingId);
     } catch (e) {
@@ -717,6 +817,7 @@ export class RecorderStore {
   private invalidateTerminalPrivacy(): void {
     ++this.terminalStatusRequest;
     this._lastNote.set(null);
+    this.clearLiveTranscript();
     const pending = this.terminalHydration;
     if (pending && this._stage() === "saved") {
       if (this.recordRouteActive) {
@@ -740,7 +841,251 @@ export class RecorderStore {
     this._lastNote.set(null);
     this._error.set(null);
     this._meetingId.set(null);
-    this._liveCaption.set("");
+    this.clearLiveTranscript();
     this._recStartMs = 0;
+  }
+
+  clearQueuedConfirmation(): void {
+    this._queuedMeetingId.set(null);
+  }
+
+  private clearLiveTranscript(): void {
+    this._liveCaption.set("");
+    this._liveTranscriptLines.set([]);
+    this._liveTranscriptTruncated.set(false);
+    this._liveTranscriptHasEarlier.set(false);
+    this.liveTranscriptBeforeSeq = null;
+  }
+
+  private liveTranscriptBeforeSeq: number | null = null;
+  private loadingOlderLiveTranscript = false;
+
+  async loadOlderLiveTranscript(): Promise<number> {
+    const meetingId = this._meetingId();
+    const beforeSeq = this.liveTranscriptBeforeSeq;
+    if (
+      !meetingId ||
+      beforeSeq === null ||
+      !this.liveTranscriptReadsAllowed ||
+      this.loadingOlderLiveTranscript
+    ) return 0;
+    this.loadingOlderLiveTranscript = true;
+    const privacyEpoch = this.liveTranscriptPrivacyEpoch;
+    try {
+      const page = await this.ipc.getLiveTranscriptPage(meetingId, beforeSeq, 200);
+      if (
+        !this.liveTranscriptReadsAllowed ||
+        privacyEpoch !== this.liveTranscriptPrivacyEpoch ||
+        meetingId !== this._meetingId() ||
+        this._stage() !== "recording"
+      ) return 0;
+      const current = this._liveTranscriptLines();
+      const known = new Set(current.map((line) => line.lineId));
+      const older = page.lines.filter(
+        (line) =>
+          !!line.lineId &&
+          !known.has(line.lineId) &&
+          (line.speaker === "me" || line.speaker === "others") &&
+          (!line.meetingId || line.meetingId === meetingId),
+      );
+      this._liveTranscriptLines.set([...older, ...current].slice(-10_000));
+      this.liveTranscriptBeforeSeq = page.nextBeforeSeq ?? null;
+      this._liveTranscriptHasEarlier.set(this.liveTranscriptBeforeSeq !== null);
+      this._liveTranscriptTruncated.set(
+        page.truncated || this._liveTranscriptTruncated(),
+      );
+      return older.length;
+    } catch {
+      return 0;
+    } finally {
+      this.loadingOlderLiveTranscript = false;
+    }
+  }
+
+  private applyLiveCaption(payload: LiveCaptionPayload): void {
+    const text = typeof payload.text === "string" ? payload.text.trim() : "";
+    const activeMeetingId = this._meetingId();
+    // The event itself is a content read. Fence every payload — including legacy
+    // `{text}` — so a late event cannot repaint transcript content after Stop/relock.
+    if (
+      !this.liveTranscriptReadsAllowed ||
+      this._stage() !== "recording" ||
+      !activeMeetingId
+    ) return;
+    if (payload.meetingId && payload.meetingId !== activeMeetingId) return;
+    if (
+      !text ||
+      !payload.lineId ||
+      (payload.speaker !== "me" && payload.speaker !== "others")
+    ) {
+      this._liveCaption.set(text);
+      return;
+    }
+
+    this._liveTranscriptLines.update((current) => {
+      const next = [...current];
+      const index = next.findIndex((line) => line.lineId === payload.lineId);
+      if (index >= 0) next[index] = mergeLiveLine(next[index], { ...payload, text });
+      else next.push({ ...payload, text });
+      orderLiveLines(next);
+      this._liveCaption.set(next.at(-1)?.text ?? "");
+      if (next.length > 10_000) {
+        this._liveTranscriptTruncated.set(true);
+        return next.slice(-10_000);
+      }
+      return next;
+    });
+    this._liveTranscriptEventRevision.update((revision) => revision + 1);
+  }
+
+  private async hydrateLiveTranscript(meetingId: string): Promise<void> {
+    if (!this.liveTranscriptReadsAllowed) return;
+    const privacyEpoch = this.liveTranscriptPrivacyEpoch;
+    const healthRevision = this.liveHealthRevision;
+    try {
+      const page = await this.ipc.getLiveTranscriptPage(meetingId, undefined, 200);
+      if (
+        !this.liveTranscriptReadsAllowed ||
+        privacyEpoch !== this.liveTranscriptPrivacyEpoch ||
+        meetingId !== this._meetingId() ||
+        this._stage() !== "recording"
+      ) {
+        return;
+      }
+      const rich = page.lines.filter(
+        (line) =>
+          !!line.lineId &&
+          (line.speaker === "me" || line.speaker === "others") &&
+          (!line.meetingId || line.meetingId === meetingId),
+      );
+      // Events may land while the page is in flight. Merge the page underneath
+      // the current event state and let the newer event copy win per lineId.
+      const merged = new Map<string, LiveCaptionPayload>();
+      for (const line of rich) merged.set(line.lineId!, line);
+      for (const line of this._liveTranscriptLines()) {
+        if (line.lineId) {
+          const snapshot = merged.get(line.lineId);
+          merged.set(line.lineId, snapshot ? mergeLiveLine(snapshot, line) : line);
+        }
+      }
+      const mergedLines = orderLiveLines([...merged.values()]).slice(-10_000);
+      this._liveTranscriptLines.set(mergedLines);
+      this._liveTranscriptTruncated.set(page.truncated);
+      // A page is a snapshot taken before it crosses IPC. A later health event
+      // wins even when the older page response settles last.
+      if (healthRevision === this.liveHealthRevision) {
+        if (page.othersState) this.liveOthersState.set(page.othersState);
+        this.applyCaptionHealth(page);
+      }
+      this.liveTranscriptBeforeSeq = page.nextBeforeSeq ?? null;
+      this._liveTranscriptHasEarlier.set(this.liveTranscriptBeforeSeq !== null);
+      const last = mergedLines.at(-1);
+      if (last?.text) this._liveCaption.set(last.text);
+    } catch {
+      // Additive compatibility: an older backend still supplies the legacy ticker.
+    }
+  }
+
+  private applyCaptionHealth(health: Pick<LiveTranscriptPage, "captionsState" | "modelLabel" | "tickIntervalMs">): void {
+    if (health.captionsState) this._liveCaptionsState.set(health.captionsState);
+    if (health.modelLabel !== undefined) this._liveCaptionModel.set(health.modelLabel);
+    if (health.tickIntervalMs !== undefined) this._liveCaptionTickMs.set(health.tickIntervalMs);
+  }
+
+  async restartLiveCaptions(): Promise<void> {
+    const meetingId = this._meetingId();
+    if (!meetingId || !this.isRecording() || this.liveCaptionsRestarting() || this.liveTranscriptPaused()) return;
+    const previous = this._liveCaptionsState();
+    const revision = this.liveHealthRevision;
+    this.liveCaptionsRestarting.set(true);
+    this.liveCaptionsRestartError.set(null);
+    this._liveCaptionsState.set("starting");
+    try {
+      await this.ipc.restartLiveCaptions(meetingId);
+      if (meetingId === this._meetingId() && this.isRecording()) {
+        await this.hydrateLiveTranscript(meetingId);
+      }
+    } catch {
+      if (meetingId === this._meetingId() && this.isRecording()) {
+        if (revision === this.liveHealthRevision) this._liveCaptionsState.set(previous);
+        this.liveCaptionsRestartError.set("Captions could not restart. Try again or check caption settings.");
+      }
+    } finally {
+      this.liveCaptionsRestarting.set(false);
+    }
+  }
+
+  async retryLiveTranscript(): Promise<void> {
+    if (this.liveTranscriptUnlocking()) return;
+    this.liveTranscriptUnlocking.set(true);
+    this.liveTranscriptUnlockError.set(null);
+    try {
+      await this.reauthorizeLiveTranscript();
+      if (!this.liveTranscriptPrivacyReady()) {
+        this.liveTranscriptUnlockError.set("The privacy connection is unavailable. Please try again.");
+      }
+    } finally {
+      this.liveTranscriptUnlocking.set(false);
+    }
+  }
+
+  async unlockLiveTranscript(): Promise<void> {
+    const meetingId = this._meetingId();
+    if (!meetingId || !this.isRecording() || this.liveTranscriptUnlocking()) return;
+    this.liveTranscriptUnlocking.set(true);
+    this.liveTranscriptUnlockError.set(null);
+    try {
+      if (!(await this.privacyBarrier.ensureReady())) return;
+      if (meetingId !== this._meetingId() || !this.isRecording()) return;
+      await this.ipc.unlockMeeting(meetingId);
+      if (meetingId !== this._meetingId() || !this.isRecording()) return;
+      // Unlock completion is not permission to render. Re-enter through a new
+      // gated page read, with the same epoch fencing as privacy invalidation.
+      await this.reauthorizeLiveTranscript();
+      if (meetingId === this._meetingId() && this.liveTranscriptPaused()) {
+        this.liveTranscriptUnlockError.set("Access could not be restored. Try unlocking again.");
+      }
+    } catch {
+      if (meetingId === this._meetingId() && this.isRecording()) {
+        this.liveTranscriptUnlockError.set("Unlock was cancelled or unavailable. Your transcript stays hidden.");
+      }
+    } finally {
+      this.liveTranscriptUnlocking.set(false);
+    }
+  }
+
+  private async reauthorizeLiveTranscript(): Promise<void> {
+    const meetingId = this._meetingId();
+    const epoch = this.liveTranscriptPrivacyEpoch;
+    const healthRevision = this.liveHealthRevision;
+    if (!meetingId || this._stage() !== "recording") return;
+    try {
+      // A successful content read alone cannot restore the invalidation listeners.
+      // Both gates must hold, including when this method is reached from Retry/Unlock.
+      const ready = await this.privacyBarrier.ensureReady();
+      if (!ready || epoch !== this.liveTranscriptPrivacyEpoch || meetingId !== this._meetingId() || !this.isRecording()) return;
+      // An unrelated deletion also invalidates the global barrier. Only a NEW
+      // successful backend-gated read may resume this recording's pushed content.
+      const page = await this.ipc.getLiveTranscriptPage(meetingId, undefined, 200);
+      if (epoch !== this.liveTranscriptPrivacyEpoch || meetingId !== this._meetingId() || this._stage() !== "recording") return;
+      this.liveTranscriptReadsAllowed = true;
+      this.liveTranscriptPaused.set(false);
+      // A page is a snapshot taken before it crosses IPC. A later health event
+      // wins even when the older page response settles last.
+      if (healthRevision === this.liveHealthRevision) {
+        if (page.othersState) this.liveOthersState.set(page.othersState);
+        this.applyCaptionHealth(page);
+      }
+      this._liveTranscriptLines.set(orderLiveLines(page.lines.filter(line =>
+        !!line.lineId && line.meetingId === meetingId &&
+        (line.speaker === "me" || line.speaker === "others"),
+      )));
+      this._liveTranscriptTruncated.set(page.truncated);
+      this.liveTranscriptBeforeSeq = page.nextBeforeSeq ?? null;
+      this._liveTranscriptHasEarlier.set(this.liveTranscriptBeforeSeq !== null);
+      this._liveCaption.set(this._liveTranscriptLines().at(-1)?.text ?? "");
+    } catch {
+      // Locked/hidden or unavailable stays scrubbed and fail-closed.
+    }
   }
 }

@@ -1906,7 +1906,7 @@ pub fn claim_disk_salvage(
         }
     };
     for id in ids {
-        if already_claimed.contains(&id) {
+        if db.processing_job(&id).map_or(true, |job| job.is_some()) || already_claimed.contains(&id) {
             continue; // the spill salvage owns this row (it has the richer dual-stream audio).
         }
         let meeting = match db.get_meeting(&id) {
@@ -2582,6 +2582,8 @@ mod tests {
             current_meeting: std::sync::Mutex::new(None),
             focus_meeting: std::sync::Mutex::new(None),
             live_transcript: std::sync::Mutex::new(String::new()),
+            live_transcript_lines: std::sync::Mutex::new(Default::default()),
+            processing_queue_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             live_bullets: std::sync::Mutex::new(String::new()),
             live_bullets_tracker: std::sync::Mutex::new(
                 crate::transcribe::bullets::BulletsTracker::default(),

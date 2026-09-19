@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 
 use crate::error::{AppError, Result};
 
+/// Exact scheduling refusal recognized by deferred work; other unavailable errors remain failures.
+pub(crate) const BACKGROUND_RECORDING_PAUSE: &str = "background local AI is paused for recording";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RecordingSessionPhase {
     Starting,
@@ -832,7 +835,7 @@ fn acquire_model_generation(
         }
         (Some(_), None) => {
             return Err(AppError::Unavailable(
-                "background local AI is paused for recording".into(),
+                BACKGROUND_RECORDING_PAUSE.into(),
             ));
         }
         (Some(active), Some(token)) => {
@@ -1057,6 +1060,25 @@ mod tests {
         drop(post);
         owner.finish().unwrap();
         assert!(acquire_unscoped_model_generation(ResidentModelKind::Whisper).is_ok());
+    }
+
+    #[test]
+    fn caption_restart_cannot_claim_model_until_previous_owner_drops() {
+        let (_serial, _reset) = session_test();
+        let mut owner = begin_recording_session().unwrap();
+        owner.transition_to_live().unwrap();
+        let token = owner.token();
+        let old = acquire_recording_model_generation(&token, ResidentModelKind::Whisper).unwrap();
+        assert!(acquire_recording_model_generation(&token, ResidentModelKind::Whisper).is_err());
+        drop(old);
+        let replacement =
+            acquire_recording_model_generation(&token, ResidentModelKind::Whisper).unwrap();
+        assert!(acquire_recording_model_generation(&token, ResidentModelKind::Whisper).is_err());
+        drop(replacement);
+        owner.transition_to_draining().unwrap();
+        assert!(acquire_recording_model_generation(&token, ResidentModelKind::Whisper).is_err());
+        owner.transition_to_postprocess().unwrap();
+        owner.finish().unwrap();
     }
 
     #[test]

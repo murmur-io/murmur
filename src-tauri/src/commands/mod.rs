@@ -27,6 +27,9 @@ use tauri::Emitter;
 /// content-free event bus itself fails, destroy the renderer and terminate instead of leaving
 /// plaintext messages/source labels available from a stale slideout cache.
 pub(crate) fn emit_ask_history_invalidated_fail_closed(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        crate::transcribe::live_history::clear_hidden_history(&state);
+    }
     if crate::events::emit_ask_history_invalidated(app) {
         return;
     }
@@ -58,6 +61,8 @@ pub(crate) fn emit_ask_history_invalidated_fail_closed(app: &AppHandle) {
 #[path = "pipeline.rs"]
 mod pipeline_commands;
 pub use pipeline_commands::*;
+mod processing_queue;
+pub use processing_queue::*;
 
 // Developer-mode diagnostics (the on-device log reader). No content surface — see the module doc.
 mod devtools;
@@ -87,6 +92,7 @@ pub use model_perf::*;
 // companion-download decision `download_model` consults. Holds no `#[tauri::command]`, so it is NOT
 // glob-re-exported — callers reach it as `live_captions::…` / `super::live_captions::…`.
 mod live_captions;
+pub use live_captions::*;
 
 // Keychain secret setters/probes. Bound as `secrets_commands` to avoid colliding with the
 // crate-level `secrets` module (`use crate::{pipeline, secrets};` above).
@@ -410,6 +416,8 @@ pub struct StartResult {
 #[serde(rename_all = "camelCase")]
 pub struct StopResult {
     pub meeting_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processing_disposition: Option<String>,
 }
 
 /// Final IPC visibility gate after a long pipeline await. Terminal command DTOs are content-free,
@@ -471,6 +479,7 @@ where
     emit_recording_finalized_after_visibility(state, notifier, meeting_id)?;
     Ok(StopResult {
         meeting_id: meeting_id.to_string(),
+        processing_disposition: None,
     })
 }
 
@@ -1674,13 +1683,36 @@ pub async fn start_recording(
             | live_captions::LiveCaptions::NoModel => {}
         }
         if let Some(model_path) = resolved.model_path() {
-            crate::transcribe::live::spawn(
+            if crate::transcribe::live::spawn(
                 app.clone(),
                 meeting_id.clone(),
                 model_path,
                 cfg.language.clone(),
                 recording_model_token,
                 manual_clip_source,
+                None,
+            )
+            .is_err()
+            {
+                crate::transcribe::live_history::captions_health_under_lifecycle(
+                    &app,
+                    &state,
+                    &meeting_id,
+                    crate::transcribe::live_history::CaptionsHealth {
+                        captions_state: crate::transcribe::live_history::CaptionsState::Stopped,
+                        ..Default::default()
+                    },
+                );
+            }
+        } else {
+            crate::transcribe::live_history::captions_health_under_lifecycle(
+                &app,
+                &state,
+                &meeting_id,
+                crate::transcribe::live_history::CaptionsHealth {
+                    captions_state: crate::transcribe::live_history::CaptionsState::Unavailable,
+                    ..Default::default()
+                },
             );
         }
     }
@@ -1721,13 +1753,15 @@ pub async fn stop_recording(
     app: AppHandle,
     state: State<'_, AppState>,
     companion_flush_completed: Option<bool>,
+    defer_processing: Option<bool>,
 ) -> Result<StopResult, AppError> {
     let flight =
-        launch_recording_stop_flight(&app, state.inner(), companion_flush_completed, None)?;
+        launch_recording_stop_flight(&app, state.inner(), companion_flush_completed, None, defer_processing.unwrap_or(false))?;
     let result = flight.wait().await.map_err(AppError::Audio)?;
     ensure_post_await_result_visible(state.inner(), &result.meeting_id)?;
     Ok(StopResult {
         meeting_id: result.meeting_id,
+        processing_disposition: result.processing_disposition,
     })
 }
 
@@ -1738,6 +1772,7 @@ fn launch_recording_stop_flight(
     state: &AppState,
     companion_flush_completed: Option<bool>,
     expected_meeting_id: Option<&str>,
+    defer_processing: bool,
 ) -> Result<std::sync::Arc<crate::state::RecordingStopFlight>, AppError> {
     let (flight, launch) = {
         // Keep the recorder identity stable through single-flight lookup/creation. An old backend
@@ -1791,10 +1826,12 @@ fn launch_recording_stop_flight(
                 owner_app,
                 delete_empty_companion,
                 expected_owner_meeting_id,
+                defer_processing,
             ));
             let outcome = match owner.await {
                 Ok(Ok(result)) => Ok(crate::state::RecordingStopResult {
                     meeting_id: result.meeting_id,
+                    processing_disposition: result.processing_disposition,
                 }),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(error) => Err(format!("recording Stop task crashed: {error}")),
@@ -1904,7 +1941,7 @@ fn spawn_recording_terminal_watchdog(app: AppHandle, meeting_id: String) {
                     }
                 }
             }
-            let _ = launch_recording_stop_flight(&app, state.inner(), None, Some(&meeting_id));
+            let _ = launch_recording_stop_flight(&app, state.inner(), None, Some(&meeting_id), false);
             return;
         }
     });
@@ -1930,6 +1967,7 @@ async fn stop_recording_owner(
     app: AppHandle,
     delete_empty_companion: bool,
     expected_meeting_id: String,
+    defer_processing: bool,
 ) -> Result<StopResult, AppError> {
     // DETACHED, panic-mapped Stop + pipeline execution. Ownership moves into a real task BEFORE
     // this command awaits anything, so webview cancellation cannot drop the sole capture/spool
@@ -1997,6 +2035,9 @@ async fn stop_recording_owner(
                     capture.ended = true;
                 }
                 drop(capture);
+                // The lifecycle guard and active id still belong to this recording here.
+                // A caption failure must never interrupt authoritative capture finalization.
+                let _ = crate::transcribe::live_history::flush_confirmed_under_lifecycle(&finish_app, &state);
                 slot.as_mut()
                     .ok_or_else(|| AppError::Audio("not recording".into()))?
                     .transition_model_to_draining()?;
@@ -2027,6 +2068,7 @@ async fn stop_recording_owner(
                             *current = None;
                         }
                         crate::transcribe::live::clear_live_transcript(&state.live_transcript);
+        crate::transcribe::live_history::clear_history(&state);
                         crate::transcribe::bullets::clear_ram(
                             &state.live_bullets,
                             &state.live_bullets_tracker,
@@ -2103,6 +2145,7 @@ async fn stop_recording_owner(
                                     crate::transcribe::live::clear_live_transcript(
                                         &state.live_transcript,
                                     );
+                                    crate::transcribe::live_history::clear_history(&state);
                                     crate::transcribe::bullets::clear_ram(
                                         &state.live_bullets,
                                         &state.live_bullets_tracker,
@@ -2199,6 +2242,7 @@ async fn stop_recording_owner(
         // it. The final batch transcript is not in SQLite yet, so clearing these buffers before the
         // owned handoff would make a valid "what did they say?" command answer from an empty note.
         crate::transcribe::live::clear_live_transcript(&state.live_transcript);
+        crate::transcribe::live_history::clear_history(&state);
         crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
 
         // Delete an empty stub only with the FE's explicit durable-flush witness. A missing/false
@@ -2234,6 +2278,21 @@ async fn stop_recording_owner(
         //   • if THIS command future is dropped (webview teardown/reload), the detached task keeps
         //     running to completion and still performs its own status writes + event emits — the
         //     (re)loaded FE recovers via the event path even without the Promise.
+        if defer_processing {
+            pipeline::defer_file_backed(&task_app, &state, &meeting_id, finalized, duration_s).await?;
+            // No ASR/provider job was admitted: the drained recording owner can retire now.
+            model_session.finish()?;
+            terminal_guard.disarm();
+            restart_voice_listener(task_app.clone());
+            // Every WebView must leave recording/processing, including the floating bar which
+            // did not invoke this Stop. Keep the id for the originating invoke's session fence.
+            let _ = task_app.emit(EVENT_STATUS, StatusPayload {
+                stage: "idle".into(), message: "Recording saved to processing queue.".into(),
+                meeting_id: Some(meeting_id.clone()),
+            });
+            return Ok(StopResult { meeting_id, processing_disposition: Some("queued".into()) });
+        }
+
         let task_meeting_id = meeting_id.clone();
         let result = pipeline::run_file_backed(
             &task_app,
@@ -7596,6 +7655,7 @@ pub async fn resummarize(
     emit_recording_finalized_after_visibility(state.inner(), &app, &result_meeting_id)?;
     Ok(StopResult {
         meeting_id: result_meeting_id,
+        processing_disposition: None,
     })
 }
 
@@ -7648,6 +7708,7 @@ pub async fn retry_transcription(
     emit_recording_finalized_after_visibility(state.inner(), &app, &result_meeting_id)?;
     Ok(StopResult {
         meeting_id: result_meeting_id,
+        processing_disposition: None,
     })
 }
 
@@ -7701,6 +7762,9 @@ pub(crate) fn retry_transcription_prep(
         .db
         .get_meeting(meeting_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no meeting with id {meeting_id}")))?;
+    if state.db.processing_job(meeting_id)?.is_some() {
+        return Err(AppError::InvalidArg("use the processing queue to retry this recording".into()));
+    }
     if meeting.status != MeetingStatus::Error {
         return Err(AppError::InvalidArg(
             "retry transcription is only available for a failed recording".into(),
@@ -10086,7 +10150,18 @@ fn move_note_command_body(
     if target_locked {
         emit_ask_history_invalidated_fail_closed(app);
     }
-    move_note_public_inner_impl(state, meeting_id, folder_id, confirmed_encryption_boundary)?;
+    // PR #708 gives the move its explicit cross-encryption-boundary confirmation; this branch
+    // still has to invalidate the live/Ask history AFTER destination authority is installed,
+    // because a refetch started before the move can otherwise land stale (or half-moved) rows.
+    // Dropping either side silently breaks one of them, so both are kept.
+    let result =
+        move_note_public_inner_impl(state, meeting_id, folder_id, confirmed_encryption_boundary);
+    if target_locked {
+        emit_ask_history_invalidated_fail_closed(app);
+    } else {
+        crate::transcribe::live_history::clear_hidden_history(state);
+    }
+    result?;
     emit_audit_updated_after_purge(app, state);
     Ok(())
 }
@@ -11136,6 +11211,8 @@ pub(crate) fn ensure_no_active_salvage_for_meeting(
 /// write cleaned up by the purge, and a job that checks post-bump aborts — no ordering leaves a
 /// stale rollup behind. Content-free (a counter), infallible, never blocks.
 pub(crate) fn bump_seal_epoch(state: &AppState) {
+    // Epoch changes revoke late work across all content domains. The post-transition
+    // renderer barrier separately clears live history ONLY if its meeting became hidden.
     state
         .seal_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

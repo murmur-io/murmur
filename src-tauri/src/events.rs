@@ -7,6 +7,7 @@ pub const EVENT_STATUS: &str = "meetnotes://status";
 pub const EVENT_TOGGLE_RECORD: &str = "murmur://toggle-record";
 
 /// Best-effort live-transcription caption emitted periodically during recording.
+pub const EVENT_LIVE_TRANSCRIPT_HEALTH: &str = "murmur://live-transcript-health";
 pub const EVENT_LIVE_CAPTION: &str = "murmur://live-caption";
 
 /// Emitted when the in-meeting voice trigger ("Claudku …") is DETECTED in a live caption tail.

@@ -183,6 +183,13 @@ pub fn run() {
             commands::set_focus_meeting,
             commands::start_recording,
             commands::stop_recording,
+            commands::get_live_transcript_page,
+            commands::restart_live_captions,
+            commands::list_processing_queue,
+            commands::process_queue_now,
+            commands::retry_processing_queue,
+            commands::remove_processing_queue,
+            commands::reorder_processing_queue,
             commands::recording_level,
             commands::recording_status,
             commands::set_mic_muted,
@@ -694,6 +701,19 @@ pub fn run() {
                             .lifecycle
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        // Queue recovery changes only durable scheduling metadata, never capture
+                        // artifacts. Reclaim it even when a surviving helper defers audio recovery.
+                        // Later remains manual across restarts; this never starts a worker.
+                        if let Err(error) = state
+                            .db
+                            .reconcile_processing_queue(&chrono::Utc::now().to_rfc3339())
+                        {
+                            tracing::warn!(target: "startup", error = %error, "queue recovery unavailable; preserving recording artifacts for a later launch");
+                            legacy_recovery_preflight
+                                .scratch_protection
+                                .preserve_all();
+                            return Ok((Vec::new(), Vec::new(), Vec::new()));
+                        }
                         if let Err(error) = crate::audio::aec::detect_surviving_capture_helpers(Some(
                             &mut legacy_recovery_preflight.scratch_protection,
                         )) {

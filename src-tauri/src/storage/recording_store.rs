@@ -1187,6 +1187,7 @@ impl Db {
                         rg.lease_expires_at_ms
                    FROM recording_generations rg
                   WHERE rg.state!='RETIRED'
+                    AND NOT EXISTS (SELECT 1 FROM processing_queue q WHERE q.meeting_id=rg.meeting_id)
                     AND rg.recovery_blocked=0
                     AND rg.lease_expires_at_ms<=?1
                     AND EXISTS(
@@ -1983,6 +1984,18 @@ mod tests {
         db.update_meeting_status(&meeting, MeetingStatus::Error)
             .unwrap();
         assert!(!db.meeting_postprocess_is_durable(&meeting).unwrap());
+    }
+
+    #[test]
+    fn deferred_queue_generation_is_never_auto_recovered() {
+        let db = db();
+        let clock = TestClock::at(5);
+        let meeting = seed_meeting(&db);
+        let (_key, _owner) = prepare(&db, &clock, &meeting);
+        db.enqueue_processing_job(&meeting, "now").unwrap();
+        clock.set(200);
+        assert!(db.claim_oldest_stale_recording_generation_with_clock(100, &clock).unwrap().is_none(),
+            "process later must never start ASR/provider work on app launch");
     }
 
     #[test]

@@ -130,6 +130,7 @@ pub type OrgOckCache = std::collections::HashMap<(String, u32), zeroize::Zeroizi
 #[derive(Clone, Debug)]
 pub struct RecordingStopResult {
     pub meeting_id: String,
+    pub processing_disposition: Option<String>,
 }
 
 /// Shared content-free result cell for idempotent Stop. Every concurrent caller observes the same
@@ -267,6 +268,8 @@ pub struct AppState {
     /// view of "what's being said right now" — the in-meeting assistant injects it so it can answer
     /// questions about the current meeting. Cleared at each recording start; bounded in size.
     pub live_transcript: Mutex<String>,
+    pub live_transcript_lines: Mutex<crate::transcribe::live_history::LiveTranscriptHistory>,
+    pub processing_queue_running: Arc<AtomicBool>,
     /// RISING-EDGE dedup for the 4h [`crate::audio::recorder::MAX_RECORDING_SECONDS`] cap notice.
     /// The status poll (`recording_level`) checks `Recorder::cap_reached()` on every tick; this flag
     /// makes the resulting [`crate::events::EVENT_RECORDING_CAPPED`] fire EXACTLY ONCE per recording.
@@ -696,6 +699,8 @@ impl AppState {
             current_meeting: Mutex::new(None),
             focus_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
+            live_transcript_lines: Mutex::new(Default::default()),
+            processing_queue_running: Arc::new(AtomicBool::new(false)),
             live_bullets: Mutex::new(String::new()),
             live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
             capped_notified: AtomicBool::new(false),
@@ -840,6 +845,8 @@ impl AppState {
             current_meeting: Mutex::new(None),
             focus_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
+            live_transcript_lines: Mutex::new(Default::default()),
+            processing_queue_running: Arc::new(AtomicBool::new(false)),
             live_bullets: Mutex::new(String::new()),
             live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
             capped_notified: AtomicBool::new(false),
@@ -1774,6 +1781,7 @@ mod tests {
         let second_waiter = tokio::spawn(async move { second.wait().await });
         flight.complete(Ok(RecordingStopResult {
             meeting_id: "meeting-42".into(),
+            processing_disposition: None,
         }));
 
         for result in [
@@ -1781,7 +1789,7 @@ mod tests {
             second_waiter.await.unwrap(),
             flight.wait().await,
         ] {
-            let RecordingStopResult { meeting_id } = result.unwrap();
+            let RecordingStopResult { meeting_id, .. } = result.unwrap();
             assert_eq!(meeting_id, "meeting-42");
         }
     }

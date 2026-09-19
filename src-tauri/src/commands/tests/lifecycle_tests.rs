@@ -99,6 +99,8 @@
             current_meeting: Mutex::new(None),
             focus_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
+            live_transcript_lines: std::sync::Mutex::new(Default::default()),
+            processing_queue_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             live_bullets: Mutex::new(String::new()),
             live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
             capped_notified: std::sync::atomic::AtomicBool::new(false),
@@ -17235,6 +17237,7 @@
     fn stop_result_wire_is_content_free_meeting_id_only() {
         let json = serde_json::to_value(StopResult {
             meeting_id: "meeting-42".into(),
+            processing_disposition: None,
         })
         .unwrap();
         assert_eq!(json, serde_json::json!({ "meetingId": "meeting-42" }));

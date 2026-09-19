@@ -232,6 +232,11 @@ impl SystemAudioRecorder {
     /// Host wall-clock instant when this system-audio stream started CAPTURING (for the merge).
     /// Prefers the helper's first-frame anchor; falls back to the spawn instant (a helper that
     /// died before capturing, or an old helper without the line).
+    /// Internal read-only live source; never exposed over IPC.
+    pub(crate) fn live_path(&self) -> &std::path::Path {
+        &self.wav_path
+    }
+
     pub fn started_at(&self) -> std::time::Instant {
         self.first_frame_at
             .get()

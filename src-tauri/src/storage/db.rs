@@ -59,6 +59,7 @@ impl MeetingStatus {
         match self {
             MeetingStatus::Draft => "DRAFT",
             MeetingStatus::Recording => "RECORDING",
+            MeetingStatus::Queued => "QUEUED",
             MeetingStatus::Transcribed => "TRANSCRIBED",
             MeetingStatus::Summarized => "SUMMARIZED",
             MeetingStatus::Exported => "EXPORTED",
@@ -74,6 +75,7 @@ impl FromStr for MeetingStatus {
         match s {
             "DRAFT" => Ok(MeetingStatus::Draft),
             "RECORDING" => Ok(MeetingStatus::Recording),
+            "QUEUED" => Ok(MeetingStatus::Queued),
             "TRANSCRIBED" => Ok(MeetingStatus::Transcribed),
             "SUMMARIZED" => Ok(MeetingStatus::Summarized),
             "EXPORTED" => Ok(MeetingStatus::Exported),
@@ -1703,7 +1705,40 @@ impl Db {
         // (`commands::trash::seal_trash_in_folder`), so it can never become an ungated back door
         // into a sealed folder.
         Self::migrate_trash(&conn)?;
+        // Deferred-processing QUEUE — the canonical home of "process later" (T5 meeting surface,
+        // 2026-09-19). Additive + guarded so migrate() stays idempotent. Runs after `meetings`
+        // because the row's PK is an FK into it. NOTHING here is content: a row is a schedule
+        // (state + position + attempts + a stable error code), never a title, transcript or path,
+        // so the queue can never become a back door around the lock model.
+        Self::migrate_processing_queue(&conn)?;
         conn.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Idempotent DEFERRED-PROCESSING QUEUE schema (2026-09-19).
+    ///
+    /// One row per meeting the user chose to process later. `state` is CHECK-constrained to the
+    /// three honest states; `position` is an explicit dense non-negative order (not rowid) so
+    /// "process now" and bulk reorder are expressible; `attempts`/`error_code` make a failure
+    /// legible without storing a raw provider message. Deleting the meeting cascades the job —
+    /// a schedule for a meeting that no longer exists is garbage, not history.
+    fn migrate_processing_queue(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS processing_queue (
+               meeting_id TEXT PRIMARY KEY,
+               state TEXT NOT NULL CHECK (state IN ('queued','processing','failed')),
+               position INTEGER NOT NULL CHECK (position >= 0),
+               stage TEXT,
+               attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+               error_code TEXT,
+               enqueued_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_processing_queue_order
+               ON processing_queue(state, position, enqueued_at, meeting_id);",
+        )
+        .map_err(map_err)?;
         Ok(())
     }
 
@@ -7668,6 +7703,7 @@ impl Db {
                       )
                     )
                   )
+                  AND NOT EXISTS (SELECT 1 FROM processing_queue q WHERE q.meeting_id=m.id)
                   ORDER BY m.started_at ASC, m.id ASC",
             )
             .map_err(map_err)?;
@@ -10083,3 +10119,7 @@ mod reminder_tests;
 #[cfg(test)]
 #[path = "db_tests/dashboard_tests.rs"]
 mod dashboard_tests;
+
+#[cfg(test)]
+#[path = "db_tests/processing_queue_tests.rs"]
+mod processing_queue_tests;

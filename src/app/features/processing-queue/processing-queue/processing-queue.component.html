@@ -1,0 +1,110 @@
+<section class="queue-page">
+  <header class="queue-head">
+    <div>
+      <span class="eyebrow">On-device workflow</span>
+      <h1>Processing queue</h1>
+      <p>Recordings you chose to process later stay on this Mac.</p>
+    </div>
+    <button
+      type="button"
+      class="btn btn-ghost"
+      (click)="store.load()"
+      [disabled]="store.loading()"
+    >
+      Refresh
+    </button>
+  </header>
+
+  <nav class="filters" aria-label="Queue status">
+    <button type="button" [class.active]="filter() === 'all'" (click)="setFilter('all')">
+      All <span class="count">{{ counts().all }}</span>
+    </button>
+    <button type="button" [class.active]="filter() === 'queued'" (click)="setFilter('queued')">
+      Waiting <span class="count">{{ counts().queued }}</span>
+    </button>
+    <button type="button" [class.active]="filter() === 'processing'" (click)="setFilter('processing')">
+      Processing <span class="count">{{ counts().processing }}</span>
+    </button>
+    <button type="button" [class.active]="filter() === 'failed'" (click)="setFilter('failed')">
+      Failed <span class="count">{{ counts().failed }}</span>
+    </button>
+    <button type="button" [class.active]="filter() === 'held'" (click)="setFilter('held')">
+      Held <span class="count">{{ counts().held }}</span>
+    </button>
+  </nav>
+
+  @if (selectedCount() > 0) {
+    <div class="bulk card" role="toolbar" aria-label="Selected queue items">
+      <strong>{{ selectedCount() }} selected</strong>
+      <span class="bulk-spacer"></span>
+      <button type="button" class="btn btn-ghost" (click)="run(selectedRunnableIds())" [disabled]="selectedRunnableIds().length === 0 || actionsDisabled()">Process now</button>
+      <button type="button" class="btn btn-ghost" (click)="retry(selectedRetryIds())" [disabled]="selectedRetryIds().length === 0 || actionsDisabled()">Retry</button>
+      <button type="button" class="btn btn-ghost" (click)="remove(selectedRemovableIds())" [disabled]="selectedRemovableIds().length === 0 || actionsDisabled()">Remove</button>
+      <button type="button" class="btn btn-ghost" (click)="clearSelection()">Clear</button>
+    </div>
+  }
+
+  @if (store.error(); as error) {
+    <div class="banner is-danger" role="alert">
+      <span>{{ error }}</span>
+      <button type="button" class="btn btn-ghost" (click)="store.load()">Try again</button>
+    </div>
+  }
+
+  @if (store.items().length === 0 && store.loading()) {
+    <div class="state-card" role="status"><mur-spinner [size]="20" /> Loading queue…</div>
+  } @else if (store.items().length === 0) {
+    <div class="empty-state card">
+      <mur-icon icon="history" />
+      <strong>Nothing is waiting</strong>
+      <span>Choose “Process later” when you stop a recording and it will appear here.</span>
+      <a class="btn btn-primary" routerLink="/record">Start a recording</a>
+    </div>
+  } @else {
+    @if (store.loading()) {
+      <p class="refreshing" role="status">Refreshing…</p>
+    }
+    <div class="queue-list" aria-label="Processing queue items">
+      @for (row of rows(); track row.id) {
+        <article class="queue-row card" [class.is-held]="row.state === 'held'">
+          <label class="select-control">
+            <input
+              type="checkbox"
+              [checked]="row.selected"
+              [disabled]="row.state === 'held'"
+              (change)="toggleSelected(row.id, $any($event.target).checked)"
+              [attr.aria-label]="'Select ' + row.title"
+            />
+          </label>
+          <div class="row-main">
+            <div class="row-title-line">
+              <h2>{{ row.title }}</h2>
+              <span class="pill" [class.is-danger]="row.state === 'failed'" [class.is-accent]="row.state === 'processing'">{{ row.stateLabel }}</span>
+            </div>
+            <p>{{ row.detailLabel }}</p>
+          </div>
+          <div class="order-actions" aria-label="Queue position">
+            <button type="button" class="icon-btn" (click)="move(row.id, -1)" [disabled]="!row.canMoveUp || actionsDisabled()" [attr.aria-label]="'Move ' + row.title + ' up'">↑</button>
+            <button type="button" class="icon-btn" (click)="move(row.id, 1)" [disabled]="!row.canMoveDown || actionsDisabled()" [attr.aria-label]="'Move ' + row.title + ' down'">↓</button>
+          </div>
+          <div class="row-actions">
+            @if (row.runnable) {
+              <button type="button" class="btn btn-primary" (click)="run([row.id])" [disabled]="actionsDisabled()">Process now</button>
+            }
+            @if (row.retryable) {
+              <button type="button" class="btn btn-primary" (click)="retry([row.id])" [disabled]="actionsDisabled()">Retry</button>
+            }
+            @if (row.removable) {
+              <button type="button" class="btn btn-ghost" (click)="remove([row.id])" [disabled]="actionsDisabled()">Remove</button>
+            }
+          </div>
+        </article>
+      } @empty {
+        <div class="empty-state card">
+          <strong>No items in this view</strong>
+          <span>Try another status filter.</span>
+        </div>
+      }
+    </div>
+  }
+</section>

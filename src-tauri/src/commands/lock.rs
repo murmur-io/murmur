@@ -737,6 +737,9 @@ fn lock_folder_inner_with_visibility_notice_policy(
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         unlocked.remove(&folder_id);
     }
+    // The renderer notice precedes session removal on this fresh-seal path. Recheck the
+    // live session cache at the settled authority boundary without re-entering lifecycle.
+    crate::transcribe::live_history::clear_hidden_history(state);
     if let Ok(mut cache) = state.verify_cache.lock() {
         cache.clear();
     }

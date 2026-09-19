@@ -55,6 +55,8 @@
   --note-leading: 1.7;
 
   /* Compact command/picker hierarchy shared by dense workspace chrome. */
+  --type-live-control: 1.2rem;
+  --type-queue-title: 1.8rem;
   --type-command-label: 0.84rem;
   --type-command-caption: 0.72rem;
   --type-command-kicker: 0.66rem;

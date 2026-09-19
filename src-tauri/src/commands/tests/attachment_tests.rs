@@ -33,6 +33,8 @@ fn build_state(tag: &str, vault: Option<&std::path::Path>) -> AppState {
         current_meeting: Mutex::new(None),
         focus_meeting: Mutex::new(None),
         live_transcript: Mutex::new(String::new()),
+        live_transcript_lines: std::sync::Mutex::new(Default::default()),
+        processing_queue_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         live_bullets: Mutex::new(String::new()),
         live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
         capped_notified: std::sync::atomic::AtomicBool::new(false),

@@ -19,6 +19,7 @@ pub mod migration;
 pub mod models;
 pub(crate) mod notes_store;
 pub(crate) mod org_store;
+pub(crate) mod processing_queue_store;
 pub(crate) mod recording_store;
 pub(crate) mod related_picker_store;
 pub(crate) mod reminder_store;

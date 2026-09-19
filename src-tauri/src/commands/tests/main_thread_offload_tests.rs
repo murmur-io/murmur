@@ -29,6 +29,8 @@ use std::path::PathBuf;
 
 /// `(file, command)` — every read the 2026-09-02 audit (S1) named as a hot listing/searching path.
 const OFFLOADED_READS: &[(&str, &str)] = &[
+    ("processing_queue.rs", "list_processing_queue"),
+    ("live_captions.rs", "get_live_transcript_page"),
     ("meetings.rs", "list_meetings"),
     ("meetings.rs", "search_meetings"),
     ("meetings.rs", "get_meeting_detail"),
