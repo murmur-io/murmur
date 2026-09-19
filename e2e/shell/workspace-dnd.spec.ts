@@ -68,7 +68,7 @@ const FOREST = [
   },
 ];
 
-async function open(page: Page): Promise<void> {
+async function open(page: Page, sessionUnlocked = false): Promise<void> {
   // Tall enough that the whole tree fits: a rail that scrolls mid-drag moves the source
   // out from under the pointer, and the drag never completes.
   await page.setViewportSize({ width: 1280, height: 1400 });
@@ -96,7 +96,7 @@ async function open(page: Page): Promise<void> {
         return null;
       },
     },
-    { list_workspace_tree: FOREST },
+    { list_workspace_tree: FOREST.map(node => node.id === "p-sealed" ? {...node, unlocked:sessionUnlocked} : node) },
   );
   await page.goto("/");
   await expect(page.getByRole("tree", { name: "Workspaces" })).toBeVisible();
@@ -148,7 +148,7 @@ test("each kind is filed through its OWN backend mover", async ({ page }) => {
     () => (globalThis as unknown as { __moves?: unknown[] }).__moves ?? [],
   );
   expect(moves).toEqual([
-    { cmd: "move_note", args: { meetingId: "m-1", folderId: "p-target" } },
+    { cmd: "move_note", args: { meetingId: "m-1", folderId: "p-target", confirmedEncryptionBoundary: false } },
     {
       cmd: "move_dashboard_to_container",
       args: { id: "d-1", folderId: "p-target" },
@@ -171,12 +171,36 @@ test("dropping a meeting on a container files it there", async ({ page }) => {
     () => (globalThis as unknown as { __moves?: unknown[] }).__moves ?? [],
   );
   expect(moves).toEqual([
-    { cmd: "move_note", args: { meetingId: "m-1", folderId: "p-target" } },
+    { cmd: "move_note", args: { meetingId: "m-1", folderId: "p-target", confirmedEncryptionBoundary: false } },
   ]);
 });
 
 test("a sealed container is not a drop target", async ({ page }) => {
   await open(page);
+
+  await page
+    .getByRole("treeitem", { name: /Standup/ })
+    .dragTo(page.getByRole("treeitem", { name: /Clients/ }));
+
+  // Every mover refuses a sealed, not-unlocked destination, so arming it would only
+  // invite a drop that can fail.
+  const moves = await page.evaluate(
+    () => (globalThis as unknown as { __moves?: unknown[] }).__moves ?? [],
+  );
+  expect(moves).toEqual([]);
+});
+
+test("a session-unlocked encrypted container is not a direct drop target", async ({ page }) => {
+  await open(page, true);
+  const source = page.getByRole("treeitem", { name: /Standup/ });
+  const target = page.getByRole("treeitem", { name: /Clients/ });
+  const dataTransfer = await page.evaluateHandle(() => new DataTransfer());
+  await source.dispatchEvent("dragstart", { dataTransfer });
+  await expect(page.getByRole("treeitem", { name: /Target/ })).toHaveClass(/is-drop-armed/);
+  await expect(target).not.toHaveClass(/is-drop-armed/);
+  await target.dispatchEvent("dragover", { dataTransfer });
+  await expect(target).not.toHaveClass(/is-drop-target/);
+  await source.dispatchEvent("dragend", { dataTransfer });
 
   await page
     .getByRole("treeitem", { name: /Standup/ })

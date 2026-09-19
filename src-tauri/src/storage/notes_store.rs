@@ -408,6 +408,19 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// Move-only raw row shared by authored notes and imported documents. The caller MUST gate
+    /// the content-free folder identity first; authoring readers remain note-only.
+    pub(crate) fn movable_document_row(&self, id: &str) -> Result<Option<NoteRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, folder_id, name, title, COALESCE(text, ''), created_at, updated_at,
+                    exported_path, (text_blob IS NOT NULL)
+               FROM documents WHERE id = ?1 AND kind IN ('note','document')",
+            rusqlite::params![id],
+            row_to_note_row,
+        ).optional().map_err(map_err)
+    }
+
     /// Content-free authorization anchor for one authored note. Commands use this BEFORE reading
     /// [`NoteRow`] so a locked row's title/body/export path never enters the process merely to find
     /// its governing folder. Timestamps are safe identity metadata used by the masked editor DTO.

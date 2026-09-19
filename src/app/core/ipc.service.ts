@@ -76,6 +76,7 @@ import type {
   ItemPage,
   LinkEdge,
   LinkKind,
+  DestinationPickerAnchorKind,
   LiveCaptionPayload,
   LiveTranscriptHealth,
   LiveTranscriptPage,
@@ -3024,12 +3025,16 @@ export class IpcService {
    * collapsed.
    */
   getRelatedPickerBootstrap(
-    anchorKind: LinkKind,
+    anchorKind: DestinationPickerAnchorKind,
     anchorId: string,
+    mode: "link" | "destination" = "link",
+    orgId?: string,
   ): Promise<RelatedPickerBootstrap> {
     return invoke<RelatedPickerBootstrap>("get_related_picker_bootstrap", {
       anchorKind,
       anchorId,
+      ...(mode === "destination" ? { mode } : {}),
+      ...(orgId !== undefined ? { orgId } : {}),
     });
   }
 
@@ -3041,12 +3046,14 @@ export class IpcService {
    * REFUSED, never answered with an empty page.
    */
   listRelatedPickerItems(
-    anchorKind: LinkKind,
+    anchorKind: DestinationPickerAnchorKind,
     anchorId: string,
     containerId: string | null,
     kind: PickerItemKind,
     offset: number,
     limit: number,
+    mode: "link" | "destination" = "link",
+    orgId?: string,
   ): Promise<RelatedPickerPage> {
     return invoke<RelatedPickerPage>("list_related_picker_items", {
       anchorKind,
@@ -3055,6 +3062,8 @@ export class IpcService {
       kind,
       offset,
       limit,
+      ...(mode === "destination" ? { mode } : {}),
+      ...(orgId !== undefined ? { orgId } : {}),
     });
   }
 
@@ -3064,11 +3073,13 @@ export class IpcService {
    * a sealed anchor cannot use search to walk around its own lock.
    */
   searchRelatedPicker(
-    anchorKind: LinkKind,
+    anchorKind: DestinationPickerAnchorKind,
     anchorId: string,
     query: string,
     offset: number,
     limit: number,
+    mode: "link" | "destination" = "link",
+    orgId?: string,
   ): Promise<RelatedPickerSearchPage> {
     return invoke<RelatedPickerSearchPage>("search_related_picker", {
       anchorKind,
@@ -3076,6 +3087,8 @@ export class IpcService {
       query,
       offset,
       limit,
+      ...(mode === "destination" ? { mode } : {}),
+      ...(orgId !== undefined ? { orgId } : {}),
     });
   }
 
@@ -3110,8 +3123,21 @@ export class IpcService {
   }
 
   /** Move a note into a folder (or to the vault root with `folderId = null`). */
-  moveNote(meetingId: string, folderId: string | null): Promise<void> {
-    return invoke<void>("move_note", { meetingId, folderId });
+  moveNote(
+    meetingId: string,
+    folderId: string | null,
+    confirmedEncryptionBoundary = false,
+  ): Promise<void> {
+    return invoke<void>("move_note", {
+      meetingId,
+      folderId,
+      confirmedEncryptionBoundary,
+    });
+  }
+
+  /** Move any local Workspace/folder container; root semantics are backend-owned. */
+  moveContainer(containerId: string, parentId: string | null): Promise<void> {
+    return invoke<void>("move_container", { id: containerId, parentId });
   }
 
   /** Seal a folder: encrypt its notes into content blobs, blank markdown, remove vault .md. */
@@ -3260,8 +3286,16 @@ export class IpcService {
    * Gated on BOTH sides — rejects (`Locked`) when the source or target folder is
    * sealed-and-not-session-unlocked.
    */
-  moveNoteDoc(id: string, folderId: string): Promise<void> {
-    return invoke<void>("move_note_doc", { id, folderId });
+  moveNoteDoc(
+    id: string,
+    folderId: string,
+    confirmedEncryptionBoundary = false,
+  ): Promise<void> {
+    return invoke<void>("move_note_doc", {
+      id,
+      folderId,
+      confirmedEncryptionBoundary,
+    });
   }
 
   /**

@@ -1,0 +1,52 @@
+@if (request(); as move) {
+  <app-related-hierarchy-picker
+    mode="destination"
+    [anchorKind]="anchorKind()"
+    [anchorId]="move.id"
+    [orgId]="move.orgId"
+    [anchorTitle]="move.title"
+    [currentContainerId]="move.currentContainerId ?? null"
+    [actionLabel]="actionLabel()"
+    [busy]="busy()"
+    [externalError]="error()"
+    (destinationPicked)="choose($event)"
+    (closed)="close()"
+    (invalidated)="invalidate()"
+  />
+
+  @if (pendingLockedTarget(); as target) {
+    <div appTeleportToBody class="destination-confirm-scrim" (mousedown)="cancelConfirmation()">
+      <section
+        class="destination-confirm"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="destination-confirm-title"
+        (mousedown)="$event.stopPropagation()"
+        (keydown)="onConfirmationKeydown($event)"
+      >
+        <span class="destination-confirm-mark" aria-hidden="true">
+          <mur-icon icon="lock" />
+        </span>
+        <h2 id="destination-confirm-title">Move into a locked folder?</h2>
+        <p>
+          This encrypts the item and removes its plaintext Markdown from the
+          vault.
+        </p>
+        <strong>{{ target.breadcrumb }}</strong>
+        <div class="destination-confirm-actions">
+          <button #confirmCancel type="button" class="btn" (click)="cancelConfirmation()">
+            Cancel
+          </button>
+          <button
+            #confirmCommit
+            type="button"
+            class="btn btn-primary"
+            (click)="confirmLockedMove()"
+          >
+            Encrypt &amp; move
+          </button>
+        </div>
+      </section>
+    </div>
+  }
+}

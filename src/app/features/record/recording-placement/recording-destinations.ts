@@ -10,10 +10,10 @@ export interface RecordingDestination {
 }
 
 /**
- * Flatten the gated workspace tree for every recording destination picker.
+ * Flatten the gated workspace tree for the compact pre-recording chooser.
  *
  * The backend remains the write authority. This helper owns the matching render
- * policy so the Record route's post-final picker and the 58px floating bar cannot drift:
+ * policy for the 58px floating bar:
  * session-unlocked sealed rows (and their descendants) remain visible but
  * disabled, while descendants of sealed-not-unlocked rows are never disclosed.
  */

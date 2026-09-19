@@ -156,12 +156,12 @@
                     : "shared item"
               }}
             </button>
-            @if (row.kind !== "unclassified") {
+            @if (row.kind !== "unclassified" && (!row.item.ownedSource || row.item.ownedSource.movable === true)) {
               <button
                 type="button"
                 class="menu-item"
                 role="menuitem"
-                (click)="openAddToSpace(row)"
+                (click)="openAddToSpace(row, $event)"
               >
                 <mur-icon
                   [icon]="row.item.ownedSource ? 'move' : 'folder-add'"
@@ -179,18 +179,3 @@
     </section>
   }
 </main>
-
-@if (addRequest(); as row) {
-  @if (addRequestItem(); as moveItem) {
-    <app-workspace-move-sheet
-      [item]="moveItem"
-      fromLabel="Shared Brains"
-      [actionVerb]="addActionVerb()"
-      [targets]="targets()"
-      [busy]="addBusy()"
-      [error]="addError()"
-      (move)="addToSpace($event)"
-      (cancelled)="closeAddToSpace()"
-    />
-  }
-}

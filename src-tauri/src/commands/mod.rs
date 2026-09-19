@@ -291,6 +291,9 @@ pub use import_commands::*;
 mod folders_commands;
 pub use folders_commands::*;
 
+mod container_move;
+pub use container_move::*;
+
 // WORKSPACE HIERARCHY command surface (Projects › Folders › items — the container forest the new
 // sidebar renders, plus its paged item reader). READ-ONLY: no seal, no key, no write. Bound as
 // `workspace_commands` (via `#[path]`) to mirror the sibling modules and avoid colliding with
@@ -2527,6 +2530,7 @@ pub(crate) fn overwrite_exported_note_guarded(
     path: &str,
     markdown: &str,
 ) -> Result<(), AppError> {
+    state.db.ensure_container_move_ready()?;
     let exported_markdown = if markdown.contains("murmur-attachment://") {
         let vault = vault_path(state)
             .ok_or_else(|| AppError::Export("no vault configured for image export".into()))?;
@@ -4503,6 +4507,7 @@ fn write_note_to_vault(
     state: &AppState,
     row: &crate::storage::db::NoteRow,
 ) -> Result<Option<String>, AppError> {
+    state.db.ensure_container_move_ready()?;
     if row.text.is_empty() {
         // A sealed (blanked) note or a fresh empty note: nothing meaningful to export; leave the
         // vault as-is (an empty file would be a leak of the note's existence, and content lives in
@@ -4732,6 +4737,7 @@ pub(crate) fn remove_rollup_export_files(paths: &[String]) {
 /// rows that carry those paths. This ordering makes an unlink failure retryable and closes the
 /// crash window where DB-first purge permanently forgot a plaintext vault file.
 pub(crate) fn remove_rollup_exports_before_seal_purge(db: &Db) -> Result<(), AppError> {
+    db.ensure_container_move_ready()?;
     for rollup in db.list_memory_rollups()? {
         if let Some(path) = rollup.exported_path.as_deref() {
             crate::crypto::remove_file_verified_absent(
@@ -8501,6 +8507,7 @@ fn ensure_meeting_folder_target(
     db: &crate::storage::db::Db,
     folder_id: Option<&str>,
 ) -> Result<(), AppError> {
+    db.ensure_container_move_ready()?;
     if let Some(fid) = folder_id {
         if !db.list_containers()?.iter().any(|row| row.id == fid) {
             return Err(AppError::InvalidArg(
@@ -8517,6 +8524,7 @@ fn ensure_recording_folder_target(
     db: &crate::storage::db::Db,
     folder_id: Option<&str>,
 ) -> Result<(), AppError> {
+    db.ensure_container_move_ready()?;
     if let Some(folder_id) = folder_id {
         let containers = db.list_containers()?;
         let selected = containers
@@ -8643,6 +8651,7 @@ fn ensure_raw_open_recording_source(
     state: &AppState,
     meeting_id: &str,
 ) -> Result<RecordingProviderSourceDomains, AppError> {
+    state.db.ensure_container_move_ready()?;
     for folder_id in state.db.folders_for_meeting(meeting_id)? {
         ensure_recording_folder_target(&state.db, Some(&folder_id))?;
     }
@@ -9703,6 +9712,7 @@ fn stage_recording_bundle_exports(
     context: RecordingBundleExportContext<'_>,
     checkpoint: &mut impl FnMut(RecordingExportStage) -> Result<(), AppError>,
 ) -> Result<(), AppError> {
+    state.db.ensure_container_move_ready()?;
     let RecordingBundleExportContext {
         meeting,
         target_folder_id,
@@ -10082,11 +10092,32 @@ pub async fn move_note(
     state: State<'_, AppState>,
     meeting_id: String,
     folder_id: Option<String>,
+    confirmed_encryption_boundary: Option<bool>,
 ) -> Result<(), AppError> {
     move_note_under_org_share_mutation_lock(state.inner(), |state| {
-        move_note_command_body(&app, state, meeting_id, folder_id)
+        move_note_command_body(&app, state, meeting_id, folder_id, confirmed_encryption_boundary.unwrap_or(false))
     })
     .await
+}
+
+/// Revalidated under lifecycle immediately before a move can seal plaintext. An omitted
+/// witness is never consent, including when the target was open when the picker loaded.
+fn require_move_encryption_confirmation(
+    state: &AppState,
+    folder_id: Option<&str>,
+    confirmed: bool,
+) -> Result<(), AppError> {
+    state.db.ensure_container_move_ready()?;
+    if !confirmed {
+        if let Some(id) = folder_id {
+            if state.db.folder_by_id(id)?.is_some_and(|folder| folder.locked) {
+                return Err(AppError::Locked(
+                    "Confirm Encrypt & move before moving into a locked folder".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Public filing boundary: every authoritative source/target check and the bundle transaction run
@@ -10107,6 +10138,7 @@ fn move_note_command_body(
     state: &AppState,
     meeting_id: String,
     folder_id: Option<String>,
+    confirmed_encryption_boundary: bool,
 ) -> Result<(), AppError> {
     let target_locked = match folder_id.as_deref() {
         Some(folder_id) => state
@@ -10118,9 +10150,12 @@ fn move_note_command_body(
     if target_locked {
         emit_ask_history_invalidated_fail_closed(app);
     }
-    let result = move_note_public_inner_impl(state, meeting_id, folder_id);
-    // A pre-move refetch may finish before the move takes lifecycle. Invalidate again
-    // after destination authority is installed, including a partially completed error.
+    // PR #708 gives the move its explicit cross-encryption-boundary confirmation; this branch
+    // still has to invalidate the live/Ask history AFTER destination authority is installed,
+    // because a refetch started before the move can otherwise land stale (or half-moved) rows.
+    // Dropping either side silently breaks one of them, so both are kept.
+    let result =
+        move_note_public_inner_impl(state, meeting_id, folder_id, confirmed_encryption_boundary);
     if target_locked {
         emit_ask_history_invalidated_fail_closed(app);
     } else {
@@ -10149,9 +10184,10 @@ fn move_note_public_inner_impl(
     state: &AppState,
     meeting_id: String,
     folder_id: Option<String>,
+    confirmed_encryption_boundary: bool,
 ) -> Result<(), AppError> {
     if manual_move_touches_locked_meeting_domain(state, &meeting_id, folder_id.as_deref())? {
-        move_note_locked_domain_compat(state, meeting_id, folder_id)
+        move_note_locked_domain_compat(state, meeting_id, folder_id, confirmed_encryption_boundary)
     } else {
         move_note_inner_impl(state, meeting_id, folder_id)
     }
@@ -10197,8 +10233,10 @@ fn move_note_locked_domain_compat(
     state: &AppState,
     meeting_id: String,
     folder_id: Option<String>,
+    confirmed_encryption_boundary: bool,
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
+    require_move_encryption_confirmation(state, folder_id.as_deref(), confirmed_encryption_boundary)?;
     ensure_no_active_salvage_for_meeting(state, &meeting_id)?;
     for source_folder_id in state.db.folders_for_meeting(&meeting_id)? {
         if state
@@ -10739,6 +10777,7 @@ pub fn classify_auto_file_target(
     state: &AppState,
     subfolder: Option<&str>,
 ) -> Result<AutoFileTarget, AppError> {
+    state.db.ensure_container_move_ready()?;
     let Some(sub) = subfolder.filter(|s| !s.is_empty()) else {
         return Ok(AutoFileTarget::Open);
     };
@@ -10976,6 +11015,7 @@ fn seal_moved_note(
     meeting_id: &str,
     ck: &[u8; 32],
 ) -> Result<(), AppError> {
+    state.db.ensure_container_move_ready()?;
     let notes = state.db.sealable_notes_for_meeting(meeting_id)?;
     // Encrypt + VERIFY every provider row BEFORE any blank, so a failure leaves intact plaintext.
     let mut sealed_rows: Vec<(String, Vec<u8>)> = Vec::new();
@@ -11734,6 +11774,7 @@ fn permanent_unseal_audio(
 /// `lock_folder`'s note seal: each blob is verified-decryptable BEFORE the plaintext is blanked /
 /// the plaintext WAV is removed — content (transcript / audio) is never lost.
 pub(crate) fn seal_folder_extras(db: &Db, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+    db.ensure_container_move_ready()?;
     seal_dashboards_in_folder(db, folder_id, ck)?;
     // TASKS LEAVE. A task's content lives in an org's E2EE store, so this folder's content key
     // cannot seal it — and a task left inside would stay exactly as readable as it was while the
@@ -12031,6 +12072,7 @@ fn repair_locked_audio_at_rest(
 /// locked folder (BLK-2) without touching the folder's other meetings. Verify-before-destroy
 /// throughout (no transcript / audio loss); idempotent on already-sealed rows.
 fn seal_meeting_extras(db: &Db, folder_id: &str, mid: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+    db.ensure_container_move_ready()?;
     // FACT LEDGER: facts, user facts and supersessions are DELETED a few steps later by the seal's
     // own purge, because their subject/predicate/object are plaintext derived from this meeting.
     // That is correct and unchanged. What was missing is the ciphertext that lets an unlock put them
@@ -13396,6 +13438,7 @@ pub(crate) fn unlocked_snapshot(
 // `pub(crate)`: the disk-salvage worker (`audio::spill::salvage_disk_one`) re-checks this SAME
 // gate fail-closed right before re-running a claimed meeting through the pipeline.
 pub(crate) fn meeting_is_unlocked(state: &AppState, meeting_id: &str) -> Result<bool, AppError> {
+    state.db.ensure_container_move_ready()?;
     let folder_ids = state.db.folders_for_meeting(meeting_id)?;
     if folder_ids.is_empty() {
         return Ok(true); // no canonical or legacy folder → unfiled and open.
@@ -13420,6 +13463,7 @@ pub(crate) fn meeting_is_unlocked(state: &AppState, meeting_id: &str) -> Result<
 /// folder directly (not a meeting), so the document commands gate on this. A non-existent folder
 /// reports `false` (fail-closed — there is nothing legitimate to read).
 pub(crate) fn folder_is_unlocked(state: &AppState, folder_id: &str) -> Result<bool, AppError> {
+    state.db.ensure_container_move_ready()?;
     let folder = match state.db.folder_by_id(folder_id)? {
         Some(f) => f,
         None => return Ok(false), // unknown folder → nothing to surface.
@@ -13474,6 +13518,7 @@ pub(crate) fn container_parent_seal(
     state: &AppState,
     parent_id: &str,
 ) -> Result<ParentSeal, AppError> {
+    state.db.ensure_container_move_ready()?;
     let parent = state
         .db
         .folder_by_id(parent_id)?

@@ -13,8 +13,9 @@ import {
 import type { NoteTemplate } from "../../../core/models";
 import { IpcService } from "../../../core/ipc.service";
 import { MurProviderIconComponent } from "../../../design-system/provider-icon/provider-icon.component";
+import { DestinationMoveService } from "../../../shared/destination-move/destination-move.service";
 import { ReminderComposerService } from "../../reminders/reminder-composer/reminder-composer.service";
-import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
+import { WorkspaceService } from "../../workspace/workspace.service";
 import { TooltipDirective } from "../../../design-system/tooltip/tooltip.directive";
 
 interface BuiltinTemplate {
@@ -37,7 +38,7 @@ const BUILTIN_TEMPLATES: readonly BuiltinTemplate[] = [
 @Component({
   selector: "app-meeting-command-bar",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurProviderIconComponent, MoveToMenuComponent, TooltipDirective],
+  imports: [MurProviderIconComponent, TooltipDirective],
   templateUrl: "./meeting-command-bar.component.html",
   styleUrl: "./meeting-command-bar.component.scss",
   host: {
@@ -47,12 +48,15 @@ const BUILTIN_TEMPLATES: readonly BuiltinTemplate[] = [
 })
 export class MeetingCommandBarComponent implements OnInit {
   private readonly ipc = inject(IpcService);
+  private readonly destinationMove = inject(DestinationMoveService);
+  private readonly workspace = inject(WorkspaceService);
   private readonly reminders = inject(ReminderComposerService);
   private readonly host = inject(ElementRef<HTMLElement>);
   private readonly destroyRef = inject(DestroyRef);
   private destroyed = false;
 
   readonly meetingId = input.required<string>();
+  readonly meetingTitle = input<string | null>(null);
   readonly folderId = input<string | null>(null);
   readonly notePresent = input(false);
   readonly provenance = input<{ model: string; provider: string } | null>(null);
@@ -65,6 +69,7 @@ export class MeetingCommandBarComponent implements OnInit {
   readonly linking = input(false);
   readonly keepsMasters = input(false);
   readonly hasAudio = input(false);
+  readonly moveAllowed = input(true);
 
   /** Edit is unavailable with no note, and redundant while already editing. */
   readonly editDisabled = computed(() => !this.notePresent() || this.editing());
@@ -87,15 +92,12 @@ export class MeetingCommandBarComponent implements OnInit {
         ? "Currently editing"
         : "Edit note",
   );
-  readonly moveOpen = input(false);
   readonly exportMsg = input("");
 
   readonly convert = output<string | null>();
   readonly resummarize = output<void>();
   readonly rename = output<void>();
-  readonly move = output<void>();
   readonly moved = output<string | null>();
-  readonly closeMove = output<void>();
   readonly delete = output<void>();
   readonly copyMd = output<void>();
   readonly saveMd = output<void>();
@@ -208,17 +210,27 @@ export class MeetingCommandBarComponent implements OnInit {
     this.exportMaster.emit(kind);
   }
 
-  pickMove(): void {
+  async pickMove(event?: Event): Promise<void> {
     this.menuOpen.set(false);
-    this.move.emit();
+    if (this.busy() || !this.moveAllowed()) {
+      return;
+    }
+    const result = await this.destinationMove.open({
+      kind: "meeting",
+      id: this.meetingId(),
+      title: this.meetingTitle() || "Untitled recording",
+      currentContainerId: this.folderId(),
+      actionLabel: "Move",
+      afterMove: () => this.workspace.reload(),
+    }, event);
+    if (result.moved) {
+      this.moved.emit(result.containerId ?? null);
+    }
   }
 
   closeOverlays(): void {
     this.templateOpen.set(false);
     this.menuOpen.set(false);
-    if (this.moveOpen()) {
-      this.closeMove.emit();
-    }
   }
 
   onDocumentClick(event: MouseEvent): void {

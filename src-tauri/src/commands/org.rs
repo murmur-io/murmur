@@ -13194,6 +13194,7 @@ fn resolve_owned_source(
             title: note_display_title(&note),
             owned: crate::storage::models::OrgOwnedSource {
                 kind: "document".to_string(),
+                movable: st.db.note_is_visible(&document_id, &std::collections::HashSet::new())?,
                 id: document_id,
             },
         }));
@@ -13213,6 +13214,7 @@ fn resolve_owned_source(
             title,
             owned: crate::storage::models::OrgOwnedSource {
                 kind: "meeting".to_string(),
+                movable: st.db.meeting_is_visible(&meeting_id, &std::collections::HashSet::new())?,
                 id: meeting_id,
             },
         }));

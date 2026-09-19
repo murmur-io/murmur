@@ -1571,3 +1571,62 @@ fn org_share_ingest_entrypoint_accepts_clean_png_bundle() {
         Err(AppError::InvalidArg(_))
     ));
 }
+
+/// The destination picker refuses sealed sources, and the public write must repeat that refusal
+/// after a lock races the picker. Session unlock and a target confirmation are not source consent.
+#[test]
+fn public_note_and_document_moves_refuse_session_unlocked_sealed_sources_without_mutation() {
+    for kind in ["note", "document"] {
+        let state = build_state(&format!("public-sealed-source-{kind}"), None);
+        let original = create_note_folder_inner(&state, "Original", None).expect("original folder");
+        let sealed = create_note_folder_inner(&state, "Sealed", None).expect("sealed folder");
+        let id = format!("source-{kind}");
+        state
+            .db
+            .insert_document(&id, &original.id, "Move source", "preserved body", kind, 1)
+            .expect("source");
+        lock_folder_inner(&state, sealed.id.clone()).expect("seal destination");
+        cache_kek_and_folder_ck(&state, &sealed.id);
+        state
+            .unlocked_folders
+            .lock()
+            .expect("unlock set")
+            .insert(sealed.id.clone());
+        // Keep the legacy internal rekey route unchanged; this seeds a real sealed document
+        // while its plaintext is available for the session, matching the reported bypass.
+        move_note_doc_inner(&state, &id, &sealed.id).expect("seed sealed source");
+        let snapshot = || {
+            state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT folder_id,text,text_blob,exported_path FROM documents WHERE id=?1",
+                    [&id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .expect("document snapshot")
+        };
+        let before = snapshot();
+        assert!(
+            before.2.is_some(),
+            "the test must exercise a genuinely sealed {kind}"
+        );
+        for confirmed in [false, true] {
+            let error = move_note_doc_confirmed_inner(&state, &id, &original.id, confirmed)
+                .expect_err("public move must refuse a durably sealed source");
+            assert!(matches!(error, AppError::Locked(_)));
+            assert_eq!(
+                snapshot(),
+                before,
+                "{kind} source bytes, blob and placement remain unchanged"
+            );
+        }
+    }
+}

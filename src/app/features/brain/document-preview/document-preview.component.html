@@ -20,6 +20,16 @@
       <header class="dp-head">
         <span class="dp-badge" aria-hidden="true">{{ badge() }}</span>
         <h3 class="dp-title" [attr.title]="d.name">{{ d.name }}</h3>
+        @if (canMove()) {
+          <button
+            type="button"
+            class="btn btn-ghost"
+            [disabled]="moving()"
+            (click)="moveDocument($event)"
+          >
+            {{ moving() ? "Moving…" : "Move…" }}
+          </button>
+        }
         <button
           #closeBtn
           type="button"

@@ -35,9 +35,10 @@ import { MeetingsListStore } from "../../../services/meetings-list-store.service
 import { OrgBrainService } from "../../../services/org-brain.service";
 import { SavedViewsService } from "../../../services/saved-views.service";
 import { ViewEngine } from "../../../services/view-engine";
+import { DestinationMoveService } from "../../../shared/destination-move/destination-move.service";
 import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
-import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
 import { NoteDragService } from "../../folders/note-drag.service";
+import { WorkspaceService } from "../../workspace/workspace.service";
 import { ToastService } from "../../../services/toast.service";
 import { MeetingsViewSwitcherComponent } from "../meetings-view-switcher/meetings-view-switcher.component";
 import { MeetingsTableViewComponent } from "../meetings-table-view/meetings-table-view.component";
@@ -104,6 +105,8 @@ export interface MeetingsListItem {
    * zoneless change detection.
    */
   canRetryTranscription: boolean;
+  /** False while the source remains sealed, including a session unlock. */
+  canMove: boolean;
 }
 
 /**
@@ -133,7 +136,7 @@ export interface OrgMeetingListItem {
   // Declarative host listeners — Angular owns their lifecycle (mirrors settings).
   // Esc lives at DOCUMENT level on purpose: after clicking non-focusable text
   // focus falls to <body>, so a panel-scoped (keydown.escape) would go dead.
-  // document:click closes the row ⋯ menu / move popover on an outside click.
+  // document:click closes the row ⋯ menu on an outside click.
   host: {
     "(document:keydown.escape)": "onEscape()",
     "(document:click)": "onDocumentClick($event)",
@@ -142,7 +145,6 @@ export interface OrgMeetingListItem {
     RouterLink,
     MurSpinnerComponent,
     LockBadgeComponent,
-    MoveToMenuComponent,
     MeetingsViewSwitcherComponent,
     MeetingsTableViewComponent,
   ],
@@ -156,6 +158,8 @@ export class LibraryComponent implements OnInit {
   private readonly destroyRef = inject(DestroyRef);
   private readonly folders = inject(FoldersService);
   private readonly drag = inject(NoteDragService);
+  private readonly destinationMove = inject(DestinationMoveService);
+  private readonly workspace = inject(WorkspaceService);
   private readonly toast = inject(ToastService);
   private readonly tabsService = inject(TabsService);
   private readonly meetingsStore = inject(MeetingsListStore);
@@ -174,7 +178,7 @@ export class LibraryComponent implements OnInit {
 
   /**
    * Esc while in Meetings closes open transient UI first (one Esc = one
-   * dismissal: the row ⋯ menu, then the move popover) — but NEVER while
+   * dismissal: the row ⋯ menu) — but NEVER while
    * you're typing: in the search box the first Esc clears it (or blurs when
    * empty), and Esc is ignored inside any other form field, so it never
    * ejects you mid-edit. `/library` is no longer a drill-down (Stage 2,
@@ -184,10 +188,6 @@ export class LibraryComponent implements OnInit {
   onEscape(): void {
     if (this.rowMenuId() !== null) {
       this.rowMenuId.set(null);
-      return;
-    }
-    if (this.movePopoverId() !== null) {
-      this.closeMovePopover();
       return;
     }
     const el = document.activeElement as HTMLElement | null;
@@ -200,27 +200,23 @@ export class LibraryComponent implements OnInit {
     }
   }
 
-  /** The meeting id whose "Move to…" popover is open (null = none). */
-  readonly movePopoverId = signal<string | null>(null);
-
   /** The meeting id whose row ⋯ actions menu is open (null = none). */
   readonly rowMenuId = signal<string | null>(null);
 
   /**
-   * Outside-click dismissal for the row ⋯ menu and the move popover. The ⋯
-   * trigger and every menu item stopPropagation, so any click that reaches the
-   * document and isn't inside an open panel means "clicked elsewhere → close".
+   * Outside-click dismissal for the row ⋯ menu. The trigger and every menu
+   * item stopPropagation, so any click that reaches the document and isn't
+   * inside the open panel means "clicked elsewhere → close".
    */
   onDocumentClick(event: MouseEvent): void {
-    if (this.rowMenuId() === null && this.movePopoverId() === null) {
+    if (this.rowMenuId() === null) {
       return;
     }
     const target = event.target as HTMLElement | null;
-    if (target?.closest(".row-menu, .row-menu-btn, .move-anchor")) {
+    if (target?.closest(".row-menu, .row-menu-btn")) {
       return;
     }
     this.rowMenuId.set(null);
-    this.movePopoverId.set(null);
   }
 
   /** The meeting id currently being dragged (mirrors the shared drag signal). */
@@ -264,7 +260,6 @@ export class LibraryComponent implements OnInit {
     untracked(() => {
       this.cancelDelete();
       this.rowMenuId.set(null);
-      this.movePopoverId.set(null);
       // A folder pick is a THIRD mutually-exclusive scope alongside tag/org —
       // always drop the org chip selection here too (mirrors NotesHomeComponent's
       // `_clearOrgOnFolderChange`), so the content pane never shows two scopes.
@@ -388,7 +383,6 @@ export class LibraryComponent implements OnInit {
   selectOrg(orgId: string): void {
     this.cancelDelete();
     this.rowMenuId.set(null);
-    this.movePopoverId.set(null);
     // Clears the SHARED sidebar-tree folder selection too (not just this
     // component's tag/org state) — the folder tree now lives outside this
     // component (`MeetingsSidebarTreeComponent`), so its selection can only be
@@ -513,6 +507,9 @@ export class LibraryComponent implements OnInit {
         statusLabel: meetingStatusLabel(meeting.status),
         canRetryTranscription:
           meeting.status === "ERROR" && !!meeting.audioPath?.trim(),
+        canMove:
+          meeting.folderId == null ||
+          this.folderById().get(meeting.folderId)?.locked === false,
       }))
       .sort((a, b) => b.sortAt - a.sortAt),
   );
@@ -830,11 +827,10 @@ export class LibraryComponent implements OnInit {
     if (this.activeTag() === tag) {
       return;
     }
-    // Switching the view dismisses any open delete confirm / row menu / move
-    // popover to avoid a dangling panel pointing at a row not in the new list.
+    // Switching the view dismisses any open delete confirm / row menu to avoid
+    // a dangling panel pointing at a row not in the new list.
     this.cancelDelete();
     this.rowMenuId.set(null);
-    this.movePopoverId.set(null);
     // Tag + folder scopes are mutually exclusive: picking a tag clears any
     // active folder (the SHARED sidebar-tree selection) so they never compose
     // into an empty surprise. An org selection is a THIRD mutually-exclusive
@@ -869,7 +865,7 @@ export class LibraryComponent implements OnInit {
     }
   }
 
-  // --- Filing: the per-row ⋯ actions menu + "Move to…" popover -------------
+  // --- Filing: the per-row ⋯ actions menu + shared destination picker -------
 
   /**
    * The display name of a meeting's current folder, or null when it's at the
@@ -883,16 +879,26 @@ export class LibraryComponent implements OnInit {
     return this.folderById().get(fid)?.name ?? null;
   }
 
-  /** Toggle the row's ⋯ actions menu (one open at a time; closes the mover). */
+  /** Toggle the row's ⋯ actions menu (one open at a time). */
   toggleRowMenu(id: string): void {
-    this.movePopoverId.set(null);
     this.rowMenuId.update((cur) => (cur === id ? null : id));
   }
 
-  /** ⋯ menu → "Move to folder…": swap the menu for the folder-picker popover. */
-  openMoveFromMenu(id: string): void {
+  /** ⋯ menu → open the one app-wide hierarchy destination picker. */
+  async openMoveFromMenu(meeting: Meeting, event?: Event): Promise<void> {
     this.rowMenuId.set(null);
-    this.movePopoverId.set(id);
+    const result = await this.destinationMove.open({
+      kind: "meeting",
+      id: meeting.id,
+      title: meeting.title || "Untitled recording",
+      currentContainerId: meeting.folderId ?? null,
+      actionLabel: "Move",
+      afterMove: () => this.workspace.reload(),
+    }, event);
+    if (!result.moved) {
+      return;
+    }
+    this.applyMove(meeting.id, result.containerId ?? null);
   }
 
   /** ⋯ menu → "Delete meeting…": swap the menu for the inline confirm panel. */
@@ -901,35 +907,12 @@ export class LibraryComponent implements OnInit {
     this.askDelete(id);
   }
 
-  closeMovePopover(): void {
-    this.movePopoverId.set(null);
-  }
-
-  /**
-   * Apply a move (from the row chip popover OR a drag-drop) into `folderId` (null
-   * = vault root). The FoldersService reloads the tree (so counts refresh), and
-   * we patch the LIBRARY-LOCAL `meetings` signal's `folderId` so the derived
-   * `folderMeetings` recomputes at once — the moved note leaves the current
-   * folder view without a manual reload. `tagMeetings` is patched in lockstep so
-   * a tag view stays coherent if one is active.
-   */
-  private async applyMove(
-    meetingId: string,
-    folderId: string | null,
-  ): Promise<void> {
+  /** Keep root-persisted and active-tag rows coherent after a successful move. */
+  private applyMove(meetingId: string, folderId: string | null): void {
     const patch = (list: Meeting[]): Meeting[] =>
       list.map((m) => (m.id === meetingId ? { ...m, folderId } : m));
     this.meetings.update(patch);
     this.tagMeetings.update(patch);
-  }
-
-  /**
-   * The popover's `moved` output already ran the IPC move via FoldersService;
-   * here we only reconcile the local list + close the popover.
-   */
-  onMoved(meetingId: string, folderId: string | null): void {
-    void this.applyMove(meetingId, folderId);
-    this.closeMovePopover();
   }
 
   // --- Filing: drag a row onto a folder (the enhancement path) -------------

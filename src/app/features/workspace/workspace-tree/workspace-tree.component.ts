@@ -44,12 +44,8 @@ import { FolderLockFlowService } from "../../../services/folder-lock-flow.servic
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
 import { SharedWorkspaceService } from "../../../services/shared-workspace.service";
+import { DestinationMoveService } from "../../../shared/destination-move/destination-move.service";
 import { WorkspaceService } from "../workspace.service";
-import {
-  workspaceDestinations,
-  type WorkspaceDestination,
-} from "../workspace-destination";
-import { WorkspaceMoveSheetComponent } from "../workspace-move-sheet/workspace-move-sheet.component";
 import {
   ContainerShareSheetComponent,
   type ContainerShareTarget,
@@ -132,7 +128,6 @@ const KIND_ROUTE: Record<ItemKind, string> = {
     OrganizeSheetComponent,
     TeleportToBodyDirective,
     WorkspaceManageSheetComponent,
-    WorkspaceMoveSheetComponent,
   ],
   templateUrl: "./workspace-tree.component.html",
   styleUrl: "./workspace-tree.component.scss",
@@ -150,6 +145,7 @@ export class WorkspaceTreeComponent {
   private readonly lockFlow = inject(FolderLockFlowService);
   private readonly notes = inject(NotesService);
   protected readonly sharedWorkspace = inject(SharedWorkspaceService);
+  private readonly destinationMove = inject(DestinationMoveService);
 
   /** Current route path, used to select a container or leaf row. */
   readonly currentPath = input("");
@@ -262,7 +258,9 @@ export class WorkspaceTreeComponent {
    * `sectionEmpty() && loading()` already spells out for cached rows.
    */
   protected readonly loading = computed(() =>
-    this.isOwnScope() ? this.workspace.loading() : this.sharedWorkspace.loading(),
+    this.isOwnScope()
+      ? this.workspace.loading()
+      : this.sharedWorkspace.loading(),
   );
   /**
    * The message this half of the forest should show, if any.
@@ -762,48 +760,21 @@ export class WorkspaceTreeComponent {
    * them and load-bearing underneath: nothing is published, the owner sees
    * nothing, and the content keeps updating from the org feed.
    */
-  protected readonly placeRequest = signal<SharedContainerNode | null>(null);
-  protected readonly placeBusy = signal(false);
-  protected readonly placeError = signal<string | null>(null);
-
-  /** Every local container this user could file a received node under. */
-  protected placeTargets(): WorkspaceDestination[] {
-    return workspaceDestinations(this.workspace.forest());
-  }
-
-  protected openPlace(node: SharedContainerNode): void {
-    this.placeError.set(null);
-    this.placeRequest.set(node);
-  }
-
-  protected closePlace(): void {
-    this.placeRequest.set(null);
-    this.placeBusy.set(false);
-    this.placeError.set(null);
-  }
-
-  protected async placeInto(destination: WorkspaceDestination): Promise<void> {
-    const node = this.placeRequest();
-    if (!node || !node.containerId) {
+  protected openPlace(node: SharedContainerNode, event?: Event): void {
+    if (!node.containerId) {
       return;
     }
-    this.placeBusy.set(true);
-    this.placeError.set(null);
-    try {
-      await this.sharedWorkspace.place(
-        node.orgId,
-        "container",
-        node.containerId,
-        destination.container.id,
-        0,
-      );
-      this.closePlace();
-      this.toast.success(`Filed under ${destination.label}`);
-    } catch (e) {
-      this.placeError.set(this.errorCopy.humanize(e));
-    } finally {
-      this.placeBusy.set(false);
-    }
+    void this.destinationMove.open({
+      kind: "shared",
+      anchorKind: "sharedContainer",
+      id: node.containerId,
+      title: node.name,
+      currentContainerId: node.localParentId,
+      actionLabel: "Keep",
+      orgId: node.orgId,
+      sharedTargetKind: "container",
+      afterMove: () => this.sharedWorkspace.load(),
+    }, event);
   }
 
   /** Put a received node back wherever its owner filed it. */
@@ -812,7 +783,11 @@ export class WorkspaceTreeComponent {
       return;
     }
     try {
-      await this.sharedWorkspace.unplace(node.orgId, "container", node.containerId);
+      await this.sharedWorkspace.unplace(
+        node.orgId,
+        "container",
+        node.containerId,
+      );
       this.toast.success("Moved back to Shared");
     } catch (e) {
       this.toast.danger(this.errorCopy.humanize(e));
@@ -825,7 +800,7 @@ export class WorkspaceTreeComponent {
    * affordance is better than offering one that always errors.
    */
   protected canCreateIn(container: ContainerNode): boolean {
-    return !(container.locked && !container.unlocked);
+    return !container.locked;
   }
 
   /**
@@ -861,7 +836,7 @@ export class WorkspaceTreeComponent {
     current: ContainerNode | null,
   ): void {
     const kind = this.draggableKind(item);
-    if (!kind || (kind === "meeting" && current?.locked)) {
+    if (!kind || current?.locked) {
       event.preventDefault();
       this.drag.end();
       return;
@@ -878,118 +853,71 @@ export class WorkspaceTreeComponent {
   }
 
   /**
-   * A sealed, not-session-unlocked container is refused by every mover, so it is
-   * not a drop target. Arming one would invite a drop that can only fail.
+   * Direct drops cannot confirm encryption. Sealed containers stay picker-only
+   * destinations, including while their contents are session-unlocked.
    */
   protected canDropInto(container: ContainerNode): boolean {
-    return !(container.locked && !container.unlocked);
+    return !container.locked;
   }
 
   /**
-   * Every container an item could be moved INTO — the keyboard's equivalent of a drag.
-   *
-   * Drag and drop is a pointer gesture with no keyboard form of its own, so shipping
-   * it alone would make filing an item impossible without a mouse. The same rules
-   * apply as to a drop: a sealed, not-session-unlocked container is refused by every
-   * mover, so it is not offered here either.
+   * Open the universal picker, which owns target eligibility and confirmation.
    */
-  protected readonly moveTargets = computed<WorkspaceDestination[]>(() =>
-    workspaceDestinations(this.workspace.forest()),
-  );
-
-  /** The container an item currently sits in, so the menu can leave it out. */
-  protected moveTargetsFor(
-    item: ItemRow,
-    current: ContainerNode,
-  ): WorkspaceDestination[] {
+  protected openMove(item: ItemRow, from: ContainerNode | null, event?: Event): void {
     const kind = this.draggableKind(item);
-    if (kind === "meeting" && current.locked) {
-      return [];
-    }
-    return kind
-      ? this.moveTargets().filter(
-          (target) =>
-            target.container.id !== current.id &&
-            this.canMoveKindInto(kind, target.container),
-        )
-      : [];
-  }
-
-  /** Unfiled recordings have no current container to exclude. */
-  protected unfiledMoveTargets(item: ItemRow): WorkspaceDestination[] {
-    const kind = this.draggableKind(item);
-    return kind
-      ? this.moveTargets().filter((target) =>
-          this.canMoveKindInto(kind, target.container),
-        )
-      : [];
-  }
-
-  protected readonly moveRequest = signal<{
-    item: ItemRow;
-    fromLabel: string;
-    targets: WorkspaceDestination[];
-  } | null>(null);
-  protected readonly moveBusy = signal(false);
-  protected readonly moveError = signal<string | null>(null);
-
-  protected openMove(
-    item: ItemRow,
-    from: ContainerNode | null,
-    targets: WorkspaceDestination[],
-  ): void {
-    if (targets.length === 0) {
+    if (!kind || from?.locked) {
       return;
     }
-    const fromLabel = from
-      ? this.moveTargets().find((target) => target.container.id === from.id)
-          ?.label ?? from.name
-      : "Unfiled recordings";
-    this.moveError.set(null);
-    this.moveRequest.set({ item, fromLabel, targets });
+    void this.destinationMove.open({
+      kind,
+      id: item.id,
+      title: this.itemTitle(item),
+      currentContainerId: from?.id ?? null,
+      afterMove: () => this.workspace.reload(),
+    }, event);
   }
 
-  protected closeMove(): void {
-    if (!this.moveBusy()) {
-      this.moveRequest.set(null);
-      this.moveError.set(null);
-    }
-  }
-
-  protected async moveItemTo(target: WorkspaceDestination): Promise<void> {
-    const request = this.moveRequest();
-    const kind = request ? this.draggableKind(request.item) : null;
-    if (!request || !kind || this.moveBusy()) {
+  protected openContainerMove(container: ContainerNode, event?: Event): void {
+    if (
+      !this.canManage(container) ||
+      container.locked
+    ) {
       return;
     }
-    this.moveBusy.set(true);
-    this.moveError.set(null);
-    try {
-      await this.workspace.moveItem(
-        kind,
-        request.item.id,
-        target.container.id,
-      );
-      this.moveRequest.set(null);
-      this.toast.success(
-        `Moved “${this.itemTitle(request.item)}” to ${target.label}`,
-      );
-    } catch (error) {
-      const message = this.errorCopy.is(error, "recording-linked-note")
-        ? this.errorCopy.humanize(error)
-        : `Couldn’t move “${this.itemTitle(request.item)}” to ${target.label}.`;
-      this.moveError.set(message);
-      this.toast.danger(message);
-    } finally {
-      this.moveBusy.set(false);
-    }
+    void this.destinationMove.open({
+      kind: "container",
+      anchorKind: "container",
+      id: container.id,
+      title: container.name,
+      currentContainerId: this.containerParentId(container.id),
+      afterMove: () => this.workspace.reload(),
+    }, event);
+  }
+
+  private containerParentId(id: string): string | null {
+    const walk = (
+      nodes: readonly ContainerNode[],
+      parentId: string | null,
+    ): string | null | undefined => {
+      for (const node of nodes) {
+        if (node.id === id) {
+          return parentId;
+        }
+        const found = walk(node.folders, node.id);
+        if (found !== undefined) {
+          return found;
+        }
+      }
+      return undefined;
+    };
+    return walk(this.workspace.forest(), null) ?? null;
   }
 
   private canMoveKindInto(
     _kind: DraggableKind,
     container: ContainerNode,
   ): boolean {
-    return !(container.locked && !container.unlocked);
+    return !container.locked;
   }
 
   protected async onDropItem(
@@ -1006,9 +934,7 @@ export class WorkspaceTreeComponent {
     ) {
       return;
     }
-    const targetLabel =
-      this.moveTargets().find((target) => target.container.id === container.id)
-        ?.label ?? container.name;
+    const targetLabel = container.name;
     try {
       await this.workspace.moveItem(payload.kind, payload.id, container.id);
       this.toast.success(`Moved item to ${targetLabel}`);

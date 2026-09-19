@@ -141,9 +141,9 @@ async function openRelatedPicker(page: Page) {
   await expect(search).toBeVisible();
   await expect(tree.locator('[data-row^="i:meeting:"]')).toHaveCount(24);
   await expect(
-    tree.getByRole("treeitem", { name: "Load earlier" }),
+    tree.getByRole("button", { name: "Load earlier" }),
   ).toBeVisible();
-  await expect(tree.getByRole("treeitem", { name: "Load more" })).toBeVisible();
+  await expect(tree.getByRole("button", { name: "Load more" })).toBeVisible();
   return { picker, search, tree };
 }
 

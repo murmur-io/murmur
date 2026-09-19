@@ -34,6 +34,7 @@
 //!    discipline `list_link_candidates_visible` established), so "the anchor is row 153" and "row
 //!    153 of that page is the anchor" cannot disagree.
 
+use rusqlite::OptionalExtension;
 use std::collections::HashSet;
 
 use crate::error::Result;
@@ -266,6 +267,22 @@ fn row_to_picker_row(kind: PickerItemKind, r: &rusqlite::Row<'_>) -> rusqlite::R
 }
 
 impl Db {
+    /// Content-free destination admission for tasks. `None` is unknown/disabled/sealed;
+    /// `Some(None)` is a live, unfiled task. No envelope/title is read before admission.
+    pub(crate) fn related_picker_task_owner(&self, id: &str) -> Result<Option<Option<String>>> {
+        self.lock()
+            .query_row(
+                "SELECT t.container_id FROM org_tasks t
+             JOIN org_state os ON os.org_id = t.org_id AND os.context_enabled = 1
+             LEFT JOIN folders f ON f.id = t.container_id
+             WHERE t.id = ?1 AND (t.container_id IS NULL OR f.locked = 0)",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_err)
+    }
+
     /// One PAGE of the linkable leaves of `(scope, kind)`, plus the true visible total.
     ///
     /// The COUNT twin shares the page query's exact `SELECT`, so a sealed leaf neither appears NOR

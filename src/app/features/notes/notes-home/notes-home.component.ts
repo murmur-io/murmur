@@ -38,6 +38,7 @@ import { NotesViewSwitcherComponent } from "../notes-view-switcher/notes-view-sw
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
 import { DateFormatService } from "../../../core/date-format.service";
+import { DestinationMoveService } from "../../../shared/destination-move/destination-move.service";
 
 const MAX_ORGANIZE_FAILURE_REASON_LENGTH = 240;
 
@@ -49,7 +50,7 @@ const MAX_ORGANIZE_FAILURE_REASON_LENGTH = 240;
  * now lives IN the main sidebar (`NotesSidebarTreeComponent`, nested under the
  * "Notes" nav row) — this component owns only the content pane: the note cards
  * for the shared {@link NotesService.activeFolderId} scope, a "New note"
- * action, a per-note "Move to…" menu, an "Auto-organize" flow, and the
+ * action, a per-note destination-picker trigger, an "Auto-organize" flow, and the
  * Shared-Brain org picker (a content-pane chip row, since orgs are not
  * note-folders and don't belong in the folder tree).
  *
@@ -86,11 +87,12 @@ export class NotesHomeComponent implements OnInit {
   private readonly tabsService = inject(TabsService);
   private readonly errorCopy = inject(ErrorCopyService);
   private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
+  private readonly destinationMove = inject(DestinationMoveService);
   private readonly destroyRef = inject(DestroyRef);
 
   /** The note list from the store (gated — masked rows carry no snippet/tags). */
   readonly noteList = this.notes.notes;
-  /** The note-kind folder list from the store (Move-to-folder menu + breadcrumb). */
+  /** The note-kind folder list from the store (breadcrumb, lock gate, organizer). */
   readonly noteFolders = this.notes.noteFolders;
   /** True while the note list is (re)loading. */
   readonly loading = this.notes.loading;
@@ -207,13 +209,10 @@ export class NotesHomeComponent implements OnInit {
   /**
    * `<mur-table>`'s per-row class hook: `is-muted` dims a masked/locked note
    * row (the table renders it, so notes-home's own scoped CSS can't reach the
-   * `<tr>` directly — see `MurTableComponent`'s class doc); `is-menu-open`
-   * raises the row whose "Move to…" popover is open above the click-away
-   * scrim (both class names are `<mur-table>`'s own small reusable vocabulary).
+   * `<tr>` directly — see `MurTableComponent`'s class doc).
    */
   readonly rowClassFor = (row: NotesListItem): Record<string, boolean> => ({
     "is-muted": row.kind === "note" && row.note.locked,
-    "is-menu-open": row.kind === "note" && this.movePopoverId() === row.note.id,
   });
 
   /**
@@ -279,6 +278,14 @@ export class NotesHomeComponent implements OnInit {
     const f = this.activeFolder();
     return !!f?.locked && !f?.unlocked;
   });
+  readonly sealedFolderIds = computed(
+    () =>
+      new Set(
+        this.noteFolders()
+          .filter((folder) => folder.locked)
+          .map((folder) => folder.id),
+      ),
+  );
 
   /**
    * The organizer's scoped backend reader requires a raw-open folder. A
@@ -351,15 +358,6 @@ export class NotesHomeComponent implements OnInit {
     () => !this.listEmpty() && this.viewItems().length === 0,
   );
 
-  /** Re-derive on any switcher change (select/config) — a no-op hook; `viewItems` is reactive. */
-  onViewChanged(): void {
-    this.movePopoverId.set(null);
-  }
-
-  // --- Per-note "Move to…" popover ----------------------------------------
-  /** The note id whose move popover is open (null = none). */
-  readonly movePopoverId = signal<string | null>(null);
-
   // --- Folder unlock (lock-gate CTA only — locking itself lives in the
   // sidebar tree now) --------------------------------------------------------
   /** Id of the folder whose unlock op is in flight (guards double-clicks). */
@@ -425,7 +423,7 @@ export class NotesHomeComponent implements OnInit {
     // Live-refresh (org-feed-updated + window-focus) is subscribed ONCE, for the
     // app's lifetime, by the shared OrgBrainService now — no per-mount wiring here.
 
-    // Load the note-folder list (Move-to-folder menu + breadcrumb — the sidebar
+    // Load the note-folder list (breadcrumb + lock gate — the sidebar
     // tree also loads it independently, but this component may mount first),
     // the note list for the CURRENT shared scope (persists across navigations —
     // the sidebar may have already selected a folder), and the org list, all in
@@ -452,7 +450,7 @@ export class NotesHomeComponent implements OnInit {
   }
 
   /**
-   * Esc closes open transient UI first (the organize sheet, a move popover) —
+   * Esc closes open transient UI first (the organize sheet) —
    * never mid-edit in a field. `/notes` is no longer a drill-down, so there is
    * no "back to Murmur" fallback here anymore; the persistent sidebar IS the
    * way back.
@@ -466,14 +464,10 @@ export class NotesHomeComponent implements OnInit {
       this.closeOrganize();
       return;
     }
-    if (this.movePopoverId() !== null) {
-      this.movePopoverId.set(null);
-    }
   }
 
   /** Select an org (chip row) — its shared items become the sole content-pane scope. */
   selectOrg(orgId: string): void {
-    this.movePopoverId.set(null);
     this.scrubOrganizeReview();
     this.activeOrgId.set(orgId);
   }
@@ -524,33 +518,31 @@ export class NotesHomeComponent implements OnInit {
     void this.tabsService.openNote(id, title || "Note");
   }
 
-  // --- Per-note "Move to…" popover ----------------------------------------
+  // --- Per-note destination picker ----------------------------------------
 
-  /** Open / close / toggle a note's folder picker (one open at a time). */
-  toggleMovePopover(id: string, event: Event): void {
+  /** Open the shared hierarchy picker, then refresh this route's current scope. */
+  async openMove(
+    id: string,
+    title: string | null,
+    currentContainerId: string,
+    event: Event,
+  ): Promise<void> {
     event.stopPropagation();
-    this.movePopoverId.update((cur) => (cur === id ? null : id));
-  }
-  closeMovePopover(): void {
-    this.movePopoverId.set(null);
-  }
-
-  /**
-   * Move a note into `folderId`, then reload the ACTIVE folder view so the moved
-   * note leaves the current list at once. The folder rail counts self-heal on
-   * the next folder load; we refresh both to stay coherent.
-   */
-  async moveNote(noteId: string, folderId: string): Promise<void> {
-    this.closeMovePopover();
-    try {
-      await this.notes.move(noteId, folderId);
-      // notes.move reloads ALL notes — re-apply the active-folder filter.
-      await this.notes.loadNotes(this.activeFolderId());
-      const name =
-        this.noteFolders().find((f) => f.id === folderId)?.name ?? "folder";
-      this.toast.success(`Moved to ${name}`);
-    } catch {
-      this.toast.danger("Couldn’t move this note. Please try again.");
+    if (this.sealedFolderIds().has(currentContainerId)) {
+      return;
+    }
+    const { moved } = await this.destinationMove.open({
+      kind: "note",
+      id,
+      title: title || "Untitled",
+      currentContainerId,
+      actionLabel: "Move",
+    }, event);
+    if (moved) {
+      await Promise.all([
+        this.notes.loadFolders(),
+        this.notes.loadNotes(this.activeFolderId()),
+      ]);
     }
   }
 
