@@ -201,15 +201,16 @@ test("meeting Related is the first, prominent, expanded Note section", async ({
   await page.goto("/meeting/m-atlas-roadmap");
 
   const notePanel = page.locator("app-note-panel .note-panel");
-  const related = notePanel.locator(":scope > .related-primary");
+  const document = notePanel.locator("app-note-document .note-document");
+  const related = document.locator(":scope > app-connections");
   await expect(related).toBeVisible({ timeout: 10_000 });
   expect(
     await related.evaluate(
-      (element) => element.previousElementSibling === null,
+      (element) => element.nextElementSibling?.classList.contains("document-body") === true,
     ),
   ).toBe(true);
 
-  const connections = related.locator("app-connections");
+  const connections = related;
   await expect(connections.locator(".cx--prominent")).toBeVisible();
   await expect(
     connections.getByRole("button", { name: "Hide related items" }),
@@ -304,4 +305,60 @@ test("fast scrolling inside Related picker does not re-layout or blank it", asyn
   await expect(
     picker.getByRole("treeitem", { name: /Scroll candidate 26/ }),
   ).toBeVisible();
+});
+
+
+test("Related remains available before a meeting has a note", async ({ page }) => {
+  await mockMeetingNote(page);
+  await page.addInitScript(() => {
+    const internals = (window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: unknown) => Promise<unknown> };
+    }).__TAURI_INTERNALS__;
+    const original = internals.invoke;
+    internals.invoke = async (command, args) => {
+      const result = await original(command, args);
+      return command === "get_meeting_detail"
+        ? { ...(result as Record<string, unknown>), note: null }
+        : result;
+    };
+  });
+  await page.goto("/meeting/m-atlas-roadmap");
+  const panel = page.locator("app-note-panel");
+  await expect(panel.getByText("No analysis yet", { exact: true })).toBeVisible();
+  await expect(panel.locator("app-note-document")).toHaveCount(1);
+  const link = panel.getByRole("button", { name: "Link", exact: true });
+  await expect(link).toBeVisible();
+  await link.click();
+  await expect(page.getByRole("dialog", { name: "Add related" })).toBeVisible();
+});
+
+test("Related remains clickable while the meeting note is regenerating", async ({ page }) => {
+  await mockMeetingNote(page);
+  await page.addInitScript(() => {
+    const internals = (window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: unknown) => Promise<unknown> };
+    }).__TAURI_INTERNALS__;
+    const original = internals.invoke;
+    internals.invoke = (command, args) => command === "resummarize"
+      ? new Promise(() => undefined)
+      : original(command, args);
+  });
+  await page.goto("/meeting/m-atlas-roadmap");
+  await page.locator("app-note-panel").getByRole("button", { name: "Preview", exact: true }).click();
+  await page.getByRole("button", { name: "Re-summarize", exact: true }).click();
+  await expect(page.getByText("Re-summarizing…", { exact: true })).toBeVisible();
+  await page.locator("app-note-panel").getByRole("button", { name: "Link", exact: true }).click({ timeout: 3_000 });
+  await expect(page.getByRole("dialog", { name: "Add related" })).toBeVisible();
+});
+
+test("direct edit prints rendered meeting content without editor controls", async ({ page }) => {
+  await mockMeetingNote(page);
+  await page.goto("/meeting/m-atlas-roadmap");
+  const document = page.locator("app-note-panel app-note-document");
+  await expect(document.locator("textarea")).toBeVisible();
+  await page.emulateMedia({ media: "print" });
+  await expect(document.locator("textarea")).toBeHidden();
+  await expect(document.locator("app-markdown:visible")).toHaveCount(1);
+  await expect(document.locator("app-markdown:visible h1, app-markdown:visible h2").first()).toBeVisible();
+  await expect(document.getByRole("button", { name: "Save", exact: true })).toBeHidden();
 });

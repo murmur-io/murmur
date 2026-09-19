@@ -60,6 +60,7 @@ export class MeetingCommandBarComponent implements OnInit {
   readonly converting = input(false);
   readonly renaming = input(false);
   readonly editing = input(false);
+  readonly dirty = input(false);
   readonly exporting = input(false);
   readonly exportingCanvas = input(false);
   readonly linking = input(false);

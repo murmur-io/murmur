@@ -1942,7 +1942,6 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
           folderId: "nf-product",
           markdown: "",
           tags: [],
-          properties: {},
           updatedAt: Date.now(),
           createdAt: Date.now() - 86400000,
           exportedPath: null,
@@ -1957,7 +1956,6 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
         markdown:
           "# Atlas — PRD v3\n\n## Open questions\n- Confirm the launch owner.",
         tags: ["atlas", "prd"],
-        properties: { status: "in-review" },
         updatedAt: Date.now() - 3600000,
         createdAt: Date.now() - 86400000,
         exportedPath: "/Vault/Notes/Product/Atlas-PRD-v3.md",

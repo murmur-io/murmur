@@ -157,7 +157,6 @@ test.describe("org-editable + library unification (mocked IPC)", () => {
         folderId: "f-notes-root",
         markdown: "# Acme onboarding brief\n\nBody.",
         tags: [],
-        properties: {},
         updatedAt: Date.now(),
         createdAt: Date.now(),
         exportedPath: null,

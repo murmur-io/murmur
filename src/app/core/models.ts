@@ -2653,9 +2653,14 @@ export interface NoteSummary {
 /**
  * The full note payload for the editor (`get_note` / `update_note`). Mirrors the
  * Rust `NoteDoc`. When `locked` is true the payload is MASKED: `title`
- * "🔒 Locked", `markdown` "", `tags` [], `properties` {} — the editor shows the
- * lock gate instead of the body. `markdown` is the FULL document INCLUDING the
- * YAML front-matter (properties/tags are vault-native, owned-file).
+ * "🔒 Locked", `markdown` "", `tags` [] — the editor shows the lock gate instead
+ * of the body. `markdown` is the FULL document INCLUDING the YAML front-matter
+ * (properties/tags are vault-native, owned-file).
+ *
+ * NO `properties` MAP (2026-09-19): the parsed front-matter scalars were a
+ * duplicate of what the editor already derives from `markdown` — and it MUST
+ * derive them there, because only the raw YAML prefix round-trips byte-exact
+ * into the owned `.md`. The Rust DTO dropped the field in the same change.
  */
 export interface NoteDoc {
   id: string;
@@ -2665,8 +2670,6 @@ export interface NoteDoc {
   markdown: string;
   /** Front-matter tags; [] when masked. */
   tags: string[];
-  /** Parsed front-matter (excluding tags); {} when masked. */
-  properties: Record<string, string>;
   updatedAt: number;
   createdAt: number;
   /** Vault `.md` path, or null when never exported / sealed. */
@@ -2964,7 +2967,7 @@ export interface NoteFolder {
 }
 
 // ── Feature C — typed note front-matter properties (a NEW, PARALLEL layer over
-// the plaintext `NoteDoc.properties: Record<string,string>`, which is UNCHANGED).
+// the plaintext front-matter scalars the editor parses out of `NoteDoc.markdown`).
 // A folder-level SCHEMA names each property's KIND so a typed view can render the
 // right cell; the underlying front-matter string round-trip (`front-matter.ts`) is
 // untouched. The note editor's Properties card — and the `property-field-types.ts`

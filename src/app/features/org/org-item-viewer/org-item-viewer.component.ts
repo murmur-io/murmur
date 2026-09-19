@@ -19,8 +19,10 @@ import type {
   OrgAccess,
   OrgItemDetail,
 } from "../../../core/models";
-import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
-import { ConnectionsComponent } from "../../../shared/connections/connections.component";
+import {
+  NoteDocumentComponent,
+  type NoteViewMode,
+} from "../../../shared/note-document/note-document.component";
 import { NoteChatComponent } from "../../notes/note-chat/note-chat.component";
 import { ToastService } from "../../../services/toast.service";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
@@ -84,7 +86,7 @@ function stableLinkIdOf(item: OrgItemDetail | null): string | null {
 @Component({
   selector: "app-org-item-viewer",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MarkdownComponent, NoteChatComponent, ConnectionsComponent],
+  imports: [NoteDocumentComponent, NoteChatComponent],
   templateUrl: "./org-item-viewer.component.html",
   styleUrl: "./org-item-viewer.component.scss",
 })
@@ -155,12 +157,27 @@ export class OrgItemViewerComponent {
       : "Sign in to use the permissions granted to your account.";
   });
 
+  /** The only permission-to-mode mapping for received org documents. */
+  readonly noteMode = computed<NoteViewMode>(() => {
+    const item = this._item();
+    if (item && this.canEdit(item)) {
+      return { access: "editable", view: this.editing() ? "edit" : "preview" };
+    }
+    return {
+      access: "view-only",
+      view: "preview",
+      reason: this.notEditableReason() ?? "You do not have permission to edit this note.",
+    };
+  });
+
   // --- Edit-in-place (server-authorized author/owner/editor) ----------------
   /** True while the author is editing this item in place (drives the editor UI). */
   readonly editing = signal(false);
   /** Draft title/body bound to the inline editor while {@link editing}. */
   readonly titleDraft = signal("");
   readonly markdownDraft = signal("");
+  /** A draft retained after the backend revokes write access while it is open. */
+  readonly revokedDraft = signal<{ readonly title: string; readonly markdown: string } | null>(null);
   /** True while `orgUpdateOwnItem` (seal → publish → tombstone-old) is in flight. */
   readonly saving = signal(false);
   /**
@@ -271,6 +288,15 @@ export class OrgItemViewerComponent {
       return;
     }
     if (this.editing() || this.saving() || this.openingLatest()) {
+      if (!this.canEdit(detail)) {
+        this.revokedDraft.set({ title: this.titleDraft(), markdown: this.markdownDraft() });
+        this._item.set(detail);
+        this.attachments.set([]);
+        this.tabsService.setTitle(tabKeyFor("org-item", routeId), detail.title || "Shared note");
+        void this.reloadAttachments(detail.itemId, routeId);
+        this.editing.set(false);
+        this.toast.info("Edit access changed. Your unsaved draft is still available to copy.");
+      }
       return;
     }
     this._item.set(detail);
@@ -291,6 +317,9 @@ export class OrgItemViewerComponent {
     this._removed.set(true);
     this._item.set(null);
     this.attachments.set([]);
+    this.revokedDraft.set(null);
+    this.titleDraft.set("");
+    this.markdownDraft.set("");
     this.editing.set(false);
     this._editConflict.set(false);
     this._openLatestFailed.set(false);
@@ -341,6 +370,7 @@ export class OrgItemViewerComponent {
     this._item.set(null);
     this._removed.set(false);
     this.attachments.set([]);
+    this.revokedDraft.set(null);
     this._orgName.set("");
     // A route change (incl. the post-save redirect to the superseded item) always exits edit mode.
     this.editing.set(false);
@@ -371,6 +401,9 @@ export class OrgItemViewerComponent {
 
   /** Load the read-only detail (+ best-effort org name) for a non-author. Stale-guarded. */
   private async load(id: string): Promise<void> {
+    this.titleDraft.set("");
+    this.markdownDraft.set("");
+    this.revokedDraft.set(null);
     try {
       const item = await this.ipc.orgGetItem(id);
       if (this.itemId() !== id) {
@@ -386,6 +419,9 @@ export class OrgItemViewerComponent {
         return;
       }
       this._item.set(item);
+      this.titleDraft.set(item.title);
+      this.markdownDraft.set(item.markdown);
+      this.editing.set(this.canEdit(item));
       await this.reloadAttachments(item.itemId, id);
       if (this.itemId() !== id) {
         return;
@@ -465,9 +501,23 @@ export class OrgItemViewerComponent {
     }
     this.titleDraft.set(it.title);
     this.markdownDraft.set(it.markdown);
+    this.revokedDraft.set(null);
     this._editConflict.set(false);
     this._openLatestFailed.set(false);
     this.editing.set(true);
+  }
+
+  async copyRevokedDraft(): Promise<void> {
+    const draft = this.revokedDraft();
+    if (draft === null) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(`${draft.title}\n\n${draft.markdown}`);
+      this.toast.success("Draft copied");
+    } catch {
+      this.toast.danger("Couldn’t copy the draft");
+    }
   }
 
   /** Leave edit mode without saving (ignored mid-save). */

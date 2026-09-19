@@ -365,70 +365,7 @@
           </button>
         </div>
       } @else {
-        <article class="note-doc" [class.is-full-width]="fullWidth()">
-          <!-- Title — HIDDEN when embedded (the companion note carries a managed
-               title equal to the meeting's; the user never edits it here). -->
-          @if (!embedded()) {
-          <input
-            #titleInput
-            type="text"
-            class="note-title-input"
-            placeholder="Untitled"
-            aria-label="Note title"
-            autocapitalize="sentences"
-            autocomplete="off"
-            spellcheck="true"
-            [value]="title()"
-            (input)="onTitleInput($event)"
-            (blur)="onBlur()"
-          />
-          }
-
-          <!-- PROPERTIES CARD REMOVED (2026-09-13, user request: "usun ta sekcje
-               Properties z notatek, to nie jest do niczego potrzebne").
-
-               Only the EDITOR UI is gone. The note's YAML front-matter is still parsed
-               on load and re-serialized on save (`parseDoc` / `serializeDoc` in
-               note-editor.component.ts), so `tags:` and any custom properties an
-               existing note carries round-trip untouched into the exported .md — the
-               Obsidian vault is byte-identical to before. What is removed is the
-               ability to VIEW or EDIT them from inside Murmur. Dropping front-matter
-               itself would be a separate, deliberate call: it would strip existing
-               values from users' vault files on the next save, and it runs against
-               CLAUDE.md's "Obsidian-native, owned files" constraint. -->
-
-          <!-- RELATED (IA consolidation, 2026-07-19) — ONE merged, deduped panel of
-               every relationship: inbound backlinks + incident link edges (deduped by
-               neighbour) + ambient semantic suggestions, collapsed behind an "N related"
-               count; with no relations it degrades to a lone `+ Link`. Self-loaded &
-               gated: the panel owns its fetch, skips it while `locked`, and re-asks on
-               a session lock-tree change.
-               `inlineWikilinkTitles` suppresses a Related chip for a neighbour the body
-               already links inline via `[[Title]]` (no triplication). Hidden when embedded
-               (the recording panel's Ask Brain tab owns relationships; the Note tab is
-               pure writing). -->
-          @if (!embedded() && note(); as doc) {
-            <app-connections
-              kind="note"
-              [id]="doc.id"
-              [locked]="doc.locked"
-              [inlineWikilinkTitles]="inlineWikilinkTitles()"
-            />
-          }
-
-          <!-- Body: preview (cached computed) OR the source-of-truth textarea.
-               Formatting lives in the floating bubble on selection (below) +
-               ⌘B/⌘I shortcuts + the `/` slash menu — no persistent toolbar.
-               `previewActive()` is force-false when embedded (the Preview toggle
-               is hidden there), so the editable body always shows. -->
-          @if (previewActive()) {
-            <div class="note-preview">
-              <app-markdown
-                [markdown]="previewMarkdown()"
-                [attachments]="attachments()"
-              />
-            </div>
-          } @else {
+        <ng-template #editorToolbar>
             <div class="body-wrap">
               <div class="body-insert-bar">
                 <button
@@ -458,30 +395,9 @@
                 aria-hidden="true"
                 (change)="onImageFilesSelected($event)"
               />
-              <!-- CSS auto-grow: the grid mirror (`::after` fed by data-value) sizes the
-                   row to the content, the textarea fills it — no per-keystroke JS reflow. -->
-              <div class="body-grow" [attr.data-value]="body()">
-                <textarea
-                  #bodyArea
-                  class="body-area"
-                  [placeholder]="bodyPlaceholder()"
-                  aria-label="Note body"
-                  autocapitalize="sentences"
-                  autocomplete="off"
-                  spellcheck="true"
-                  [value]="body()"
-                  (input)="onBodyInput($event)"
-                  (keydown)="onBodyKeydown($event)"
-                  (paste)="onBodyPaste($event)"
-                  (dragover)="onBodyDragOver($event)"
-                  (drop)="onBodyDrop($event)"
-                  (mouseup)="onBodySelect()"
-                  (keyup)="onBodySelect()"
-                  (select)="onBodySelect()"
-                  (blur)="onBlur()"
-                ></textarea>
-              </div>
-
+            </div>
+        </ng-template>
+        <ng-template #editorFooter>
               <!-- Slash menu (opaque overlay, T3). -->
               @if (slashOpen()) {
                 <div class="menu slash-menu" role="listbox" aria-label="Insert block">
@@ -500,10 +416,31 @@
                   }
                 </div>
               }
-            </div>
-          }
-
-        </article>
+        </ng-template>
+        <app-note-document
+          [mode]="{ access: 'editable', view: previewActive() ? 'preview' : 'edit' }"
+          [title]="title()"
+          [showTitle]="!embedded()"
+          [markdown]="previewMarkdown()"
+          [attachments]="attachments()"
+          [toolbarTemplate]="editorToolbar"
+          [footerTemplate]="editorFooter"
+          [editorBody]="body()"
+          editorLabel="Note body"
+          [editorPlaceholder]="bodyPlaceholder()"
+          (editorInput)="onBodyInput($event)"
+          (editorKeydown)="onBodyKeydown($event)"
+          (editorPaste)="onBodyPaste($event)"
+          (editorDragover)="onBodyDragOver($event)"
+          (editorDrop)="onBodyDrop($event)"
+          (editorSelect)="onBodySelect()"
+          (editorBlur)="onBlur()"
+          [measure]="embedded() ? 'embedded' : 'page'"
+          [wide]="fullWidth()"
+          [related]="!embedded() ? { kind: 'note', id: doc.id, locked: doc.locked, inlineWikilinkTitles: inlineWikilinkTitles() } : null"
+          (titleChange)="onTitleValue($event)"
+          (titleBlur)="onBlur()"
+        />
       }
     }
   </div>

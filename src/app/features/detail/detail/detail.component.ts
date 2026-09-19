@@ -277,10 +277,15 @@ export class DetailComponent implements OnInit {
   readonly editing = signal(false);
   /** Two-way working copy of the note's markdown (textarea (input) → signal). */
   readonly draft = signal("");
+  /** Sharing is blocked only by an unsaved divergence, not by clean direct-edit mode. */
+  readonly noteDirty = computed(
+    () => this.editing() && this.draft() !== (this.detail()?.note?.markdown ?? ""),
+  );
   /** Disables Save/Cancel while an updateNote IPC call is in flight. */
   readonly saving = signal(false);
   /** Inline error surfaced when a save fails. */
   readonly saveError = signal("");
+  readonly attachmentLoadFailed = signal(false);
   /** Drives the brief "Saved" confirmation badge after a successful write. */
   readonly justSaved = signal(false);
   /** Gated image DTOs for this meeting note; synchronously cleared on relock. */
@@ -289,6 +294,11 @@ export class DetailComponent implements OnInit {
   private attachmentSeq = 0;
   /** Exact attachment set present when the current edit session began. */
   private editAttachmentSnapshot: NoteAttachmentDto[] = [];
+  /**
+   * A meeting opened straight into edit must not snapshot attachments until the gated list read
+   * completes. Otherwise Revert can mistake every pre-existing image for a draft-only upload.
+   */
+  private directEditAwaitingAttachmentsFor: string | null = null;
 
   /** Tracked so we can cancel the pending "Saved" reset on destroy (no leaks). */
   private savedResetTimer: ReturnType<typeof setTimeout> | null = null;
@@ -432,12 +442,41 @@ export class DetailComponent implements OnInit {
       if (seq !== this.attachmentSeq || this.locked()) {
         return;
       }
-      this.attachments.set(Array.isArray(rows) ? rows : []);
+      const loaded = Array.isArray(rows) ? rows : [];
+      this.attachments.set(loaded);
+      this.attachmentLoadFailed.set(false);
+      this.finishDirectEditAttachmentSnapshot(id, loaded);
     } catch {
       if (seq === this.attachmentSeq) {
-        this.attachments.set([]);
+        // A failed read says nothing about existing images. Keep the initial
+        // edit baseline pending so Revert cannot classify them as new uploads.
+        this.attachmentLoadFailed.set(true);
       }
     }
+  }
+
+  retryNoteAttachments(): void {
+    const id = this.detail()?.meeting.id;
+    if (!id || this.locked() || !this.attachmentLoadFailed()) return;
+    this.attachmentLoadFailed.set(false);
+    void this.fetchAttachments(id, ++this.attachmentSeq);
+  }
+
+  private finishDirectEditAttachmentSnapshot(
+    meetingId: string,
+    rows: NoteAttachmentDto[],
+  ): void {
+    if (
+      this.directEditAwaitingAttachmentsFor !== meetingId ||
+      this.detail()?.meeting.id !== meetingId ||
+      this.locked()
+    ) {
+      return;
+    }
+    this.directEditAwaitingAttachmentsFor = null;
+    this.editAttachmentSnapshot = [...rows];
+    this.meetingAttachmentBusy.set(false);
+    this.editing.set(true);
   }
 
   onMeetingAttachmentAdded(attachment: NoteAttachmentDto): void {
@@ -885,6 +924,9 @@ export class DetailComponent implements OnInit {
     this.editing.set(false);
     this.draft.set("");
     this.attachments.set([]);
+    this.editAttachmentSnapshot = [];
+    this.directEditAwaitingAttachmentsFor = null;
+    this.attachmentLoadFailed.set(false);
     this.meetingAttachmentBusy.set(false);
     // Retire any open drawer on a lock transition so none reappears on a later
     // unlock (each template guard already hides its drawer while locked; this
@@ -904,15 +946,14 @@ export class DetailComponent implements OnInit {
       // Stale-result guard: drop this if the user has since navigated elsewhere
       // within this same (possibly backgrounded) component instance.
       if (this.detail()?.meeting.id === id) {
-        this.detail.set(fresh);
-        // A lock that arrives through THIS path (indeterminate folder, or a
-        // seal only the backend could see) never ran `maskLocally`, so an open
-        // drawer would stay latched behind its template guard and pop back up
-        // on the next unlock. Retire it on the refetched truth, so "closed by
-        // default, re-summon is deliberate" holds on every path into locked,
-        // not just the synchronous one.
         if (fresh?.locked === true) {
-          this._openDrawer.set(null);
+          // The indeterminate-folder/backend-only path did not synchronously mask
+          // side signals. Apply the same complete scrub now that the gated read
+          // confirms the lock; swapping only the DTO would leave editor plaintext
+          // resident behind the lock gate.
+          this.maskLocally(fresh);
+        } else {
+          this.detail.set(fresh);
         }
         // Keep the tab strip + persisted tab title truthful (F3): after a
         // lock this is the backend's "🔒 Locked", after an unlock the real one.
@@ -1094,7 +1135,11 @@ export class DetailComponent implements OnInit {
     this.tags.set([]);
     this.graph.set(null);
     this.graphError.set("");
+    ++this.attachmentSeq;
     this.attachments.set([]);
+    this.editAttachmentSnapshot = [];
+    this.directEditAwaitingAttachmentsFor = null;
+    this.attachmentLoadFailed.set(false);
     this.meetingAttachmentBusy.set(false);
     this.editing.set(false);
     this.renaming.set(false);
@@ -1111,7 +1156,17 @@ export class DetailComponent implements OnInit {
     // <audio> element + currentTime/duration/playing signals. The panel is
     // re-instantiated per active tab, so there is nothing to reset here.)
     try {
-      this.detail.set(await this.ipc.getMeetingDetail(id));
+      const loaded = await this.ipc.getMeetingDetail(id);
+      if (loaded && !loaded.locked && loaded.note) {
+        this.draft.set(loaded.note.markdown);
+        this.directEditAwaitingAttachmentsFor = loaded.meeting.id;
+        // Permission mode is known from the gated detail read. Enter it immediately so
+        // commands cannot observe a transient preview state while attachment baselining runs;
+        // editor writes stay disabled until that second gated read completes.
+        this.meetingAttachmentBusy.set(true);
+        this.editing.set(true);
+      }
+      this.detail.set(loaded);
     } finally {
       this.loading.set(false);
     }
@@ -1811,6 +1866,12 @@ export class DetailComponent implements OnInit {
     this.editing.set(true);
   }
 
+  showNotePreview(): void {
+    if (!this.noteDirty() && !this.saving() && !this.meetingAttachmentBusy()) {
+      this.editing.set(false);
+    }
+  }
+
   /** Two-way bind: mirror the textarea value into the `draft` signal. */
   onDraftInput(event: Event): void {
     this.draft.set((event.target as HTMLTextAreaElement).value);
@@ -1849,7 +1910,6 @@ export class DetailComponent implements OnInit {
       }
       this.attachments.set([...this.editAttachmentSnapshot]);
       this.draft.set(this.detail()?.note?.markdown ?? "");
-      this.editing.set(false);
     } catch (e) {
       this.saveError.set(this.errorCopy.because("Couldn’t discard added images", e));
     } finally {
@@ -1868,8 +1928,8 @@ export class DetailComponent implements OnInit {
   /**
    * Persist the draft: re-write the vault file via `updateNote`, fold the
    * returned markdown back into the in-memory detail signal (so the `note()`
-   * computed re-parses and the analysis cards re-render), exit edit mode, then
-   * flash a brief "Saved" confirmation. Errors surface inline; the page state
+   * computed re-parses), keep the direct editor open, then flash a brief "Saved"
+   * confirmation. Errors surface inline; the page state
    * (audio / timeline / transcript) is never touched.
    */
   async saveNote(): Promise<void> {
@@ -1902,7 +1962,6 @@ export class DetailComponent implements OnInit {
         rows.filter((row) => referenced.has(row.id.toLowerCase())),
       );
       this.editAttachmentSnapshot = [...this.attachments()];
-      this.editing.set(false);
       this.flashSaved();
     } catch (e) {
       this.saveError.set(this.errorCopy.because("Couldn’t save", e));
@@ -2008,7 +2067,7 @@ export class DetailComponent implements OnInit {
    * parsed analysis). Flashes a brief "Copied" confirmation on the button.
    */
   async copyMarkdown(): Promise<void> {
-    if (this.editing()) {
+    if (this.noteDirty()) {
       return;
     }
     const markdown = this.detail()?.note?.markdown;
@@ -2030,7 +2089,7 @@ export class DetailComponent implements OnInit {
    * no-op; failures surface inline.
    */
   async saveMarkdown(id: string, title: string | null): Promise<void> {
-    if (this.editing() || this.exporting()) {
+    if (this.noteDirty() || this.exporting()) {
       return;
     }
     this.exportError.set("");
@@ -2057,7 +2116,7 @@ export class DetailComponent implements OnInit {
    * meeting actually has audio (the button is gated on `audioSrc()`).
    */
   async saveAudio(id: string, title: string | null): Promise<void> {
-    if (this.editing() || this.exporting()) {
+    if (this.noteDirty() || this.exporting()) {
       return;
     }
     this.exportError.set("");
@@ -2092,7 +2151,7 @@ export class DetailComponent implements OnInit {
     id: string,
     title: string | null,
   ): Promise<void> {
-    if (this.editing() || this.exporting()) {
+    if (this.noteDirty() || this.exporting()) {
       return;
     }
     this.exportError.set("");
@@ -2144,7 +2203,7 @@ export class DetailComponent implements OnInit {
    * `window.print()` call, then is cleared so the live UI is untouched.
    */
   saveAsPdf(): void {
-    if (this.editing()) {
+    if (this.noteDirty()) {
       return;
     }
     document.body.classList.add("murmur-printing");
@@ -2163,7 +2222,7 @@ export class DetailComponent implements OnInit {
    * first") surface inline and leave the rest of the page untouched.
    */
   async exportCanvas(id: string): Promise<void> {
-    if (this.editing() || this.exportingCanvas() || !this.note()) {
+    if (this.noteDirty() || this.exportingCanvas() || !this.note()) {
       return;
     }
     this.canvasError.set("");

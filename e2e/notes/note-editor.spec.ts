@@ -92,7 +92,6 @@ test("Cmd-V keeps mixed text and a normalized image at the exact caret while typ
         folderId: "nf1",
         markdown: args.markdown,
         tags: [],
-        properties: {},
         updatedAt: 1_720_000_200_000,
         createdAt: 1_719_000_000_000,
         exportedPath: "/Vault/Notes/My-First-Note.md",
@@ -385,7 +384,7 @@ test("a locked note renders the lock gate (no body) with no console errors", asy
  * The labels were plain text, so nothing stopped a future change from dropping
  * the accessible name along with them.
  */
-test("the mode toggle is icon-only, and a note with a body starts in Preview", async ({
+test("the mode toggle is icon-only, and a writable note opens directly in Edit", async ({
   page,
 }) => {
   await mockNotes(page);
@@ -403,19 +402,16 @@ test("the mode toggle is icon-only, and a note with a body starts in Preview", a
   await expect(edit.locator("svg")).toHaveCount(1);
   await expect(preview.locator("svg")).toHaveCount(1);
 
-  // `get_note` returns "# Heading\n\nSome body text…", so there IS something to
-  // read: the note opens rendered, not as raw markdown in a textarea.
-  await expect(preview).toHaveAttribute("aria-pressed", "true");
-  await expect(edit).toHaveAttribute("aria-pressed", "false");
-  await expect(page.locator(".note-preview")).toBeVisible();
-  await expect(page.locator(".body-area")).toHaveCount(0);
+  await expect(edit).toHaveAttribute("aria-pressed", "true");
+  await expect(preview).toHaveAttribute("aria-pressed", "false");
+  await expect(page.locator("app-note-document")).toHaveAttribute("data-mode", "edit");
+  await expect(page.locator(".body-area")).toBeVisible();
 
   // The toggle still toggles, and state is exposed programmatically rather than
   // by colour alone.
-  await edit.click();
-  await expect(edit).toHaveAttribute("aria-pressed", "true");
-  await expect(preview).toHaveAttribute("aria-pressed", "false");
-  await expect(page.locator(".body-area")).toBeVisible();
+  await preview.click();
+  await expect(preview).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".note-preview")).toBeVisible();
 });
 
 test("a brand-new empty note starts in Edit, not in a read-only empty pane", async ({
@@ -428,7 +424,6 @@ test("a brand-new empty note starts in Edit, not in a read-only empty pane", asy
       folderId: "nf1",
       markdown: "",
       tags: [],
-      properties: {},
       updatedAt: 1_720_000_000_000,
       createdAt: 1_720_000_000_000,
       exportedPath: null,

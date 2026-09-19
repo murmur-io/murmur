@@ -212,6 +212,48 @@ test("view-only received item has reverse Related but no edit or management cont
   });
 });
 
+test("explicit canEdit false wins over legacy editable true and never mounts an editor", async ({
+  page,
+}) => {
+  await mockNotes(page, {
+    org_resolve_source: () => null,
+    org_get_item: () => ({
+      itemId: "item-no-write",
+      docId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      linkId: "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      authorHint: "kasia",
+      title: "No write permission",
+      createdAt: "2026-08-12T10:00:00Z",
+      rev: 2,
+      markdown: "# Protected\n\nRendered, never editable.",
+      access: "view",
+      canEdit: false,
+      canManage: false,
+      editable: true,
+    }),
+    org_list_statuses: ORG,
+    list_org_items: () => [],
+    org_update_item: (args: unknown) => {
+      const target = window as unknown as { __forbiddenWrites?: unknown[] };
+      (target.__forbiddenWrites ??= []).push(args);
+      throw new Error("must not write");
+    },
+  });
+
+  await page.goto("/org-item/item-no-write");
+  const document = page.locator("app-note-document");
+  await expect(document).toHaveAttribute("data-mode", "preview");
+  await expect(document).toHaveAttribute("data-access", "view-only");
+  await expect(document.getByText("View only", { exact: true })).toBeVisible();
+  await expect(document.getByRole("textbox")).toHaveCount(0);
+  await expect(document.getByText("Rendered, never editable.")).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { __forbiddenWrites?: unknown[] }).__forbiddenWrites ?? [],
+    ),
+  ).toEqual([]);
+});
+
 test("edit conflict opens the stable latest head across an in-flight sync event", async ({
   page,
 }) => {
@@ -355,12 +397,9 @@ test("edit conflict opens the stable latest head across an in-flight sync event"
   });
 
   await page.goto("/org-item/item-conflict");
-  const edit = page.getByRole("button", { name: "Edit", exact: true });
-  await expect(edit).toBeVisible();
   const activeTab = page.locator(".tab-item.active");
   await expect(activeTab.locator(".tab-label")).toHaveText("Concurrent plan");
   await expect(page.locator(".oi-permissions")).toHaveCount(0);
-  await edit.click();
   const titleDraft = page.getByRole("textbox", { name: "Note title" });
   const draft = page.getByRole("textbox", { name: "Note content (markdown)" });
   await titleDraft.fill("My exact draft title");
@@ -460,9 +499,9 @@ test("edit conflict opens the stable latest head across an in-flight sync event"
   });
 
   await expect(page).toHaveURL(/\/org-item\/item-latest$/);
-  await expect(page.locator(".oi-title")).toHaveText("Authoritative plan");
+  await expect(page.getByRole("textbox", { name: "Note title" })).toHaveValue("Authoritative plan");
   await expect(page.locator(".oi-rev")).toHaveText("revision 4");
-  await expect(page.locator(".oi-body")).toContainText("Authoritative body");
+  await expect(page.getByRole("textbox", { name: "Note content (markdown)" })).toHaveValue("# Authoritative body");
   await expect.poll(async () =>
     page.evaluate(
       () => (window as unknown as { __orgItemReads?: string[] }).__orgItemReads ?? [],
@@ -590,8 +629,7 @@ test("source-share conflict stops silent republish and opens the latest head", a
 
   await conflict.getByRole("button", { name: "Open latest" }).click();
   await expect(page).toHaveURL(/\/org-item\/item-current$/);
-  await expect(page.locator(".oi-title")).toHaveText("Latest shared plan");
-  await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Note title" })).toHaveValue("Latest shared plan");
   await expect(page.locator(".oi-permissions")).toHaveCount(0);
   expect(
     await page.evaluate(
@@ -643,7 +681,7 @@ test("editor can edit while only a manager can change member access", async ({
   });
 
   await page.goto("/org-item/item-2");
-  await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Note title" })).toHaveValue("Managed plan");
   const editAccess = page.locator(".oi-permissions").getByRole("button", {
     name: "Can edit",
     exact: true,
@@ -658,3 +696,28 @@ test("editor can edit while only a manager can change member access", async ({
     ),
   ).toEqual([{ itemId: "item-2", access: "edit" }]);
 });
+
+for (const [label, capability, mode] of [
+  ["modern write", { canEdit: true, editable: false }, "edit"],
+  ["legacy write", { editable: true }, "edit"],
+  ["missing capability", {}, "preview"],
+] as const) {
+  test(`backend capability ${label} determines the initial document mode`, async ({ page }) => {
+    await page.addInitScript(value => {
+      (window as unknown as { __modeCapability: unknown }).__modeCapability = value;
+    }, capability);
+    await mockNotes(page, {
+      org_resolve_source: () => null,
+      org_get_item: () => ({
+        itemId: "mode-matrix", authorHint: "teammate", title: "Mode matrix",
+        createdAt: "2026-08-12T10:00:00Z", rev: 1, markdown: "# Body",
+        ...(window as unknown as { __modeCapability: object }).__modeCapability,
+      }),
+      org_list_statuses: ORG,
+    });
+    await page.goto("/org-item/mode-matrix");
+    const document = page.locator("app-note-document");
+    await expect(document).toHaveAttribute("data-mode", mode);
+    await expect(document.locator("textarea")).toHaveCount(mode === "edit" ? 1 : 0);
+  });
+}

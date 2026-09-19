@@ -32,7 +32,6 @@ test("typing / in the recording note shows Ask Brain first and summons the panel
       folderId: "",
       markdown: '---\nmeeting: "[[Test Meeting]]"\n---\n',
       tags: [],
-      properties: {},
       updatedAt: 0,
       createdAt: 0,
       exportedPath: null,
