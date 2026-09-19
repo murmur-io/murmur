@@ -48,8 +48,7 @@ import {
   type AttachmentPastePlan,
   type MarkdownEdit,
 } from "../../../services/note-attachment.service";
-import { ConnectionsComponent } from "../../../shared/connections/connections.component";
-import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
+import { NoteDocumentComponent } from "../../../shared/note-document/note-document.component";
 import { LinkPickerComponent } from "../link-picker/link-picker.component";
 import { NOTE_ASSIST_CATALOG } from "../note-brain-popover/note-assist-catalog";
 import {
@@ -62,7 +61,10 @@ import { NoteSelectionToolbarComponent } from "../note-selection-toolbar/note-se
 import { NoteChatComponent } from "../note-chat/note-chat.component";
 import { MurCopyIdComponent } from "../../../design-system/copy-id/copy-id.component";
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
-import { parseDoc, serializeDoc } from "./front-matter";
+import {
+  joinNoteDocument,
+  splitNoteDocument,
+} from "../../../shared/note-document/front-matter";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { NoteRemindersPanelComponent } from "../../reminders/note-reminders-panel/note-reminders-panel.component";
 import { SmartReminderCardComponent } from "../../reminders/smart-reminder-card/smart-reminder-card.component";
@@ -171,9 +173,8 @@ const NOTE_SMART_OPEN_KEY = "murmur-note-smart-open";
     "(document:pointerdown)": "onDocumentPointerDown($event)",
   },
   imports: [
-    ConnectionsComponent,
+    NoteDocumentComponent,
     LinkPickerComponent,
-    MarkdownComponent,
     NoteBrainPopoverComponent,
     NoteSelectionToolbarComponent,
     NoteSharePanelComponent,
@@ -303,8 +304,8 @@ export class NoteEditorComponent {
   readonly importingImages = signal(0);
   /** Front-matter tags. */
   readonly tags = signal<string[]>([]);
-  /** Front-matter properties (key → value), excluding tags. */
-  readonly properties = signal<Record<string, string>>({});
+  /** Exact opaque YAML prefix, including its original separators and line endings. */
+  readonly frontMatterPrefix = signal("");
 
   // --- View state ----------------------------------------------------------
   /**
@@ -324,7 +325,6 @@ export class NoteEditorComponent {
    * yank someone out of Edit mid-note, while a genuine open — or an unlock, which
    * changes the `locked` half — still gets the default.
    */
-  private previewDefaultedFor: string | null = null;
   /** The autosave indicator. */
   readonly saveState = signal<SaveState>("idle");
   /**
@@ -421,10 +421,8 @@ export class NoteEditorComponent {
   /** True once the AI button opened the Brain popover for the current selection. */
   readonly brainOpen = signal(false);
 
-  private readonly titleInput =
-    viewChild<ElementRef<HTMLInputElement>>("titleInput");
-  private readonly bodyArea =
-    viewChild<ElementRef<HTMLTextAreaElement>>("bodyArea");
+  private readonly document = viewChild(NoteDocumentComponent);
+  private readonly bodyArea = computed(() => this.document()?.editorArea());
   private readonly imageFileInput =
     viewChild<ElementRef<HTMLInputElement>>("imageFileInput");
   /** Live textarea node passed to the teleported link picker for motion filtering. */
@@ -493,7 +491,7 @@ export class NoteEditorComponent {
 
   /** The rendered preview HTML source — a cached `computed` off title + doc markdown. */
   readonly previewMarkdown = computed(() =>
-    serializeDoc(this.tags(), this.properties(), this.body()),
+    joinNoteDocument(this.frontMatterPrefix(), this.body()),
   );
 
   /** The folder this note lives in (for the breadcrumb). */
@@ -947,7 +945,6 @@ export class NoteEditorComponent {
         title: "🔒 Locked",
         markdown: "",
         tags: [],
-        properties: {},
         exportedPath: null,
       });
       this.clearSelection();
@@ -1120,16 +1117,14 @@ export class NoteEditorComponent {
     this.settledRevisionSaved = false;
     this.note.set(doc);
     this.title.set(doc.title === "🔒 Locked" ? "" : doc.title);
-    // The DTO carries parsed tags/properties, but the source-of-truth body is
-    // derived by stripping the front-matter from the FULL markdown so a save
-    // round-trips exactly. Prefer the DTO's structured fields when present.
-    const parsed = parseDoc(doc.markdown);
+    // Preserve the opaque owned-file prefix; tags remain a read projection.
+    const parsed = splitNoteDocument(doc.markdown);
     this.body.set(parsed.body);
-    this.tags.set(doc.tags.length ? [...doc.tags] : parsed.tags);
-    this.properties.set(
-      Object.keys(doc.properties).length ? { ...doc.properties } : parsed.properties,
-    );
-    this.applyPreviewDefault(doc, parsed.body);
+    this.tags.set(doc.tags.length ? [...doc.tags] : [...parsed.tags]);
+    this.frontMatterPrefix.set(parsed.frontMatterPrefix);
+    // Writable local notes open directly on their content. Locked notes never
+    // mount this surface; embedded notes likewise remain in edit.
+    this.preview.set(false);
     this.saveState.set("idle");
     this.dirtyFull = false;
     this.hydrating = false;
@@ -1138,42 +1133,13 @@ export class NoteEditorComponent {
     this.tabsService.setTitle(tabKeyFor("note", doc.id), doc.title || "Untitled");
   }
 
-  /**
-   * A note with something to read OPENS in Preview; anything else opens in Edit.
-   *
-   * Reading is the common case — an existing note was landing in a raw-markdown
-   * textarea, so every open began by showing source rather than the note. The
-   * three exclusions are not stylistic:
-   *
-   *  - **empty body** — a brand-new note (`/notes/new` creates one, then this
-   *    editor hydrates it) has nothing to render, and a read-only empty pane is a
-   *    dead end where the user meant to start typing.
-   *  - **locked** — a sealed note's body is masked server-side, so there is
-   *    nothing to preview; the template shows the lock gate instead, and
-   *    `setPreview` itself refuses while locked. Defaulting past that guard would
-   *    be the one place preview mode is reachable for a locked document.
-   *  - **embedded** — the recording panel's Note tab is a capture surface. It
-   *    already force-disables preview via `previewActive`; keeping the signal
-   *    false too honors that component's belt-and-braces contract.
-   */
-  private opensInPreview(doc: NoteDoc, body: string): boolean {
-    return !doc.locked && !this.embedded() && body.trim().length > 0;
-  }
-
-  /** Apply {@link opensInPreview} once per opened document — see {@link previewDefaultedFor}. */
-  private applyPreviewDefault(doc: NoteDoc, body: string): void {
-    const key = `${doc.id}:${doc.locked}`;
-    if (key === this.previewDefaultedFor) {
-      return;
-    }
-    this.previewDefaultedFor = key;
-    this.preview.set(this.opensInPreview(doc, body));
-  }
-
   // ── Title ────────────────────────────────────────────────────────────────
 
   onTitleInput(event: Event): void {
-    const value = (event.target as HTMLInputElement).value;
+    this.onTitleValue((event.target as HTMLInputElement).value);
+  }
+
+  onTitleValue(value: string): void {
     this.title.set(value);
     // Live tab-title sync (root-cause fix, 2026-07-15): update the tab-strip label
     // OPTIMISTICALLY from the typed value, independent of whether the debounced
@@ -1555,7 +1521,7 @@ export class NoteEditorComponent {
   private currentPayload(): { title: string; markdown: string } {
     return {
       title: this.title().trim() || "Untitled",
-      markdown: serializeDoc(this.tags(), this.properties(), this.body()),
+      markdown: joinNoteDocument(this.frontMatterPrefix(), this.body()),
     };
   }
 
@@ -1843,9 +1809,8 @@ export class NoteEditorComponent {
   }
 
   // TAGS + PROPERTIES EDITING REMOVED (2026-09-13) — see the note in the template.
-  // The `tags` / `properties` signals stay: they are loaded by `parseDoc` and written
-  // back by `serializeDoc`, so a note's front-matter round-trips byte-exact into the
-  // exported .md. Only the in-app editing surface is gone.
+  // Tags remain a read projection. The exact opaque YAML prefix is joined to
+  // the edited body, so unknown vault-owned front matter is never regenerated.
 
   // ── Edit / Preview ───────────────────────────────────────────────────────
 

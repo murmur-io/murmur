@@ -34,7 +34,6 @@ test.describe("Record — companion note hero + summoned Ask Brain panel", () =>
         folderId: "",
         markdown: '---\nmeeting: "[[Test Meeting]]"\n---\n',
         tags: [],
-        properties: {},
         updatedAt: 0,
         createdAt: 0,
         exportedPath: null,

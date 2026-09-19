@@ -33,7 +33,6 @@ test("Related panel: collapse-by-default, dedup, cross-dedup, ambient suggestion
       markdown:
         "# Weekly plan\n\nSee the [[Meeting 2026-07-17]] for context and the roadmap.",
       tags: [],
-      properties: {},
       updatedAt: 1_720_000_000_000,
       createdAt: 1_719_000_000_000,
       exportedPath: null,

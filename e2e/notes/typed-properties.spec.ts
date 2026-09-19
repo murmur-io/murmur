@@ -85,7 +85,6 @@ const NOTE_WITH_PROPS = {
     markdown:
       "---\ntags: [idea]\nStatus: In progress\nReviewed: true\nDue: 2026-08-01\n---\n\n# Heading\n\nSome body text to select.",
     tags: ["idea"],
-    properties: { Status: "In progress", Reviewed: "true", Due: "2026-08-01" },
     updatedAt: 1_720_000_000_000,
     createdAt: 1_719_000_000_000,
     exportedPath: null,
@@ -156,7 +155,11 @@ test("a note's front-matter survives a BODY edit untouched (no Properties UI)", 
   // Every front-matter line the note arrived with is still there, in one leading
   // YAML block. This is the assertion that fails if the removal ever grows teeth it
   // should not have.
-  expect(saved.startsWith("---\n")).toBeTruthy();
+  expect(
+    saved.startsWith(
+      "---\ntags: [idea]\nStatus: In progress\nReviewed: true\nDue: 2026-08-01\n---\n\n",
+    ),
+  ).toBeTruthy();
   expect(saved).toContain("tags: [idea]");
   expect(saved).toContain("Status: In progress");
   expect(saved).toContain("Reviewed: true");
@@ -237,4 +240,44 @@ test("a LOCKED folder shows the lock gate and hides the Saved Views bar", async 
   await expect(page.locator("app-notes-view-switcher")).toHaveCount(0);
 
   expect(consoleErrors).toEqual([]);
+});
+
+test("body edits preserve opaque CRLF YAML and newly pasted front matter", async ({ page }) => {
+  await mockNotes(page, {
+    get_note: (args: { id: string }) => ({
+      id: args.id, title: "Opaque YAML", folderId: "nf1", tags: ["idea"],
+      markdown: "\uFEFF---\r\n# keep comment\r\ntags: [idea]\r\ncustom: 'a:b'\r\nnested:\r\n  keys: [one, two]\r\nempty:\r\n---\r\n\r\n\r\nOriginal body",
+      updatedAt: 1720000000000, createdAt: 1719000000000, exportedPath: null, locked: false, shared: false,
+    }),
+    save_note_text: (args: { markdown: string }) => {
+      (window as unknown as { __opaqueSave: string }).__opaqueSave = args.markdown;
+      return 1720000001000;
+    },
+  });
+  await page.goto("/notes/n1");
+  const body = page.getByRole("textbox", { name: "Note body", exact: true });
+  await expect(body).toHaveValue("Original body");
+  await body.fill("Edited body");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __opaqueSave: string }).__opaqueSave)).toBe(
+    "\uFEFF---\r\n# keep comment\r\ntags: [idea]\r\ncustom: 'a:b'\r\nnested:\r\n  keys: [one, two]\r\nempty:\r\n---\r\n\r\n\r\nEdited body",
+  );
+});
+
+test("newly entered YAML in a body-only note survives subsequent typing", async ({ page }) => {
+  await mockNotes(page, {
+    get_note: (args: { id: string }) => ({
+      id: args.id, title: "Fresh YAML", folderId: "nf1", tags: [], markdown: "",
+      updatedAt: 1720000000000, createdAt: 1719000000000, exportedPath: null, locked: false, shared: false,
+    }),
+    save_note_text: (args: { markdown: string }) => {
+      (window as unknown as { __opaqueSave: string }).__opaqueSave = args.markdown;
+      return 1720000001000;
+    },
+  });
+  await page.goto("/notes/n1");
+  const body = page.getByRole("textbox", { name: "Note body", exact: true });
+  await body.fill("---\ncustom: keep\n---\nBody");
+  await body.press("End");
+  await body.pressSequentially(" changed");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __opaqueSave: string }).__opaqueSave)).toBe("---\ncustom: keep\n---\nBody changed");
 });

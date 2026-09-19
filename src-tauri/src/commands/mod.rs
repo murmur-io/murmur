@@ -4370,16 +4370,17 @@ fn note_display_title(row: &crate::storage::db::NoteRow) -> String {
 }
 
 /// Build the FULL (editor) DTO from a raw note row — caller has ALREADY confirmed the folder is
-/// unlocked. Parses front-matter into tags/properties; `markdown` is the full stored text.
+/// unlocked. Projects the front-matter `tags:` list (the Notes list renders tag pills); the OTHER
+/// front-matter scalars are deliberately NOT projected — the editor parses them out of `markdown`,
+/// which is the full stored text INCLUDING the raw YAML prefix, so a save round-trips byte-exact.
 fn note_doc_from_row(row: &crate::storage::db::NoteRow) -> NoteDoc {
-    let (tags, properties) = crate::storage::db::parse_front_matter(&row.text);
+    let (tags, _properties) = crate::storage::db::parse_front_matter(&row.text);
     NoteDoc {
         id: row.id.clone(),
         title: note_display_title(row),
         folder_id: row.folder_id.clone(),
         markdown: row.text.clone(),
         tags,
-        properties,
         updated_at: row.updated_at.unwrap_or(row.created_at),
         created_at: row.created_at,
         exported_path: row.exported_path.clone(),
@@ -4397,7 +4398,6 @@ fn masked_note_doc(id: &str, folder_id: &str, created_at: i64, updated_at: Optio
         folder_id: folder_id.to_string(),
         markdown: String::new(),
         tags: Vec::new(),
-        properties: std::collections::BTreeMap::new(),
         updated_at: updated_at.unwrap_or(created_at),
         created_at,
         exported_path: None,

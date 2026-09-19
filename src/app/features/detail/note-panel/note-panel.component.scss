@@ -417,12 +417,6 @@
 }
 
 /* In-app note editor. */
-.editor {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  padding: var(--space-4);
-}
 .editor-insert-bar {
   display: flex;
   align-items: center;
@@ -444,25 +438,6 @@
 }
 .editor-image-input {
   display: none;
-}
-.meeting-markdown-note {
-  overflow: hidden;
-}
-.editor-area {
-  width: 100%;
-  min-height: 360px;
-  flex: 1 1 auto;
-  padding: var(--space-4);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--surface-input);
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 0.875rem;
-  font-variant-numeric: tabular-nums;
-  line-height: 1.7;
-  resize: vertical;
-  tab-size: 2;
 }
 .editor-error {
   margin: 0;
@@ -487,12 +462,6 @@
 }
 .empty-card {
   padding: var(--space-5);
-}
-
-.is-resummarizing {
-  opacity: 0.55;
-  pointer-events: none;
-  transition: opacity var(--transition);
 }
 
 @media (prefers-reduced-motion: reduce) {

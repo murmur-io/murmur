@@ -71,9 +71,9 @@ test.describe("org-item viewer — the author can remove their own item from a n
     });
 
     await page.goto("/org-item/oi1");
-    await expect(page.locator(".oi-title")).toHaveText("My Roadmap");
+    await expect(page.getByRole("textbox", { name: "Note title" })).toHaveValue("My Roadmap");
 
-    // Edit + Remove both present for an editable item; no confirm yet.
+    // Direct edit + Remove are both present for an editable item; no confirm yet.
     const removeBtn = page.locator(".oi-remove-btn");
     await expect(removeBtn).toBeVisible();
     await expect(page.locator("text=Remove from the org?")).toHaveCount(0);
@@ -131,7 +131,7 @@ test.describe("org-item viewer — the author can remove their own item from a n
     });
 
     await page.goto("/org-item/oi1");
-    await expect(page.locator(".oi-title")).toHaveText("My Roadmap");
+    await expect(page.getByRole("textbox", { name: "Note title" })).toHaveValue("My Roadmap");
 
     await page.locator(".oi-remove-btn").click();
     await expect(page.locator("text=Remove from the org?")).toBeVisible();

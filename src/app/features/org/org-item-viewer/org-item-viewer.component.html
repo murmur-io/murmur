@@ -66,43 +66,13 @@
       </button>
     </div>
   } @else if (item(); as it) {
-    <article class="card oi-card">
+    <div class="oi-card">
       <header class="oi-head">
         <div class="oi-head-top">
-          @if (editing()) {
-            <input
-              class="oi-title-input"
-              type="text"
-              [value]="titleDraft()"
-              (input)="titleDraft.set($any($event.target).value)"
-              placeholder="Title"
-              aria-label="Note title"
-            />
-          } @else {
-            <h1 class="oi-title">{{ it.title }}</h1>
-          }
-
           <!-- Editing follows server-authoritative document access; management stays author/Owner-only. -->
           @if (canEdit(it)) {
             <div class="oi-actions">
-              @if (editing()) {
-                <button
-                  type="button"
-                  class="btn btn-ghost"
-                  [disabled]="saving() || openingLatest()"
-                  (click)="cancelEdit()"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-primary"
-                  [disabled]="saving() || openingLatest()"
-                  (click)="saveEdit()"
-                >
-                  {{ saving() ? "Saving…" : "Save" }}
-                </button>
-              } @else if (confirmingRemove()) {
+              @if (confirmingRemove()) {
                 <span class="oi-remove-confirm">Remove from the org?</span>
                 <button
                   type="button"
@@ -120,13 +90,22 @@
                 >
                   {{ saving() ? "Removing…" : "Remove" }}
                 </button>
-              } @else {
+              } @else if (editing()) {
                 <button
                   type="button"
                   class="btn btn-ghost"
-                  (click)="startEdit()"
+                  [disabled]="saving() || openingLatest()"
+                  (click)="cancelEdit()"
                 >
-                  Edit
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  [disabled]="saving() || openingLatest()"
+                  (click)="saveEdit()"
+                >
+                  {{ saving() ? "Saving…" : "Save" }}
                 </button>
                 @if (canManage(it)) {
                   <button
@@ -137,34 +116,23 @@
                     Remove
                   </button>
                 }
+              } @else {
+                <button type="button" class="btn btn-ghost" (click)="startEdit()">Edit</button>
+                @if (canManage(it)) {
+                  <button
+                    type="button"
+                    class="btn btn-ghost oi-remove-btn"
+                    (click)="askRemove()"
+                  >Remove</button>
+                }
               }
             </div>
           } @else if (notEditableReason(); as reason) {
-            <span class="oi-readonly-reason text-muted">{{ reason }}</span>
+            <span class="oi-view-only" role="status" [attr.aria-label]="reason" [attr.title]="reason">View only</span>
           }
         </div>
 
-        <div class="oi-meta">
-          <span class="oi-org-chip">
-            <span class="oi-org-dot" aria-hidden="true"></span>
-            Org Brain
-          </span>
-          @if (orgName(); as name) {
-            <span class="oi-meta-sep" aria-hidden="true">·</span>
-            <span class="oi-org-name">{{ name }}</span>
-          }
-          @if (it.authorHint) {
-            <span class="oi-meta-sep" aria-hidden="true">·</span>
-            <span class="oi-author">Shared by {{ it.authorHint }}</span>
-          }
-          <span class="oi-meta-sep" aria-hidden="true">·</span>
-          <span class="oi-date">{{ formatDate(it.createdAt) }}</span>
-          <span class="oi-meta-sep" aria-hidden="true">·</span>
-          <span class="oi-rev">revision {{ it.rev }}</span>
-          <span class="oi-meta-sep" aria-hidden="true">·</span>
-          <span class="oi-access-label">{{ accessOf(it) === "edit" ? "Can edit" : "View only" }}</span>
-        </div>
-        @if (canManage(it) && !editing()) {
+        @if (canManage(it)) {
           <div class="oi-permissions" aria-label="Member access">
             <span class="oi-permissions-label">Member access</span>
             <div class="oi-access-options">
@@ -186,6 +154,17 @@
               >Can edit</button>
             </div>
             <span class="oi-permissions-note">Related links stay private and never grant access.</span>
+          </div>
+        }
+        @if (revokedDraft() !== null) {
+          <div class="oi-edit-conflict" role="alert" data-testid="org-revoked-draft">
+            <div class="oi-edit-conflict-copy">
+              <strong>Edit access changed</strong>
+              <span>The latest shared version is shown. Your unsaved draft is retained locally.</span>
+            </div>
+            <button type="button" class="btn btn-ghost oi-edit-conflict-open" (click)="copyRevokedDraft()">
+              Copy draft
+            </button>
           </div>
         }
         @if (editing() && editConflict()) {
@@ -214,37 +193,19 @@
           </div>
         }
       </header>
-      <div class="oi-body">
-        @if (editing()) {
-          <textarea
-            class="oi-editor"
-            [value]="markdownDraft()"
-            (input)="markdownDraft.set($any($event.target).value)"
-            aria-label="Note content (markdown)"
-            spellcheck="false"
-          ></textarea>
-        } @else {
-          <app-markdown
-            [markdown]="it.markdown"
-            [attachments]="attachments()"
-          />
-        }
-      </div>
-      @if (!editing()) {
-        @if (it.linkId; as linkId) {
-          <app-connections
-            [kind]="'org'"
-            [id]="linkId"
-            [expandedByDefault]="true"
-            [prominent]="true"
-          />
-        } @else {
-          <p class="oi-link-unavailable text-muted">
-            Related links become available after this older shared note is republished.
-          </p>
-        }
-      }
-    </article>
+      <app-note-document
+        [mode]="noteMode()"
+        [title]="editing() ? titleDraft() : it.title"
+        [markdown]="editing() ? markdownDraft() : it.markdown"
+        [attachments]="attachments()"
+        [busy]="saving() || openingLatest()"
+        [origin]="documentOrigin()"
+        [related]="it.linkId ? { kind: 'org', id: it.linkId, expandedByDefault: true, prominent: true } : null"
+        relatedUnavailable="Related links become available after this older shared note is republished."
+        (titleChange)="titleDraft.set($event)"
+        (markdownChange)="markdownDraft.set($event)"
+      />
+    </div>
   }
       </div>
       <!-- /.oi-scroll -->

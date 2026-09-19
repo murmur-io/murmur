@@ -79,15 +79,7 @@
      jammed under the recording chrome (Calm-Notepad, 2026-07-19). */
   padding: var(--space-6) var(--space-5) var(--space-8);
 }
-.editor.is-embedded .note-doc {
-  /* Calm-Notepad measure (2026-07-19): a CENTERED writing column, not the
-     full-bleed void. The old `max-width: none` assumed a narrow beside-the-drawer
-     tab; the drawer is gone (Ask is now a summoned panel), so an unmeasured note
-     spanned the whole card and one line read as a gargantuan empty canvas. A
-     bounded, centered ~40rem column turns the surplus into deliberate margin. */
-  max-width: var(--editor-measure);
-  margin: 0 auto;
-}
+
 
 /* Transparent full-viewport backdrop that closes an open header menu on an
    outside click (a real focusable button for a11y; sits under the menus). */
@@ -538,49 +530,7 @@
    1920px gives ≈1496px, both genuinely wider than the default). Transition is
    `max-width` only (layout, not paint) so the toggle reads as an intentional
    resize, not a jump-cut. */
-.note-doc {
-  max-width: var(--editor-max);
-  margin: 0 auto;
-  /* The DOCUMENT face. Defaults to --font-sans (see typography.css), so this is
-     a no-op for the base skin; Paper points it at the system serif. Scoped to
-     the document body on purpose — the editor's own chrome (toolbars, the
-     properties rail, code blocks) keeps the UI face. */
-  font-family: var(--font-reading);
-  /* Reading follows WRITING inside the document: the rendered markdown picks up
-     the same pair the textarea uses, so a paragraph breaks at the same words in
-     both modes and the text no longer shifts when you toggle. Custom properties
-     inherit across component boundaries, so this reaches `.md-body` inside the
-     child renderer without `::ng-deep` — and only inside this subtree, which is
-     why Ask, chat and the panels keep the shared --prose-* metrics. */
-  --prose-size: var(--note-size);
-  --prose-leading: var(--note-leading);
-  transition: max-width var(--transition);
-}
-.note-doc.is-full-width {
-  max-width: max(var(--editor-max), min(1600px, 92%));
-}
-.note-title-input {
-  width: 100%;
-  border: 0;
-  background: transparent;
-  color: var(--text-primary);
-  font: inherit;
-  font-size: 1.75rem;
-  font-weight: 650;
-  letter-spacing: -0.025em;
-  line-height: 1.2;
-  padding: 0;
-  margin-bottom: var(--space-3);
-}
-.note-title-input::placeholder {
-  color: var(--text-muted);
-}
-.note-title-input:focus {
-  outline: none;
-}
-
-/* Properties bar. */
-/* Body textarea (document surface) with CSS auto-grow. */
+/* Host-owned attachment toolbar and slash-menu chrome. */
 .body-wrap {
   position: relative;
 }
@@ -606,61 +556,6 @@
 }
 .image-file-input {
   display: none;
-}
-/* The grid mirror: the `::after` pseudo (fed by [data-value]="body()") renders the
-   SAME text HIDDEN and sizes the single grid cell; the textarea overlays + fills it.
-   Both share identical typography + box so they wrap line-for-line — the textarea
-   auto-grows with content with ZERO per-keystroke JS reflow (the old height:auto →
-   scrollHeight thrash was the typing-lag culprit). */
-.body-grow {
-  display: grid;
-}
-.body-grow::after {
-  content: attr(data-value) " ";
-  visibility: hidden;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  word-break: break-word;
-}
-.body-grow > .body-area,
-.body-grow::after {
-  grid-area: 1 / 1 / 2 / 2;
-  width: 100%;
-  min-height: 60vh;
-  box-sizing: border-box;
-  font: inherit;
-  /* The textarea and its hidden `::after` mirror MUST stay typographically
-     identical or the auto-grow measurement drifts — that is why they share one
-     rule, and why these are one pair of tokens rather than two. */
-  font-size: var(--note-size);
-  line-height: var(--note-leading);
-  padding: 0;
-  border: 0;
-  margin: 0;
-}
-.body-area {
-  display: block;
-  background: transparent;
-  color: var(--text-primary);
-  resize: none;
-  overflow: hidden;
-}
-.body-area::placeholder {
-  color: var(--text-muted);
-}
-.body-area:focus {
-  outline: none;
-  box-shadow: none;
-}
-/* Make the selection clearly VISIBLE — it's the whole anchor the Brain popover acts
-   on. A strong accent highlight so you always see what's selected. */
-.body-area::selection {
-  background: color-mix(in srgb, var(--accent) 42%, transparent);
-  color: var(--text-primary);
-}
-.body-area::-moz-selection {
-  background: color-mix(in srgb, var(--accent) 42%, transparent);
-  color: var(--text-primary);
 }
 .slash-menu {
   position: absolute;
@@ -691,19 +586,10 @@
   color: var(--accent-hover);
 }
 
-/* Preview. */
-.note-preview {
-  min-height: 40vh;
-  font-size: 1rem;
-  line-height: 1.7;
-}
 
 @media (prefers-reduced-motion: reduce) {
   .save-spin {
     animation: none;
-    transition: none;
-  }
-  .note-doc {
     transition: none;
   }
   .note-chat-drawer,

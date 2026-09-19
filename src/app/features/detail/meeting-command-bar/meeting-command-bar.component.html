@@ -92,7 +92,7 @@
       type="button"
       class="btn btn-ghost command-btn"
       appTooltip="Re-summarize"
-      [disabled]="busy() || renaming()"
+      [disabled]="busy() || renaming() || editing()"
       (click)="resummarize.emit()"
     >
       <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
@@ -118,21 +118,22 @@
          tooltip is slow and plainly styled, but it is the only thing left that
          can say WHY the control is dead. The two can never both be live, since
          the state that enables one silences the other. -->
-    <button
-      type="button"
-      class="btn btn-ghost command-btn quiet-btn"
-      [class.command-btn-active]="editing()"
-      [disabled]="editDisabled()"
-      [attr.aria-pressed]="editing()"
-      [appTooltip]="editHint()"
-      [attr.title]="editDisabled() ? editHint() : null"
-      (click)="requestEdit()"
-    >
-      <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
-        <path d="m4 13.8.7-3.2 7.4-7.4a1.4 1.4 0 0 1 2 0l.7.7a1.4 1.4 0 0 1 0 2l-7.4 7.4-3.4.5Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" />
-      </svg>
-      <span class="sr-only">Edit</span>
-    </button>
+    @if (!editing()) {
+      <button
+        type="button"
+        class="btn btn-ghost command-btn quiet-btn"
+        [disabled]="editDisabled()"
+        aria-pressed="false"
+        [appTooltip]="editHint()"
+        [attr.title]="editDisabled() ? editHint() : null"
+        (click)="requestEdit()"
+      >
+        <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
+          <path d="m4 13.8.7-3.2 7.4-7.4a1.4 1.4 0 0 1 2 0l.7.7a1.4 1.4 0 0 1 0 2l-7.4 7.4-3.4.5Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" />
+        </svg>
+        <span class="sr-only">Edit</span>
+      </button>
+    }
 
     <div class="more-zone">
       <button
@@ -162,26 +163,26 @@
           @if (notePresent()) {
             <div class="menu-group">
               <span class="menu-group-label">Export &amp; save</span>
-              <button type="button" class="menu-item" role="menuitem" (click)="pickCopyMarkdown()" [disabled]="editing()">{{ exportMsg() === "md-copied" ? "Copied" : "Copy Markdown" }}</button>
-              <button type="button" class="menu-item" role="menuitem" (click)="pickSaveMarkdown()" [disabled]="editing() || exporting()">{{ exportMsg() === "md-saved" ? "Saved" : "Save Markdown…" }}</button>
-              <button type="button" class="menu-item" role="menuitem" (click)="pickSavePdf()" [disabled]="editing()">Save as PDF</button>
-              <button type="button" class="menu-item" role="menuitem" (click)="pickExportCanvas()" [disabled]="editing() || exportingCanvas()">{{ exportingCanvas() ? "Exporting…" : "Export Canvas" }}</button>
+              <button type="button" class="menu-item" role="menuitem" (click)="pickCopyMarkdown()" [disabled]="dirty()">{{ exportMsg() === "md-copied" ? "Copied" : "Copy Markdown" }}</button>
+              <button type="button" class="menu-item" role="menuitem" (click)="pickSaveMarkdown()" [disabled]="dirty() || exporting()">{{ exportMsg() === "md-saved" ? "Saved" : "Save Markdown…" }}</button>
+              <button type="button" class="menu-item" role="menuitem" (click)="pickSavePdf()" [disabled]="dirty()">Save as PDF</button>
+              <button type="button" class="menu-item" role="menuitem" (click)="pickExportCanvas()" [disabled]="dirty() || exportingCanvas()">{{ exportingCanvas() ? "Exporting…" : "Export Canvas" }}</button>
               @if (hasAudio()) {
-                <button type="button" class="menu-item" role="menuitem" (click)="pickSaveAudio()" [disabled]="editing() || exporting()">{{ exportMsg() === "audio-saved" ? "Saved" : "Save audio…" }}</button>
+                <button type="button" class="menu-item" role="menuitem" (click)="pickSaveAudio()" [disabled]="dirty() || exporting()">{{ exportMsg() === "audio-saved" ? "Saved" : "Save audio…" }}</button>
               }
             </div>
           }
           @if (keepsMasters() && hasAudio()) {
             <div class="menu-group">
               <span class="menu-group-label">Hi-res masters</span>
-              <button type="button" class="menu-item" role="menuitem" (click)="pickExportMaster('mic')" [disabled]="editing() || exporting()">Export master (mic)…</button>
-              <button type="button" class="menu-item" role="menuitem" (click)="pickExportMaster('sys')" [disabled]="editing() || exporting()">Export master (system)…</button>
+              <button type="button" class="menu-item" role="menuitem" (click)="pickExportMaster('mic')" [disabled]="dirty() || exporting()">Export master (mic)…</button>
+              <button type="button" class="menu-item" role="menuitem" (click)="pickExportMaster('sys')" [disabled]="dirty() || exporting()">Export master (system)…</button>
             </div>
           }
           @if (notePresent()) {
             <div class="menu-group">
               <span class="menu-group-label">Graph</span>
-              <button type="button" class="menu-item" role="menuitem" (click)="pickLinkGraph()" [disabled]="editing() || linking()">{{ linking() ? "Linking…" : "Link people & projects" }}</button>
+              <button type="button" class="menu-item" role="menuitem" (click)="pickLinkGraph()" [disabled]="dirty() || linking()">{{ linking() ? "Linking…" : "Link people & projects" }}</button>
             </div>
           }
           <div class="menu-group">

@@ -137,7 +137,7 @@ test.describe("org-editable + library unification (mocked IPC)", () => {
     await expect(page.getByText("revision 3")).toBeVisible();
     await expect(page.getByText("Shared by kasia")).toBeVisible();
     // The org name resolves into the metadata strip (best-effort match).
-    await expect(page.locator(".oi-org-name")).toHaveText("Acme Inc.");
+    await expect(page.locator("app-note-document .origin-strip").getByText("Acme Inc.", { exact: true })).toBeVisible();
 
     // Back → /notes (B1).
     await page.getByRole("button", { name: /notes/i }).first().click();
@@ -157,7 +157,6 @@ test.describe("org-editable + library unification (mocked IPC)", () => {
         folderId: "f-notes-root",
         markdown: "# Acme onboarding brief\n\nBody.",
         tags: [],
-        properties: {},
         updatedAt: Date.now(),
         createdAt: Date.now(),
         exportedPath: null,
