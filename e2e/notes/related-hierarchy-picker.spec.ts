@@ -227,9 +227,21 @@ test("roving keyboard traverses Current, Linked, and locked rows to the next lin
   ).toHaveCount(0);
   await later.press("ArrowRight");
   await expect(later).toBeFocused();
-  await expect(
-    dialog.getByRole("button", { name: "Link Space Later Space" }),
-  ).toBeVisible();
+  const linkSpace = dialog.getByRole("button", {
+    name: "Link Space Later Space",
+  });
+  await expect(linkSpace).toBeVisible();
+
+  // WCAG 2.1.1 — the revealed trailing action must also be KEYBOARD-reachable, not
+  // just present. T1 (b51f7258) set tabindex="-1" on the linkContainer branch, which
+  // left "Link Space" mouse-only; every role-based query above still passed, so the
+  // regression reached CI green and was caught only by hand. Pin the focus, not the
+  // role. `linkLeaf` and the destination-mode `selectDestination` stay at -1 by
+  // design — roving focus owns those rows — so this asserts the one branch that the
+  // base at origin/murmur shipped as tabbable.
+  await expect(linkSpace).toHaveAttribute("tabindex", "0");
+  await later.press("Tab");
+  await expect(linkSpace).toBeFocused();
 });
 
 test("destination mode searches every hierarchy page beyond the old 30-row cap", async ({ page }) => {
