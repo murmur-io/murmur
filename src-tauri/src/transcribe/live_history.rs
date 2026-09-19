@@ -28,6 +28,9 @@ pub struct LiveCaptionPayload {
     /// Internal stabilization witness; never part of the IPC contract.
     #[serde(skip)]
     pub(crate) confirmed: bool,
+    /// Sentence cue already evaluated with committed context; retained only for Stop flush.
+    #[serde(skip)]
+    question_if_final: bool,
 }
 
 /// Content-free state of the resident captions worker. Decode failures retry on its next tick;
@@ -106,10 +109,8 @@ impl LiveTranscriptHistory {
             .map(|mut line| {
                 line.finalized = true;
                 line.is_question = line.text.contains('?');
-                let direct = normalize(&line.text)
-                    .split_whitespace()
-                    .any(|w| matches!(w, "you" | "your" | "ty" | "ciebie" | "cię" | "tobie"));
-                line.possible_question = line.is_question && line.speaker == "others" && direct;
+                line.possible_question =
+                    line.is_question && line.speaker == "others" && line.question_if_final;
                 line
             })
             .collect()
@@ -326,6 +327,7 @@ struct Hypothesis {
     start: u64,
     end: u64,
     confirmed: bool,
+    overlaps_committed: bool,
 }
 #[derive(Default)]
 pub(crate) struct StreamCaptionAssembler {
@@ -337,6 +339,7 @@ pub(crate) struct StreamCaptionAssembler {
     last_window_end: u64,
     restart_namespace: String,
     resume_floor_ms: u64,
+    sentence_cue: SentenceQuestionCue,
 }
 impl StreamCaptionAssembler {
     /// A recovered worker starts with new speech. Preserve historical identities, and never
@@ -362,6 +365,7 @@ impl StreamCaptionAssembler {
         if now_ms < self.last_window_end {
             return vec![];
         }
+        let previous_window_end = self.last_window_end;
         self.last_window_end = now_ms;
         let previous = std::mem::take(&mut self.pending);
         let mut out = Vec::new();
@@ -369,14 +373,85 @@ impl StreamCaptionAssembler {
             .segments
             .iter()
             .map(|segment| Hypothesis {
-                text: segment.text.trim().into(),
-                start: window_start_ms.saturating_add((segment.start_s.max(0.0) * 1000.0) as u64),
+                text: speech_text(&segment.text),
+                // Whisper may timestamp padded audio beyond the supplied window. Those
+                // synthetic future times must never delay retirement of a real utterance.
+                start: window_start_ms
+                    .saturating_add((segment.start_s.max(0.0) * 1000.0) as u64)
+                    .min(now_ms),
                 end: window_start_ms
-                    .saturating_add((segment.end_s.max(segment.start_s).max(0.0) * 1000.0) as u64),
+                    .saturating_add((segment.end_s.max(segment.start_s).max(0.0) * 1000.0) as u64)
+                    .min(now_ms),
                 confirmed: false,
+                overlaps_committed: false,
             })
             .collect();
         candidates.sort_by_key(|h| h.start);
+        // The rolling decoder may revise/resegment a whole 14-second window. A partial
+        // that cannot be aligned to the next decode must not disappear from scrollback.
+        // Retire the aged previous observation before replacing it. "Final" here means
+        // immutable session caption, NOT authoritative ASR: batch transcription still owns
+        // the stored transcript. Exact overlap continues through the two-observation path.
+        let retiring = previous.iter().any(|old| {
+            !old.overlaps_committed
+                && old.end <= previous_window_end
+                && previous_window_end < now_ms
+                && !candidates.iter().any(|next| {
+                    old.start.abs_diff(next.start) < 2_000
+                        && old
+                            .text
+                            .split_whitespace()
+                            .zip(next.text.split_whitespace())
+                            .take_while(|(a, b)| normalize(a) == normalize(b))
+                            .count()
+                            >= 3.min(old.text.split_whitespace().count())
+                                .min(next.text.split_whitespace().count())
+                                .max(1)
+                })
+        });
+        if retiring {
+            for old in &previous {
+                if old.overlaps_committed {
+                    continue;
+                }
+                if old.end > previous_window_end || previous_window_end >= now_ms {
+                    break;
+                }
+                if old.end > self.committed_end {
+                    // An unrelated later revision must not make retirement discard a
+                    // strictly extending, already-aged hypothesis of this earlier chunk.
+                    // Preserve the old prefix verbatim; only append new words. Never
+                    // adopt rewritten prefixes, fresh audio, or pre-resume content here.
+                    let old_words: Vec<_> = old.text.split_whitespace().map(normalize).collect();
+                    let extension = candidates
+                        .iter()
+                        .filter(|next| {
+                            next.start >= self.resume_floor_ms
+                                && old.start.abs_diff(next.start) < 2_000
+                                && next.end >= old.end
+                                && next.end <= previous_window_end
+                                && next.text.len() <= 16_384
+                        })
+                        .filter_map(|next| {
+                            let words: Vec<_> = next.text.split_whitespace().collect();
+                            if words.len() <= old_words.len()
+                                || !words
+                                    .iter()
+                                    .zip(&old_words)
+                                    .all(|(a, b)| normalize(a) == *b)
+                            {
+                                return None;
+                            }
+                            let text =
+                                format!("{} {}", old.text, words[old_words.len()..].join(" "));
+                            (text.len() <= 16_384).then_some((text, next.end))
+                        })
+                        .max_by_key(|(text, end)| (*end, text.len()));
+                    let (text, end) = extension.unwrap_or_else(|| (old.text.clone(), old.end));
+                    out.push(self.commit(text, old.start, end, meeting_id, speaker));
+                }
+            }
+        }
         let mut blocked = false;
         for mut candidate in candidates {
             if candidate.text.is_empty()
@@ -427,6 +502,16 @@ impl StreamCaptionAssembler {
                 if overlap > 0 {
                     candidate.text = words[overlap..].join(" ");
                     candidate.start = self.committed_end;
+                } else if self.committed_end.saturating_sub(candidate.start) <= 2_000
+                    && normalized_words.len() >= 3
+                    && !committed
+                        .windows(normalized_words.len())
+                        .any(|window| window == normalized_words)
+                {
+                    // Whisper shifts boundaries by up to the same two-second tolerance used
+                    // for matching hypotheses below. A novel sentence immediately after a
+                    // tiny finalized fragment must not be discarded solely for that jitter.
+                    candidate.start = self.committed_end;
                 } else {
                     // Keep uncertain novel content visible as a partial, but never recommit
                     // an unanchored hypothesis which overlaps already-finalized history.
@@ -436,6 +521,7 @@ impl StreamCaptionAssembler {
             if candidate.text.is_empty() {
                 continue;
             }
+            candidate.overlaps_committed = overlap_unresolved;
             let old = previous
                 .iter()
                 .find(|old| old.start.abs_diff(candidate.start) < 2_000);
@@ -478,18 +564,7 @@ impl StreamCaptionAssembler {
                         + (candidate.end - candidate.start) * commit_words as u64
                             / words.len() as u64
                 };
-                out.push(self.payload(text.clone(), candidate.start, true, meeting_id, speaker));
-                self.generation += 1;
-                self.committed_end = self.committed_end.max(end);
-                let normalized = normalize(&text);
-                let committed_words: Vec<_> = self
-                    .committed_tail
-                    .split_whitespace()
-                    .chain(normalized.split_whitespace())
-                    .collect();
-                self.committed_tail =
-                    committed_words[committed_words.len().saturating_sub(64)..].join(" ");
-                self.last_partial.clear();
+                out.push(self.commit(text, candidate.start, end, meeting_id, speaker));
                 if commit_words < words.len() {
                     blocked = true;
                     self.pending.push(Hypothesis {
@@ -497,10 +572,13 @@ impl StreamCaptionAssembler {
                         start: end,
                         end: candidate.end,
                         confirmed: false,
+                        overlaps_committed: false,
                     });
                 }
             } else {
-                blocked = true;
+                // An unanchored revision of already-finalized audio cannot prevent later,
+                // disjoint speech from becoming history. It remains provisional only.
+                blocked |= !overlap_unresolved;
                 self.pending.push(candidate);
             }
         }
@@ -521,6 +599,29 @@ impl StreamCaptionAssembler {
         }
         out
     }
+    fn commit(
+        &mut self,
+        text: String,
+        start: u64,
+        end: u64,
+        meeting_id: &str,
+        speaker: &str,
+    ) -> LiveCaptionPayload {
+        let line = self.payload(text.clone(), start, true, meeting_id, speaker);
+        self.sentence_cue.observe(&text);
+        self.generation += 1;
+        self.committed_end = self.committed_end.max(end);
+        let normalized = normalize(&text);
+        let words: Vec<_> = self
+            .committed_tail
+            .split_whitespace()
+            .chain(normalized.split_whitespace())
+            .collect();
+        self.committed_tail = words[words.len().saturating_sub(64)..].join(" ");
+        self.last_partial.clear();
+        line
+    }
+
     fn payload(
         &self,
         text: String,
@@ -530,9 +631,7 @@ impl StreamCaptionAssembler {
         speaker: &str,
     ) -> LiveCaptionPayload {
         let is_question = finalized && text.contains('?');
-        let direct = normalize(&text)
-            .split_whitespace()
-            .any(|w| matches!(w, "you" | "your" | "ty" | "ciebie" | "cię" | "tobie"));
+        let question_if_final = self.sentence_cue.clone().observe(&text);
         LiveCaptionPayload {
             text,
             meeting_id: meeting_id.into(),
@@ -556,10 +655,89 @@ impl StreamCaptionAssembler {
             seq: None,
             finalized,
             is_question,
-            possible_question: is_question && speaker == "others" && direct,
+            possible_question: is_question && speaker == "others" && question_if_final,
             confirmed: finalized,
+            question_if_final,
         }
     }
+}
+
+/// A question may span committed chunks. Carry only the unfinished sentence's direct
+/// address cue, never an arbitrary historical "you" from a different sentence.
+#[derive(Clone, Default)]
+struct SentenceQuestionCue {
+    words_since_address: Option<usize>,
+}
+impl SentenceQuestionCue {
+    fn observe(&mut self, text: &str) -> bool {
+        let mut addressed_question = false;
+        for word in text.split_whitespace() {
+            self.words_since_address = self
+                .words_since_address
+                .and_then(|words| (words + 1 < 64).then_some(words + 1));
+            if matches!(
+                normalize(word).as_str(),
+                "you" | "your" | "ty" | "ciebie" | "cię" | "tobie"
+            ) {
+                self.words_since_address = Some(0);
+            }
+            if word.contains('?') && self.words_since_address.is_some() {
+                addressed_question = true;
+            }
+            let end = word.trim_end_matches(['"', '\'', ')', ']']);
+            if end.ends_with(['.', '?', '!']) {
+                self.words_since_address = None;
+            }
+        }
+        addressed_question
+    }
+}
+
+/// Decoder control/non-speech labels are not utterances (and must not become questions).
+fn speech_text(text: &str) -> String {
+    let trimmed = text.trim();
+    let label = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .or_else(|| trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')')));
+    if let Some(label) = label {
+        let normalized = label
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "blank_audio"
+                | "silence"
+                | "no_speech"
+                | "music"
+                | "applause"
+                | "speaking in foreign language"
+                | "music playing"
+                | "upbeat music"
+                | "inaudible"
+                | "_beg_"
+        ) {
+            return String::new();
+        }
+    }
+    text.split_whitespace()
+        .filter(|word| {
+            !matches!(
+                word.to_ascii_lowercase().as_str(),
+                "[blank_audio]"
+                    | "[silence]"
+                    | "[no_speech]"
+                    | "[music]"
+                    | "[applause]"
+                    | "(silence)"
+                    | "(music)"
+                    | "(applause)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn normalize(s: &str) -> String {
@@ -588,6 +766,7 @@ mod tests {
             is_question: false,
             possible_question: false,
             confirmed: true,
+            question_if_final: false,
         }
     }
     #[test]
@@ -693,6 +872,363 @@ mod tests {
         );
         assert_eq!(third.iter().filter(|line| line.finalized).count(), 1);
         assert_eq!(third[0].text, "four five six");
+    }
+
+    #[test]
+    fn sliding_windows_keep_earlier_utterances_and_question_before_stop() {
+        let mut assembler = StreamCaptionAssembler::default();
+        let mut history = LiveTranscriptHistory::default();
+        let words: Vec<String> = (0..96)
+            .map(|index| match index {
+                30 => "Can".into(),
+                31 => "you".into(),
+                32 => "answer?".into(),
+                _ => format!("word{index}"),
+            })
+            .collect();
+        // The actual loop decodes the last 14 seconds, often six seconds apart.
+        // Once full, both the segment start and its textual prefix MOVE each tick.
+        for end in (6usize..=96).step_by(6) {
+            let start = end.saturating_sub(14);
+            for line in assembler.update(
+                &transcript(&[(&words[start..end].join(" "), 0.0, (end - start) as f64)]),
+                start as u64 * 1000,
+                end as u64 * 1000,
+                "m",
+                "others",
+            ) {
+                history.insert(line);
+            }
+        }
+        let page = history.page("m", None, 200);
+        let finals: Vec<_> = page.lines.iter().filter(|line| line.finalized).collect();
+        let actual: Vec<_> = finals
+            .iter()
+            .flat_map(|line| line.text.split_whitespace())
+            .collect();
+        assert_eq!(
+            actual,
+            words[..90],
+            "all prior rolling windows survive exactly once"
+        );
+        assert!(finals.iter().any(|line| line.possible_question));
+        assert_eq!(finals.first().unwrap().seq, Some(1));
+    }
+
+    #[test]
+    fn native_window_revisions_retain_previously_visible_question() {
+        // Real Whisper-small outputs replayed from QA's operator-owned synthetic system
+        // audio. The decoder changes segment boundaries and even the whole hypothesis.
+        let windows: serde_json::Value =
+            serde_json::from_str(include_str!("tests/live_sliding_windows.json")).unwrap();
+        let mut assembler = StreamCaptionAssembler::default();
+        let mut history = LiveTranscriptHistory::default();
+        for window in windows.as_array().unwrap() {
+            let end = window["end"].as_u64().unwrap();
+            let transcript = super::super::types::Transcript {
+                full_text: String::new(),
+                language: None,
+                segments: serde_json::from_value(window["segments"].clone()).unwrap(),
+            };
+            for line in assembler.update(
+                &transcript,
+                end.saturating_sub(14) * 1000,
+                end * 1000,
+                "m",
+                "others",
+            ) {
+                history.insert(line);
+            }
+        }
+        let page = history.page("m", None, 200);
+        let finals: Vec<_> = page.lines.iter().filter(|line| line.finalized).collect();
+        assert!(
+            finals.len() >= 4,
+            "native rolling speech must keep scrollback"
+        );
+        assert_eq!(
+            finals
+                .iter()
+                .filter(|line| line
+                    .text
+                    .contains("Jakub, what do you think about shipping the code?"))
+                .count(),
+            1,
+            "a previously visible question survives ASR revisions exactly once"
+        );
+        assert!(finals.iter().any(|line| line.possible_question));
+        assert!(page
+            .lines
+            .iter()
+            .all(|line| !line.text.contains("BLANK_AUDIO")));
+        assert!(finals.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    }
+
+    #[test]
+    fn ambiguous_overlap_cannot_starve_later_question_or_padded_timestamp_retirement() {
+        let mut assembler = StreamCaptionAssembler {
+            committed_end: 3000,
+            committed_tail: "already committed words".into(),
+            ..Default::default()
+        };
+        let first = transcript(&[
+            ("revised old words", 0.0, 4.0),
+            // Real Whisper can report a segment beyond the end of its input audio.
+            ("Can you answer the question?", 5.0, 70.0),
+        ]);
+        let partial = assembler.update(&first, 0, 9000, "m", "others");
+        assert!(partial
+            .iter()
+            .any(|line| line.text.contains("Can you answer")));
+        let next = assembler.update(
+            &transcript(&[("[BLANK_AUDIO]", 0.0, 10.0)]),
+            3000,
+            12000,
+            "m",
+            "others",
+        );
+        let finals: Vec<_> = next.iter().filter(|line| line.finalized).collect();
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].text, "Can you answer the question?");
+        assert!(finals[0].possible_question);
+        assert!(assembler
+            .update(
+                &transcript(&[("[BLANK_AUDIO]", 0.0, 10.0)]),
+                6000,
+                15000,
+                "m",
+                "others"
+            )
+            .is_empty());
+    }
+
+    fn finalize_growing_question(first: &str, second: &str) -> Vec<LiveCaptionPayload> {
+        let mut assembler = StreamCaptionAssembler::default();
+        let mut finals = Vec::new();
+        let third = format!("{second} The next topic");
+        for (text, end) in [(first, 3), (second, 6), (third.as_str(), 9)] {
+            finals.extend(
+                assembler
+                    .update(
+                        &transcript(&[(text, 0.0, end as f64)]),
+                        0,
+                        end * 1000,
+                        "m",
+                        "others",
+                    )
+                    .into_iter()
+                    .filter(|line| line.finalized),
+            );
+        }
+        finals
+    }
+
+    #[test]
+    fn split_direct_question_keeps_affordance_across_finalized_chunks() {
+        let finals = finalize_growing_question(
+            "What do you think",
+            "What do you think about shipping this week?",
+        );
+        assert_eq!(
+            finals
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            "What do you think about shipping this week?"
+        );
+        assert!(finals.iter().any(|line| line.possible_question));
+    }
+
+    #[test]
+    fn direct_question_cue_expires_at_sentence_boundary_and_sixty_four_words() {
+        for punctuation in [".", "!", "?"] {
+            let first = format!("You already approved{punctuation}");
+            let second = format!("{first} Is Monday available?");
+            let finals = finalize_growing_question(&first, &second);
+            assert!(
+                !finals
+                    .iter()
+                    .find(|line| line.text.contains("Monday"))
+                    .unwrap()
+                    .possible_question
+            );
+        }
+        let first = format!("You {}", vec!["word"; 64].join(" "));
+        let finals = finalize_growing_question(&first, &format!("{first} Is Monday available?"));
+        assert!(finals.iter().all(|line| !line.possible_question));
+    }
+
+    #[test]
+    fn stop_flush_preserves_split_question_context_without_marking_partial_event() {
+        let mut assembler = StreamCaptionAssembler::default();
+        let mut history = LiveTranscriptHistory::default();
+        for (text, end) in [
+            ("What do you think", 3),
+            ("What do you think about shipping this week?", 6),
+        ] {
+            for line in assembler.update(
+                &transcript(&[(text, 0.0, end as f64)]),
+                0,
+                end * 1000,
+                "m",
+                "others",
+            ) {
+                history.insert(line);
+            }
+        }
+        for line in assembler.update(
+            &transcript(&[("about shipping this week?", 0.0, 3.0)]),
+            3000,
+            7000,
+            "m",
+            "others",
+        ) {
+            assert!(!line.finalized);
+            assert!(!line.possible_question);
+            let json = serde_json::to_value(&line).unwrap();
+            assert!(json.get("questionIfFinal").is_none());
+            history.insert(line);
+        }
+        let flushed = history.confirmed_tail();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].text, "about shipping this week?");
+        assert!(flushed[0].possible_question);
+    }
+
+    fn retirement_with_later_revision(first_current: &str, end: f64) -> Vec<LiveCaptionPayload> {
+        let mut assembler = StreamCaptionAssembler::default();
+        assembler.update(
+            &transcript(&[
+                ("alpha beta gamma delta", 0.0, 3.0),
+                ("zulu yankee xray", 3.0, 5.0),
+            ]),
+            0,
+            6000,
+            "m",
+            "others",
+        );
+        assembler.update(
+            &transcript(&[
+                (first_current, 0.0, end),
+                ("completely different words here", 3.0, 5.0),
+            ]),
+            0,
+            12000,
+            "m",
+            "others",
+        )
+    }
+
+    #[test]
+    fn unrelated_retirement_preserves_aged_entire_prefix_extension() {
+        let lines = retirement_with_later_revision("alpha beta gamma delta epsilon", 3.5);
+        let finals: Vec<_> = lines
+            .iter()
+            .filter(|line| line.finalized)
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(
+            finals,
+            ["alpha beta gamma delta epsilon", "zulu yankee xray"]
+        );
+    }
+
+    #[test]
+    fn retirement_never_adopts_rewritten_prefix_or_fresh_extension() {
+        for (text, end) in [
+            ("alpha beta revised delta epsilon", 3.5),
+            ("alpha beta gamma delta epsilon", 9.0),
+        ] {
+            let lines = retirement_with_later_revision(text, end);
+            assert_eq!(lines[0].text, "alpha beta gamma delta");
+            assert!(lines[0].finalized);
+            assert!(lines
+                .iter()
+                .filter(|line| line.finalized)
+                .all(|line| !line.text.contains("epsilon")));
+        }
+    }
+
+    #[test]
+    fn nearly_nominal_tick_preserves_replaced_question() {
+        let mut assembler = StreamCaptionAssembler::default();
+        assembler.update(
+            &transcript(&[("Can you answer?", 0.0, 3.0)]),
+            0,
+            3000,
+            "m",
+            "others",
+        );
+        let next = assembler.update(
+            &transcript(&[("The next statement.", 0.0, 3.0)]),
+            3000,
+            5990,
+            "m",
+            "others",
+        );
+        assert!(next
+            .iter()
+            .any(|line| line.finalized && line.text == "Can you answer?"));
+    }
+
+    #[test]
+    fn boundary_timestamp_jitter_does_not_discard_novel_question() {
+        let mut assembler = StreamCaptionAssembler {
+            committed_end: 20000,
+            committed_tail: "yeah".into(),
+            ..Default::default()
+        };
+        let question = "Jakub, what do you think about shipping the panel this week?";
+        let first = assembler.update(
+            &transcript(&[(question, 0.0, 10.0)]),
+            19000,
+            29000,
+            "m",
+            "others",
+        );
+        assert!(first.iter().any(|line| line.text == question));
+        let next = assembler.update(
+            &transcript(&[("The next statement.", 0.0, 3.0)]),
+            29000,
+            32000,
+            "m",
+            "others",
+        );
+        assert_eq!(
+            next.iter()
+                .filter(|line| line.finalized && line.text == question)
+                .count(),
+            1
+        );
+        assert!(next.iter().any(|line| line.possible_question));
+    }
+
+    #[test]
+    fn non_speech_tokens_never_become_live_caption_content() {
+        let mut assembler = StreamCaptionAssembler::default();
+        for marker in [
+            "[BLANK_AUDIO]",
+            "[SILENCE]",
+            "[Music]",
+            "(silence)",
+            "[NO_SPEECH]",
+            "(speaking in foreign language)",
+            "[ Silence ]",
+            "[Music playing]",
+            "(upbeat music)",
+            "[ INAUDIBLE ]",
+            "[_BEG_]",
+        ] {
+            let input = transcript(&[(marker, 0.0, 1.0)]);
+            assert!(assembler.update(&input, 0, 4000, "m", "others").is_empty());
+            assert!(assembler.update(&input, 0, 7000, "m", "others").is_empty());
+        }
+        // Parenthesized speech is not a decoder label merely because it has brackets.
+        assert_eq!(speech_text("(Can you answer?)"), "(Can you answer?)");
+        let speech = transcript(&[("[BLANK_AUDIO] Can you answer? [Music]", 0.0, 1.0)]);
+        let lines = assembler.update(&speech, 0, 10000, "m", "others");
+        assert_eq!(lines[0].text, "Can you answer?");
     }
 
     #[test]
@@ -1199,6 +1735,7 @@ mod health_tests {
             is_question: false,
             possible_question: false,
             confirmed: true,
+            question_if_final: false,
         });
         history.health = CaptionsHealth {
             captions_state: CaptionsState::ModelError,

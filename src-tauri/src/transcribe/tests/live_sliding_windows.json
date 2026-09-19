@@ -1,0 +1,204 @@
+[
+  {
+    "end": 6,
+    "segments": [
+      {
+        "idx": 0,
+        "startS": 0.0,
+        "endS": 4.0,
+        "text": "Good morning everyone, thanks for your evening,",
+        "speaker": null,
+        "confidence": null
+      },
+      {
+        "idx": 1,
+        "startS": 4.0,
+        "endS": 6.0,
+        "text": "the way to listen to the recording people.",
+        "speaker": null,
+        "confidence": null
+      }
+    ]
+  },
+  {
+    "end": 12,
+    "segments": [
+      {
+        "idx": 0,
+        "startS": 0.0,
+        "endS": 13.0,
+        "text": "Good morning everyone, thanks for your evening, the way I listen to the resorting people in the last week we should be the day for emigrating and deliver transcript trial, debuts can't know if you're listening to me or not.",
+        "speaker": null,
+        "confidence": null
+      }
+    ]
+  },
+  {
+    "end": 18,
+    "segments": [
+      {
+        "idx": 0,
+        "startS": 0.0,
+        "endS": 14.0,
+        "text": "The best way to do this is to make sure that the audio system is not damaged.",
+        "speaker": null,
+        "confidence": null
+      }
+    ]
+  },
+  {
+    "end": 24,
+    "segments": [
+      {
+        "idx": 0,
+        "startS": 0.0,
+        "endS": 6.0,
+        "text": "script trial, debuts can't know if the system audio file and the code is either true or not.",
+        "speaker": null,
+        "confidence": null
+      },
+      {
+        "idx": 1,
+        "startS": 6.0,
+        "endS": 11.0,
+        "text": "We may asure the media and the code is a bit off about 100 milliseconds per kick.",
+        "speaker": null,
+        "confidence": null
+      },
+      {
+        "idx": 2,
+        "startS": 11.0,
+        "endS": 16.0,
+        "text": "Jakub, what do you think about shipping the code?",
+        "speaker": null,
+        "confidence": null
+      }
+    ]
+  },
+  {
+    "end": 30,
+    "segments": [
+      {
+        "idx": 0,
+        "startS": 0.0,
+        "endS": 5.0,
+        "text": "In the US, we have a lot of people who are not familiar with the language.",
+        "speaker": null,
+        "confidence": null
+      },
+      {
+        "idx": 1,
+        "startS": 5.0,
+        "endS": 9.0,
+        "text": "We have a lot of people who are not familiar with the language.",
+        "speaker": null,
+        "confidence": null
+      },
+      {
+        "idx": 2,
+        "startS": 9.0,
+        "endS": 13.0,
+        "text": "We have a lot of people who are not familiar with the language.",
+        "speaker": null,
+        "confidence": null
+      },
+      {
+        "idx": 3,
+        "startS": 13.0,
+        "endS": 17.0,
+        "text": "We have a lot of people who are not familiar with the language.",
+        "speaker": null,
+        "confidence": null
+      }
+    ]
+  },
+  {
+    "end": 36,
+    "segments": [
+      {
+        "idx": 0,
+        "startS": 0.0,
+        "endS": 3.92,
+        "text": "(speaking in foreign language)",
+        "speaker": null,
+        "confidence": null
+      }
+    ]
+  },
+  {
+    "end": 42,
+    "segments": [
+      {
+        "idx": 0,
+        "startS": 0.0,
+        "endS": 7.0,
+        "text": "and the development of the building. After stop, the U.S. and USA are processing the building.",
+        "speaker": null,
+        "confidence": null
+      },
+      {
+        "idx": 1,
+        "startS": 7.0,
+        "endS": 12.0,
+        "text": "The U.S. and USA are applying the rest of the building to the other end of the building.",
+        "speaker": null,
+        "confidence": null
+      },
+      {
+        "idx": 2,
+        "startS": 12.0,
+        "endS": 15.0,
+        "text": "That is everything from me, let's go.",
+        "speaker": null,
+        "confidence": null
+      }
+    ]
+  },
+  {
+    "end": 48,
+    "segments": [
+      {
+        "idx": 0,
+        "startS": 0.0,
+        "endS": 6.0,
+        "text": "process later, the QFUS will be the application restart becausadestatelivesinaesculita,",
+        "speaker": null,
+        "confidence": null
+      },
+      {
+        "idx": 1,
+        "startS": 6.0,
+        "endS": 10.32,
+        "text": "that is everything from me, let us open the floor for questions.",
+        "speaker": null,
+        "confidence": null
+      }
+    ]
+  },
+  {
+    "end": 54,
+    "segments": [
+      {
+        "idx": 0,
+        "startS": 0.0,
+        "endS": 4.32,
+        "text": "That is everything from me, let's open the floor for questions.",
+        "speaker": null,
+        "confidence": null
+      }
+    ]
+  },
+  {
+    "end": 60,
+    "segments": [
+      {
+        "idx": 0,
+        "startS": 0.0,
+        "endS": 10.0,
+        "text": "[BLANK_AUDIO]",
+        "speaker": null,
+        "confidence": null
+      }
+    ]
+  }
+]
