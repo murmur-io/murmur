@@ -519,3 +519,40 @@
     display: none;
   }
 }
+
+/* Destination mode keeps its staged choice visible at every window size. */
+.rhp--destination .rhp-row-main[aria-selected="true"] {
+  background: var(--shell-active-bg);
+  color: var(--shell-active-text);
+  box-shadow: var(--shell-active-shadow);
+}
+
+.rhp--destination .rhp-foot-copy {
+  display: grid;
+  gap: var(--space-1);
+  overflow-wrap: anywhere;
+}
+
+.rhp-encryption-hint {
+  color: var(--text-secondary);
+}
+
+@media (pointer: coarse) {
+  .rhp--destination .rhp-row-main,
+  .rhp--destination .rhp-disclosure,
+  .rhp--destination .rhp-action,
+  .rhp--destination .rhp-foot button {
+    min-height: var(--destination-touch-target);
+  }
+}
+
+@media (max-width: 620px) {
+  .rhp--destination .rhp-foot {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .rhp--destination .rhp-foot-copy {
+    grid-column: 1 / -1;
+  }
+}

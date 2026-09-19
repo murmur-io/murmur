@@ -195,6 +195,7 @@ pub fn create_space(state: State<'_, AppState>, name: String) -> Result<Folder, 
 
 pub(crate) fn create_space_inner(state: &AppState, name: String) -> Result<Folder, AppError> {
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     let clean = crate::summarize::organize::sanitize_folder(&name)
         .ok_or_else(|| AppError::InvalidArg("space name is empty or invalid".into()))?;
     if state
@@ -471,6 +472,7 @@ pub(crate) fn rename_folder_inner(
     // rewrites `path` columns that the seal/unseal lifecycle keys vault FS ops off — hold the guard
     // so it can't interleave with a concurrent lock/unlock/remove that also rewrites paths.
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
 
     let clean = crate::summarize::organize::sanitize_folder(&new_name)
         .ok_or_else(|| AppError::InvalidArg("folder name is empty or invalid".into()))?;
@@ -748,6 +750,7 @@ pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result
     // Serialize the reassign + row delete + FS cleanup under the lifecycle guard so it can't race a
     // concurrent lock/move on the same folder.
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     ensure_no_active_salvage_in_folder(state, &folder_id)?;
 
     // Rehome EVERY meeting governed by this folder, including a newly filed recording that has no

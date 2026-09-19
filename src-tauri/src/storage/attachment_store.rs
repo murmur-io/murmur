@@ -1448,7 +1448,7 @@ impl Db {
         let changed = tx
             .execute(
                 "UPDATE documents SET folder_id=?2,title=?3,text=?4,text_blob=?5,updated_at=?6,
-                    exported_path=NULL,exported_hash=NULL WHERE id=?1 AND kind='note'",
+                    exported_path=NULL,exported_hash=NULL WHERE id=?1 AND kind IN ('note','document')",
                 rusqlite::params![document_id, folder_id, title, text, text_blob, updated_at],
             )
             .map_err(map_err)?;
@@ -1513,7 +1513,7 @@ impl Db {
         let changed = tx
             .execute(
                 "UPDATE documents SET folder_id=?2,text_blob=NULL,exported_path=NULL,
-                    exported_hash=NULL WHERE id=?1 AND kind='note'",
+                    exported_hash=NULL WHERE id=?1 AND kind IN ('note','document')",
                 rusqlite::params![document_id, folder_id],
             )
             .map_err(map_err)?;

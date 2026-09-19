@@ -1,3 +1,4 @@
+import { mockDestinationPicker } from "../notes/destination-picker-mock";
 import { expect, test, type Page } from "@playwright/test";
 
 import { mockTauri } from "../settings-ai/mock-invoke";
@@ -116,7 +117,7 @@ async function boot(
               createdAt: "2026-08-22T10:00:00Z",
               seq: 2,
               kind: "meeting",
-              ownedSource: { kind: "meeting", id: "meeting-local" },
+              ownedSource: { kind: "meeting", id: "meeting-local", movable: true },
             },
           ],
         } as Record<string, unknown[]>;
@@ -151,6 +152,7 @@ async function boot(
       list_workspace_tree: FOREST,
     },
   );
+  await mockDestinationPicker(page);
   await page.goto("/shared-brains");
   await expect(
     page.getByRole("heading", { name: "Shared Brains" }),
@@ -244,6 +246,7 @@ test("a local membership gate closing evicts previously rendered Shared Brain me
     },
     { list_workspace_tree: FOREST },
   );
+  await mockDestinationPicker(page);
   await page.goto("/shared-brains");
   await expect(
     page.getByText("GATED_SECRET_TITLE", { exact: true }),
@@ -372,6 +375,7 @@ test("the received-item viewer resolves its organization locally", async ({
     },
   );
 
+  await mockDestinationPicker(page);
   await page.goto("/org-item/shared-note");
   await expect(page.locator(".oi-title")).toHaveText("Local viewer item");
   await expect(page.locator(".oi-org-name")).toHaveText("Acme");
@@ -387,14 +391,15 @@ test("received replicas add a snapshot copy to a Workspace", async ({ page }) =>
     .click();
   await page.getByRole("menuitem", { name: "Add a copy to Workspace…" }).click();
   const copySheet = page.getByRole("dialog", {
-    name: "Add a copy note “Research brief” to Workspace",
+    name: "Add a copy “Research brief”",
   });
   await expect(
-    copySheet.getByRole("button", { name: "Add a copy to Unlocked private" }),
+    copySheet.getByRole("button", { name: "Choose Unlocked private" }),
   ).toHaveCount(0);
   await copySheet
-    .getByRole("button", { name: "Add a copy to Product" })
+    .getByRole("button", { name: "Choose Product" })
     .click();
+  await copySheet.getByRole("button", { name: "Add a copy here", exact: true }).click();
   await expect
     .poll(() =>
       page.evaluate(
@@ -457,12 +462,13 @@ test("owned sources move the local original to a Workspace", async ({ page }) =>
     .getByRole("menuitem", { name: "Move local original to Workspace…" })
     .click();
   const moveSheet = page.getByRole("dialog", {
-    name: "Move recording “Studio planning” to Workspace",
+    name: "Move “Studio planning”",
   });
   await expect(
-    moveSheet.getByRole("button", { name: "Move to Unlocked private" }),
+    moveSheet.getByRole("button", { name: "Choose Unlocked private" }),
   ).toBeVisible();
-  await moveSheet.getByRole("button", { name: "Move to Product" }).click();
+  await moveSheet.getByRole("button", { name: "Choose Product" }).click();
+  await moveSheet.getByRole("button", { name: "Move here", exact: true }).click();
   await expect
     .poll(() =>
       page.evaluate(
@@ -471,7 +477,7 @@ test("owned sources move the local original to a Workspace", async ({ page }) =>
           [],
       ),
     )
-    .toEqual([{ meetingId: "meeting-local", folderId: "space-product" }]);
+    .toEqual([{ meetingId: "meeting-local", folderId: "space-product", confirmedEncryptionBoundary: false }]);
   await expect(page).toHaveURL(/\/meeting\/meeting-local$/);
   expect(runtimeErrors).toEqual([]);
 });
@@ -504,3 +510,58 @@ for (const viewport of [
     expect(runtimeErrors).toEqual([]);
   });
 }
+
+test('privacy invalidation hides an in-flight copy and blocks duplicates until its write settles', async ({page}) => {
+  await boot(page);
+  await page.evaluate(() => {
+    const host = window as any;
+    const invoke = host.__TAURI_INTERNALS__.invoke.bind(host.__TAURI_INTERNALS__);
+    host.__pendingCopies = 0;
+    host.__TAURI_INTERNALS__.invoke = (cmd: string,args: any) => {
+      if (cmd === 'add_org_item_to_container') {
+        host.__pendingCopies++;
+        return new Promise(resolve => {
+          host.__finishPendingCopy = () => resolve({kind:'note',id:'note-imported'});
+        });
+      }
+      return invoke(cmd,args);
+    };
+  });
+  const openCopy = async () => {
+    await page.getByRole('button',{name:'Actions for Research brief',exact:true}).click();
+    await page.getByRole('menuitem',{name:'Add a copy to Workspace…',exact:true}).click();
+  };
+  await openCopy();
+  const dialog = page.getByRole('dialog',{name:'Add a copy “Research brief”'});
+  await dialog.getByRole('button',{name:'Choose Product',exact:true}).click();
+  await dialog.getByRole('button',{name:'Add a copy here',exact:true}).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__pendingCopies)).toBe(1);
+  await page.evaluate(() => (window as any).__demoEmit('murmur://reminder-visibility-invalidated',null));
+  await expect(dialog).toHaveCount(0);
+  await openCopy();
+  await expect(dialog).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__pendingCopies)).toBe(1);
+  await page.evaluate(() => (window as any).__finishPendingCopy());
+  await page.waitForTimeout(150);
+  await expect(page).toHaveURL(/\/shared-brains$/);
+  await expect(page.getByRole('tab', {name:/Research brief/})).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__pendingCopies)).toBe(1);
+});
+
+test('a readable owned share with movable false does not expose its local Move action', async ({page}) => {
+  await boot(page);
+  await page.addInitScript(() => {
+    const host = window as any;
+    const invoke = host.__TAURI_INTERNALS__.invoke.bind(host.__TAURI_INTERNALS__);
+    host.__TAURI_INTERNALS__.invoke = async (cmd: string,args: any) => {
+      const result = await invoke(cmd,args);
+      return cmd === 'list_org_items' ? result.map((item: any) => ({...item,
+        ownedSource:item.ownedSource ? {...item.ownedSource,movable:false} : null})) : result;
+    };
+  });
+  await page.reload();
+  await page.getByRole('button',{name:'Studio',exact:true}).click();
+  await page.getByRole('button',{name:'Actions for Studio planning',exact:true}).click();
+  await expect(page.getByRole('menuitem',{name:'Move local original to Workspace…',exact:true})).toHaveCount(0);
+  await expect(page.getByRole('menuitem',{name:'Open meeting',exact:true})).toBeVisible();
+});

@@ -87,6 +87,7 @@
     (activate)="selected.emit(node().id)"
     appFolderDrop
     [dropFolderId]="node().id"
+    [dropDisabled]="node().locked"
     (dropNote)="dropNote.emit({ meetingId: $event, folderId: node().id })"
   >
   <!-- Trailing action cluster (2026-07-12, unification round 2): the lock

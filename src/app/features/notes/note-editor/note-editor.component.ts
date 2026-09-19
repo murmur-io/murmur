@@ -28,6 +28,7 @@ import { TabsService } from "../../../core/tabs.service";
 import { WorkspaceService } from "../../workspace/workspace.service";
 import type {
   AppConfigDto,
+  ContainerNode,
   FolderNode,
   NoteAttachmentDto,
   NoteCitation,
@@ -65,6 +66,7 @@ import { parseDoc, serializeDoc } from "./front-matter";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { NoteRemindersPanelComponent } from "../../reminders/note-reminders-panel/note-reminders-panel.component";
 import { SmartReminderCardComponent } from "../../reminders/smart-reminder-card/smart-reminder-card.component";
+import { DestinationMoveService } from "../../../shared/destination-move/destination-move.service";
 
 /** The autosave indicator state. */
 type SaveState = "idle" | "saving" | "saved" | "error";
@@ -205,6 +207,7 @@ export class NoteEditorComponent {
   private readonly destroyRef = inject(DestroyRef);
   /** The flush-before-finalize seam — registered while EMBEDDED (companion editor). */
   private readonly flushService = inject(RecordingFlushService);
+  private readonly destinationMove = inject(DestinationMoveService);
 
   /** Drill-down back navigation ("← Notes"). */
   readonly nav = inject(NavHistoryService);
@@ -337,7 +340,7 @@ export class NoteEditorComponent {
    */
   readonly saveErrorMessage = signal<string | null>(null);
   /** Which floating menu (if any) is open in the header. */
-  readonly menu = signal<"none" | "move" | "more">("none");
+  readonly menu = signal<"none" | "more">("none");
   /** Two-step delete confirm. */
   readonly confirmingDelete = signal(false);
   /** True while the Share modal is open over the document. */
@@ -363,7 +366,7 @@ export class NoteEditorComponent {
    * one tool column at a time. */
   readonly noteSmartOpen = signal(this.readStoredSmartOpen());
 
-  /** The note-kind folders (for the Move menu + breadcrumb). */
+  /** The note-kind folders (for the breadcrumb and lock-state reconciliation). */
   readonly noteFolders = signal<NoteFolder[]>([]);
   /** True while a folder unlock is in flight (lock gate). */
   readonly unlocking = signal(false);
@@ -502,6 +505,17 @@ export class NoteEditorComponent {
     return this.noteFolders().find((f) => f.id === id) ?? null;
   });
 
+  /** Mixed workspace destination, used when the owner is not a note-kind folder. */
+  readonly currentWorkspaceContainer = computed<ContainerNode | null>(() => {
+    const id = this.note()?.folderId;
+    return id ? this.findContainerNode(this.workspace.forest(), id) : null;
+  });
+  readonly currentOwnerSealed = computed(
+    () =>
+      this.currentFolder()?.locked === true ||
+      this.currentWorkspaceContainer()?.locked === true,
+  );
+
   /**
    * True when this note lives in the reserved always-open root — it's "unfiled"
    * and therefore NOT sealable (unfiled notes are deliberately open plaintext;
@@ -516,7 +530,7 @@ export class NoteEditorComponent {
     if (folder?.isRoot) {
       return "Unfiled";
     }
-    return folder ? folder.name : "Notes";
+    return folder?.name ?? this.currentWorkspaceContainer()?.name ?? "Notes";
   });
 
 
@@ -690,7 +704,7 @@ export class NoteEditorComponent {
   });
 
   constructor() {
-    // Warm the note-folder list (Move menu + breadcrumb) + the note list (tag
+    // Warm the note-folder list (breadcrumb + lock state) + the note list (tag
     // autocomplete) + the config (note-assistant toggles). Best-effort; a
     // failure just means no suggestions / every assistant action defaults ON.
     void this.loadFolders();
@@ -848,7 +862,7 @@ export class NoteEditorComponent {
    */
   private maybeAutoTitle(): void {
     const doc = this.note();
-    if (!doc || doc.locked) {
+    if (!doc || doc.locked || this.currentOwnerSealed()) {
       return;
     }
     const t = this.title().trim();
@@ -950,6 +964,22 @@ export class NoteEditorComponent {
         return n;
       }
       const hit = this.findFolderNode(n.children ?? [], id);
+      if (hit) {
+        return hit;
+      }
+    }
+    return null;
+  }
+
+  private findContainerNode(
+    nodes: readonly ContainerNode[],
+    id: string,
+  ): ContainerNode | null {
+    for (const node of nodes) {
+      if (node.id === id) {
+        return node;
+      }
+      const hit = this.findContainerNode(node.folders, id);
       if (hit) {
         return hit;
       }
@@ -2330,7 +2360,7 @@ export class NoteEditorComponent {
 
   // ── Header: Move / ⋯ / Share / Export / Delete ──────────────────────────
 
-  toggleMenu(which: "move" | "more"): void {
+  toggleMenu(which: "more"): void {
     this.menu.update((cur) => (cur === which ? "none" : which));
     this.confirmingDelete.set(false);
   }
@@ -2429,22 +2459,46 @@ export class NoteEditorComponent {
     }
   }
 
-  /** Move this note into `folderId` via `moveNoteDoc`; reload the doc. */
-  async moveTo(folderId: string): Promise<void> {
+  /** Open the shared hierarchy picker and reconcile the canonical owner afterwards. */
+  async openMove(event?: Event): Promise<void> {
     const doc = this.note();
-    if (!doc || folderId === doc.folderId) {
-      this.closeMenus();
+    if (!doc || doc.locked || this.currentOwnerSealed()) {
       return;
     }
     this.closeMenus();
     try {
-      await this.notes.move(doc.id, folderId);
+      const { moved } = await this.destinationMove.open({
+        kind: "note",
+        id: doc.id,
+        title: this.title().trim() || doc.title || "Untitled",
+        currentContainerId: doc.folderId,
+        actionLabel: "Move",
+      }, event);
+      if (!moved || !this.saveResponseStillApplies(doc.id)) {
+        return;
+      }
+      const [fresh] = await Promise.all([
+        this.ipc.getNote(doc.id),
+        this.loadFolders(),
+        this.workspace.reload(),
+      ]);
       if (!this.saveResponseStillApplies(doc.id)) {
         return;
       }
-      this.note.update((cur) => (cur ? { ...cur, folderId } : cur));
-      const name = this.noteFolders().find((f) => f.id === folderId)?.name ?? "folder";
-      this.toast.success(`Moved to ${name}`);
+      if (fresh.locked) {
+        this.debounce.cancel(this.saveDebounceKey(doc.id));
+        this.pendingSave = null;
+        this.dirtyFull = false;
+        this.attachments.set([]);
+        this.hydrate(fresh);
+        this.clearSelection();
+        this.closeLinkPicker();
+      } else {
+        // Preserve live, potentially not-yet-saved editor text; only ownership changed.
+        this.note.update((current) =>
+          current ? { ...current, folderId: fresh.folderId } : current,
+        );
+      }
     } catch (e) {
       this.toast.danger(this.errorCopy.because("Couldn’t move", e));
     }

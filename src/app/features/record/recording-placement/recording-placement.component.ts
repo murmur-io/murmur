@@ -11,21 +11,22 @@ import {
 import { RouterLink } from "@angular/router";
 
 import { IpcService } from "../../../core/ipc.service";
+import type { ContainerNode } from "../../../core/models";
 import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
+import { DestinationMoveService } from "../../../shared/destination-move/destination-move.service";
 import { WorkspaceService } from "../../workspace/workspace.service";
-import {
-  flattenRecordingDestinations,
-  type RecordingDestination,
-} from "./recording-destinations";
 
-const LAST_DESTINATION_KEY = "murmur.recording.lastDestination";
+interface CurrentRecordingLocation {
+  readonly id: string;
+  readonly label: string;
+  readonly locked: boolean;
+}
 
 /** One focused final result: open the saved meeting or file it without leaving. */
 @Component({
   selector: "app-recording-placement",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterLink],
-  host: { "(document:keydown.escape)": "closePicker()" },
   templateUrl: "./recording-placement.component.html",
   styleUrl: "./recording-placement.component.scss",
 })
@@ -33,17 +34,16 @@ export class RecordingPlacementComponent {
   private readonly ipc = inject(IpcService);
   private readonly workspace = inject(WorkspaceService);
   private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
+  private readonly destinationMove = inject(DestinationMoveService);
   private readonly destroyRef = inject(DestroyRef);
-  readonly destinationsLoading = this.workspace.loading;
 
   readonly meetingId = input<string | null>(null);
   readonly exportedPath = input<string | null>(null);
 
-  private readonly _pickerOpen = signal(false);
-  readonly pickerOpen = this._pickerOpen.asReadonly();
   private readonly _filing = signal(false);
   readonly filing = this._filing.asReadonly();
   private readonly _currentFolderId = signal<string | null>(null);
+  private readonly _meetingTitle = signal<string | null>(null);
   private readonly _placementState = signal<
     "idle" | "loading" | "resolved" | "masked" | "unavailable"
   >("idle");
@@ -53,8 +53,6 @@ export class RecordingPlacementComponent {
   );
   private readonly _error = signal<string | null>(null);
   readonly error = this._error.asReadonly();
-  private readonly _lastAttempt = signal<RecordingDestination | null>(null);
-  readonly query = signal("");
   private placementRequest = 0;
   private privacyGeneration = 0;
   private destinationLoadMeetingId: string | null = null;
@@ -76,19 +74,17 @@ export class RecordingPlacementComponent {
   private readonly _resetPerMeeting = effect(() => {
     const meetingId = this.meetingId();
     const request = ++this.placementRequest;
-    this._pickerOpen.set(false);
     this._filing.set(false);
     this._currentFolderId.set(null);
+    this._meetingTitle.set(null);
     this._placementState.set(meetingId ? "loading" : "idle");
     this._error.set(null);
-    this._lastAttempt.set(null);
-    this.query.set("");
     if (meetingId) {
       void this.resolveCurrentPlacement(meetingId, request);
     }
   });
 
-  /** Load destinations only for the collapsed post-final control. */
+  /** Load the cached forest only to render the collapsed current-location summary. */
   private readonly _load = effect(() => {
     const meetingId = this.meetingId();
     if (!meetingId) {
@@ -105,44 +101,17 @@ export class RecordingPlacementComponent {
       // boot, and an empty forest is a legitimate RESULT — so an emptiness
       // guard re-read a forest that had just been read and come back empty.
       // `recording-placement.spec.ts`'s "an empty destination forest loads once,
-      // stays calm, and retries only on request" is the oracle. The explicit
-      // "Refresh locations" button still calls `reload()` directly.
+      // stays calm, and retries only on request" is the existing cache oracle.
       this.destinationLoadMeetingId = meetingId;
       void this.workspace.ensureLoaded();
     }
   });
 
-  readonly destinations = computed<RecordingDestination[]>(() => {
-    const rows = flattenRecordingDestinations(this.workspace.forest());
-    const rememberedId = readLastDestination();
-    if (!rememberedId) return rows;
-    const remembered = rows.find(
-      (destination) => destination.id === rememberedId && !destination.blocked,
-    );
-    return remembered
-      ? [
-          remembered,
-          ...rows.filter((destination) => destination !== remembered),
-        ]
-      : rows;
-  });
-
-  readonly visibleDestinations = computed(() => {
-    const needle = this.query().trim().toLowerCase();
-    return needle
-      ? this.destinations().filter((destination) =>
-          destination.label.toLowerCase().includes(needle),
-        )
-      : this.destinations();
-  });
-
-  readonly filedIn = computed<RecordingDestination | null>(() => {
+  readonly filedIn = computed<CurrentRecordingLocation | null>(() => {
     const folderId = this._currentFolderId();
     return folderId === null
       ? null
-      : (this.destinations().find(
-          (destination) => destination.id === folderId,
-        ) ?? null);
+      : findCurrentLocation(this.workspace.forest(), folderId);
   });
 
   readonly placementUnavailable = computed(
@@ -179,17 +148,58 @@ export class RecordingPlacementComponent {
       : "Saved safely in Murmur on this Mac.",
   );
 
-  togglePicker(): void {
-    if (!this._filing() && !this.placementMasked()) {
-      this._pickerOpen.update((open) => !open);
-      this._error.set(null);
+  async openMove(event?: Event): Promise<void> {
+    const meetingId = this.meetingId();
+    const privacyGeneration = this.privacyGeneration;
+    if (
+      !meetingId ||
+      this._filing() ||
+      this.placementMasked() ||
+      this.filedIn()?.locked === true
+    ) {
+      return;
     }
-  }
 
-  closePicker(): void {
-    if (!this._filing()) {
-      this._pickerOpen.set(false);
-      this._error.set(null);
+    this._error.set(null);
+    this._filing.set(true);
+    try {
+      const { moved } = await this.destinationMove.open({
+        kind: "meeting",
+        id: meetingId,
+        title: this._meetingTitle() || "Recording",
+        currentContainerId:
+          this._placementState() === "resolved"
+            ? this._currentFolderId()
+            : undefined,
+        actionLabel: "Move",
+      }, event);
+      if (
+        !moved ||
+        meetingId !== this.meetingId() ||
+        privacyGeneration !== this.privacyGeneration
+      ) {
+        return;
+      }
+      const request = ++this.placementRequest;
+      this._placementState.set("loading");
+      await Promise.all([
+        this.workspace.reload(),
+        this.resolveCurrentPlacement(meetingId, request),
+      ]);
+    } catch {
+      if (
+        meetingId === this.meetingId() &&
+        privacyGeneration === this.privacyGeneration
+      ) {
+        this._error.set("Couldn’t move this recording. Nothing was lost.");
+      }
+    } finally {
+      if (
+        meetingId === this.meetingId() &&
+        privacyGeneration === this.privacyGeneration
+      ) {
+        this._filing.set(false);
+      }
     }
   }
 
@@ -209,68 +219,6 @@ export class RecordingPlacementComponent {
     }
   }
 
-  retryDestinations(): void {
-    if (!this.workspace.loading()) {
-      void this.workspace.reload();
-    }
-  }
-
-  async file(destination: RecordingDestination): Promise<void> {
-    const meetingId = this.meetingId();
-    const privacyGeneration = this.privacyGeneration;
-    if (
-      !meetingId ||
-      destination.blocked ||
-      this._filing() ||
-      this.placementMasked()
-    )
-      return;
-
-    this._lastAttempt.set(destination);
-    this._error.set(null);
-    this._filing.set(true);
-    try {
-      await this.workspace.moveItem("meeting", meetingId, destination.id);
-      if (
-        meetingId !== this.meetingId() ||
-        privacyGeneration !== this.privacyGeneration
-      )
-        return;
-      const request = ++this.placementRequest;
-      this._placementState.set("loading");
-      await this.resolveCurrentPlacement(meetingId, request);
-      if (
-        meetingId !== this.meetingId() ||
-        privacyGeneration !== this.privacyGeneration
-      )
-        return;
-      writeLastDestination(destination.id);
-      this._pickerOpen.set(false);
-      this.query.set("");
-    } catch {
-      if (
-        meetingId === this.meetingId() &&
-        privacyGeneration === this.privacyGeneration
-      ) {
-        this._error.set(
-          `Couldn’t move this recording to ${destination.label}. Nothing was lost.`,
-        );
-      }
-    } finally {
-      if (
-        meetingId === this.meetingId() &&
-        privacyGeneration === this.privacyGeneration
-      ) {
-        this._filing.set(false);
-      }
-    }
-  }
-
-  retry(): void {
-    const destination = this._lastAttempt();
-    if (destination) void this.file(destination);
-  }
-
   private async resolveCurrentPlacement(
     meetingId: string,
     request: number,
@@ -282,7 +230,7 @@ export class RecordingPlacementComponent {
       }
       if (!privacyReady) {
         this._currentFolderId.set(null);
-        this._pickerOpen.set(false);
+        this._meetingTitle.set(null);
         this._placementState.set("masked");
         return;
       }
@@ -296,14 +244,13 @@ export class RecordingPlacementComponent {
       }
       if (detail.locked) {
         this._currentFolderId.set(null);
-        this._pickerOpen.set(false);
+        this._meetingTitle.set(null);
         this._error.set(null);
-        this._lastAttempt.set(null);
-        this.query.set("");
         this._placementState.set("masked");
         return;
       }
       this._currentFolderId.set(detail.meeting.folderId ?? null);
+      this._meetingTitle.set(detail.meeting.title);
       this._placementState.set("resolved");
     } catch {
       if (request === this.placementRequest && meetingId === this.meetingId()) {
@@ -317,11 +264,9 @@ export class RecordingPlacementComponent {
     const request = ++this.placementRequest;
     ++this.privacyGeneration;
     this._currentFolderId.set(null);
-    this._pickerOpen.set(false);
+    this._meetingTitle.set(null);
     this._filing.set(false);
     this._error.set(null);
-    this._lastAttempt.set(null);
-    this.query.set("");
     this._placementState.set(meetingId ? "masked" : "idle");
     if (meetingId) {
       void this.resolveCurrentPlacement(meetingId, request);
@@ -329,18 +274,26 @@ export class RecordingPlacementComponent {
   }
 }
 
-function readLastDestination(): string | null {
-  try {
-    return localStorage.getItem(LAST_DESTINATION_KEY);
-  } catch {
+function findCurrentLocation(
+  forest: readonly ContainerNode[],
+  id: string,
+): CurrentRecordingLocation | null {
+  const visit = (
+    nodes: readonly ContainerNode[],
+    ancestors: readonly string[],
+  ): CurrentRecordingLocation | null => {
+    for (const node of nodes) {
+      const labels = [...ancestors, node.name];
+      if (node.id === id) {
+        return { id, label: labels.join(" / "), locked: node.locked };
+      }
+      const child = visit(node.folders, labels);
+      if (child) {
+        return child;
+      }
+    }
     return null;
-  }
-}
+  };
 
-function writeLastDestination(id: string): void {
-  try {
-    localStorage.setItem(LAST_DESTINATION_KEY, id);
-  } catch {
-    // Filing succeeds even when remembering the convenience choice is unavailable.
-  }
+  return visit(forest, []);
 }

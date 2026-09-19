@@ -468,6 +468,7 @@ fn lock_folder_inner_with_visibility_notice_policy(
     visibility_revoked: impl FnOnce(),
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     let folder = state
         .db
         .folder_by_id(&folder_id)?
@@ -1027,6 +1028,7 @@ pub async fn unlock_folder(
         // it, so the guard never crosses a suspend point (same invariant the old inline code
         // relied on, preserved by construction — a spawn_blocking closure body is plain sync code).
         let _lifecycle = lifecycle_guard(&state);
+        state.db.ensure_container_move_ready()?;
 
         // Decrypt EACH sealed provider row's own blob back into its own markdown column for the
         // session (no dedup by meeting — every provider's distinct content is restored
@@ -1192,6 +1194,7 @@ async fn unlock_container_with_cached_kek(
         // Same lifecycle guard as the primary restore, for the same reason: this mutates plaintext
         // columns, and a concurrent relock must not blank them mid-restore.
         let _lifecycle = lifecycle_guard(&state);
+        state.db.ensure_container_move_ready()?;
 
         for n in &state.db.notes_in_folder(&folder_id)? {
             let Some(blob) = &n.content_blob else {
@@ -1275,6 +1278,7 @@ pub(crate) fn relock_folder_inner_with_visibility_notice(
     // BLK-1: serialize with the rest of the lock state machine (it re-blanks the same columns
     // `remove_lock` is mid-restoring).
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     if !folder_is_unlocked(state, folder_id)? {
         return Err(AppError::Locked(
             "folder visibility changed before relock preparation".into(),
@@ -1473,6 +1477,8 @@ pub(crate) fn relock_all_inner_with_visibility_notice(
     if let Ok(mut cache) = state.verify_cache.lock() {
         cache.clear();
     }
+    // A pending move blocks physical cleanup, never screen-share visibility revocation.
+    state.db.ensure_container_move_ready()?;
     // Resolve every target and preflight ALL non-empty plaintext before the first export removal or
     // DB blank. Retained blobs are authenticated; missing blobs are encrypt+verified into immutable
     // repair plans. Visibility is already revoked fail-closed, while the cached KEK remains held for
@@ -1587,6 +1593,7 @@ pub async fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Resul
 /// between the two steps — the exact `markdown='' + content_blob=NULL` permanent-loss race.
 pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     let folder = state
         .db
         .folder_by_id(&folder_id)?
@@ -1944,6 +1951,7 @@ async fn discard_unrecoverable_folder_lock_with_enumeration(
     // Serialize with the rest of the lock state machine (acquired AFTER the awaits above so the guard
     // never crosses a suspend point).
     let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
     // Discard changes both the key/content generation and the protection domain. Invalidate any
     // post-await Ask writer before the first attachment/seal mutation.
     bump_seal_epoch(state);

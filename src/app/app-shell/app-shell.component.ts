@@ -60,6 +60,7 @@ import { FoldersService } from "../services/folders.service";
 import { NotesService } from "../services/notes.service";
 import { TilePaletteService } from "../services/tile-palette.service";
 import { ToastService, type Toast } from "../services/toast.service";
+import { DestinationMoveComponent } from "../shared/destination-move/destination-move.component";
 
 const BROWSE_GROUPS = ["Work", "Intelligence", "Insights", "Storage"] as const;
 
@@ -130,6 +131,7 @@ const BROWSE_EXPANDED_KEY = "murmur.shell.browseExpanded";
     TilePaletteComponent,
     AccountSessionBannerComponent,
     FilingRecoveryBannerComponent,
+    DestinationMoveComponent,
   ],
   host: {
     // Publishes the sidebar's CURRENT width to `--shell-content-inset` in
@@ -436,7 +438,10 @@ export class AppShellComponent {
       );
       return null;
     }
-    const id = await this.workspace.createFolder(parent.container, pending.name);
+    const id = await this.workspace.createFolder(
+      parent.container,
+      pending.name,
+    );
     return { id, label: `${parent.label} / ${pending.name}` };
   }
 

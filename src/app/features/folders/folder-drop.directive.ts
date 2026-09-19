@@ -45,6 +45,8 @@ export class FolderDropDirective {
    * THIS target id to call `moveNote(meetingId, dropFolderId)`.
    */
   readonly dropFolderId = input<string | null>(null);
+  /** A direct gesture cannot supply an encryption confirmation. */
+  readonly dropDisabled = input(false);
 
   /** Emits the dragged meeting id when a note is dropped onto this target. */
   readonly dropNote = output<string>();
@@ -68,10 +70,10 @@ export class FolderDropDirective {
    * (subtle dashed outline) so the user can see where notes can go the instant
    * they pick a row up, not only once they hover a specific folder.
    */
-  readonly armed = computed(() => this.drag.draggingId() !== null);
+  readonly armed = computed(() => !this.dropDisabled() && this.drag.draggingId() !== null);
 
   onDragEnter(event: DragEvent): void {
-    if (this.drag.draggingId() === null) {
+    if (this.dropDisabled() || this.drag.draggingId() === null) {
       return; // not our drag — ignore (e.g. a file dragged in from Finder)
     }
     event.preventDefault();
@@ -79,7 +81,7 @@ export class FolderDropDirective {
   }
 
   onDragOver(event: DragEvent): void {
-    if (this.drag.draggingId() === null) {
+    if (this.dropDisabled() || this.drag.draggingId() === null) {
       return;
     }
     // MUST preventDefault or the webview never fires `drop`.
@@ -109,7 +111,7 @@ export class FolderDropDirective {
     // asking afterwards would always see a meeting.
     const kind = this.drag.draggingKind() ?? "meeting";
     this.drag.end();
-    if (!id) {
+    if (this.dropDisabled() || !id) {
       return;
     }
     event.preventDefault();

@@ -3108,7 +3108,7 @@ export interface OrgItemHeader {
    * read-only replica shared by someone else (or a locked own source), opened via
    * the `/org-item/:id` viewer. Mirrors the Rust `OrgItemHeader.owned_source`.
    */
-  ownedSource?: { kind: "document" | "meeting"; id: string } | null;
+  ownedSource?: { kind: "document" | "meeting"; id: string; movable?: boolean } | null;
 }
 
 /** Result of importing a received Shared Brain replica into a local Workspace. */
@@ -3816,6 +3816,19 @@ export interface ItemPage {
 // "four variants of which two are filtered at every call site" is exactly how one
 // gets back in. Three variants, no filtering.
 
+export type PickerMode = "link" | "destination";
+export type DestinationPickerAnchorKind = LinkKind | "task" | "dashboard" | "sharedContainer" | "sharedDoc";
+
+export interface PickerAvailability {
+  selectable: boolean;
+  here: boolean;
+  self: boolean;
+  descendant: boolean;
+  locked: boolean;
+  confirm: boolean;
+  incompatible: boolean;
+}
+
 /** The three LINKABLE leaf kinds: a recording, an authored note, an imported document. */
 export type PickerItemKind = "meeting" | "note" | "document";
 
@@ -3852,6 +3865,8 @@ export interface PickerContainerNode {
   /** EMPTY for a sealed-not-unlocked container — not even a zero. */
   groups: PickerGroup[];
   folders: PickerContainerNode[];
+  /** Backend-owned eligibility, present only for destination mode. */
+  availability?: PickerAvailability;
 }
 
 /** Where the anchor sits, and the bounded window the modal opens on. */
@@ -3876,6 +3891,26 @@ export interface RelatedPickerBootstrap {
   unclassified: PickerGroup[];
   /** `null` when the anchor has no place in the local hierarchy (a Shared Brain item). */
   anchor: PickerAnchorLocation | null;
+  /** Destination-only placement semantics; absent for link-mode compatibility. */
+  destination?: {
+    sourceKind: string;
+    sourceLocked: boolean;
+    currentContainerId: string | null;
+    currentPath: string[];
+    root: {
+      kind: string;
+      label: string;
+      containerId: string | null;
+      availability: PickerAvailability;
+    };
+    container: {
+      id: string;
+      level: ContainerLevel;
+      parentId: string | null;
+      pathIds: string[];
+      subtreeIds: string[];
+    } | null;
+  };
 }
 
 /** One lazy page of a scope's leaves. */
@@ -3896,6 +3931,7 @@ export interface RelatedPickerHit {
 
 /** One bounded page of search results. */
 export interface RelatedPickerSearchPage {
+  containers?: { id: string; name: string; level: ContainerLevel; breadcrumb: string[]; availability: PickerAvailability }[];
   offset: number;
   hits: RelatedPickerHit[];
   total: number;
@@ -4014,10 +4050,7 @@ export type SharedPlacementTarget = "container" | "doc";
  * recovery without a restart.
  */
 export type McpListenerState =
-  | "starting"
-  | "listening"
-  | "portInUse"
-  | "unavailable";
+  "starting" | "listening" | "portInUse" | "unavailable";
 
 export interface McpStatus {
   state: McpListenerState;
