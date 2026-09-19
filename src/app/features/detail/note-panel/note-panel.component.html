@@ -59,14 +59,14 @@
     </ng-template>
     <!-- Related stays first and usable while generation updates the document. -->
     <app-note-document
-      [mode]="{ access: 'editable', view: note() && editing() ? 'edit' : 'preview' }"
+      [mode]="{ access: 'editable', view: noteRaw() !== null && editing() ? 'edit' : 'preview' }"
       [showTitle]="false"
       [markdown]="editing() ? draft() : (noteRaw() ?? '')"
       [attachments]="attachments()"
       [printMarkdown]="noteRaw()"
       [toolbarTemplate]="meetingToolbar"
       [footerTemplate]="meetingFooter"
-      [emptyTemplate]="note() ? null : emptyNote"
+      [emptyTemplate]="noteRaw() === null ? emptyNote : null"
       [related]="{ kind: 'meeting', id: meetingId(), expandedByDefault: true, prominent: true }"
       measure="page"
       editorLabel="Note markdown"

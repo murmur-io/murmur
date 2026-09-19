@@ -422,3 +422,33 @@ test("unlock opens the gated meeting note directly in edit and baselines attachm
   await page.getByRole("button", { name: "Preview", exact: true }).click();
   await expect(editor).toHaveCount(0);
 });
+
+test("an empty persisted meeting note opens directly in edit", async ({ page }) => {
+  await mockTauri(page, {
+    get_meeting_detail: () => ({
+      meeting: {
+        id: "m-empty-note", title: "Empty persisted note", status: "EXPORTED",
+        startedAt: "2026-07-21T09:00:00Z", endedAt: "2026-07-21T09:30:00Z",
+        durationS: 1800, audioPath: null, folderId: null,
+      },
+      note: { meetingId: "m-empty-note", providerId: "claude_code", markdown: "", exportedPath: null },
+      segments: [], assistantInteractions: [], locked: false,
+      aiProvider: "claude_code", aiModel: null, modelServed: null,
+    }),
+    get_note_receipts: () => [],
+    list_note_attachments: () => [],
+    update_note: (args: any) => {
+      (window as any).__savedEmptyNote = args.markdown;
+      return { meetingId: args.meetingId, providerId: "claude_code", markdown: args.markdown, exportedPath: null };
+    },
+  });
+  await page.goto("/meeting/m-empty-note");
+  const editor = page.getByRole("textbox", { name: "Note markdown" });
+  await expect(editor).toBeVisible();
+  await expect(editor).toBeEnabled();
+  await expect(editor).toHaveValue("");
+  await expect(page.getByText("No analysis yet", { exact: true })).toHaveCount(0);
+  await editor.fill("# First content");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__savedEmptyNote)).toBe("# First content");
+});
