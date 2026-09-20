@@ -845,6 +845,13 @@ pub struct OrgItemHeader {
     /// stale publish-time snapshot and never routes through the read-only viewer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owned_source: Option<OrgOwnedSource>,
+    /// The collaboration permission the SENDER published this item with — `"view"` or `"edit"`,
+    /// straight off the stored `org_items.access` column (the server-enforced `OrgItemAccess` the
+    /// feed carried). Legacy rows predate the column and read as the schema default `"view"`, which
+    /// is also the fail-safe for any unexpected stored value. This is the permission for a LOOSE
+    /// received item; an item filed inside a received container is governed by THAT container's
+    /// access instead (`build_shared_node` overrides it), because sharing a container is one grant.
+    pub access: String,
 }
 
 /// The caller's local editable source behind an org item they authored (see `OrgItemHeader.owned_source`).

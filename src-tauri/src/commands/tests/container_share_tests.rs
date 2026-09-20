@@ -11,9 +11,9 @@
 
 use super::*;
 use crate::commands::org_containers::{
-    build_shared_workspace, plan_container_share, ContainerSharePreview, ContainerShareResult,
-    ContainerShareStatus, SharedContainerNode, SharedItemRow, SharedWorkspace,
-    MAX_CONTAINER_SHARE_ITEMS,
+    build_shared_workspace, list_container_share_status_inner, plan_container_share,
+    ContainerSharePreview, ContainerShareResult, ContainerShareStatus, SharedContainerNode,
+    SharedItemRow, SharedWorkspace, MAX_CONTAINER_SHARE_ITEMS,
 };
 use crate::storage::db::Db;
 use crate::storage::models::{
@@ -137,16 +137,28 @@ fn received_container(
     .unwrap();
 }
 
-/// A received ITEM, written straight into the replica the way ingest would.
+/// A received ITEM, written straight into the replica the way ingest would. `access` defaults to
+/// the schema's `view`; `received_item_with_access` states it explicitly.
 fn received_item(db: &Db, org: &str, item_id: &str, title: &str, parent: Option<&str>) {
+    received_item_with_access(db, org, item_id, title, parent, "view");
+}
+
+fn received_item_with_access(
+    db: &Db,
+    org: &str,
+    item_id: &str,
+    title: &str,
+    parent: Option<&str>,
+    access: &str,
+) {
     db.lock()
         .execute(
             "INSERT INTO org_items(item_id, org_id, seq, author_hint, title, markdown, created_at,
                                    rev, generation, is_current, tombstoned, source_kind,
-                                   parent_container_id, position)
+                                   parent_container_id, position, access)
              VALUES (?1, ?2, 1, 'kgm004a', ?3, 'body', '2026-08-29T10:00:00Z', 1, 1, 1, 0,
-                     'document', ?4, 0)",
-            rusqlite::params![item_id, org, title, parent],
+                     'document', ?4, 0, ?5)",
+            rusqlite::params![item_id, org, title, parent, access],
         )
         .unwrap();
 }
@@ -601,5 +613,178 @@ fn a_container_this_device_published_does_not_come_back_as_a_second_copy() {
         names,
         vec!["Partners".to_string()],
         "only a container someone ELSE published belongs in the received forest"
+    );
+}
+
+/// A LOOSE received item keeps the permission its sender granted.
+///
+/// The read model used to hardcode every loose row to `view` while the column, the feed and the
+/// protocol all carried `edit` — so an item shared for editing was presented as read-only, and the
+/// sidebar had no honest value to label the row with. The inherited-access case below it is the
+/// other half: inside a container, the CONTAINER's grant wins.
+#[test]
+fn a_loose_received_item_keeps_the_access_it_was_shared_with() {
+    let db = fresh_db("loose-access");
+    seed_org(&db, "o1", "Siema");
+    received_item_with_access(&db, "o1", "i-edit", "Wycena", None, "edit");
+    received_item_with_access(&db, "o1", "i-view", "Notatki", None, "view");
+    let headers = db.list_org_items("o1").unwrap();
+    let header = headers.iter().find(|row| row.item_id == "i-edit").unwrap();
+    let wire = serde_json::to_value(header).unwrap();
+    assert_eq!(wire["access"], "edit");
+    assert_eq!(wire["itemId"], "i-edit");
+    assert!(wire.get("authorHint").is_some());
+    assert!(wire.as_object().unwrap().keys().all(|key| !key.contains('_')));
+    let state = state_with(db);
+
+    let workspace = build_shared_workspace(&state).unwrap();
+    let access = |item_id: &str| {
+        workspace
+            .shared_brains
+            .items
+            .iter()
+            .find(|i| i.item_id == item_id)
+            .map(|i| i.access.as_str())
+    };
+    assert_eq!(
+        access("i-edit"),
+        Some("edit"),
+        "a loose item shared for editing must not be presented as read-only"
+    );
+    assert_eq!(access("i-view"), Some("view"));
+}
+
+/// An unexpected stored permission falls back to the least privilege, never to `edit`.
+///
+/// The column's CHECK constraint refuses such a value today, so this writes one the only way a
+/// future schema or an out-of-band edit could: with the constraint suspended. The read model must
+/// not depend on a constraint it does not enforce itself.
+#[test]
+fn an_unknown_stored_access_reads_back_as_view() {
+    let db = fresh_db("loose-access-bogus");
+    seed_org(&db, "o1", "Siema");
+    received_item(&db, "o1", "i1", "Notatka", None);
+    {
+        let conn = db.lock();
+        conn.pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        conn.execute(
+            "UPDATE org_items SET access = 'admin' WHERE item_id = 'i1'",
+            rusqlite::params![],
+        )
+        .unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", false)
+            .unwrap();
+    }
+    let state = state_with(db);
+
+    let workspace = build_shared_workspace(&state).unwrap();
+    assert_eq!(workspace.shared_brains.items[0].access, "view");
+}
+
+// ── the outbound-status lock gate ────────────────────────────────────────────────────────────
+
+/// A local container the caller shared OUT, journalled the way the publisher leaves it.
+fn published_out(db: &Db, id: &str, folder_id: &str, org: &str, access: &str) {
+    db.upsert_container_share(&ContainerShareRow {
+        id: id.into(),
+        org_id: org.into(),
+        folder_id: folder_id.into(),
+        container_id: format!("c-{folder_id}"),
+        access: access.into(),
+        scrub: true,
+        is_root: true,
+        state: "published".into(),
+        item_id: Some(format!("item-c-{folder_id}")),
+        rev: 1,
+        generation: 1,
+        content_sha256: None,
+        position: 0,
+        last_error: None,
+        created_at: "t".into(),
+        updated_at: "t".into(),
+    })
+    .unwrap();
+}
+
+fn status_folders(state: &AppState) -> Vec<String> {
+    list_container_share_status_inner(state)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.folder_id)
+        .collect()
+}
+
+/// An OPEN shared container reports its org, permission and state.
+#[test]
+fn an_open_containers_outbound_share_is_visible() {
+    let db = fresh_db("status-open");
+    seed_org(&db, "o1", "Siema");
+    container(&db, "f-open", "Partners", "/p", None, "project");
+    published_out(&db, "cs1", "f-open", "o1", "edit");
+    let state = state_with(db);
+
+    let rows = list_container_share_status_inner(&state).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].folder_id, "f-open");
+    assert_eq!(rows[0].org_name, "Siema");
+    assert_eq!(rows[0].access, "edit");
+}
+
+/// A SEALED container discloses its name and nothing else.
+///
+/// The name is already out — you have to see a container to unlock it. WHO it was shared with, at
+/// WHAT permission, and the fact that it left this device at all are not part of that disclosure,
+/// and the sidebar is about to render exactly those three things next to the row.
+#[test]
+fn a_sealed_containers_outbound_share_is_not_disclosed() {
+    let db = fresh_db("status-sealed");
+    seed_org(&db, "o1", "Siema");
+    container(&db, "f-sealed", "Wyceny", "/w", None, "project");
+    seal(&db, "f-sealed");
+    published_out(&db, "cs1", "f-sealed", "o1", "edit");
+    let state = state_with(db);
+
+    assert!(
+        status_folders(&state).is_empty(),
+        "a sealed container must not report its org, permission or share state"
+    );
+}
+
+/// Unlocking for the session restores it; relocking takes it away again.
+#[test]
+fn a_session_unlock_restores_the_outbound_share_and_a_relock_removes_it() {
+    let db = fresh_db("status-unlock");
+    seed_org(&db, "o1", "Siema");
+    container(&db, "f-sealed", "Wyceny", "/w", None, "project");
+    seal(&db, "f-sealed");
+    published_out(&db, "cs1", "f-sealed", "o1", "view");
+    let state = state_with(db);
+
+    state
+        .unlocked_folders
+        .lock()
+        .unwrap()
+        .insert("f-sealed".to_string());
+    assert_eq!(status_folders(&state), vec!["f-sealed".to_string()]);
+
+    state.unlocked_folders.lock().unwrap().remove("f-sealed");
+    assert!(
+        status_folders(&state).is_empty(),
+        "a relock must withdraw the metadata the unlock disclosed"
+    );
+}
+
+/// A share row pointing at a folder this device no longer has fails CLOSED.
+#[test]
+fn an_outbound_share_for_an_unknown_folder_is_dropped() {
+    let db = fresh_db("status-unknown");
+    seed_org(&db, "o1", "Siema");
+    published_out(&db, "cs1", "f-gone", "o1", "edit");
+    let state = state_with(db);
+
+    assert!(
+        status_folders(&state).is_empty(),
+        "an unresolvable folder is not evidence that its share is safe to show"
     );
 }

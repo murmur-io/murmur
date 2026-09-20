@@ -25,7 +25,8 @@
   color: var(--text-secondary);
 }
 
-.tree {
+.tree,
+.shared-group__tree {
   display: flex;
   flex-direction: column;
   gap: var(--sidebar-row-gap);
@@ -36,8 +37,115 @@
 
 /* The fixed header and independently scrolling tree meet at a hard seam. Snap
    direct rows there so a stopped scroll never leaves half a row clipped. */
-.tree > * {
+.tree > *,
+.shared-group__tree > * {
   scroll-snap-align: start;
+}
+
+.shared-group {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--sidebar-row-gap);
+  padding-left: var(--space-1);
+  border-left: var(--border-width-thin) solid var(--border-strong);
+}
+
+.shared-group--items {
+  border-left-style: dashed;
+}
+
+.shared-group__heading {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  width: 100%;
+  min-width: 0;
+  min-height: var(--sidebar-row-h);
+  padding: var(--space-1) var(--sidebar-row-pad-x);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: var(--sidebar-section-font);
+  font-weight: var(--sidebar-section-weight);
+  letter-spacing: var(--sidebar-section-tracking);
+  text-align: left;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.shared-group__heading:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.shared-group__heading:focus-visible,
+.shared-overview:focus-visible {
+  outline: var(--border-width-thin) solid var(--accent);
+  outline-offset: calc(-1 * var(--border-width-thin));
+}
+
+.shared-group__caret {
+  flex: none;
+  transition: transform var(--transition-fast);
+}
+
+.shared-group__caret.is-open {
+  transform: rotate(90deg);
+}
+
+.shared-group__label {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.shared-group__org {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shared-group__type {
+  color: var(--text-secondary);
+  letter-spacing: normal;
+  text-transform: none;
+  overflow-wrap: anywhere;
+}
+
+.shared-group__count {
+  flex: none;
+  margin-left: auto;
+}
+
+.shared-overview {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--sidebar-row-h);
+  padding: 0 var(--sidebar-row-pad-x);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: var(--sidebar-row-font);
+  cursor: pointer;
+}
+
+.shared-overview:hover,
+.shared-overview[aria-current="page"] {
+  background: var(--surface-hover);
+  color: var(--text-primary);
 }
 
 mur-tree-row {
@@ -153,15 +261,36 @@ mur-tree-row:has(mur-row-menu.is-open) {
   margin-left: auto;
 }
 
-/* The shared marker. One dim glyph, the sentence in `title` and `aria-label`:
-   a pill would take the row's spare width and truncate the container name,
-   which is exactly the lesson the unlocked mark already records. */
-.shared-mark {
+/* Provenance remains subordinate to the row name, but WHO / ACCESS / DIRECTION
+   are now visible without hover. The full sentence lives on this one labelled
+   wrapper so assistive technology does not announce its decorative pieces. */
+.shared-meta {
   display: inline-flex;
   align-items: center;
+  gap: var(--space-1);
   flex: none;
+  min-width: 0;
+  max-width: 48%;
   margin-left: var(--space-1);
-  color: var(--text-muted);
+  color: var(--text-tertiary);
+  font-size: var(--sidebar-section-font);
+}
+
+.shared-meta--outgoing {
+  color: var(--accent-text);
+}
+
+.shared-meta__who {
+  overflow: hidden;
+  max-width: calc(var(--space-8) + var(--space-3));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shared-meta__access,
+.shared-meta__more {
+  flex: none;
+  font-weight: var(--sidebar-section-weight);
 }
 
 /* Received rows read as slightly quieter than the user's own: the content is
@@ -169,4 +298,10 @@ mur-tree-row:has(mur-row-menu.is-open) {
 .line--shared .row-label,
 .line--shared-item .row-label {
   color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shared-group__caret {
+    transition: none;
+  }
 }

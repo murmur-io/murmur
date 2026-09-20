@@ -839,7 +839,9 @@ app-shell.sidebar-collapsed {
   flex: none;
   flex-direction: column;
   gap: var(--sidebar-row-gap);
-  padding: 0 var(--space-2);
+  margin-top: var(--space-2);
+  padding: var(--space-3) var(--space-2) 0;
+  border-top: var(--border-width-thin) solid var(--border-subtle);
 }
 
 /* The menu floats OVER the tree, so it takes the OPAQUE overlay surface — the
