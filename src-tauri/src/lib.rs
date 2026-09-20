@@ -519,8 +519,6 @@ pub fn run() {
             commands::get_related_picker_bootstrap,
             commands::list_related_picker_items,
             commands::search_related_picker,
-            commands::plan_workspace_organization,
-            commands::apply_workspace_organization,
             commands::create_space,
             commands::create_folder,
             commands::rename_folder,
@@ -554,6 +552,9 @@ pub fn run() {
             commands::list_notes_typed,
             // Notes — selection Brain-assistant (WP4) + auto-organize (WP5) + link sharing (WP6).
             commands::note_assistant_action,
+            commands::plan_smart_organize,
+            commands::apply_smart_organize_plan,
+            commands::discard_smart_organize_plan,
             commands::plan_organize_notes,
             commands::apply_organize_plan,
             commands::share_note_to_link_doc,
@@ -586,6 +587,9 @@ pub fn run() {
                 }
             };
             app.manage(state);
+            // One RAM-only Smart-organize preview at a time; managed next to AppState so its
+            // lifetime is the app's, not a command's.
+            app.manage(commands::SmartOrganizePlanRegistry::new());
             // One Tauri-managed, process-local cancellation authority is shared by the MCP
             // transport and every relock entrypoint. It contains socket clones and content-free
             // lease ids only; no meeting data or authentication material.

@@ -140,7 +140,7 @@ test.describe("org-editable + library unification (mocked IPC)", () => {
     await expect(page.locator("app-note-document .origin-strip").getByText("Acme Inc.", { exact: true })).toBeVisible();
 
     // Back → /notes (B1).
-    await page.getByRole("button", { name: /notes/i }).first().click();
+    await page.getByRole("button", { name: "Notes", exact: true }).click();
     await expect(page).toHaveURL(/\/notes$/, { timeout: 10_000 });
   });
 

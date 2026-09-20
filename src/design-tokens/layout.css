@@ -148,6 +148,14 @@
   --destination-confirm-width: 27rem;
   --destination-border-width: 1px;
   --destination-touch-target: 44px;
+  --smart-organize-sheet-width: 44rem;
+  --smart-organize-card-min-width: 14rem;
+  --smart-organize-touch-target: 2.75rem;
+  --smart-organize-title-size: 1.05rem;
+  --smart-organize-body-size: 0.82rem;
+  --smart-organize-status-size: 0.78rem;
+  --smart-organize-focus-width: 2px;
+  --smart-organize-excluded-opacity: 0.5;
 
   /* Meeting workspace overlays and global account-session surfaces. */
   --meeting-command-provider-max: 14rem;

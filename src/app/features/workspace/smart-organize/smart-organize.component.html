@@ -1,0 +1,116 @@
+<div class="smart-scrim" appTeleportToBody (mousedown)="smart.close()">
+  <section
+    class="smart-sheet"
+    role="dialog"
+    aria-modal="true"
+    tabindex="-1"
+    aria-labelledby="smart-title"
+    (mousedown)="$event.stopPropagation()"
+    (keydown)="onDialogKeydown($event)"
+  >
+    <header class="smart-head">
+      <div class="smart-heading">
+        <span class="smart-mark" aria-hidden="true"><mur-icon icon="spaces" /></span>
+        <div><h2 id="smart-title">Smart organize</h2><p>Choose one clear rule, review every move, then apply.</p></div>
+      </div>
+      <button #closeButton type="button" class="icon-button" aria-label="Close Smart organize" [disabled]="smart.applying()" (click)="smart.close()"><mur-icon icon="close" /></button>
+    </header>
+
+    <div class="smart-body">
+      @if (smart.receipt(); as receipt) {
+        <section class="receipt" aria-labelledby="receipt-title">
+          <span class="receipt-mark" aria-hidden="true"><mur-icon icon="check" /></span>
+          <h3 id="receipt-title">Organization finished</h3>
+          <p>{{ receipt.applied.length }} moved · {{ receipt.failures.length }} need attention</p>
+          @if (receipt.applied.length > 0) {
+            <ul class="receipt-list">
+              @for (item of receipt.applied; track item.itemId) {
+                <li><strong>{{ item.title }}</strong><span>{{ item.fromBreadcrumb }} → {{ item.toBreadcrumb }}</span><mur-pill [kind]="item.bucketStatus === 'new' ? 'accent' : 'neutral'" [dot]="false">{{ item.bucketStatus === "new" ? "New folder" : "Existing folder" }}</mur-pill></li>
+              }
+            </ul>
+          }
+          @if (receipt.failures.length > 0) {
+            <ul class="receipt-list receipt-list--failures">
+              @for (failure of receipt.failures; track failure.itemId) {
+                <li><strong>{{ failure.title || "Item unavailable" }}</strong><span>{{ failure.reason }}</span></li>
+              }
+            </ul>
+          }
+          <button type="button" class="btn btn-primary" (click)="smart.previewAgain()">Preview again</button>
+        </section>
+      } @else {
+        <section class="step-section" aria-labelledby="scope-title">
+          <h3 id="scope-title" class="step-title"><span aria-hidden="true">1</span> Scope</h3>
+          <fieldset [disabled]="smart.busy() || !!smart.plan()">
+          <legend class="sr-only">Scope selection</legend>
+          <div class="kind-grid">
+            <label><input type="checkbox" [checked]="smart.noteKind()" [disabled]="smart.rule() === 'byRelation' || smart.source()?.containerId === null" (change)="onKind('note', $event)" /><mur-icon icon="notes" /><span><strong>Notes</strong><small>Authored notes</small></span></label>
+            <label><input type="checkbox" [checked]="smart.meetingKind()" [disabled]="smart.rule() === 'byRelation' || smart.source()?.containerId === null" (change)="onKind('meeting', $event)" /><mur-icon icon="meetings" /><span><strong>Recordings</strong><small>Meeting recordings</small></span></label>
+          </div>
+          <button type="button" class="place-row" (click)="smart.chooseSource($event)">
+            <mur-icon icon="folder" /><span><small>Place</small><strong>{{ smart.source()?.breadcrumb || "Choose a Workspace, folder, or Not classified" }}</strong></span><mur-icon icon="chevron-right" />
+          </button>
+          @if (smart.source()?.containerId === null && smart.source()) {
+            <button type="button" class="place-row" (click)="smart.chooseDestination($event)">
+              <mur-icon icon="folder-add" /><span><small>New folders go in</small><strong>{{ smart.destination()?.breadcrumb || "Choose a Workspace or folder" }}</strong></span><mur-icon icon="chevron-right" />
+            </button>
+          }
+          @if (smart.source()?.containerId) {
+            <div class="choice-row" role="radiogroup" aria-label="Scope depth">
+              <label><input type="radio" name="smart-depth" value="direct" [checked]="!smart.includeDescendants()" (change)="onDepth($event)" />This {{ smart.source()?.level === "project" ? "workspace" : "folder" }}</label>
+              <label><input type="radio" name="smart-depth" value="descendants" [checked]="smart.includeDescendants()" (change)="onDepth($event)" />{{ smart.source()?.level === "project" ? "Whole workspace" : "Folder and subfolders" }}</label>
+            </div>
+          }
+          </fieldset>
+        </section>
+
+        <section class="step-section" aria-labelledby="rule-title">
+          <h3 id="rule-title" class="step-title"><span aria-hidden="true">2</span> Rule</h3>
+          <fieldset [disabled]="smart.busy() || !!smart.plan()">
+          <legend class="sr-only">Organization rule</legend>
+          <div class="rule-grid" role="radiogroup" aria-label="Organization rule">
+            <label [class.is-selected]="smart.rule() === 'byDay'"><input type="radio" name="smart-rule" value="byDay" [checked]="smart.rule() === 'byDay'" (change)="onRule('byDay')" /><mur-icon icon="history" /><span><strong>A folder per day</strong><small>Clear YYYY-MM-DD folders from immutable dates.</small></span></label>
+            <label [class.is-selected]="smart.rule() === 'byRelation'"><input type="radio" name="smart-rule" value="byRelation" [checked]="smart.rule() === 'byRelation'" (change)="onRule('byRelation')" /><mur-icon icon="link" /><span><strong>Group related recordings</strong><small>Only direct, explicit relationship evidence counts.</small></span></label>
+          </div>
+          <p class="rule-sentence" aria-live="polite">{{ smart.ruleSentence() }}</p>
+          </fieldset>
+        </section>
+
+        <section class="review" aria-labelledby="review-title">
+          <div class="section-title"><h3 id="review-title"><span aria-hidden="true">3</span> Review</h3>@if (!smart.plan()) { <button type="button" class="btn btn-primary" [disabled]="!smart.request() || smart.busy()" (click)="smart.preview()">{{ smart.planning() ? "Building preview…" : "Preview moves" }}</button> }</div>
+          @if (smart.error(); as message) { <p class="alert" role="alert">{{ message }}</p> }
+          @if (smart.plan(); as plan) {
+            <dl class="summary"><div><dt>Scanned</dt><dd>{{ plan.totalScanned }}</dd></div><div><dt>To move</dt><dd>{{ smart.selectedCount() }}</dd></div><div><dt>Already there</dt><dd>{{ plan.alreadyThere }}</dd></div><div><dt>Deferred</dt><dd>{{ plan.deferred }}</dd></div><div><dt>New folders</dt><dd>{{ plan.newFolders }}</dd></div><div><dt>Existing folders</dt><dd>{{ plan.reusedFolders }}</dd></div></dl>
+            @if (smart.rule() === "byDay") { <p class="timezone-copy">Dates in this preview are frozen in {{ plan.timezoneLabel }}.</p> }
+            @if (plan.buckets.length === 0) { <div class="empty"><mur-icon icon="check" /><strong>No moves proposed</strong><span>Check the skipped and deferred counts, or edit your choices to try another scope or rule.</span></div> }
+            @if (smart.relationPageRange(); as range) { <p class="timezone-copy">{{ range }} in this preview. Relations are evaluated within this batch.</p> }
+            @if ((plan.nextPageOffset ?? null) !== null) { <button type="button" class="btn btn-ghost" [disabled]="smart.busy()" (click)="smart.previewNextBatch()">Preview next batch</button><p class="timezone-copy">Replaces this preview without applying any moves.</p> }
+            <div class="buckets">
+              @for (view of bucketViews(); track view.bucket.bucketId) {
+                @let bucket = view.bucket;
+                <article class="bucket">
+                  <header><label><input type="checkbox" [disabled]="smart.applying()" [checked]="view.checked" [indeterminate]="view.indeterminate" [attr.aria-label]="'Include ' + bucket.folderName" (change)="smart.toggleBucket(view.itemIds)" /></label><span><h4>{{ bucket.folderName }}</h4><small>{{ bucket.destinationBreadcrumb }}</small></span><mur-pill [kind]="bucket.status === 'new' ? 'accent' : 'neutral'" [dot]="false">{{ bucket.status === "new" ? "New folder" : "Existing folder" }}</mur-pill></header>
+                  <ul>
+                    @for (item of bucket.items; track item.itemId) {
+                      <li [class.is-excluded]="smart.excluded().has(item.itemId)"><label><input type="checkbox" [disabled]="smart.applying()" [checked]="!smart.excluded().has(item.itemId)" (change)="smart.toggleItem(item.itemId)" /><span><strong>{{ item.title }}</strong><small>{{ item.fromBreadcrumb }} → {{ bucket.destinationBreadcrumb }}</small><small>{{ item.reason }}</small></span></label></li>
+                    }
+                  </ul>
+                </article>
+              }
+            </div>
+            @if (plan.skipped.length > 0) {
+              <button type="button" class="skip-toggle" [attr.aria-expanded]="smart.expandedSkipped()" (click)="smart.expandedSkipped.update(value => !value)"><span>{{ plan.skipped.length }} not included</span><mur-icon icon="chevron-right" /></button>
+              @if (smart.expandedSkipped()) { <ul class="skipped">@for (item of plan.skipped; track item.code + ':' + item.itemId) { <li><strong>{{ item.title || item.code }}</strong><span>{{ item.reason }}</span></li> }</ul> }
+            }
+          } @else if (!smart.planning()) { <p class="review-placeholder">Preview shows every destination and reason before anything moves.</p> }
+        </section>
+      }
+    </div>
+
+    <footer class="smart-foot">
+      <span>{{ smart.receipt() ? "Applied results are shown above." : smart.uncertain() ? "Some items may have moved. Preview again to check the workspace." : smart.applying() ? "Applying the reviewed moves…" : "Nothing has moved yet." }}</span>
+      <button type="button" class="btn btn-ghost" [disabled]="smart.applying()" (click)="smart.close()">{{ smart.receipt() ? "Close" : "Cancel" }}</button>
+      @if (smart.plan()) { <button type="button" class="btn btn-ghost" [disabled]="smart.busy()" (click)="smart.editChoices()">Edit choices</button><button type="button" class="btn btn-primary" [disabled]="smart.selectedCount() === 0 || smart.busy()" (click)="smart.apply()">{{ smart.applying() ? "Applying…" : "Apply " + smart.selectedCount() + " moves" }}</button> }
+    </footer>
+  </section>
+</div>

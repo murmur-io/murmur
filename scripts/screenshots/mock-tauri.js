@@ -781,7 +781,7 @@ scope to the GA-critical path only.
   const CONTAINER_ITEMS = {
     // containerId `null` is the UNFILED inbox — recordings that belong to no
     // lockable container yet. It renders as the first section of the Spaces tree,
-    // above "File recordings with Brain", which is what that button acts on.
+    // above Smart organize, where it can be chosen explicitly as a recording scope.
     unfiled: {
       meeting: [
         IR("meeting", "m-unfiled-standup", "Monday standup", 0, 900),
@@ -1638,6 +1638,12 @@ scope to the GA-critical path only.
       // `list_*`/`get_*` with `[]`, which would make a command this app does not
       // have look exactly like a vault with nothing in it.
       case "get_related_picker_bootstrap": {
+        if (args?.mode === "scope") {
+          const availability = { selectable: true, here: false, self: false, descendant: false, locked: false, confirm: false, incompatible: false };
+          const containers = (nodes) => nodes.filter((node) => !node.locked).map((node) => ({ ...node, groups: [], folders: containers(node.folders), availability }));
+          return { spaces: RICH() ? containers(PICKER_SPACES) : [], unclassified: [], anchor: null,
+            destination: { sourceKind: "container", sourceLocked: false, currentContainerId: args.anchorId, currentPath: [args.anchorId], root: { kind: "unfiled", label: "Not classified", containerId: null, availability }, container: null } };
+        }
         // The anchor is `Q2 Roadmap Planning`, filed in Product / Project Atlas —
         // so the modal opens with exactly that path expanded and the anchor row
         // inside a bounded window that contains it.
@@ -1663,6 +1669,7 @@ scope to the GA-critical path only.
         };
       }
       case "list_related_picker_items": {
+        if (args?.mode === "scope") return { kind: args.kind, offset: args.offset ?? 0, items: [], total: 0 };
         const key = `${args?.containerId ?? "u"}|${args?.kind}`;
         const items = RICH() ? PICKER_ITEMS[key] || [] : [];
         const offset = args?.offset ?? 0;
@@ -1674,6 +1681,16 @@ scope to the GA-critical path only.
         };
       }
       case "search_related_picker": {
+        if (args?.mode === "scope") {
+          const query = String(args?.query ?? "").trim().toLowerCase();
+          const flatten = (nodes, path = []) => nodes.filter((node) => !node.locked).flatMap((node) => [
+            { id: node.id, name: node.name, level: node.level, breadcrumb: [...path, node.name], availability: { selectable: true, here: false, self: false, descendant: false, locked: false, confirm: false, incompatible: false } },
+            ...flatten(node.folders, [...path, node.name]),
+          ]);
+          const hits = (RICH() ? flatten(PICKER_SPACES) : []).filter((row) => row.name.toLowerCase().includes(query));
+          const offset = args?.offset ?? 0;
+          return { offset, containers: hits.slice(offset, offset + (args?.limit ?? 30)), hits: [], total: hits.length };
+        }
         const q = String(args?.query ?? "").trim().toLowerCase();
         const all = RICH()
           ? Object.values(PICKER_ITEMS).flat()
@@ -1913,6 +1930,15 @@ scope to the GA-critical path only.
       case "move_note_doc": case "delete_note": return null;
       case "export_note_doc": return `${VAULT}/Notes/Product/Atlas-PRD-v3.md`;
       case "plan_organize_notes": return { moves: [] };
+      // Complete Smart organize DTOs; specialized E2E supplies bounded rule fixtures.
+      // This demo starts with no eligible moves instead of returning an unknown-command null.
+      case "plan_smart_organize": return {
+        planId: "demo-smart-plan", totalScanned: 0, alreadyThere: 0, deferred: 0,
+        newFolders: 0, reusedFolders: 0, timezoneLabel: "this Mac’s local calendar", buckets: [], skipped: [], nextPageOffset: null,
+      };
+      case "apply_smart_organize_plan": return { applied: [], failures: [] };
+      case "discard_smart_organize_plan": return null;
+
       case "apply_organize_plan": return null;
       case "note_assistant_action":
         return {
