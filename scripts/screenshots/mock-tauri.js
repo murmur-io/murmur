@@ -1934,7 +1934,7 @@ scope to the GA-critical path only.
       // This demo starts with no eligible moves instead of returning an unknown-command null.
       case "plan_smart_organize": return {
         planId: "demo-smart-plan", totalScanned: 0, alreadyThere: 0, deferred: 0,
-        newFolders: 0, reusedFolders: 0, timezoneLabel: "this Mac’s local calendar", buckets: [], skipped: [],
+        newFolders: 0, reusedFolders: 0, timezoneLabel: "this Mac’s local calendar", buckets: [], skipped: [], nextPageOffset: null,
       };
       case "apply_smart_organize_plan": return { applied: [], failures: [] };
       case "discard_smart_organize_plan": return null;

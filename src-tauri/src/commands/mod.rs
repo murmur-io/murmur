@@ -10171,20 +10171,6 @@ fn move_note_command_body(
     Ok(())
 }
 
-/// Organizer apply is deliberately raw-open-only even though the public manual Move command keeps
-/// supporting already-unlocked sealed folders. The reviewed plan never proposes a locked target;
-/// if privacy changes between review and apply, the raw-open witnesses fail closed.
-fn file_recording_command_body(
-    app: &AppHandle,
-    state: &AppState,
-    meeting_id: String,
-    folder_id: Option<String>,
-) -> Result<(), AppError> {
-    move_note_inner_impl(state, meeting_id, folder_id)?;
-    emit_audit_updated_after_purge(app, state);
-    Ok(())
-}
-
 fn move_note_public_inner_impl(
     state: &AppState,
     meeting_id: String,

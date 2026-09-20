@@ -52,6 +52,30 @@ const ELIGIBLE_EDGE_PREDICATE: &str = "l.status = 'active'
 /// a third recording, and `org`/`container` endpoints are authorization edges, not user relations.
 const ENDPOINT_KINDS: &str = "('note', 'document', 'container')";
 
+/// macOS folder-name equality: case-insensitive Unicode canonical equivalence. Pure CF C API;
+/// owned string handles remain live across the call, with no Objective-C messaging or exceptions.
+#[cfg(target_os = "macos")]
+pub(crate) fn smart_organize_names_equal(left: &str, right: &str) -> bool {
+    use core_foundation::base::{CFComparisonResult, TCFType};
+    use core_foundation::string::{
+        kCFCompareCaseInsensitive, kCFCompareNonliteral, CFString, CFStringCompare,
+    };
+    let left = CFString::new(left);
+    let right = CFString::new(right);
+    // SAFETY: both immutable CFStringRefs are retained by the owned wrappers throughout the call.
+    unsafe {
+        CFStringCompare(
+            left.as_concrete_TypeRef(),
+            right.as_concrete_TypeRef(),
+            kCFCompareCaseInsensitive | kCFCompareNonliteral,
+        ) == CFComparisonResult::EqualTo
+    }
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn smart_organize_names_equal(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase()
+}
+
 impl Db {
     /// Authored notes (never meeting companions) owned by one of `container_ids`, newest event
     /// first, capped at `limit`. Returns `(rows, total_matching)` so the caller can report an
@@ -227,7 +251,6 @@ impl Db {
         let mut stmt = conn
             .prepare("SELECT id, name, COALESCE(locked, 0) FROM folders WHERE parent_id = ?1")
             .map_err(map_err)?;
-        let folded = name.to_lowercase();
         let rows = stmt
             .query_map(rusqlite::params![parent_id], |row| {
                 Ok((
@@ -241,7 +264,7 @@ impl Db {
             .map_err(map_err)?;
         let mut matches = rows
             .into_iter()
-            .filter(|(_, candidate, _)| candidate.to_lowercase() == folded)
+            .filter(|(_, candidate, _)| smart_organize_names_equal(candidate, name))
             .map(|(id, candidate, _)| (id, candidate))
             .collect::<Vec<_>>();
         matches.sort();

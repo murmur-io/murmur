@@ -104,6 +104,7 @@ fn request() -> SmartOrganizeRequest {
         kinds: vec![SmartOrganizeKind::Note],
         rule: SmartOrganizeRule::ByDay,
         destination_parent_id: "source".into(),
+        page_offset: 0,
     }
 }
 fn note(state: &AppState, id: &str) {
@@ -314,6 +315,7 @@ fn immutable_dates_batch_limit_and_wire_contract() {
         "newFolders",
         "reusedFolders",
         "timezoneLabel",
+        "nextPageOffset",
         "buckets",
         "skipped",
     ] {
@@ -338,6 +340,7 @@ fn immutable_dates_batch_limit_and_wire_contract() {
     );
     let request:SmartOrganizeRequest=serde_json::from_value(serde_json::json!({"sourceContainerId":null,"includeDescendants":false,"kinds":["meeting"],"rule":"byDay","destinationParentId":"space"})).unwrap();
     assert!(request.source_container_id.is_none());
+    assert_eq!(request.page_offset, 0);
 }
 #[test]
 fn local_midnight_and_per_event_dst_offsets_are_frozen() {
@@ -431,6 +434,7 @@ fn recording_plan(
                 SmartOrganizeRule::ByDay
             },
             destination_parent_id: "source".into(),
+            page_offset: 0,
         },
         &|_| Ok(0),
         capture_content_visibility_snapshot_under_lifecycle(state),
@@ -666,4 +670,99 @@ fn relation_removal_or_anchor_rename_refuses_before_creation() {
             Some("source")
         );
     }
+}
+#[test]
+fn relation_next_page_reaches_later_matches_without_writing() {
+    let (state, _) = fixture("relation-pages");
+    note(&state, "anchor");
+    for index in 0..52 {
+        recording(&state, &format!("m{index:02}"), Some("source"));
+    }
+    for id in ["m50", "m51"] {
+        link(&state, id, "anchor", "manual", "user", "active");
+    }
+    let count = state.db.list_containers().unwrap().len();
+    let (_, first) = recording_plan(&state, true, false);
+    assert!(first.buckets.is_empty());
+    assert_eq!(first.next_page_offset, Some(50));
+    assert_eq!(first.deferred, 2);
+    let mut request = SmartOrganizeRequest {
+        source_container_id: Some("source".into()),
+        include_descendants: false,
+        kinds: vec![SmartOrganizeKind::Meeting],
+        rule: SmartOrganizeRule::ByRelation,
+        destination_parent_id: "source".into(),
+        page_offset: 50,
+    };
+    let make = |request: &SmartOrganizeRequest| {
+        let _guard = lifecycle_guard(&state);
+        build_plan(
+            &state,
+            request,
+            &|_| Ok(0),
+            capture_content_visibility_snapshot_under_lifecycle(&state),
+        )
+    };
+    let (plan, second) = make(&request).unwrap();
+    assert_eq!(second.buckets[0].items.len(), 2);
+    assert_eq!(second.next_page_offset, None);
+    assert_eq!(second.deferred, 0);
+    assert_eq!(state.db.list_containers().unwrap().len(), count);
+    assert!(plan
+        .moves
+        .iter()
+        .all(|item| ["m50", "m51"].contains(&item.item_id.as_str())));
+    request.page_offset = u32::MAX;
+    let (_, empty) = make(&request).unwrap();
+    assert!(empty.buckets.is_empty());
+    assert_eq!(empty.next_page_offset, None);
+    assert_eq!(empty.deferred, 0);
+    request.rule = SmartOrganizeRule::ByDay;
+    assert!(make(&request).is_err());
+}
+#[cfg(target_os = "macos")]
+#[test]
+fn canonical_unicode_and_case_folder_collisions_are_refused() {
+    assert!(smart_organize_names_equal("CAFÉ", "cafe\u{301}"));
+    assert!(!smart_organize_names_equal("café", "cafe"));
+    let (state, _) = fixture("unicode-collision");
+    folder(
+        &state.db,
+        "one",
+        "CAFÉ",
+        Some("source"),
+        "meeting",
+        "folder",
+        false,
+    );
+    folder(
+        &state.db,
+        "two",
+        "cafe\u{301}",
+        Some("source"),
+        "meeting",
+        "folder",
+        false,
+    );
+    assert_eq!(
+        state
+            .db
+            .smart_organize_child_folders_case_folded("source", "Café")
+            .unwrap()
+            .len(),
+        2
+    );
+    let ids = ["a", "b", "c", "d"].map(str::to_string);
+    let edges = vec![
+        endpoint("a", "one"),
+        endpoint("b", "one"),
+        endpoint("c", "two"),
+        endpoint("d", "two"),
+    ];
+    let groups = group_by_relation(&ids, &edges, &|_, id| {
+        Some(if id == "one" { "CAFÉ" } else { "cafe\u{301}" }.into())
+    });
+    assert!(groups
+        .values()
+        .all(|group| *group == Grouping::Skip("nameCollision")));
 }

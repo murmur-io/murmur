@@ -259,3 +259,23 @@ test("Not classified requires a real destination through the same picker", async
   await sheet.getByRole("button", { name: "Preview moves" }).click();
   expect(await page.evaluate(() => (window as unknown as { __smartPlanArgs?: unknown[] }).__smartPlanArgs?.at(-1))).toEqual({ request: { sourceContainerId: null, destinationParentId: "space-1", includeDescendants: false, kinds: ["meeting"], rule: "byDay" } });
 });
+
+
+test("relation batches can reach later recordings without applying an earlier preview", async ({ page }) => {
+  await open(page);
+  const sheet = page.getByRole("dialog", { name: "Smart organize" });
+  await sheet.getByRole("radio", { name: /Group related recordings/ }).check();
+  await page.evaluate(() => {
+    const target = window as unknown as { __smartPlans: unknown[] };
+    target.__smartPlans = [
+      { planId: "page-1", totalScanned: 52, alreadyThere: 0, deferred: 2, newFolders: 0, reusedFolders: 0, timezoneLabel: "", buckets: [], skipped: [], nextPageOffset: 50 },
+      { planId: "page-2", totalScanned: 52, alreadyThere: 0, deferred: 0, newFolders: 0, reusedFolders: 0, timezoneLabel: "", buckets: [], skipped: [], nextPageOffset: null },
+    ];
+  });
+  await sheet.getByRole("button", { name: "Preview moves" }).click();
+  await sheet.getByRole("button", { name: "Preview next batch" }).click();
+  expect(await page.evaluate(() => (window as unknown as { __smartPlanArgs?: unknown[] }).__smartPlanArgs?.at(-1))).toEqual({ request: { sourceContainerId: "space-1", destinationParentId: "space-1", includeDescendants: true, kinds: ["meeting"], rule: "byRelation", pageOffset: 50 } });
+  await expect(sheet).toContainText("Recordings 51–52");
+  await expect(sheet.getByRole("button", { name: "Preview next batch" })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as { __smartWrites?: string[] }).__smartWrites ?? [])).toEqual([]);
+});

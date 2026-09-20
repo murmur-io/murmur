@@ -7,7 +7,9 @@ use crate::storage::models::{
     SmartOrganizeKind, SmartOrganizeMove, SmartOrganizePreview, SmartOrganizeReceipt,
     SmartOrganizeRequest, SmartOrganizeRule, SmartOrganizeSkip, SmartOrganizeSkipCode,
 };
-use crate::storage::smart_organize_store::{SmartOrganizeCandidateRow, SmartOrganizeEndpointRow};
+use crate::storage::smart_organize_store::{
+    smart_organize_names_equal, SmartOrganizeCandidateRow, SmartOrganizeEndpointRow,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
@@ -205,7 +207,6 @@ pub(crate) fn group_by_relation(
     // A bucket needs at least two in-batch recordings, and its name must be unambiguous. Two
     // different anchors whose labels case-fold together would merge unrelated groups, so both are
     // skipped rather than merged or suffixed with an unstable counter.
-    let mut folded_names: HashMap<String, usize> = HashMap::new();
     let mut named: Vec<((String, String), String, Vec<String>)> = Vec::new();
     for (anchor, mut items) in unique_anchor {
         items.sort();
@@ -223,15 +224,20 @@ pub(crate) fn group_by_relation(
             }
             continue;
         };
-        *folded_names.entry(label.to_lowercase()).or_default() += 1;
         named.push((anchor, label, items));
     }
-    for (anchor, label, items) in named {
-        let collides = folded_names
-            .get(&label.to_lowercase())
-            .copied()
-            .unwrap_or_default()
-            > 1;
+    // There are at most 25 viable anchors in a 50-recording batch; pairwise comparison keeps
+    // canonical equivalence exact without retaining or inventing a normalized label as identity.
+    let collisions = named
+        .iter()
+        .enumerate()
+        .map(|(index, (_, label, _))| {
+            named.iter().enumerate().any(|(other, (_, candidate, _))| {
+                index != other && smart_organize_names_equal(label, candidate)
+            })
+        })
+        .collect::<Vec<_>>();
+    for ((anchor, label, items), collides) in named.into_iter().zip(collisions) {
         for id in items {
             if collides {
                 result.insert(id, Grouping::Skip("nameCollision"));
@@ -357,24 +363,22 @@ fn relation_groups(
         endpoint_label(state, kind, id).ok()
     }))
 }
+struct CandidateBatch {
+    rows: Vec<(SmartOrganizeKind, SmartOrganizeCandidateRow)>,
+    total: u32,
+    already_there: u32,
+}
 fn collect_candidates(
     state: &AppState,
     scope: &[String],
     request: &SmartOrganizeRequest,
     offset_for_event: &dyn Fn(i64) -> Result<i32, AppError>,
-) -> Result<
-    (
-        Vec<(SmartOrganizeKind, SmartOrganizeCandidateRow)>,
-        u32,
-        u32,
-    ),
-    AppError,
-> {
+) -> Result<CandidateBatch, AppError> {
     let mut rows = Vec::new();
     let mut total = 0;
     let mut already = 0;
     for kind in &request.kinds {
-        let mut offset = 0;
+        let mut offset = request.page_offset as usize;
         let mut retained = 0;
         loop {
             let (page, count) = match kind {
@@ -389,7 +393,7 @@ fn collect_candidates(
                     offset,
                 )?,
             };
-            if offset == 0 {
+            if offset == request.page_offset as usize {
                 total += count;
             }
             let page_len = page.len();
@@ -441,7 +445,11 @@ fn collect_candidates(
             .then(a.1.id.cmp(&b.1.id))
     });
     rows.truncate(SMART_ORGANIZE_BATCH_LIMIT);
-    Ok((rows, total, already))
+    Ok(CandidateBatch {
+        rows,
+        total,
+        already_there: already,
+    })
 }
 fn item_readiness(state: &AppState, kind: SmartOrganizeKind, id: &str) -> Result<(), AppError> {
     if kind == SmartOrganizeKind::Meeting {
@@ -501,6 +509,11 @@ pub(crate) fn build_plan(
     {
         return Err(stale("Choose the item kinds"));
     }
+    if request.rule == SmartOrganizeRule::ByDay && request.page_offset != 0 {
+        return Err(stale(
+            "Day batches automatically reach the next unfiled items",
+        ));
+    }
     ensure_open_user_container_chain(&state.db, &request.destination_parent_id)?;
     if request
         .source_container_id
@@ -520,7 +533,11 @@ pub(crate) fn build_plan(
         Some(id) => resolve_scope(&state.db, id, request.include_descendants)?,
         None => BTreeSet::new(),
     };
-    let (candidates, total, previously_filed) = collect_candidates(
+    let CandidateBatch {
+        rows: candidates,
+        total,
+        already_there: previously_filed,
+    } = collect_candidates(
         state,
         &scope.iter().cloned().collect::<Vec<_>>(),
         request,
@@ -693,7 +710,19 @@ pub(crate) fn build_plan(
         plan_id: plan_id.clone(),
         total_scanned: total,
         already_there,
-        deferred: total.saturating_sub(candidates.len() as u32 + previously_filed),
+        deferred: total.saturating_sub(
+            request
+                .page_offset
+                .saturating_add(candidates.len() as u32 + previously_filed),
+        ),
+        next_page_offset: if request.rule == SmartOrganizeRule::ByRelation
+            && !candidates.is_empty()
+            && request.page_offset.saturating_add(candidates.len() as u32) < total
+        {
+            Some(request.page_offset.saturating_add(candidates.len() as u32))
+        } else {
+            None
+        },
         new_folders: buckets
             .iter()
             .filter(|b| b.status == SmartOrganizeBucketStatus::New)

@@ -2947,6 +2947,8 @@ export interface SmartOrganizePlanRequest {
   kinds: SmartOrganizeItemKind[];
   rule: SmartOrganizeRule;
   destinationParentId: string;
+  /** Read-only relation-batch navigation; each page needs a fresh preview. */
+  pageOffset?: number;
 }
 
 export interface SmartOrganizePreviewItem {
@@ -2993,6 +2995,7 @@ export interface SmartOrganizePlan {
   timezoneLabel: string;
   buckets: SmartOrganizeBucket[];
   skipped: SmartOrganizeSkippedItem[];
+  nextPageOffset: number | null;
 }
 
 export interface SmartOrganizeAppliedItem {

@@ -3032,6 +3032,9 @@ pub struct SmartOrganizeRequest {
     pub kinds: Vec<SmartOrganizeKind>,
     pub rule: SmartOrganizeRule,
     pub destination_parent_id: String,
+    /// Read-only pagination for relation batches; changing pages always creates a fresh plan.
+    #[serde(default)]
+    pub page_offset: u32,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -3101,6 +3104,7 @@ pub struct SmartOrganizePreview {
     pub timezone_label: String,
     pub buckets: Vec<SmartOrganizeBucket>,
     pub skipped: Vec<SmartOrganizeSkip>,
+    pub next_page_offset: Option<u32>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

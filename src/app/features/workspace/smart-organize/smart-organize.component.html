@@ -83,6 +83,8 @@
             <dl class="summary"><div><dt>Scanned</dt><dd>{{ plan.totalScanned }}</dd></div><div><dt>To move</dt><dd>{{ smart.selectedCount() }}</dd></div><div><dt>Already there</dt><dd>{{ plan.alreadyThere }}</dd></div><div><dt>Deferred</dt><dd>{{ plan.deferred }}</dd></div><div><dt>New folders</dt><dd>{{ plan.newFolders }}</dd></div><div><dt>Existing folders</dt><dd>{{ plan.reusedFolders }}</dd></div></dl>
             @if (smart.rule() === "byDay") { <p class="timezone-copy">Dates in this preview are frozen in {{ plan.timezoneLabel }}.</p> }
             @if (plan.buckets.length === 0) { <div class="empty"><mur-icon icon="check" /><strong>No moves proposed</strong><span>Check the skipped and deferred counts, or edit your choices to try another scope or rule.</span></div> }
+            @if (smart.relationPageRange(); as range) { <p class="timezone-copy">{{ range }} in this preview. Relations are evaluated within this batch.</p> }
+            @if ((plan.nextPageOffset ?? null) !== null) { <button type="button" class="btn btn-ghost" [disabled]="smart.busy()" (click)="smart.previewNextBatch()">Preview next batch</button><p class="timezone-copy">Replaces this preview without applying any moves.</p> }
             <div class="buckets">
               @for (view of bucketViews(); track view.bucket.bucketId) {
                 @let bucket = view.bucket;

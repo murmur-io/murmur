@@ -45,6 +45,12 @@ export class SmartOrganizeService {
   readonly uncertain = signal(false);
   readonly excluded = signal<ReadonlySet<string>>(new Set());
   readonly expandedSkipped = signal(false);
+  readonly pageOffset = signal(0);
+  readonly relationPageRange = computed(() => {
+    const plan = this.plan();
+    if (this.rule() !== "byRelation" || !plan || plan.totalScanned === 0) return null;
+    return `Recordings ${this.pageOffset() + 1}–${Math.min(this.pageOffset() + 50, plan.totalScanned)}`;
+  });
 
   readonly effectiveKinds = computed<readonly SmartOrganizeItemKind[]>(() => {
     if (this.rule() === "byRelation") return ["meeting"];
@@ -70,6 +76,7 @@ export class SmartOrganizeService {
       kinds: [...kinds],
       rule: this.rule(),
       destinationParentId: destination.containerId,
+      ...(this.rule() === "byRelation" && this.pageOffset() > 0 ? { pageOffset: this.pageOffset() } : {}),
     };
   });
 
@@ -84,7 +91,7 @@ export class SmartOrganizeService {
         : source.level === "project" ? "this workspace only" : "this folder only";
     const place = `“${source.breadcrumb}”${depth ? ` (${depth})` : ""}`;
     if (this.rule() === "byRelation") {
-      return `Group recordings in ${place} only when at least two point directly to the same note, document, or explicitly linked folder. Manual links, wikilinks, and accepted semantic links count; suggestions and companion links do not. Recordings with more than one possible group stay put for review. New folders will be created in “${destination?.breadcrumb ?? "choose a destination"}”.`;
+      return `Group recordings in ${place} only when at least two in the current batch point directly to the same note, document, or explicitly linked folder. Manual links, wikilinks, and accepted semantic links count; suggestions and companion links do not. Recordings with more than one possible group stay put for review. Each preview considers up to 50 recordings; use the next batch to review more. New folders will be created in “${destination?.breadcrumb ?? "choose a destination"}”.`;
     }
     const kinds = this.effectiveKinds();
     const basis = kinds.length === 2
@@ -244,12 +251,14 @@ export class SmartOrganizeService {
       this.plan.set(null);
       this.excluded.set(new Set());
       this.uncertain.set(false);
+      this.pageOffset.set(0);
       this.receipt.set(receipt);
       await this.workspace.reload();
     } catch (cause) {
       if (epoch !== this.epoch) return;
       this.plan.set(null);
       this.excluded.set(new Set());
+      this.pageOffset.set(0);
       this.uncertain.set(true);
       this.error.set(`${this.message(cause, "The result is uncertain.")} Preview again before applying anything else.`);
       await this.workspace.reload();
@@ -258,7 +267,15 @@ export class SmartOrganizeService {
     }
   }
 
-  previewAgain(): void { this.receipt.set(null); this.error.set(null); }
+  previewAgain(): void { this.pageOffset.set(0); this.receipt.set(null); this.error.set(null); }
+
+  async previewNextBatch(): Promise<void> {
+    const next = this.plan()?.nextPageOffset;
+    if (next == null || this.busy()) return;
+    this.changeInput();
+    this.pageOffset.set(next);
+    await this.preview();
+  }
 
   editChoices(): void {
     if (this.busy()) return;
@@ -281,6 +298,7 @@ export class SmartOrganizeService {
     this.planning.set(false);
     this.applying.set(false);
     this.uncertain.set(false);
+    this.pageOffset.set(0);
     this.source.set(null);
     this.destination.set(null);
     this.plan.set(null);
@@ -291,6 +309,7 @@ export class SmartOrganizeService {
   }
 
   private changeInput(): void {
+    this.pageOffset.set(0);
     const planId = this.plan()?.planId;
     this.plan.set(null);
     this.receipt.set(null);
