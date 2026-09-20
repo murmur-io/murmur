@@ -3176,6 +3176,15 @@ export interface OrgItemHeader {
    * the `/org-item/:id` viewer. Mirrors the Rust `OrgItemHeader.owned_source`.
    */
   ownedSource?: { kind: "document" | "meeting"; id: string; movable?: boolean } | null;
+  /**
+   * The permission the SENDER published this item with — read straight off the
+   * stored `org_items.access` column, so an item shared for editing no longer
+   * reports as view-only. An item filed inside a received CONTAINER is governed
+   * by that container's access instead (the backend overrides it), because a
+   * container share is one grant. Legacy rows read as `"view"`, which is also the
+   * fail-safe for an unexpected value. Mirrors the Rust `OrgItemHeader.access`.
+   */
+  access: "view" | "edit";
 }
 
 /** Result of importing a received Shared Brain replica into a local Workspace. */

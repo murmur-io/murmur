@@ -849,18 +849,38 @@ fn planned_from_share(
 pub fn list_container_share_status(
     state: State<'_, AppState>,
 ) -> Result<Vec<ContainerShareStatus>> {
-    let st = state.inner();
-    let org_names: HashMap<String, String> = st
+    list_container_share_status_inner(state.inner())
+}
+
+/// Outbound share status for every LOCAL container the caller may currently read.
+///
+/// LOCK GATE. A sealed container discloses its NAME and nothing else — the name is already out,
+/// because you must see a container in the sidebar to unlock it. Who it was shared with, at what
+/// permission, and the fact that it was shared OUT at all are NOT part of that disclosure, and this
+/// read is keyed by the local `folders.id`, so it is a gated read like any other. Every row is
+/// therefore filtered through `folder_is_unlocked`; an unknown folder fails CLOSED. A session
+/// unlock makes the row appear again, a relock removes it.
+///
+/// This is the authoritative filter. The sidebar's own suppression is defence in depth against a
+/// stale cache, not the gate.
+pub(crate) fn list_container_share_status_inner(
+    state: &AppState,
+) -> Result<Vec<ContainerShareStatus>> {
+    let org_names: HashMap<String, String> = state
         .db
         .list_org_states()?
         .into_iter()
         .map(|org| (org.org_id, org.name))
         .collect();
-    Ok(st
-        .db
-        .list_container_shares(None)?
-        .into_iter()
-        .map(|row| ContainerShareStatus {
+    // One gate call per share row. A folder is consulted once per row it owns rather than being
+    // cached, because the unlock set can change between rows only under a concurrent relock — and
+    // the fresher answer is the safer one.
+    let mut out = Vec::new();
+    for row in state.db.list_container_shares(None)? {
+        if !super::folder_is_unlocked(state, &row.folder_id)? {
+            continue;
+        }
+        out.push(ContainerShareStatus {
             org_name: org_names.get(&row.org_id).cloned().unwrap_or_default(),
             org_id: row.org_id,
             folder_id: row.folder_id,
@@ -868,8 +888,9 @@ pub fn list_container_share_status(
             access: row.access,
             is_root: row.is_root,
             state: row.state,
-        })
-        .collect())
+        });
+    }
+    Ok(out)
 }
 
 // ── The sweep that keeps a shared container live ──────────────────────────────────────────────
@@ -1258,7 +1279,12 @@ pub(crate) fn build_shared_workspace(state: &AppState) -> Result<SharedWorkspace
                 created_at: header.created_at,
                 org_id: org.org_id.clone(),
                 org_name: org.name.clone(),
-                access: "view".into(),
+                // The permission the sender granted for THIS item. A row filed under a received
+                // container has it overwritten with that container's access in `build_shared_node`,
+                // because a container share is a single grant over everything inside it — only a
+                // LOOSE item keeps its own. It used to be hardcoded `view`, which quietly understated
+                // an item shared for editing.
+                access: header.access,
                 position,
             };
             match parent.filter(|id| known.contains(id)) {

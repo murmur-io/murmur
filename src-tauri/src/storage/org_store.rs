@@ -4683,7 +4683,7 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT item_id, doc_id, title, author_hint, created_at, seq, source_kind
+                "SELECT item_id, doc_id, title, author_hint, created_at, seq, source_kind, access
                    FROM org_items
                   WHERE org_id = ?1 AND tombstoned = 0
                     AND COALESCE(source_kind, '') NOT IN ('task','container')
@@ -4705,6 +4705,13 @@ impl Db {
                     // enrich/override for the caller's own items via the local `org_shares` resolver.
                     kind: r.get::<_, Option<String>>(6)?,
                     owned_source: None,
+                    // One more column on the SAME bounded query, not a second lookup. Anything the
+                    // CHECK constraint should have excluded (a hand-edited or future value) reads
+                    // back as the least-privilege `view` rather than granting edit by accident.
+                    access: match r.get::<_, String>(7)?.as_str() {
+                        "edit" => "edit".to_string(),
+                        _ => "view".to_string(),
+                    },
                 })
             })
             .map_err(map_err)?;
