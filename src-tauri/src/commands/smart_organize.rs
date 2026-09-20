@@ -829,6 +829,9 @@ fn validate_source(
     plan: &StoredPlan,
     item: &AuthorizedMove,
 ) -> Result<(), AppError> {
+    // Under-lifecycle writers assume their caller has refused unfinished filesystem recovery.
+    // Recheck at both admissions: a failed inverse rename revokes path mutation authority.
+    state.db.ensure_container_move_ready()?;
     require_current_content_visibility_snapshot_under_lifecycle(state, plan.visibility)?;
     if current_owner(state, item)? != item.source_container_id {
         return Err(stale("The item left its reviewed source"));

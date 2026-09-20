@@ -322,7 +322,7 @@ The three structural changes 2.0 made. Everything above lives inside them.
 - **Lock a workspace and everything inside it is sealed with it.** A project lock cascades to each child
   folder in its own right, so every existing visibility gate applies unchanged.
 - **Review-first Smart organize.** Choose notes and/or recordings, a Workspace or folder scope, and a deterministic day or direct-relation rule; you
-  review the plan and nothing moves until you approve it.
+  review up to 50 moves and nothing moves until you approve it. Not classified recordings can be filed into a separately chosen destination; relation previews let you step through later batches.
 
 <p align="center">
   <img src="docs/screenshots/spaces-locked.png" alt="A sealed workspace discloses its name and nothing else" width="820">

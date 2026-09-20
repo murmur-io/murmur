@@ -766,3 +766,44 @@ fn canonical_unicode_and_case_folder_collisions_are_refused() {
         .values()
         .all(|group| *group == Grouping::Skip("nameCollision")));
 }
+#[test]
+fn pending_container_move_recovery_refuses_filing_before_folder_creation() {
+    for after_admission in [false, true] {
+        let (state, _) = fixture("pending-container-recovery");
+        note(&state, "n");
+        // Reuse is crucial: creation has its own admission, but an existing target reaches
+        // the under-lifecycle note writer directly and previously bypassed recovery entirely.
+        folder(
+            &state.db,
+            "target",
+            "2023-11-14",
+            Some("source"),
+            "meeting",
+            "folder",
+            false,
+        );
+        let (plan, _) = plan(&state);
+        let selected = plan.moves.clone();
+        let count = state.db.list_containers().unwrap().len();
+        let pending = || {
+            state.db.lock().execute(
+                "INSERT INTO container_move_journal(container_id,old_parent,new_parent,old_path,new_path,intended_level,phase,payload) VALUES('source','space','space','source','moved','folder','prepared','{}')",
+                [],
+            ).unwrap();
+        };
+        if !after_admission {
+            pending();
+        }
+        let receipt = apply_plan_inner_with_hook(&state, plan, selected, |_| {
+            if after_admission {
+                pending();
+            }
+        })
+        .unwrap();
+        assert!(receipt.applied.is_empty());
+        assert_eq!(receipt.failures.len(), 1);
+        assert_eq!(state.db.note_gate_anchor("n").unwrap().unwrap().0, "source");
+        assert_eq!(state.db.list_containers().unwrap().len(), count);
+        assert!(state.db.ensure_container_move_ready().is_err());
+    }
+}
