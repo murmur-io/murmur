@@ -628,6 +628,13 @@ fn a_loose_received_item_keeps_the_access_it_was_shared_with() {
     seed_org(&db, "o1", "Siema");
     received_item_with_access(&db, "o1", "i-edit", "Wycena", None, "edit");
     received_item_with_access(&db, "o1", "i-view", "Notatki", None, "view");
+    let headers = db.list_org_items("o1").unwrap();
+    let header = headers.iter().find(|row| row.item_id == "i-edit").unwrap();
+    let wire = serde_json::to_value(header).unwrap();
+    assert_eq!(wire["access"], "edit");
+    assert_eq!(wire["itemId"], "i-edit");
+    assert!(wire.get("authorHint").is_some());
+    assert!(wire.as_object().unwrap().keys().all(|key| !key.contains('_')));
     let state = state_with(db);
 
     let workspace = build_shared_workspace(&state).unwrap();

@@ -8,6 +8,7 @@ import {
 } from "@angular/core";
 
 import { IpcService } from "../core/ipc.service";
+import { AskHistoryPrivacyBarrierService } from "../core/ask-history-privacy-barrier.service";
 import type {
   ContainerShareStatus,
   OrgAccess,
@@ -35,6 +36,7 @@ import type {
 @Injectable({ providedIn: "root" })
 export class SharedWorkspaceService {
   private readonly ipc = inject(IpcService);
+  private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
   private readonly destroyRef = inject(DestroyRef);
 
   private readonly _spaces = signal<SharedContainerNode[]>([]);
@@ -82,26 +84,33 @@ export class SharedWorkspaceService {
     );
   });
 
-  /** The org an item was published to on its own, keyed `<kind>:<id>`. */
+  /** Every org an item was published to on its own, keyed `<kind>:<id>`. */
   readonly shareByItem = computed(() => {
-    const map = new Map<string, OrgShareTargetRow>();
+    const map = new Map<string, OrgShareTargetRow[]>();
     for (const target of this._shareTargets()) {
-      map.set(`${target.kind}:${target.id}`, target);
+      const key = `${target.kind}:${target.id}`;
+      const targets = map.get(key) ?? [];
+      targets.push(target);
+      map.set(key, targets);
     }
     return map;
   });
 
-  /** The container share for one local folder, if this device publishes it. */
+  /** Every container share for one local folder, if this device publishes it. */
   readonly shareByFolder = computed(() => {
-    const map = new Map<string, ContainerShareStatus>();
+    const map = new Map<string, ContainerShareStatus[]>();
     for (const share of this._containerShares()) {
-      map.set(share.folderId, share);
+      const shares = map.get(share.folderId) ?? [];
+      shares.push(share);
+      map.set(share.folderId, shares);
     }
     return map;
   });
 
   /** Bumped per load so a late (stale) reload result is dropped. */
   private loadSeq = 0;
+  /** Local privacy authority is independent of the received org replica. */
+  private privacyGeneration = 0;
   private feedUnlisten: (() => void) | null = null;
   private feedDestroyed = false;
   /**
@@ -121,6 +130,14 @@ export class SharedWorkspaceService {
   };
 
   constructor() {
+    const unregisterPrivacy = this.privacyBarrier.registerInvalidator(() => {
+      // Relock can arrive while an IPC response is in flight. Scrub first and
+      // invalidate that response even if the subsequent gated reload fails.
+      ++this.privacyGeneration;
+      this._containerShares.set([]);
+      this._shareTargets.set([]);
+      if (this.privacyBarrier.ready()) void this.load();
+    });
     // A workspace mutation can change what a shared container HOLDS — a note
     // created in it, moved out of it, or deleted. Reconcile straight away so
     // "the folder is live" is true in seconds rather than at the next
@@ -133,6 +150,7 @@ export class SharedWorkspaceService {
     });
     window.addEventListener("focus", this.onWindowFocus);
     this.destroyRef.onDestroy(() => {
+      unregisterPrivacy();
       // A root service is never actually destroyed in practice; honor the
       // contract in case a test harness tears it down.
       this.feedDestroyed = true;
@@ -177,15 +195,22 @@ export class SharedWorkspaceService {
    */
   async load(): Promise<void> {
     const seq = ++this.loadSeq;
+    const privacyGeneration = this.privacyGeneration;
     this._loading.set(true);
     try {
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (seq !== this.loadSeq) return;
       // `allSettled`, not `all`: one unreachable read must not discard the two that succeeded.
       // What changes is that a rejection is now RECORDED rather than silently becoming an empty
       // list — the difference between "nothing is shared with you" and "we could not find out".
       const [workspace, shares, targets] = await Promise.allSettled([
         this.ipc.listSharedWorkspace(),
-        this.ipc.listContainerShareStatus(),
-        this.ipc.listOrgShareTargets(),
+        privacyReady
+          ? this.ipc.listContainerShareStatus()
+          : Promise.reject(new Error("Sharing metadata unavailable securely")),
+        privacyReady
+          ? this.ipc.listOrgShareTargets()
+          : Promise.reject(new Error("Sharing metadata unavailable securely")),
       ]);
       const failed =
         workspace.status === "rejected" ||
@@ -195,18 +220,20 @@ export class SharedWorkspaceService {
         return;
       }
       this._loadFailed.set(failed);
-      // Each leg applies only if it actually resolved. A rejected leg leaves its previous value
-      // alone rather than clearing it, so a partial failure never erases rows the user can still
-      // legitimately see.
+      // Received replicas belong to the org-disclosed domain and may stay cached.
+      // Outbound metadata depends on local lock gates: a failed read cannot renew
+      // permission to display an earlier destination/access value after a relock.
       if (workspace.status === "fulfilled" && workspace.value) {
         this.applyWorkspace(workspace.value);
       }
-      if (shares.status === "fulfilled") {
-        this._containerShares.set(shares.value);
-      }
-      if (targets.status === "fulfilled") {
-        this._shareTargets.set(targets.value);
-      }
+      const outboundVisible =
+        privacyGeneration === this.privacyGeneration && this.privacyBarrier.ready();
+      this._containerShares.set(
+        outboundVisible && shares.status === "fulfilled" ? shares.value : [],
+      );
+      this._shareTargets.set(
+        outboundVisible && targets.status === "fulfilled" ? targets.value : [],
+      );
     } finally {
       if (seq === this.loadSeq) {
         this._loading.set(false);

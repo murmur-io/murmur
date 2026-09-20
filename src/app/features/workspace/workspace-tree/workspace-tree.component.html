@@ -1,3 +1,32 @@
+<ng-template #sharedMetadata let-meta>
+  @if (meta) {
+    <span
+      class="shared-meta"
+      [class.shared-meta--incoming]="meta.direction === 'incoming'"
+      [class.shared-meta--outgoing]="meta.direction === 'outgoing'"
+      [attr.data-direction]="meta.direction"
+      role="img"
+      [attr.aria-label]="meta.description"
+      [title]="meta.description"
+    >
+      <span class="shared-meta__who" aria-hidden="true">{{ meta.who }}</span>
+      @if (meta.additionalRecipients) {
+        <span class="shared-meta__more" aria-hidden="true">+{{ meta.additionalRecipients }}</span>
+      }
+      <span class="shared-meta__access" aria-hidden="true">{{ meta.access === "mixed" ? "View/Edit" : meta.access === "edit" ? "Edit" : "View" }}</span>
+      <svg viewBox="0 0 12 12" width="12" height="12" fill="none" aria-hidden="true">
+        <path
+          [attr.d]="meta.direction === 'incoming' ? 'M2.5 2.5 9.5 9.5M5.5 9.5h4v-4' : 'M9.5 9.5 2.5 2.5M6.5 2.5h-4v4'"
+          stroke="currentColor"
+          stroke-width="1.3"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+    </span>
+  }
+</ng-template>
+
 <!-- Loading must never hide rows that are already cached: the spinner is gated
      on emptiness AND loading, so the first visit shows it and every return
      shows the previous tree while the (still unconditional) reload replaces it
@@ -23,8 +52,8 @@
   }
   <div
     class="tree"
-    role="tree"
-    [attr.aria-label]="isOwnScope() ? 'Workspaces' : 'Shared'"
+    [attr.role]="isOwnScope() ? 'tree' : null"
+    [attr.aria-label]="isOwnScope() ? 'Workspaces' : null"
   >
     @if (isOwnScope()) {
       @if (unfiledRecordings(); as inbox) {
@@ -63,6 +92,10 @@
                 (dragend)="onDragEnd()"
                 (activate)="openItem(item)"
               >
+                <ng-container
+                  [ngTemplateOutlet]="sharedMetadata"
+                  [ngTemplateOutletContext]="{ $implicit: unfiledSharedMeta().get(item.kind + ':' + item.id) }"
+                />
                 <mur-row-menu
                   [label]="'Actions for recording ' + itemTitle(item)"
                 >
@@ -128,7 +161,12 @@
                 [icon]="kindIcon(item.kind)"
                 [selected]="isItemSelected(item)"
                 (activate)="openItem(item)"
-              />
+              >
+                <ng-container
+                  [ngTemplateOutlet]="sharedMetadata"
+                  [ngTemplateOutletContext]="{ $implicit: unfiledSharedMeta().get(item.kind + ':' + item.id) }"
+                />
+              </mur-tree-row>
             }
             @if (inbox.total > inbox.items.length) {
               <button
@@ -146,7 +184,8 @@
         }
       }
     }
-    @for (line of lines(); track line.key) {
+    <ng-template #treeRows let-rowLines>
+    @for (line of rowLines; track line.key) {
       @if (line.item; as item) {
         <!-- An ITEM row: a leaf, so the gutter renders the equal-width spacer
              and its icon aligns with every other row at this depth. The
@@ -172,36 +211,10 @@
             (dragend)="onDragEnd()"
             (activate)="openItem(item)"
           >
-            @if (sharedMark(line); as mark) {
-              <span
-                class="shared-mark"
-                role="img"
-                [attr.aria-label]="mark"
-                [title]="mark"
-              >
-                <svg
-                  viewBox="0 0 16 16"
-                  width="12"
-                  height="12"
-                  fill="none"
-                  aria-hidden="true"
-                >
-                  <circle
-                    cx="8"
-                    cy="4.8"
-                    r="2.1"
-                    stroke="currentColor"
-                    stroke-width="1.3"
-                  />
-                  <path
-                    d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0"
-                    stroke="currentColor"
-                    stroke-width="1.3"
-                    stroke-linecap="round"
-                  />
-                </svg>
-              </span>
-            }
+            <ng-container
+              [ngTemplateOutlet]="sharedMetadata"
+              [ngTemplateOutletContext]="{ $implicit: line.sharedMeta }"
+            />
             <mur-row-menu
               [label]="'Actions for ' + item.kind + ' ' + itemTitle(item)"
             >
@@ -257,36 +270,10 @@
           [selected]="isSharedItemSelected(sharedItem)"
           (activate)="openSharedItem(sharedItem)"
         >
-          @if (sharedMark(line); as mark) {
-            <span
-              class="shared-mark"
-              role="img"
-              [attr.aria-label]="mark"
-              [title]="mark"
-            >
-              <svg
-                viewBox="0 0 16 16"
-                width="12"
-                height="12"
-                fill="none"
-                aria-hidden="true"
-              >
-                <circle
-                  cx="8"
-                  cy="4.8"
-                  r="2.1"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                />
-                <path
-                  d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                  stroke-linecap="round"
-                />
-              </svg>
-            </span>
-          }
+          <ng-container
+            [ngTemplateOutlet]="sharedMetadata"
+            [ngTemplateOutletContext]="{ $implicit: line.sharedMeta }"
+          />
         </mur-tree-row>
       } @else if (line.shared; as shared) {
         <!-- A RECEIVED container: a shared Workspace, a shared folder, or the
@@ -341,36 +328,10 @@
               }
             </mur-row-menu>
           }
-          @if (sharedMark(line); as mark) {
-            <span
-              class="shared-mark"
-              role="img"
-              [attr.aria-label]="mark"
-              [title]="mark"
-            >
-              <svg
-                viewBox="0 0 16 16"
-                width="12"
-                height="12"
-                fill="none"
-                aria-hidden="true"
-              >
-                <circle
-                  cx="8"
-                  cy="4.8"
-                  r="2.1"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                />
-                <path
-                  d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                  stroke-linecap="round"
-                />
-              </svg>
-            </span>
-          }
+          <ng-container
+            [ngTemplateOutlet]="sharedMetadata"
+            [ngTemplateOutletContext]="{ $implicit: line.sharedMeta }"
+          />
         </mur-tree-row>
       } @else if (line.container; as container) {
         <!-- A CONTAINER row: a Project or a Folder. A sealed-and-not-unlocked
@@ -538,39 +499,10 @@
               }
             }
           </mur-row-menu>
-          @if (sharedMark(line); as mark) {
-            <!-- Same discipline as the unlocked mark below, for the same reason:
-                 one dim glyph, the sentence on hover and for a screen reader. A
-                 pill would take the row's spare width and truncate the name. -->
-            <span
-              class="shared-mark"
-              role="img"
-              [attr.aria-label]="mark"
-              [title]="mark"
-            >
-              <svg
-                viewBox="0 0 16 16"
-                width="12"
-                height="12"
-                fill="none"
-                aria-hidden="true"
-              >
-                <circle
-                  cx="8"
-                  cy="4.8"
-                  r="2.1"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                />
-                <path
-                  d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                  stroke-linecap="round"
-                />
-              </svg>
-            </span>
-          }
+          <ng-container
+            [ngTemplateOutlet]="sharedMetadata"
+            [ngTemplateOutletContext]="{ $implicit: line.sharedMeta }"
+          />
           @if (container.locked && container.unlocked) {
             <!-- A WORD here cost the project its name: the pill took the row's
                  spare width and truncated "Prywatne" to "P…". The state still
@@ -610,6 +542,68 @@
           }
         </mur-tree-row>
       }
+    }
+    </ng-template>
+    @if (isOwnScope()) {
+      <ng-container
+        [ngTemplateOutlet]="treeRows"
+        [ngTemplateOutletContext]="{ $implicit: lines() }"
+      />
+    } @else {
+      @for (group of sharedGroups(); track group.key) {
+        <section
+          class="shared-group"
+          [class.shared-group--items]="group.kind === 'items'"
+        >
+          <button
+            type="button"
+            class="shared-group__heading"
+            [id]="group.headingId"
+            [attr.aria-expanded]="group.expanded"
+            [attr.aria-controls]="group.treeId"
+            [attr.aria-label]="group.label + ', ' + group.count + (group.count === 1 ? ' item' : ' items')"
+            (click)="toggleSharedGroup(group)"
+          >
+            <svg
+              class="shared-group__caret"
+              [class.is-open]="group.expanded"
+              viewBox="0 0 12 12"
+              width="11"
+              height="11"
+              aria-hidden="true"
+            >
+              <path d="M4.5 2.5 8 6l-3.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none" />
+            </svg>
+            <span class="shared-group__label" aria-hidden="true">
+              <span class="shared-group__org" [title]="group.orgName">{{ group.orgName }}</span>
+              <span class="shared-group__type">{{ group.typeLabel }}</span>
+            </span>
+            <span class="count shared-group__count" aria-hidden="true">{{ group.count }}</span>
+          </button>
+          @if (group.expanded) {
+            <div
+              class="shared-group__tree"
+              role="tree"
+              [id]="group.treeId"
+              [attr.aria-labelledby]="group.headingId"
+            >
+              <ng-container
+                [ngTemplateOutlet]="treeRows"
+                [ngTemplateOutletContext]="{ $implicit: group.lines }"
+              />
+            </div>
+          }
+        </section>
+      }
+      <button
+        type="button"
+        class="shared-overview"
+        [attr.aria-current]="currentPath() === '/shared-brains' ? 'page' : null"
+        (click)="openSharedOverview()"
+      >
+        Browse all shared content
+        <span aria-hidden="true">→</span>
+      </button>
     }
   </div>
 }

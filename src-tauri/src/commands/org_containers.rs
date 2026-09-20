@@ -866,15 +866,14 @@ pub fn list_container_share_status(
 pub(crate) fn list_container_share_status_inner(
     state: &AppState,
 ) -> Result<Vec<ContainerShareStatus>> {
+    let _lifecycle = super::lifecycle_guard(state);
     let org_names: HashMap<String, String> = state
         .db
         .list_org_states()?
         .into_iter()
         .map(|org| (org.org_id, org.name))
         .collect();
-    // One gate call per share row. A folder is consulted once per row it owns rather than being
-    // cached, because the unlock set can change between rows only under a concurrent relock — and
-    // the fresher answer is the safer one.
+    // The lifecycle interval keeps the gate and the metadata read atomic with relock.
     let mut out = Vec::new();
     for row in state.db.list_container_shares(None)? {
         if !super::folder_is_unlocked(state, &row.folder_id)? {
@@ -1518,6 +1517,7 @@ pub fn list_org_share_targets(
     state: State<'_, AppState>,
 ) -> Result<Vec<OrgShareTargetRow>> {
     let st = state.inner();
+    let _lifecycle = super::lifecycle_guard(st);
     let org_names: HashMap<String, String> = st
         .db
         .list_org_states()?
