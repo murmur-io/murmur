@@ -19,10 +19,6 @@ import { filter, map } from "rxjs";
 import { TabsService } from "../core/tabs.service";
 import { AskHistoryPrivacyBarrierService } from "../core/ask-history-privacy-barrier.service";
 import { IpcService } from "../core/ipc.service";
-import type {
-  WorkspaceOrganizeFailure,
-  WorkspaceOrganizeMove,
-} from "../core/models";
 import {
   MurIconComponent,
   type ShellIcon,
@@ -48,11 +44,8 @@ import {
   type WorkspaceCreateRequest,
 } from "../features/workspace/workspace-create-sheet/workspace-create-sheet.component";
 import { workspaceDestinations } from "../features/workspace/workspace-destination";
-import { WorkspaceOrganizeSheetComponent } from "../features/workspace/workspace-organize-sheet/workspace-organize-sheet.component";
-import type {
-  WorkspaceOrganizeAttemptReceipt,
-  WorkspaceOrganizeViewPlan,
-} from "../features/workspace/workspace-organize-sheet/workspace-organize-sheet.component";
+import { SmartOrganizeComponent } from "../features/workspace/smart-organize/smart-organize.component";
+import { SmartOrganizeService } from "../features/workspace/smart-organize/smart-organize.service";
 import { WorkspaceTreeComponent } from "../features/workspace/workspace-tree/workspace-tree.component";
 import { DocumentPreviewService } from "../services/document-preview.service";
 import { FolderLockFlowService } from "../services/folder-lock-flow.service";
@@ -125,7 +118,7 @@ const BROWSE_EXPANDED_KEY = "murmur.shell.browseExpanded";
     MurTabStripComponent,
     WorkspaceTreeComponent,
     WorkspaceCreateSheetComponent,
-    WorkspaceOrganizeSheetComponent,
+    SmartOrganizeComponent,
     LockSharesDialogComponent,
     DocumentPreviewComponent,
     ReminderComposerComponent,
@@ -158,6 +151,7 @@ export class AppShellComponent {
   private readonly trash = inject(TrashService);
   private readonly reminderComposer = inject(ReminderComposerService);
   protected readonly workspace = inject(WorkspaceService);
+  protected readonly smartOrganize = inject(SmartOrganizeService);
 
   readonly reminderCount = this.reminders.dueInboxCount;
   /**
@@ -214,24 +208,12 @@ export class AppShellComponent {
   readonly unlockedCount = this.folders.unlockedCount;
   readonly relockingAll = signal(false);
   readonly toasts = this.toast.toasts;
-  readonly workspaceOrganizePlanning = signal(false);
-  readonly workspaceOrganizeApplying = signal(false);
-  readonly workspaceOrganizePlan = signal<WorkspaceOrganizeViewPlan | null>(
-    null,
-  );
-  private workspaceOrganizePlanGeneration = 0;
   readonly workspaceCreateOpen = signal(false);
   readonly workspaceCreateKind = signal<WorkspaceCreateKind>("space");
   readonly workspaceCreateBusy = signal(false);
   readonly workspaceCreateError = signal<string | null>(null);
   readonly workspaceDestinations = computed(() =>
     workspaceDestinations(this.workspace.forest()),
-  );
-  readonly workspaceOrganizeDisabled = computed(
-    () =>
-      this.workspace.unfiledRecordings().total === 0 ||
-      this.workspaceOrganizePlanning() ||
-      this.workspaceOrganizeApplying(),
   );
   readonly relockAllAriaLabel = computed(() => {
     const count = this.unlockedCount();
@@ -246,14 +228,14 @@ export class AppShellComponent {
 
   constructor() {
     const unregisterPrivacy = this.privacyBarrier.registerInvalidator(() =>
-      this.scrubWorkspaceOrganization(),
+      this.smartOrganize.scrub(),
     );
     // Listener installation stays demand-driven in plan/apply below. Starting
     // it from the always-mounted shell would turn later route consumers into
     // implicit retries after a registration failure.
     this.destroyRef.onDestroy(() => {
       unregisterPrivacy();
-      this.scrubWorkspaceOrganization();
+      this.smartOrganize.scrub();
     });
     void this.reminders.initSummary();
     // Seed the Trash badge on a cold start: without this it reads 0 until either
@@ -507,193 +489,6 @@ export class AppShellComponent {
   newReminder(): void {
     this.closeCreateMenu();
     this.reminderComposer.openCreate();
-  }
-
-  async planWorkspaceOrganization(
-    guidance: string | null = null,
-    replace = false,
-  ): Promise<void> {
-    if (
-      this.workspaceOrganizeDisabled() ||
-      (this.workspaceOrganizePlan() && !replace)
-    ) {
-      return;
-    }
-    const generation = ++this.workspaceOrganizePlanGeneration;
-    this.workspaceOrganizePlanning.set(true);
-    try {
-      const privacyReady = await this.privacyBarrier.ensureReady();
-      if (generation !== this.workspaceOrganizePlanGeneration) {
-        return;
-      }
-      if (!privacyReady) {
-        this.scrubWorkspaceOrganization();
-        return;
-      }
-      const plan = await this.ipc.planWorkspaceOrganization(guidance);
-      if (generation !== this.workspaceOrganizePlanGeneration) {
-        return;
-      }
-      this.workspaceOrganizePlan.set({
-        ...plan,
-        receipt: null,
-        applyError: null,
-      });
-    } catch {
-      if (generation === this.workspaceOrganizePlanGeneration) {
-        this.toast.danger(
-          "Brain couldn’t plan the organization. Please try again.",
-        );
-      }
-    } finally {
-      if (generation === this.workspaceOrganizePlanGeneration) {
-        this.workspaceOrganizePlanning.set(false);
-      }
-    }
-  }
-
-  async replanWorkspaceOrganization(guidance: string): Promise<void> {
-    await this.planWorkspaceOrganization(guidance || null, true);
-  }
-
-  async applyWorkspaceOrganization(
-    moves: WorkspaceOrganizeMove[],
-  ): Promise<void> {
-    if (
-      moves.length === 0 ||
-      this.workspaceOrganizePlanning() ||
-      this.workspaceOrganizeApplying()
-    ) {
-      return;
-    }
-    const plan = this.workspaceOrganizePlan();
-    if (!plan) {
-      return;
-    }
-    const generation = this.workspaceOrganizePlanGeneration;
-    this.workspaceOrganizeApplying.set(true);
-    try {
-      const privacyReady = await this.privacyBarrier.ensureReady();
-      if (generation !== this.workspaceOrganizePlanGeneration) {
-        return;
-      }
-      if (!privacyReady) {
-        this.scrubWorkspaceOrganization();
-        return;
-      }
-      const result = await this.ipc.applyWorkspaceOrganization(moves);
-      if (generation !== this.workspaceOrganizePlanGeneration) {
-        return;
-      }
-      await this.workspace.reload();
-      if (generation !== this.workspaceOrganizePlanGeneration) {
-        return;
-      }
-      const receipt = this.mergeWorkspaceOrganizeReceipt(
-        plan.receipt,
-        moves,
-        result.appliedIds,
-        result.failures,
-      );
-      if (receipt.failures.length === 0) {
-        this.workspaceOrganizePlan.set(null);
-      } else {
-        this.workspaceOrganizePlan.set({
-          ...plan,
-          receipt,
-          applyError: null,
-        });
-      }
-      const applied = result.appliedIds.length;
-      const failed = receipt?.failures.length ?? result.failures.length;
-      if (failed > 0) {
-        const appliedCopy =
-          applied === 0
-            ? "No recordings organized"
-            : `${applied} ${applied === 1 ? "recording" : "recordings"} organized`;
-        this.toast.danger(
-          `${appliedCopy}; ${failed} still need attention. Review the filing result.`,
-        );
-      } else {
-        this.toast.success(
-          `${applied} ${applied === 1 ? "recording" : "recordings"} organized`,
-        );
-      }
-    } catch {
-      if (generation !== this.workspaceOrganizePlanGeneration) {
-        return;
-      }
-      await this.workspace.reload();
-      if (generation !== this.workspaceOrganizePlanGeneration) {
-        return;
-      }
-      this.workspaceOrganizePlan.update((plan) =>
-        plan
-          ? {
-              ...plan,
-              applyError:
-                "The filing request didn’t finish. Review the selected moves and try again.",
-            }
-          : plan,
-      );
-      this.toast.danger(
-        "Couldn’t finish applying the Brain plan. Refresh to see what moved.",
-      );
-    } finally {
-      if (generation === this.workspaceOrganizePlanGeneration) {
-        this.workspaceOrganizeApplying.set(false);
-      }
-    }
-  }
-
-  closeWorkspaceOrganization(): void {
-    if (this.workspaceOrganizePlanning() || this.workspaceOrganizeApplying()) {
-      return;
-    }
-    this.scrubWorkspaceOrganization();
-  }
-
-  /** Synchronous privacy boundary for the global Brain organizer review. */
-  private scrubWorkspaceOrganization(): void {
-    ++this.workspaceOrganizePlanGeneration;
-    this.workspaceOrganizePlanning.set(false);
-    this.workspaceOrganizeApplying.set(false);
-    this.workspaceOrganizePlan.set(null);
-  }
-
-  private mergeWorkspaceOrganizeReceipt(
-    previous: WorkspaceOrganizeAttemptReceipt | null | undefined,
-    attemptedMoves: readonly WorkspaceOrganizeMove[],
-    appliedIds: readonly string[],
-    failures: readonly WorkspaceOrganizeFailure[],
-  ): WorkspaceOrganizeAttemptReceipt {
-    const moves = new Map(
-      (previous?.moves ?? []).map((move) => [move.itemId, move]),
-    );
-    const applied = new Set(previous?.appliedIds ?? []);
-    const unresolved = new Map(
-      (previous?.failures ?? []).map((failure) => [failure.itemId, failure]),
-    );
-
-    for (const move of attemptedMoves) {
-      moves.set(move.itemId, move);
-      unresolved.delete(move.itemId);
-    }
-    for (const itemId of appliedIds) {
-      applied.add(itemId);
-      unresolved.delete(itemId);
-    }
-    for (const failure of failures) {
-      if (!applied.has(failure.itemId)) {
-        unresolved.set(failure.itemId, failure);
-      }
-    }
-
-    return {
-      moves: [...moves.values()],
-      appliedIds: [...applied],
-      failures: [...unresolved.values()],
-    };
   }
 
   async relockAll(): Promise<void> {

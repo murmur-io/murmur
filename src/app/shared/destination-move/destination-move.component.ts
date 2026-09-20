@@ -50,13 +50,16 @@ export class DestinationMoveComponent {
   private readonly picker = viewChild(RelatedHierarchyPickerComponent);
   readonly request = computed(() => this.moves.active()?.request ?? null);
   readonly actionLabel = computed(() => this.request()?.actionLabel ?? "Move");
+  readonly pickerMode = computed<"destination" | "scope">(() =>
+    this.request()?.kind === "scope" ? "scope" : "destination",
+  );
   readonly anchorKind = computed<DestinationPickerAnchorKind>(() => {
     const request = this.request();
     if (!request) {
       return "meeting";
     }
     return (
-      request.anchorKind ?? (request.kind === "shared" ? "org" : request.kind)
+      request.anchorKind ?? (request.kind === "shared" ? "org" : request.kind === "scope" ? "container" : request.kind)
     );
   });
 
@@ -86,6 +89,17 @@ export class DestinationMoveComponent {
   }
 
   choose(target: DestinationPickerTarget): void {
+    if (this.request()?.kind === "scope") {
+      this.moves.finish({
+        moved: false,
+        selected: true,
+        containerId: target.containerId,
+        level: target.level,
+        label: target.label,
+        breadcrumb: target.breadcrumb,
+      });
+      return;
+    }
     if (target.locked) {
       this.pendingLockedTarget.set(target);
       return;
@@ -145,6 +159,8 @@ export class DestinationMoveComponent {
         await request.execute(target.containerId, target.locked);
       } else {
         switch (request.kind) {
+          case "scope":
+            return;
           case "meeting":
             await this.folders.moveNote(
               request.id,

@@ -3,6 +3,7 @@ import { Injectable, signal } from "@angular/core";
 import type { DestinationPickerAnchorKind } from "../../core/models";
 
 export type DestinationMoveKind =
+  | "scope"
   | "meeting"
   | "note"
   | "document"
@@ -20,6 +21,8 @@ export interface DestinationMoveRequest {
   readonly anchorKind?: DestinationPickerAnchorKind;
   readonly orgId?: string;
   readonly sharedTargetKind?: "container" | "doc";
+  /** Selection-only scope picker. No move, reload, or toast is performed. */
+  readonly allowUnclassified?: boolean;
   readonly execute?: (
     containerId: string | null,
     confirmedEncryptionBoundary: boolean,
@@ -29,7 +32,11 @@ export interface DestinationMoveRequest {
 
 export interface DestinationMoveResult {
   readonly moved: boolean;
+  readonly selected?: boolean;
   readonly containerId?: string | null;
+  readonly level?: "project" | "folder" | null;
+  readonly label?: string;
+  readonly breadcrumb?: string;
 }
 
 interface ActiveMove {

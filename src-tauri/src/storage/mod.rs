@@ -25,6 +25,7 @@ pub(crate) mod related_picker_store;
 pub(crate) mod reminder_store;
 pub(crate) mod seal_store;
 pub(crate) mod settings_store;
+pub(crate) mod smart_organize_store;
 pub(crate) mod tasks_store;
 pub(crate) mod trash_store;
 pub mod usage;

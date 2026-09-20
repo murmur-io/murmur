@@ -11,7 +11,7 @@
   <section
     #dialog
     class="rhp"
-    [class.rhp--destination]="mode() === 'destination'"
+    [class.rhp--destination]="mode() !== 'link'"
     role="dialog"
     aria-modal="true"
     aria-labelledby="rhp-title"
@@ -20,18 +20,22 @@
   >
     <header class="rhp-head">
       <span class="rhp-mark" aria-hidden="true">
-        <mur-icon [icon]="mode() === 'destination' ? 'move' : 'link'" />
+        <mur-icon [icon]="mode() === 'scope' ? 'spaces' : mode() === 'destination' ? 'move' : 'link'" />
       </span>
       <div class="rhp-heading">
         <h2 id="rhp-title">
           {{
-            mode() === "destination"
-              ? actionLabel() + " “" + anchorTitle() + "”"
-              : "Add related"
+            mode() === "scope"
+              ? "Choose a scope"
+              : mode() === "destination"
+                ? actionLabel() + " “" + anchorTitle() + "”"
+                : "Add related"
           }}
         </h2>
         <p id="rhp-subtitle">
-          @if (mode() === "destination") {
+          @if (mode() === "scope") {
+            Choose Not classified, a Workspace, or a folder.
+          } @else if (mode() === "destination") {
             Choose All notes, a Workspace, or a folder.
           } @else {
             Choose a Space, folder, recording, note, or document.
@@ -60,12 +64,12 @@
         autocomplete="off"
         spellcheck="false"
         [placeholder]="
-          mode() === 'destination'
+          mode() !== 'link'
             ? 'Search every destination…'
             : 'Search every Space…'
         "
         [attr.aria-label]="
-          mode() === 'destination'
+          mode() !== 'link'
             ? 'Search destinations'
             : 'Search items to link'
         "
@@ -114,12 +118,12 @@
         <p class="rhp-state">
           @if (searching()) {
             No matching
-            {{ mode() === "destination" ? "destinations" : "items" }}. Try a
+            {{ mode() !== "link" ? "places" : "items" }}. Try a
             folder or Workspace name.
           } @else {
             {{
-              mode() === "destination"
-                ? "No destination is available."
+              mode() !== "link"
+                ? "No place is available."
                 : "Nothing to link yet."
             }}
           }
@@ -133,33 +137,33 @@
             class="rhp-row"
             [attr.data-row]="line.key"
             [attr.role]="
-              mode() !== 'destination'
+              mode() === 'link'
                 ? searching()
                   ? 'option'
                   : 'treeitem'
                 : null
             "
             [attr.aria-level]="
-              mode() !== 'destination' && !searching() ? line.level : null
+              mode() === 'link' && !searching() ? line.level : null
             "
             [attr.aria-expanded]="
-              mode() !== 'destination' && line.expandable ? line.expanded : null
+              mode() === 'link' && line.expandable ? line.expanded : null
             "
             [attr.aria-selected]="
-              mode() !== 'destination' && searching()
+              mode() === 'link' && searching()
                 ? line.key === tabbableKey()
                 : null
             "
             [attr.aria-current]="
-              mode() !== 'destination' && line.isCurrent ? 'true' : null
+              mode() === 'link' && line.isCurrent ? 'true' : null
             "
             [attr.aria-posinset]="
-              mode() !== 'destination'
+              mode() === 'link'
                 ? (rowPositions().get(line.key)?.position ?? null)
                 : null
             "
             [attr.aria-setsize]="
-              mode() !== 'destination'
+              mode() === 'link'
                 ? (rowPositions().get(line.key)?.size ?? null)
                 : null
             "
@@ -200,24 +204,24 @@
               type="button"
               class="rhp-row-main"
               [attr.role]="
-                mode() === 'destination' && !line.page
+                mode() !== 'link' && !line.page
                   ? searching()
                     ? 'option'
                     : 'treeitem'
                   : null
               "
               [attr.aria-level]="
-                mode() === 'destination' && !searching() && !line.page
+                mode() !== 'link' && !searching() && !line.page
                   ? line.level
                   : null
               "
               [attr.aria-expanded]="
-                mode() === 'destination' && line.expandable
+                mode() !== 'link' && line.expandable
                   ? line.expanded
                   : null
               "
               [attr.aria-selected]="
-                mode() === 'destination'
+                mode() !== 'link'
                   ? stagedDestination()
                     ? stagedDestination()?.containerId ===
                       (line.target?.id === '__destination_root__'
@@ -227,21 +231,21 @@
                   : null
               "
               [attr.aria-current]="
-                mode() === 'destination' && line.isCurrent ? 'location' : null
+                mode() !== 'link' && line.isCurrent ? 'location' : null
               "
               [attr.aria-posinset]="
-                mode() === 'destination'
+                mode() !== 'link'
                   ? (rowPositions().get(line.key)?.position ?? null)
                   : null
               "
               [attr.aria-setsize]="
-                mode() === 'destination'
+                mode() !== 'link'
                   ? (rowPositions().get(line.key)?.size ?? null)
                   : null
               "
               [tabindex]="line.key === tabbableKey() ? 0 : -1"
               [attr.aria-disabled]="
-                (mode() === 'destination' &&
+                (mode() !== 'link' &&
                   line.action === 'none' &&
                   !line.expandable) ||
                 line.isCurrent ||
@@ -259,7 +263,7 @@
                 @switch (line.status) {
                   @case ("current") {
                     <span class="rhp-tag rhp-tag--current">{{
-                      mode() === "destination" ? "Here" : "Current"
+                      mode() !== "link" ? "Here" : "Current"
                     }}</span>
                   }
                   @case ("linked") {
@@ -268,7 +272,7 @@
                   @case ("contains") {
                     <span class="rhp-tag rhp-tag--contains">
                       {{
-                        mode() === "destination"
+                        mode() !== "link"
                           ? "Moving"
                           : "Contains current item"
                       }}
@@ -353,7 +357,7 @@
       </button>
     }
     <footer class="rhp-foot">
-      @if (mode() === "destination") {
+      @if (mode() !== "link") {
         <span class="rhp-foot-copy">
           @if (stagedDestination(); as target) {
             <strong>{{ target.breadcrumb }}</strong>
@@ -371,14 +375,14 @@
       <button type="button" class="btn btn-ghost rhp-cancel" (click)="close()">
         Cancel
       </button>
-      @if (mode() === "destination") {
+      @if (mode() !== "link") {
         <button
           type="button"
           class="btn btn-primary"
           [disabled]="!stagedDestination() || busy()"
           (click)="commitDestination()"
         >
-          {{ busy() ? "Moving…" : actionLabel() + " here" }}
+          {{ busy() ? (mode() === "scope" ? "Choosing…" : "Moving…") : mode() === "scope" ? "Choose scope" : actionLabel() + " here" }}
         </button>
       }
     </footer>

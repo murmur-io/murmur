@@ -116,26 +116,15 @@
         </button>
       </div>
 
-      <!-- "File recordings with Brain" moved with the tree it acts on. The old
-           Spaces panel carried it in its header; dropping it in the rewrite left
-           `planWorkspaceOrganization()` and the organize sheet with no trigger,
-           i.e. the whole filing-review feature unreachable. -->
       <button
         type="button"
         class="brain-action"
-        [disabled]="workspaceOrganizeDisabled()"
-        [attr.aria-busy]="workspaceOrganizePlanning()"
-        (click)="planWorkspaceOrganization()"
-        aria-label="Review filing moves with Brain"
-        title="Review filing moves with Brain"
+        (click)="smartOrganize.show($event)"
+        aria-label="Smart organize notes and recordings"
+        title="Smart organize notes and recordings"
       >
-        @if (workspaceOrganizePlanning()) {
-          <span class="context-spinner" aria-hidden="true"></span>
-          <span>Planning filing suggestions…</span>
-        } @else {
-          <mur-icon icon="brain" />
-          <span>File recordings with Brain</span>
-        }
+        <mur-icon icon="spaces" />
+        <span>Smart organize</span>
       </button>
 
       <div class="sb-tree">
@@ -380,16 +369,8 @@
 
 <app-reminder-composer />
 
-@if (workspaceOrganizePlan(); as plan) {
-  <app-workspace-organize-sheet
-    [plan]="plan"
-    [busy]="workspaceOrganizeApplying() || workspaceOrganizePlanning()"
-    [planning]="workspaceOrganizePlanning()"
-    [applying]="workspaceOrganizeApplying()"
-    (apply)="applyWorkspaceOrganization($event)"
-    (replan)="replanWorkspaceOrganization($event)"
-    (cancelled)="closeWorkspaceOrganization()"
-  />
+@if (smartOrganize.open()) {
+  <app-smart-organize />
 }
 
 @if (workspaceCreateOpen()) {
