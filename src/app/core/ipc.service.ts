@@ -110,9 +110,9 @@ import type {
   OrganizePlan,
   OrganizeApplyResult,
   FilingRecoveryStatus,
-  WorkspaceOrganizeApplyResult,
-  WorkspaceOrganizeMove,
-  WorkspaceOrganizePlan,
+  SmartOrganizeApplyResult,
+  SmartOrganizePlan,
+  SmartOrganizePlanRequest,
   OrgFeedUpdatedPayload,
   OrgItemDetail,
   OrgItemHeader,
@@ -3027,13 +3027,13 @@ export class IpcService {
   getRelatedPickerBootstrap(
     anchorKind: DestinationPickerAnchorKind,
     anchorId: string,
-    mode: "link" | "destination" = "link",
+    mode: "link" | "destination" | "scope" = "link",
     orgId?: string,
   ): Promise<RelatedPickerBootstrap> {
     return invoke<RelatedPickerBootstrap>("get_related_picker_bootstrap", {
       anchorKind,
       anchorId,
-      ...(mode === "destination" ? { mode } : {}),
+      ...(mode !== "link" ? { mode } : {}),
       ...(orgId !== undefined ? { orgId } : {}),
     });
   }
@@ -3052,7 +3052,7 @@ export class IpcService {
     kind: PickerItemKind,
     offset: number,
     limit: number,
-    mode: "link" | "destination" = "link",
+    mode: "link" | "destination" | "scope" = "link",
     orgId?: string,
   ): Promise<RelatedPickerPage> {
     return invoke<RelatedPickerPage>("list_related_picker_items", {
@@ -3062,7 +3062,7 @@ export class IpcService {
       kind,
       offset,
       limit,
-      ...(mode === "destination" ? { mode } : {}),
+      ...(mode !== "link" ? { mode } : {}),
       ...(orgId !== undefined ? { orgId } : {}),
     });
   }
@@ -3078,7 +3078,7 @@ export class IpcService {
     query: string,
     offset: number,
     limit: number,
-    mode: "link" | "destination" = "link",
+    mode: "link" | "destination" | "scope" = "link",
     orgId?: string,
   ): Promise<RelatedPickerSearchPage> {
     return invoke<RelatedPickerSearchPage>("search_related_picker", {
@@ -3087,7 +3087,7 @@ export class IpcService {
       query,
       offset,
       limit,
-      ...(mode === "destination" ? { mode } : {}),
+      ...(mode !== "link" ? { mode } : {}),
       ...(orgId !== undefined ? { orgId } : {}),
     });
   }
@@ -3417,23 +3417,23 @@ export class IpcService {
     });
   }
 
-  /** Propose where unfiled recordings belong. Nothing moves until apply. */
-  planWorkspaceOrganization(
-    guidance: string | null = null,
-  ): Promise<WorkspaceOrganizePlan> {
-    return invoke<WorkspaceOrganizePlan>("plan_workspace_organization", {
-      guidance,
+  /** Build a bounded, deterministic, read-only organization preview. */
+  planSmartOrganize(request: SmartOrganizePlanRequest): Promise<SmartOrganizePlan> {
+    return invoke<SmartOrganizePlan>("plan_smart_organize", { request });
+  }
+
+  /** Apply only item ids belonging to the opaque, backend-owned reviewed plan. */
+  applySmartOrganizePlan(
+    planId: string,
+    selectedItemIds: string[],
+  ): Promise<SmartOrganizeApplyResult> {
+    return invoke<SmartOrganizeApplyResult>("apply_smart_organize_plan", {
+      request: { planId, selectedItemIds },
     });
   }
 
-  /** Apply only the recording moves the user kept selected in the review sheet. */
-  applyWorkspaceOrganization(
-    moves: WorkspaceOrganizeMove[],
-  ): Promise<WorkspaceOrganizeApplyResult> {
-    return invoke<WorkspaceOrganizeApplyResult>(
-      "apply_workspace_organization",
-      { moves },
-    );
+  discardSmartOrganizePlan(planId: string): Promise<void> {
+    return invoke<void>("discard_smart_organize_plan", { request: { planId } });
   }
 
   /** Content-free health for crash-safe filing recovery; no ids, paths, or titles. */

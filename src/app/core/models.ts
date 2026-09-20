@@ -2914,7 +2914,13 @@ export interface OrganizePlan {
   totalScanned: number;
   alreadyOrganized: number;
   deferred: number;
-  targets: WorkspaceOrganizeTarget[];
+  targets: OrganizeTarget[];
+}
+
+/** Backend-allowlisted destination for the surviving per-folder note organizer. */
+export interface OrganizeTarget {
+  id: string;
+  label: string;
 }
 
 /** One per-note refusal returned by `apply_organize_plan`. */
@@ -2930,62 +2936,88 @@ export interface OrganizeApplyResult {
   failures: OrganizeFailure[];
 }
 
-/** One reviewed recording move proposed by `plan_workspace_organization`. */
-export interface WorkspaceOrganizeMove {
+// Deterministic Smart organize. The renderer chooses scope/rule and item ids only;
+// bucket destinations remain backend-owned authority in the one-shot plan registry.
+export type SmartOrganizeItemKind = "note" | "meeting";
+export type SmartOrganizeRule = "byDay" | "byRelation";
+
+export interface SmartOrganizePlanRequest {
+  sourceContainerId: string | null;
+  includeDescendants: boolean;
+  kinds: SmartOrganizeItemKind[];
+  rule: SmartOrganizeRule;
+  destinationParentId: string;
+}
+
+export interface SmartOrganizePreviewItem {
   itemId: string;
+  kind: SmartOrganizeItemKind;
   title: string;
   fromContainerId: string | null;
-  fromContainer: string;
-  toContainerId: string;
-  toContainer: string;
+  fromBreadcrumb: string;
   reason: string;
 }
 
-/** A recording the planner inspected but could not safely classify or move. */
-export interface WorkspaceOrganizeSkip {
-  itemId: string;
-  title: string;
+export interface SmartOrganizeBucket {
+  bucketId: string;
+  folderName: string;
+  destinationBreadcrumb: string;
+  status: "new" | "existing";
+  items: SmartOrganizePreviewItem[];
+}
+
+export type SmartOrganizeSkipCode =
+  | "locked"
+  | "notReady"
+  | "noDate"
+  | "noMatch"
+  | "ambiguousRelation"
+  | "nameCollision"
+  | "deferred"
+  | "targetUnavailable";
+
+export interface SmartOrganizeSkippedItem {
+  itemId: string | null;
+  title: string | null;
+  code: SmartOrganizeSkipCode;
   reason: string;
-  code: "notReady" | "emptyNote" | "deferred" | "noDestination";
 }
 
-/** Content-bearing recording that Brain deliberately leaves for a human destination choice. */
-export interface WorkspaceOrganizeReview {
-  itemId: string;
-  title: string;
-  suggestedTargetId: string | null;
-  suggestedTarget: string | null;
-  reason: string;
-  code: "uncertain" | "noMatch" | "invalidDecision";
-}
-
-/** Backend-allowlisted manual destination, labelled with its full hierarchy breadcrumb. */
-export interface WorkspaceOrganizeTarget {
-  id: string;
-  label: string;
-}
-
-/** Review-before-apply result for the visible workspace Brain organizer. */
-export interface WorkspaceOrganizePlan {
-  moves: WorkspaceOrganizeMove[];
-  review: WorkspaceOrganizeReview[];
-  skipped: WorkspaceOrganizeSkip[];
-  targets: WorkspaceOrganizeTarget[];
+export interface SmartOrganizePlan {
+  planId: string;
   totalScanned: number;
+  alreadyThere: number;
+  deferred: number;
+  newFolders: number;
+  reusedFolders: number;
+  timezoneLabel: string;
+  buckets: SmartOrganizeBucket[];
+  skipped: SmartOrganizeSkippedItem[];
 }
 
-/** One per-item refusal returned by `apply_workspace_organization`. */
-export interface WorkspaceOrganizeFailure {
+export interface SmartOrganizeAppliedItem {
   itemId: string;
+  kind: SmartOrganizeItemKind;
+  title: string;
+  fromContainerId: string | null;
+  toContainerId: string;
+  fromBreadcrumb: string;
+  toBreadcrumb: string;
+  bucketId: string;
+  folderName: string;
+  bucketStatus: "new" | "existing";
+}
+
+export interface SmartOrganizeFailure {
+  itemId: string;
+  title: string | null;
   reason: string;
-  /** True only when submitting the same move again can succeed without a fresh plan. */
   retryable: boolean;
 }
 
-/** Honest bulk-apply receipt: successes and failures are reported separately. */
-export interface WorkspaceOrganizeApplyResult {
-  appliedIds: string[];
-  failures: WorkspaceOrganizeFailure[];
+export interface SmartOrganizeApplyResult {
+  applied: SmartOrganizeAppliedItem[];
+  failures: SmartOrganizeFailure[];
 }
 
 /** Content-free filing-journal health shown when crash recovery needs attention. */
@@ -3883,7 +3915,7 @@ export interface ItemPage {
 // "four variants of which two are filtered at every call site" is exactly how one
 // gets back in. Three variants, no filtering.
 
-export type PickerMode = "link" | "destination";
+export type PickerMode = "link" | "destination" | "scope";
 export type DestinationPickerAnchorKind = LinkKind | "task" | "dashboard" | "sharedContainer" | "sharedDoc";
 
 export interface PickerAvailability {

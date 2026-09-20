@@ -1,12 +1,13 @@
 @if (request(); as move) {
   <app-related-hierarchy-picker
-    mode="destination"
+    [mode]="pickerMode()"
     [anchorKind]="anchorKind()"
     [anchorId]="move.id"
     [orgId]="move.orgId"
     [anchorTitle]="move.title"
     [currentContainerId]="move.currentContainerId ?? null"
     [actionLabel]="actionLabel()"
+    [allowUnclassified]="move.allowUnclassified ?? true"
     [busy]="busy()"
     [externalError]="error()"
     (destinationPicked)="choose($event)"

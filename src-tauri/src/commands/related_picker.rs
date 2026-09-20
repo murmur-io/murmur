@@ -181,6 +181,8 @@ pub enum PickerMode {
     /// Pick a place to MOVE to. Containers (and the root) are the targets; leaves are inert
     /// context.
     Destination,
+    /// Choose a raw-open local container as an organization scope; never read leaf content.
+    Scope,
 }
 
 /// The seven inputs of ONE picker search, behind the Tauri boundary.
@@ -1105,6 +1107,158 @@ fn destination_context(
     }
 }
 
+/// Scope selection is deliberately separate from move authorization: the anchor and its
+/// descendants are valid choices, while all durable locks remain excluded even in an unlocked
+/// session. Gate the real container anchor before assembling any hierarchy response.
+fn scope_index(
+    db: &crate::storage::db::Db,
+    anchor_kind: &str,
+    anchor_id: &str,
+    org_id: Option<&str>,
+) -> Result<ContainerIndex, AppError> {
+    if anchor_kind != "container" || org_id.is_some() {
+        return Err(anchor_unavailable());
+    }
+    require_destination_anchor(db, anchor_kind, anchor_id, None)?;
+    let index = ContainerIndex::load(db)?;
+    if !scope_container_is_open(&index, anchor_id) {
+        return Err(anchor_unavailable());
+    }
+    Ok(index)
+}
+
+fn scope_container_is_open(index: &ContainerIndex, id: &str) -> bool {
+    index.is_reachable(id)
+        && index.get(id).is_some_and(|row| !row.locked)
+        && !index.has_sealed_ancestor(id, &std::collections::HashSet::new())
+}
+
+fn scope_availability() -> PickerAvailability {
+    PickerAvailability {
+        selectable: true,
+        here: false,
+        is_self: false,
+        descendant: false,
+        locked: false,
+        confirm: false,
+        incompatible: false,
+    }
+}
+
+/// Containers only: this path never queries leaf titles, identifiers or counts.
+fn scope_container_node(
+    index: &ContainerIndex,
+    row: &crate::storage::models::ContainerRow,
+) -> PickerContainerNode {
+    let mut folders = Vec::new();
+    for child in index.children_of(&row.id) {
+        if index.is_canonical_notes_root(child) {
+            folders.extend(
+                index
+                    .children_of(&child.id)
+                    .filter(|row| scope_container_is_open(index, &row.id))
+                    .map(|row| scope_container_node(index, row)),
+            );
+        } else if scope_container_is_open(index, &child.id) {
+            folders.push(scope_container_node(index, child));
+        }
+    }
+    PickerContainerNode {
+        id: row.id.clone(),
+        name: row.name.clone(),
+        level: row.level.clone(),
+        emoji: row.emoji.clone(),
+        locked: false,
+        unlocked: false,
+        linkable: false,
+        groups: Vec::new(),
+        folders,
+        availability: Some(scope_availability()),
+    }
+}
+
+fn scope_bootstrap(index: &ContainerIndex, anchor_id: &str) -> RelatedPickerBootstrap {
+    let spaces = index
+        .rows
+        .iter()
+        .filter(|row| scope_container_is_open(index, &row.id))
+        .filter(|row| {
+            row.parent_id.is_none()
+                || row
+                    .parent_id
+                    .as_deref()
+                    .and_then(|id| index.get(id))
+                    .is_some_and(|parent| {
+                        index.is_canonical_notes_root(parent) && parent.parent_id.is_none()
+                    })
+        })
+        .map(|row| scope_container_node(index, row))
+        .collect();
+    RelatedPickerBootstrap {
+        spaces,
+        unclassified: Vec::new(),
+        anchor: None,
+        destination: Some(PickerDestinationContext {
+            source_kind: "container".into(),
+            source_locked: false,
+            current_container_id: Some(anchor_id.into()),
+            current_path: index.path_to(anchor_id),
+            root: PickerRootTarget {
+                kind: "unfiled".into(),
+                label: UNCLASSIFIED_LABEL.into(),
+                container_id: None,
+                availability: scope_availability(),
+            },
+            container: None,
+        }),
+    }
+}
+
+fn scope_search(
+    index: &ContainerIndex,
+    query: &str,
+    offset: u32,
+    limit: u32,
+) -> RelatedPickerSearchPage {
+    let query = query.trim().to_lowercase();
+    let mut rows: Vec<_> = index
+        .rows
+        .iter()
+        .filter(|row| scope_container_is_open(index, &row.id))
+        .filter(|row| {
+            index
+                .breadcrumb(&row.id)
+                .join(" / ")
+                .to_lowercase()
+                .contains(&query)
+        })
+        .collect();
+    rows.sort_by_key(|row| {
+        (
+            index.breadcrumb(&row.id).join(" / ").to_lowercase(),
+            &row.id,
+        )
+    });
+    RelatedPickerSearchPage {
+        offset,
+        total: rows.len() as u32,
+        hits: Vec::new(),
+        containers: Some(
+            rows.into_iter()
+                .skip(offset as usize)
+                .take(limit.clamp(1, MAX_SEARCH_PAGE) as usize)
+                .map(|row| PickerContainerHit {
+                    id: row.id.clone(),
+                    name: row.name.clone(),
+                    level: row.level.clone(),
+                    breadcrumb: index.breadcrumb(&row.id),
+                    availability: scope_availability(),
+                })
+                .collect(),
+        ),
+    }
+}
+
 // ── Commands ─────────────────────────────────────────────────────────────────────────────────────
 
 /// The picker's first frame: the metadata hierarchy, the anchor's ancestor path, and a BOUNDED
@@ -1163,6 +1317,10 @@ fn related_picker_bootstrap_with_org(
     mode: PickerMode,
     org_id: Option<&str>,
 ) -> Result<RelatedPickerBootstrap, AppError> {
+    if mode == PickerMode::Scope {
+        let index = scope_index(db, anchor_kind, anchor_id, org_id)?;
+        return Ok(scope_bootstrap(&index, anchor_id));
+    }
     // ── ANCHOR GATE, FIRST — before ANY hierarchy, window or total is computed, so a refused call
     //    discloses nothing at all, and a sealed anchor is indistinguishable from an unknown one. ──
     let destination_kind = if mode == PickerMode::Destination {
@@ -1193,7 +1351,7 @@ fn related_picker_bootstrap_with_org(
     // DESTINATION mode resolves WHERE THE SOURCE IS before any row is rendered, because every
     // availability verdict below (`Here`, self, descendant) is relative to it.
     let dest = match mode {
-        PickerMode::Link => None,
+        PickerMode::Link | PickerMode::Scope => None,
         PickerMode::Destination => Some(destination_rules(
             db,
             &index,
@@ -1383,6 +1541,18 @@ fn related_picker_items_with_org(
     mode: PickerMode,
     org_id: Option<&str>,
 ) -> Result<RelatedPickerPage, AppError> {
+    if mode == PickerMode::Scope {
+        let index = scope_index(db, anchor_kind, anchor_id, org_id)?;
+        if container_id.is_some_and(|id| !scope_container_is_open(&index, id)) {
+            return Err(scope_unavailable());
+        }
+        return Ok(RelatedPickerPage {
+            kind: parse_picker_kind(kind)?,
+            offset,
+            items: Vec::new(),
+            total: 0,
+        });
+    }
     // Gate the anchor before loading the hierarchy or counting/paging a scope. Otherwise a modal
     // opened while the anchor was visible could keep probing other containers after auto-relock.
     if mode == PickerMode::Destination {
@@ -1510,6 +1680,10 @@ fn related_picker_search_with_org(
         mode,
         org_id,
     } = request;
+    if mode == PickerMode::Scope {
+        let index = scope_index(db, anchor_kind, anchor_id, org_id)?;
+        return Ok(scope_search(&index, query, offset, limit));
+    }
     // ── ANCHOR GATE, FIRST — before the query is even escaped, so a refusal costs no read at all. ──
     let destination_kind = if mode == PickerMode::Destination {
         Some(require_destination_anchor(
@@ -1546,7 +1720,7 @@ fn related_picker_search_with_org(
     // ever return. That is half of the reported "the picker only shows part of the tree": a folder
     // with nothing in it was unfindable, and so was every folder past the FE's 30-row slice.
     let dest = match mode {
-        PickerMode::Link => None,
+        PickerMode::Link | PickerMode::Scope => None,
         PickerMode::Destination => Some(destination_rules(
             db,
             &index,

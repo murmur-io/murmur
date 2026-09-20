@@ -2889,7 +2889,6 @@ pub struct LocalPlacementRow {
     pub position: i64,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3010,4 +3009,124 @@ pub struct ProcessingQueueJob {
     pub error_code: Option<String>,
     pub enqueued_at: String,
     pub updated_at: String,
+}
+
+// Smart organize: renderer previews are separate from server-owned move authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SmartOrganizeRule {
+    ByDay,
+    ByRelation,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SmartOrganizeKind {
+    Note,
+    Meeting,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SmartOrganizeRequest {
+    pub source_container_id: Option<String>,
+    pub include_descendants: bool,
+    pub kinds: Vec<SmartOrganizeKind>,
+    pub rule: SmartOrganizeRule,
+    pub destination_parent_id: String,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SmartOrganizeApplyRequest {
+    pub plan_id: String,
+    pub selected_item_ids: Vec<String>,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SmartOrganizeDiscardRequest {
+    pub plan_id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartOrganizeMove {
+    pub item_id: String,
+    pub kind: SmartOrganizeKind,
+    pub title: String,
+    pub from_container_id: Option<String>,
+    pub from_breadcrumb: String,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SmartOrganizeBucketStatus {
+    New,
+    Existing,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartOrganizeBucket {
+    pub bucket_id: String,
+    pub folder_name: String,
+    pub destination_breadcrumb: String,
+    pub status: SmartOrganizeBucketStatus,
+    pub items: Vec<SmartOrganizeMove>,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SmartOrganizeSkipCode {
+    Locked,
+    NotReady,
+    NoDate,
+    NoMatch,
+    AmbiguousRelation,
+    NameCollision,
+    Deferred,
+    TargetUnavailable,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartOrganizeSkip {
+    pub item_id: Option<String>,
+    pub title: Option<String>,
+    pub code: SmartOrganizeSkipCode,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartOrganizePreview {
+    pub plan_id: String,
+    pub total_scanned: u32,
+    pub already_there: u32,
+    pub deferred: u32,
+    pub new_folders: u32,
+    pub reused_folders: u32,
+    pub timezone_label: String,
+    pub buckets: Vec<SmartOrganizeBucket>,
+    pub skipped: Vec<SmartOrganizeSkip>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartOrganizeFailure {
+    pub item_id: String,
+    pub title: Option<String>,
+    pub reason: String,
+    pub retryable: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartOrganizeApplied {
+    pub item_id: String,
+    pub kind: SmartOrganizeKind,
+    pub title: String,
+    pub from_container_id: Option<String>,
+    pub to_container_id: String,
+    pub from_breadcrumb: String,
+    pub to_breadcrumb: String,
+    pub bucket_id: String,
+    pub folder_name: String,
+    pub bucket_status: SmartOrganizeBucketStatus,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartOrganizeReceipt {
+    pub applied: Vec<SmartOrganizeApplied>,
+    pub failures: Vec<SmartOrganizeFailure>,
 }

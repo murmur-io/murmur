@@ -190,6 +190,11 @@ pub use notes_commands::*;
 mod note_organize_commands;
 pub use note_organize_commands::*;
 
+// Deterministic, review-first segregation by an explicit rule.
+#[path = "smart_organize.rs"]
+mod smart_organize_commands;
+pub use smart_organize_commands::*;
+
 // Canonical note-image attachments: gated binary CRUD + validation and the shared bundle seam.
 #[path = "attachments.rs"]
 mod attachment_commands;
@@ -10375,13 +10380,36 @@ fn move_note_inner_impl_with_staging(
     state: &AppState,
     meeting_id: String,
     folder_id: Option<String>,
+    stage_checkpoint: impl FnMut(RecordingExportStage) -> Result<(), AppError>,
+    persist: impl FnOnce(
+        &crate::storage::Db,
+        &crate::storage::OpenRecordingBundleMove<'_>,
+    ) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    let lifecycle = lifecycle_guard(state);
+    move_note_under_lifecycle_with_staging(
+        state,
+        &lifecycle,
+        meeting_id,
+        folder_id,
+        stage_checkpoint,
+        persist,
+    )
+}
+
+/// Canonical recording bundle writer with an already-held lifecycle barrier. Smart organize
+/// validates its reviewed authority and calls this without opening a second race window.
+fn move_note_under_lifecycle_with_staging(
+    state: &AppState,
+    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+    meeting_id: String,
+    folder_id: Option<String>,
     mut stage_checkpoint: impl FnMut(RecordingExportStage) -> Result<(), AppError>,
     persist: impl FnOnce(
         &crate::storage::Db,
         &crate::storage::OpenRecordingBundleMove<'_>,
     ) -> Result<(), AppError>,
 ) -> Result<(), AppError> {
-    let _lifecycle = lifecycle_guard(state);
     // The salvage finalizer is folder/CK-bound. Reassignment while it is awaiting ASR/provider
     // work would either apply that key to the wrong folder or leave fresh plaintext ungoverned.
     ensure_no_active_salvage_for_meeting(state, &meeting_id)?;

@@ -2474,3 +2474,244 @@ fn destination_received_anchors_are_distinct_from_links_and_resolve_shared_root(
         assert_eq!(error.to_string(), unknown.to_string());
     }
 }
+
+// Scope selection has a stricter raw-open posture than Link and permits the identities that Move
+// correctly refuses (the anchor itself and its descendants).
+#[test]
+fn scope_picker_selects_anchor_descendants_empty_folders_and_unclassified_without_leaves() {
+    let (db, _path) = fresh_db("scope-containers");
+    container(&db, "space", "Workspace", "space", None, "project");
+    container(
+        &db,
+        "empty",
+        "Empty",
+        "space/empty",
+        Some("space"),
+        "folder",
+    );
+    container(
+        &db,
+        "child",
+        "Child",
+        "space/child",
+        Some("space"),
+        "folder",
+    );
+    meeting_in(
+        &db,
+        "secret-leaf-id",
+        "NEVER-LEAF-TITLE",
+        "2026-09-01T10:00:00Z",
+        Some("child"),
+    );
+    let bootstrap = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "container",
+        "space",
+        PickerMode::Scope,
+    )
+    .unwrap();
+    assert_eq!(serde_json::to_value(PickerMode::Scope).unwrap(), "scope");
+    assert!(bootstrap.anchor.is_none());
+    assert!(bootstrap.unclassified.is_empty());
+    let context = bootstrap.destination.as_ref().unwrap();
+    assert_eq!(context.root.label, "Not classified");
+    assert_eq!(context.root.container_id, None);
+    assert!(context.root.availability.selectable);
+    let space = bootstrap
+        .spaces
+        .iter()
+        .find(|row| row.id == "space")
+        .unwrap();
+    assert!(space.availability.as_ref().unwrap().selectable);
+    assert!(space.groups.is_empty());
+    assert_eq!(space.folders.len(), 2);
+    assert!(space
+        .folders
+        .iter()
+        .all(|row| row.availability.as_ref().unwrap().selectable && row.groups.is_empty()));
+    assert!(!wire(&bootstrap).contains("NEVER-LEAF-TITLE"));
+    assert!(!wire(&bootstrap).contains("secret-leaf-id"));
+    for target in [None, Some("space"), Some("empty"), Some("child")] {
+        let page = related_picker_items_with_org(
+            &db,
+            &HashSet::new(),
+            "container",
+            "space",
+            target,
+            "meeting",
+            0,
+            100,
+            PickerMode::Scope,
+            None,
+        )
+        .unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.total, 0);
+    }
+    let search = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "container",
+            anchor_id: "space",
+            query: "Workspace",
+            offset: 0,
+            limit: 1,
+            mode: PickerMode::Scope,
+            org_id: None,
+        },
+    )
+    .unwrap();
+    assert!(search.hits.is_empty());
+    assert_eq!(search.total, 3);
+    assert_eq!(search.containers.as_ref().unwrap().len(), 1);
+    let next = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "container",
+            anchor_id: "space",
+            query: "Workspace",
+            offset: 1,
+            limit: 100,
+            mode: PickerMode::Scope,
+            org_id: None,
+        },
+    )
+    .unwrap();
+    let ids: HashSet<_> = search
+        .containers
+        .unwrap()
+        .into_iter()
+        .chain(next.containers.unwrap())
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(ids, unlocked(&["space", "empty", "child"]));
+    let leaf_search = related_picker_search_inner(
+        &db,
+        &HashSet::new(),
+        PickerSearchQuery {
+            anchor_kind: "container",
+            anchor_id: "space",
+            query: "NEVER-LEAF-TITLE",
+            offset: 0,
+            limit: 100,
+            mode: PickerMode::Scope,
+            org_id: None,
+        },
+    )
+    .unwrap();
+    assert!(leaf_search.hits.is_empty());
+    assert_eq!(leaf_search.total, 0);
+    let destination = related_picker_bootstrap_inner(
+        &db,
+        &HashSet::new(),
+        "container",
+        "space",
+        PickerMode::Destination,
+    )
+    .unwrap();
+    let space = destination
+        .spaces
+        .iter()
+        .find(|row| row.id == "space")
+        .unwrap();
+    assert!(!space.availability.as_ref().unwrap().selectable);
+    assert!(space
+        .folders
+        .iter()
+        .all(|row| !row.availability.as_ref().unwrap().selectable));
+}
+
+#[test]
+fn scope_picker_refuses_locked_ancestry_and_unknown_anchors_on_every_read_even_if_unlocked() {
+    let (db, _path) = fresh_db("scope-lock");
+    container(&db, "open", "Open", "open", None, "project");
+    container(&db, "sealed", "HIDDEN-SEALED", "sealed", None, "project");
+    container(
+        &db,
+        "child",
+        "HIDDEN-CHILD",
+        "sealed/child",
+        Some("sealed"),
+        "folder",
+    );
+    seal(&db, "sealed");
+    let session = unlocked(&["sealed", "child"]);
+    let visible =
+        related_picker_bootstrap_inner(&db, &session, "container", "open", PickerMode::Scope)
+            .unwrap();
+    assert_eq!(visible.spaces.len(), 1);
+    assert!(!wire(&visible).contains("HIDDEN"));
+    let search = related_picker_search_inner(
+        &db,
+        &session,
+        PickerSearchQuery {
+            anchor_kind: "container",
+            anchor_id: "open",
+            query: "HIDDEN",
+            offset: 0,
+            limit: 50,
+            mode: PickerMode::Scope,
+            org_id: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(search.total, 0);
+    for id in ["sealed", "child", "unknown"] {
+        let bootstrap_error =
+            related_picker_bootstrap_inner(&db, &session, "container", id, PickerMode::Scope)
+                .unwrap_err();
+        assert!(matches!(bootstrap_error, AppError::Locked(_)));
+        assert_eq!(
+            bootstrap_error.to_string(),
+            anchor_unavailable().to_string()
+        );
+        let page_error = related_picker_items_with_org(
+            &db,
+            &session,
+            "container",
+            id,
+            Some("open"),
+            "note",
+            0,
+            10,
+            PickerMode::Scope,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(page_error.to_string(), bootstrap_error.to_string());
+        let search_error = related_picker_search_inner(
+            &db,
+            &session,
+            PickerSearchQuery {
+                anchor_kind: "container",
+                anchor_id: id,
+                query: "Open",
+                offset: 0,
+                limit: 10,
+                mode: PickerMode::Scope,
+                org_id: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(search_error.to_string(), bootstrap_error.to_string());
+        assert!(matches!(
+            related_picker_items_with_org(
+                &db,
+                &session,
+                "container",
+                "open",
+                Some(id),
+                "note",
+                0,
+                10,
+                PickerMode::Scope,
+                None
+            ),
+            Err(AppError::Locked(_))
+        ));
+    }
+}

@@ -321,7 +321,7 @@ The three structural changes 2.0 made. Everything above lives inside them.
   note share the footer. One click collapses the whole thing to an icon rail.
 - **Lock a workspace and everything inside it is sealed with it.** A project lock cascades to each child
   folder in its own right, so every existing visibility gate applies unchanged.
-- **Brain-assisted filing.** "File recordings with Brain" proposes where stray recordings belong; you
+- **Review-first Smart organize.** Choose notes and/or recordings, a Workspace or folder scope, and a deterministic day or direct-relation rule; you
   review the plan and nothing moves until you approve it.
 
 <p align="center">
