@@ -293,6 +293,10 @@ export class DetailComponent implements OnInit {
   readonly saveError = signal("");
   /** Serializes preview checklist writes (see `toggleNoteTask`). */
   private taskSaveChain: Promise<void> = Promise.resolve();
+  private taskSaveGeneration = 0;
+  private taskSavesPending = 0;
+  /** The last markdown `updateNote` confirmed for the meeting being toggled. */
+  private taskConfirmed: { meetingId: string; markdown: string } | null = null;
   readonly attachmentLoadFailed = signal(false);
   /** Drives the brief "Saved" confirmation badge after a successful write. */
   readonly justSaved = signal(false);
@@ -1979,8 +1983,10 @@ export class DetailComponent implements OnInit {
   /**
    * A checklist box was ticked in the note PREVIEW (not the editor): show the new
    * state immediately, then persist through the same `updateNote` path as Save.
-   * Toggles are chained so rapid clicks land in order; a failed write reloads the
-   * meeting so the view never shows a state that is not on disk.
+   * Toggles are chained so rapid clicks land in order. A failed write bumps the
+   * generation — every toggle still queued behind it is DROPPED, not written —
+   * and restores the last CONFIRMED markdown in place (no reload, so the preview
+   * stays open): the view never shows a state that is not on disk.
    */
   toggleNoteTask(markdown: string): void {
     const current = this.detail();
@@ -1988,10 +1994,21 @@ export class DetailComponent implements OnInit {
     if (!current?.note || !meetingId || current.locked || this.editing()) {
       return;
     }
+    if (this.taskSavesPending === 0 || this.taskConfirmed?.meetingId !== meetingId) {
+      this.taskConfirmed = { meetingId, markdown: current.note.markdown };
+    }
     this.detail.set({ ...current, note: { ...current.note, markdown } });
+    const generation = this.taskSaveGeneration;
+    this.taskSavesPending += 1;
     this.taskSaveChain = this.taskSaveChain.then(async () => {
       try {
+        if (generation !== this.taskSaveGeneration) {
+          return; // an earlier toggle failed and was rolled back; never write this one
+        }
         const updated = await this.ipc.updateNote(meetingId, markdown);
+        if (this.taskConfirmed?.meetingId === meetingId) {
+          this.taskConfirmed = { meetingId, markdown: updated.markdown };
+        }
         const now = this.detail();
         // Late response after navigation/relock, or a newer toggle already applied.
         if (!now || now.meeting.id !== meetingId || now.locked || now.note?.markdown !== markdown) {
@@ -1999,10 +2016,15 @@ export class DetailComponent implements OnInit {
         }
         this.detail.set({ ...now, note: updated });
       } catch (e) {
+        this.taskSaveGeneration += 1;
         this.toast.danger(this.errorCopy.because("Couldn’t save the checklist", e));
-        if (this.detail()?.meeting.id === meetingId) {
-          await this.loadMeeting(meetingId);
+        const now = this.detail();
+        const confirmed = this.taskConfirmed;
+        if (now?.note && !now.locked && now.meeting.id === meetingId && confirmed?.meetingId === meetingId) {
+          this.detail.set({ ...now, note: { ...now.note, markdown: confirmed.markdown } });
         }
+      } finally {
+        this.taskSavesPending -= 1;
       }
     });
   }

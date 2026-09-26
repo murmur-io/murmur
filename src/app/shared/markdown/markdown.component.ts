@@ -16,6 +16,7 @@ import type { NoteAttachmentDto } from "../../core/models";
 import { TabsService } from "../../core/tabs.service";
 import { DocumentPreviewService } from "../../services/document-preview.service";
 import { ToastService } from "../../services/toast.service";
+import { escapeHtml, preprocessMarkdown } from "./preprocess";
 import { taskStates, toggleTask } from "./task-list";
 
 /**
@@ -146,11 +147,14 @@ export class MarkdownComponent {
     }
     const boxes = Array.from(this.host.nativeElement.querySelectorAll(".md-task-box"));
     const source = this.markdown() ?? "";
-    // The DOM index is only meaningful if the source lexes to the same task count.
-    if (boxes.length !== taskStates(source).length) {
+    // The DOM index is only meaningful if the rendered view of the source lexes to
+    // exactly the boxes on screen (a raw-HTML `md-task-box` span would not).
+    const onScreen = boxes.map((b) => b.getAttribute("aria-checked") === "true");
+    const rendered = taskStates(preprocessMarkdown(source));
+    if (onScreen.length !== rendered.length || onScreen.some((c, i) => c !== rendered[i])) {
       return true;
     }
-    const next = toggleTask(source, boxes.indexOf(box));
+    const next = toggleTask(source, boxes.indexOf(box), preprocessMarkdown);
     if (next !== null) {
       this.tasksChange.emit(next);
     }
@@ -213,24 +217,7 @@ export class MarkdownComponent {
     attachments: readonly NoteAttachmentDto[],
     interactiveTasks: boolean,
   ): string {
-    let text = this.stripFrontMatter(src);
-    // Raw HTML image/picture/source tags never reach the DOM. The only renderable
-    // image route is a gated opaque attachment id below.
-    text = text.replace(
-      /<\s*\/?\s*(?:img|picture|source)\b[^>]*>/gi,
-      '<span class="md-image-blocked">External image blocked for privacy</span>',
-    );
-    // [[Wikilink]] / [[Wikilink|alias]] → clickable accent chip (marked passes raw HTML through).
-    // The chip's TEXT is the title — no `data-*` attribute (Angular's `[innerHTML]` sanitizer
-    // strips those; see the class doc's ROOT-CAUSE FIX note), so `chipTitle()` reads `textContent`.
-    // Capture the preceding character so `![[embed]]` is not corrupted on older WKWebView.
-    text = text.replace(
-      /(^|[^!])\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g,
-      (_m, prefix: string, title: string) => {
-        const safe = this.escapeHtml(title.trim());
-        return `${prefix}<span class="md-wikilink" role="link" tabindex="0">${safe}</span>`;
-      },
-    );
+    const text = preprocessMarkdown(src);
 
     const byId = new Map(
       attachments.map((attachment) => [attachment.id.toLowerCase(), attachment]),
@@ -292,15 +279,15 @@ export class MarkdownComponent {
     );
     const alt = token.text.trim() || "Image";
     if (!match) {
-      return `<span class="md-image-blocked">${this.escapeHtml(alt)} — external image blocked for privacy</span>`;
+      return `<span class="md-image-blocked">${escapeHtml(alt)} — external image blocked for privacy</span>`;
     }
     const attachment = byId.get(match[1].toLowerCase());
     if (!attachment || !this.isSafeDataUrl(attachment)) {
-      return `<span class="md-image-unavailable" role="status">${this.escapeHtml(alt)} — image unavailable</span>`;
+      return `<span class="md-image-unavailable" role="status">${escapeHtml(alt)} — image unavailable</span>`;
     }
-    const safeAlt = this.escapeHtml(alt);
+    const safeAlt = escapeHtml(alt);
     const caption = (token.title?.trim() || alt).trim();
-    const safeCaption = this.escapeHtml(caption);
+    const safeCaption = escapeHtml(caption);
     return `<span class="md-attachment" role="figure" aria-label="${safeCaption}"><img src="${attachment.dataUrl}" alt="${safeAlt}" loading="lazy" decoding="async"><span class="md-attachment-caption">${safeCaption}</span></span>`;
   }
 
@@ -316,18 +303,5 @@ export class MarkdownComponent {
     }
     const payload = attachment.dataUrl.slice(prefix.length);
     return payload.length > 0 && /^[a-z0-9+/]+={0,2}$/i.test(payload);
-  }
-
-  private escapeHtml(s: string): string {
-    return s.replace(/[&<>"]/g, (c) =>
-      c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;",
-    );
-  }
-
-  private stripFrontMatter(src: string): string {
-    let s = src.trimStart();
-    s = s.replace(/^```ya?ml\s*[\s\S]*?```/i, "").trimStart(); // fenced front-matter
-    s = s.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "").trimStart(); // --- front-matter ---
-    return s;
   }
 }

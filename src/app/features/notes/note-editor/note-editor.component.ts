@@ -1177,15 +1177,26 @@ export class NoteEditorComponent {
   }
 
   /**
-   * A task checkbox was ticked in Preview. The emitted markdown carries the same
-   * front-matter prefix as `previewMarkdown()`, so only the body changes; it goes
-   * through the normal debounced autosave like a keystroke would.
+   * A task checkbox was ticked in Preview. `markdown` is `previewMarkdown()` with
+   * one marker flipped. The new body is taken as the SUFFIX of it relative to this
+   * editor's own front-matter prefix — never by re-splitting: a `---` block the
+   * user typed into the body this session is not `frontMatterPrefix()`, and a
+   * re-split would hand it to the prefix and silently drop it on save. A change
+   * that is not wholly inside the body is refused. Saves like a keystroke would.
    */
   onPreviewTasksChange(markdown: string): void {
     if (this.note()?.locked) {
       return;
     }
-    this.body.set(splitNoteDocument(markdown).body);
+    const current = this.previewMarkdown();
+    const bodyStart = current.length - this.body().length;
+    if (
+      markdown.length !== current.length ||
+      markdown.slice(0, bodyStart) !== current.slice(0, bodyStart)
+    ) {
+      return;
+    }
+    this.body.set(markdown.slice(bodyStart));
     this.scheduleSave();
   }
 

@@ -2,6 +2,7 @@ import { test, expect } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
 import { mockTauri } from "../settings-ai/mock-invoke";
 import { taskStates, toggleTask } from "../../src/app/shared/markdown/task-list";
+import { preprocessMarkdown } from "../../src/app/shared/markdown/preprocess";
 
 /**
  * GFM task lists (`- [ ]` / `- [x]`). They used to render as plain bullets:
@@ -24,6 +25,31 @@ const NOTE_BODY = [
   "",
   "1. [ ] ordered task",
 ].join("\n");
+
+const MEETING_TODO = {
+  locked: false,
+  meeting: {
+    id: "m-todo",
+    startedAt: "2026-08-13T09:00:00Z",
+    endedAt: "2026-08-13T10:00:00Z",
+    title: "Planning",
+    durationS: 3600,
+    audioPath: null,
+    status: "SUMMARIZED",
+    folderId: null,
+  },
+  note: {
+    meetingId: "m-todo",
+    providerId: "claude_code",
+    markdown: "# Planning\n\n## Action items\n- [ ] Send the deck\n- [ ] Book the room",
+    exportedPath: null,
+  },
+  segments: [],
+  assistantInteractions: [],
+  aiProvider: "claude_code",
+  aiModel: "gpt-5.6-codex",
+  modelServed: "gpt-5.6-codex",
+};
 
 test("task list items render as checkboxes, not bare bullets", async ({ page }) => {
   await mockNotes(page, {
@@ -159,6 +185,78 @@ test("ticking a box in a meeting note preview persists through update_note", asy
     .toBe("# Planning\n\n## Action items\n- [ ] Send the deck\n- [x] Book the room");
 });
 
+test("front matter TYPED into the body this session survives a Preview tick", async ({ page }) => {
+  // Verifier finding: the note loaded WITHOUT front matter, the user types a `---`
+  // block + checklist in Edit, then ticks in Preview. Re-splitting the emitted
+  // markdown used to hand the typed block to the (empty) prefix and drop it on save.
+  await mockNotes(page, {
+    get_note: (args: { id: string }) => ({
+      id: args.id,
+      title: "Todo",
+      folderId: "nf1",
+      markdown: "",
+      tags: [],
+      updatedAt: 1_720_000_000_000,
+      createdAt: 1_719_000_000_000,
+      exportedPath: null,
+      locked: false,
+      shared: false,
+    }),
+    save_note_text: (args: any) => {
+      const w = window as any;
+      w.__saved = [...(w.__saved ?? []), args.markdown];
+      return 1_720_000_200_000;
+    },
+  });
+  await page.goto("/notes/n1");
+  await page.locator(".body-area").fill("---\ntags: [shopping]\n---\n- [ ] buy milk");
+  await page.getByRole("button", { name: "Preview", exact: true }).click();
+  const box = page.locator(".note-preview").getByRole("checkbox");
+  await expect(box).toHaveCount(1);
+  await box.click();
+  await expect(box).toHaveAttribute("aria-checked", "true");
+  await expect
+    .poll(() => page.evaluate(() => ((window as any).__saved ?? []).at(-1) ?? null), {
+      timeout: 10_000,
+    })
+    .toBe("---\ntags: [shopping]\n---\n- [x] buy milk");
+});
+
+test("a failed meeting-note save drops the toggles queued behind it and rolls back", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {
+      update_note: (args: any) => {
+        const w = window as any;
+        w.__updates = [...(w.__updates ?? []), args.markdown];
+        // Held until the test fails it, so the second click is provably queued.
+        return new Promise((_resolve, reject) => {
+          w.__failSave = () => reject("disk full");
+        });
+      },
+    },
+    { audit_reminder_suggestions: [], get_meeting_detail: MEETING_TODO },
+  );
+  await page.goto("/meeting/m-todo");
+  await page.getByRole("button", { name: "Preview", exact: true }).click();
+  const boxes = page.locator("app-note-panel .note-preview").getByRole("checkbox");
+  await expect(boxes).toHaveCount(2);
+  await boxes.nth(0).click();
+  await boxes.nth(1).click(); // queued behind the in-flight save
+  await expect(boxes.nth(1)).toHaveAttribute("aria-checked", "true");
+  await page.evaluate(() => (window as any).__failSave());
+  // The view rolls back to what is on disk (both unchecked), preview still open ...
+  await expect(boxes.nth(0)).toHaveAttribute("aria-checked", "false", { timeout: 10_000 });
+  await expect(boxes.nth(1)).toHaveAttribute("aria-checked", "false");
+  // ... and the queued second toggle was never written.
+  await page.waitForTimeout(800);
+  expect(await page.evaluate(() => (window as any).__updates)).toEqual([
+    "# Planning\n\n## Action items\n- [x] Send the deck\n- [ ] Book the room",
+  ]);
+});
+
 test.describe("toggleTask (source mapping)", () => {
   test("flips exactly the Nth task, ignoring code fences", () => {
     expect(toggleTask(NOTE_BODY, 0)).toBe(NOTE_BODY.replace("- [ ] milk", "- [x] milk"));
@@ -180,6 +278,20 @@ test.describe("toggleTask (source mapping)", () => {
     const src = "Intro\n\n    - [ ] code, not a task\n\n- [ ] real";
     expect(taskStates(src)).toEqual([false]);
     expect(toggleTask(src, 0)).toBe(src.replace("- [ ] real", "- [x] real"));
+  });
+
+  test("verifies against the RENDERED view, not the raw source", () => {
+    // Verifier repros: preprocessing (a multi-line <img>, a stripped front-matter
+    // block) shifts which line is code, so the raw lexer "verified" the wrong line.
+    const cases: Array<[string, string, string]> = [
+      ['<img x="\n```\n">\n- [ ] b\n```\n- [ ] c', "- [ ] b", "- [x] b"],
+      ["```yaml\nk: v ```\n- [ ] a\n```\n- [ ] b", "- [ ] a", "- [x] a"],
+      ["---\n```\n---\n- [ ] b\n```\n- [ ] c", "- [ ] b", "- [x] b"],
+    ];
+    for (const [src, from, to] of cases) {
+      expect(taskStates(preprocessMarkdown(src))).toEqual([false]);
+      expect(toggleTask(src, 0, preprocessMarkdown)).toBe(src.replace(from, to));
+    }
   });
 
   test("an empty marker is not a task, and out-of-range indexes are refused", () => {

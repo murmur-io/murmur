@@ -12,6 +12,10 @@ import { marked, type Tokens } from "marked";
  * exactly the old task states with position `index` flipped. Anything else
  * returns `null` and the caller leaves the note untouched — a wrong toggle
  * would silently edit a line the user never clicked.
+ *
+ * `view` maps the source to the text that is actually rendered (the markdown
+ * component's preprocessing). States are always compared in THAT view, so a
+ * transform that shifts lines cannot make a flip of the wrong line "verify".
  */
 
 /** A list-item line whose content starts with `[ ]` / `[x]` — a task CANDIDATE. */
@@ -40,8 +44,12 @@ export function taskStates(markdown: string): boolean[] {
  * Flip the `index`-th task (0-based, document order) in `markdown`.
  * Returns the new markdown, or `null` when the toggle cannot be proven exact.
  */
-export function toggleTask(markdown: string, index: number): string | null {
-  const before = taskStates(markdown);
+export function toggleTask(
+  markdown: string,
+  index: number,
+  view: (source: string) => string = (source) => source,
+): string | null {
+  const before = taskStates(view(markdown));
   if (!Number.isInteger(index) || index < 0 || index >= before.length) {
     return null;
   }
@@ -53,7 +61,7 @@ export function toggleTask(markdown: string, index: number): string | null {
     if (next === null) {
       return null;
     }
-    const after = taskStates(next);
+    const after = taskStates(view(next));
     return after.length === expected.length && after.every((c, i) => c === expected[i])
       ? next
       : null;
