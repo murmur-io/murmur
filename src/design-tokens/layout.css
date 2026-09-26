@@ -66,6 +66,9 @@
   --editor-wide-width: 92%;
   --editor-min-height: 60vh;
   --editor-focus-ring: 0 2px 0 var(--accent);
+  /* Gap between the note body's focus frame and its text. Applied as outline-offset, so the
+     frame moves outward and the text stays exactly where Preview renders it. */
+  --editor-focus-offset: var(--space-3);
   --editor-selection: color-mix(in srgb, var(--accent) 42%, transparent);
   --note-state-border-width: 1px;
 

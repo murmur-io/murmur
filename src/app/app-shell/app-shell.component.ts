@@ -25,6 +25,7 @@ import {
 } from "../design-system/icon/icon.component";
 import { MurQuickSearchComponent } from "../design-system/quick-search/quick-search.component";
 import { MurSidebarComponent } from "../design-system/sidebar/sidebar.component";
+import { ResizeHandleDirective } from "../design-system/sidebar/resize-handle.directive";
 import { MurTabStripComponent } from "../design-system/tab-strip/tab-strip.component";
 import { DocumentPreviewComponent } from "../features/brain/document-preview/document-preview.component";
 import { TilePaletteComponent } from "../features/dashboards/tile-palette/tile-palette.component";
@@ -105,6 +106,18 @@ const BROWSE_ITEMS: readonly BrowseItem[] = [
  */
 const SIDEBAR_EXPANDED_KEY = "murmur.shell.sidebarExpanded";
 const BROWSE_EXPANDED_KEY = "murmur.shell.browseExpanded";
+/**
+ * The expanded sidebar's width, dragged by the user at its right edge. Absent
+ * means "the token default" — the host then binds nothing and
+ * `--shell-sidebar-w` from layout.css applies untouched. The default mirrors
+ * that token (`--space-8 * 4`) because the drag needs a number to start from.
+ */
+const SIDEBAR_WIDTH_KEY = "murmur.shell.sidebarWidth";
+const SIDEBAR_DEFAULT_W = 256;
+/** Narrower and the workspace tree's labels truncate to nothing. */
+const SIDEBAR_MIN_W = 200;
+/** Wider and the sidebar starts eating the content pane on a laptop screen. */
+const SIDEBAR_MAX_W = 480;
 
 @Component({
   selector: "app-shell",
@@ -115,6 +128,7 @@ const BROWSE_EXPANDED_KEY = "murmur.shell.browseExpanded";
     MurIconComponent,
     MurQuickSearchComponent,
     MurSidebarComponent,
+    ResizeHandleDirective,
     MurTabStripComponent,
     WorkspaceTreeComponent,
     WorkspaceCreateSheetComponent,
@@ -132,6 +146,10 @@ const BROWSE_EXPANDED_KEY = "murmur.shell.browseExpanded";
     // styles.css, so a `position: fixed` view (/settings) knows where the
     // content pane really starts instead of hardcoding a rail width.
     "[class.sidebar-collapsed]": "!sidebarExpanded()",
+    // A user-chosen width overrides the token on the shell, so the sidebar AND
+    // `--shell-content-inset` (both read `--shell-sidebar-w`) move together.
+    "[style.--shell-sidebar-w]": "sidebarWidthCss()",
+    "[class.sidebar-resizing]": "sidebarResizing()",
     "(document:keydown)": "onGlobalKeydown($event)",
     "(window:keydown.escape)": "onWindowEscape($event)",
   },
@@ -192,6 +210,23 @@ export class AppShellComponent {
    * on every launch is worse than no toggle at all.
    */
   readonly sidebarExpanded = this._sidebarExpanded.asReadonly();
+
+  private readonly _sidebarWidth = signal<number | null>(
+    readStoredWidth(SIDEBAR_WIDTH_KEY),
+  );
+  readonly sidebarMinWidth = SIDEBAR_MIN_W;
+  readonly sidebarMaxWidth = SIDEBAR_MAX_W;
+  /** The expanded sidebar's current width in px (the default until dragged). */
+  readonly sidebarWidth = computed(
+    () => this._sidebarWidth() ?? SIDEBAR_DEFAULT_W,
+  );
+  readonly sidebarWidthCss = computed(() => {
+    const width = this._sidebarWidth();
+    return width === null ? null : `${width}px`;
+  });
+  private readonly _sidebarResizing = signal(false);
+  /** True while the edge is being dragged — the width transition is off then. */
+  readonly sidebarResizing = this._sidebarResizing.asReadonly();
 
   private readonly _browseExpanded = signal(
     readStoredBoolean(BROWSE_EXPANDED_KEY, false),
@@ -448,6 +483,28 @@ export class AppShellComponent {
     }
   }
 
+  resizeSidebar(requested: number): void {
+    const width = clampSidebarWidth(requested);
+    if (width === this._sidebarWidth()) return;
+    this._sidebarWidth.set(width);
+    if (!this._sidebarResizing()) {
+      writeStoredWidth(SIDEBAR_WIDTH_KEY, width);
+    }
+  }
+
+  setSidebarResizing(resizing: boolean): void {
+    this._sidebarResizing.set(resizing);
+    // Persist once per drag rather than on every pointermove.
+    if (!resizing) {
+      writeStoredWidth(SIDEBAR_WIDTH_KEY, this._sidebarWidth());
+    }
+  }
+
+  resetSidebarWidth(): void {
+    this._sidebarWidth.set(null);
+    writeStoredWidth(SIDEBAR_WIDTH_KEY, null);
+  }
+
   /**
    * Reveal the sidebar from a collapsed rail row. The Workspaces and Shared
    * trees cannot render in a 100px column, so their collapsed rows open the
@@ -565,5 +622,32 @@ function writeStoredBoolean(key: string, value: boolean): void {
     localStorage.setItem(key, String(value));
   } catch {
     // Sidebar collapse is a convenience; storage failure must not break navigation.
+  }
+}
+
+function clampSidebarWidth(width: number): number {
+  return Math.round(Math.min(SIDEBAR_MAX_W, Math.max(SIDEBAR_MIN_W, width)));
+}
+
+function readStoredWidth(key: string): number | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null) return null;
+    const width = Number(raw);
+    return Number.isFinite(width) ? clampSidebarWidth(width) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredWidth(key: string, width: number | null): void {
+  try {
+    if (width === null) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, String(width));
+    }
+  } catch {
+    // The width is a convenience; storage failure must not break navigation.
   }
 }

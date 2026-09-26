@@ -486,6 +486,59 @@ app-shell.sidebar-collapsed {
   overflow: hidden;
 }
 
+/* The drag handle on the expanded sidebar's right edge. It is a SIBLING of the
+   panel, not a child: the panel clips (`overflow: hidden`) and its own right
+   edge is where the workspace tree's scrollbar sits, so a handle inside it
+   would steal the scrollbar's drag. It straddles the panel's border and runs
+   over the gutter; the visible cue is a hairline on that border that only
+   appears on hover, focus and drag, so the resting edge looks as before. */
+.sb-resize-handle {
+  position: fixed;
+  top: var(--shell-gutter);
+  bottom: var(--shell-gutter);
+  left: calc(var(--shell-gutter) + var(--shell-sidebar-w) - 2px);
+  z-index: 10;
+  width: var(--space-2);
+  cursor: col-resize;
+  touch-action: none;
+  -webkit-app-region: no-drag;
+}
+
+.sb-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: var(--shell-panel-radius);
+  bottom: var(--shell-panel-radius);
+  left: 0;
+  width: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.sb-resize-handle:hover::after,
+.sb-resize-handle:focus-visible::after,
+app-shell.sidebar-resizing .sb-resize-handle::after {
+  opacity: 1;
+}
+
+.sb-resize-handle:focus-visible {
+  outline: none;
+}
+
+/* While dragging, the width follows the pointer 1:1 — an eased transition
+   would make it lag behind — and nothing under the pointer gets selected. */
+app-shell.sidebar-resizing .app-sidebar.primary-sidebar {
+  transition: none;
+}
+
+app-shell.sidebar-resizing {
+  cursor: col-resize;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 /* ── The one sidebar ───────────────────────────────────────────────────────
    Search + collapse on top, destinations, the workspace tree, and the create
    actions pinned to the bottom. Collapsed it keeps only the glyph column, so
