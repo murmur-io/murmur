@@ -291,6 +291,8 @@ export class DetailComponent implements OnInit {
   readonly saving = signal(false);
   /** Inline error surfaced when a save fails. */
   readonly saveError = signal("");
+  /** Serializes preview checklist writes (see `toggleNoteTask`). */
+  private taskSaveChain: Promise<void> = Promise.resolve();
   readonly attachmentLoadFailed = signal(false);
   /** Drives the brief "Saved" confirmation badge after a successful write. */
   readonly justSaved = signal(false);
@@ -1972,6 +1974,37 @@ export class DetailComponent implements OnInit {
     } finally {
       this.saving.set(false);
     }
+  }
+
+  /**
+   * A checklist box was ticked in the note PREVIEW (not the editor): show the new
+   * state immediately, then persist through the same `updateNote` path as Save.
+   * Toggles are chained so rapid clicks land in order; a failed write reloads the
+   * meeting so the view never shows a state that is not on disk.
+   */
+  toggleNoteTask(markdown: string): void {
+    const current = this.detail();
+    const meetingId = current?.meeting.id;
+    if (!current?.note || !meetingId || current.locked || this.editing()) {
+      return;
+    }
+    this.detail.set({ ...current, note: { ...current.note, markdown } });
+    this.taskSaveChain = this.taskSaveChain.then(async () => {
+      try {
+        const updated = await this.ipc.updateNote(meetingId, markdown);
+        const now = this.detail();
+        // Late response after navigation/relock, or a newer toggle already applied.
+        if (!now || now.meeting.id !== meetingId || now.locked || now.note?.markdown !== markdown) {
+          return;
+        }
+        this.detail.set({ ...now, note: updated });
+      } catch (e) {
+        this.toast.danger(this.errorCopy.because("Couldn’t save the checklist", e));
+        if (this.detail()?.meeting.id === meetingId) {
+          await this.loadMeeting(meetingId);
+        }
+      }
+    });
   }
 
   /**

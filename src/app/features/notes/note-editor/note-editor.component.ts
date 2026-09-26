@@ -1176,6 +1176,19 @@ export class NoteEditorComponent {
     this.scheduleSave();
   }
 
+  /**
+   * A task checkbox was ticked in Preview. The emitted markdown carries the same
+   * front-matter prefix as `previewMarkdown()`, so only the body changes; it goes
+   * through the normal debounced autosave like a keystroke would.
+   */
+  onPreviewTasksChange(markdown: string): void {
+    if (this.note()?.locked) {
+      return;
+    }
+    this.body.set(splitNoteDocument(markdown).body);
+    this.scheduleSave();
+  }
+
   /** Preserve the exact caret before the explicit image button opens a picker. */
   rememberImageInsertion(): void {
     const el = this.bodyArea()?.nativeElement;

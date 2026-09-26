@@ -110,6 +110,7 @@
   --leading-body: 1.65;
 
   /* --- Shape: a document, not a floating pane -------------------------- */
+  --radius-xs: 3px;
   --radius-sm: 5px;
   --radius-md: 7px;
   --radius-lg: 10px;

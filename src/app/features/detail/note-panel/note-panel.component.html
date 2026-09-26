@@ -74,6 +74,8 @@
       editorAutocapitalize="off"
       [busy]="saving() || busy()"
       (markdownChange)="draftInput.emit($event)"
+      [interactiveTasks]="!editing() && !saving() && !busy()"
+      (tasksChange)="toggleTask.emit($event)"
       (editorPaste)="onEditorPaste($event)"
       (editorDragover)="onEditorDragOver($event)"
       (editorDrop)="onEditorDrop($event)"
