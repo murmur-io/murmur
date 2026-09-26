@@ -1,6 +1,6 @@
 ---
 name: release-murmur
-description: Cut a signed, notarized macOS release of Murmur (Tauri 2 + Angular 22). The exact, proven step-by-step runbook — preflight gates → version bump (+ Cargo.lock sync) → JakubGawr commit → PR-merge to the `murmur` trunk (never direct-push) → rustup targets → stop dev → universal build → Developer-ID sign BY IDENTITY HASH (the Polish-ń cert gotcha) → DMG → notarize → staple/spctl → gh release create + upload. Use whenever the user wants to ship, release, cut a version, build a distributable .app/.dmg, sign/notarize, or publish a GitHub release of Murmur. Supersedes the stale docs/RELEASE-CHECKLIST.md.
+description: Cut a signed, notarized macOS release of Murmur (Tauri 2 + Angular 22). The exact, proven step-by-step runbook — preflight gates → version bump (+ Cargo.lock sync) → commit (authored by whoever cuts the release) → PR-merge to the `murmur` trunk (never direct-push) → rustup targets → stop dev → universal build → Developer-ID sign BY IDENTITY HASH (the Polish-ń cert gotcha) → DMG → notarize → staple/spctl → gh release create + upload. Use whenever the user wants to ship, release, cut a version, build a distributable .app/.dmg, sign/notarize, or publish a GitHub release of Murmur. Supersedes the stale docs/RELEASE-CHECKLIST.md.
 ---
 
 # /release-murmur — the Murmur macOS release runbook
@@ -23,11 +23,11 @@ stop at that boundary and hand back the exact command the user must run.
 
 ## Hard constraints (verify every one — they have each bitten before)
 
-1. **`gh` active account MUST be `JakubGawr`.** `gh auth status` → "Active account: true"
-   on `JakubGawr` (a second account `jakub-united` is also logged in — do not use it).
-2. **Commit author MUST be `JakubGawr <63911380+JakubGawr@users.noreply.github.com>`.** NO `Co-Authored-By: Codex`,
-   NO Codex trailers anywhere in release commits/PR bodies. (Repo git config is already
-   `JakubGawr` / `63911380+JakubGawr@users.noreply.github.com`; the v0.3.0 bump commit `be4ef0f3` proves the shape.)
+1. **`gh` active account MUST be the releaser's OWN account.** `gh auth status` → "Active account: true"
+   on your account. If several accounts are logged in, switch to yours (`gh auth switch`) — never publish under someone else's.
+2. **Commit author MUST be the person cutting the release** — your own `git config user.name` /
+   `user.email`, not whoever committed last. NO `Co-Authored-By: Codex`,
+   NO Codex trailers anywhere in release commits/PR bodies.
 3. **NEVER `git push origin murmur` / `…main` directly.** The trunk branch is `murmur`;
    integrate via a PR (`gh pr create … --base murmur` → `gh pr merge`). An environment-level
    `block-bash.sh` guard rejects direct pushes to main/master — a PR is the only path.
@@ -50,8 +50,8 @@ latest tag — existing releases: `v0.1.0`, `v0.2.0`, `v0.3.0`).
 source "$HOME/.cargo/env"
 cd /Users/jakubgawronski/Projects/meetnotes
 git rev-parse --abbrev-ref HEAD            # confirm a feature branch, NOT murmur/main
-gh auth status                            # confirm Active account: JakubGawr
-git log -1 --format='%an <%ae>'           # confirm JakubGawr <63911380+JakubGawr@users.noreply.github.com>
+gh auth status                            # confirm the Active account is YOURS
+git config user.name; git config user.email  # confirm the commit identity is YOURS
 scripts/agent-resource-run -- bash scripts/ci.sh  # must end "✅ CI: all gates green"
 ```
 
@@ -93,17 +93,17 @@ scripts/agent-resource-run --chdir src-tauri -- cargo update -p murmur --precise
 grep -A1 '^name = "murmur"' Cargo.lock   # workspace-root lock; confirm version = "<NEW>"
 ```
 
-## Stage 3 — Commit as JakubGawr (no Codex trailers)
+## Stage 3 — Commit as yourself (no Codex trailers)
 
 ```bash
 git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml Cargo.lock
 git commit -m "chore(release): bump version to $NEW"
-git log -1 --format='%an <%ae>%n%b'   # author JakubGawr, body has NO Co-Authored-By / Codex
+git log -1 --format='%an <%ae>%n%b'   # author = you (the releaser), body has NO Co-Authored-By / Codex
 ```
 
 > **CALLOUT — no Codex trailers.** If your environment auto-appends a
 > `Co-Authored-By: Codex` trailer, strip it (`git commit --amend`) before pushing.
-> Release history is JakubGawr-only.
+> Release commits carry the releaser's own identity and nothing else.
 
 ## Stage 4 — Merge to the `murmur` trunk via PR (NEVER direct push)
 
@@ -117,7 +117,7 @@ git checkout murmur && git pull origin murmur             # local trunk now has 
 ```
 
 > **CALLOUT.** `--base murmur` (the trunk), not `main`/`master`. Direct `git push origin
-> murmur` is blocked by the environment guard — the PR is mandatory. `gh` account = JakubGawr.
+> murmur` is blocked by the environment guard — the PR is mandatory. `gh` account = your own.
 
 ---
 
@@ -285,8 +285,8 @@ build→sign→notarize leg is long-running and Mac-bound. Two shapes:
   `cargo test --lib`, `ng lint`, `ng build`, version-triple-agreement, `gh`-account +
   commit-author identity — collect verdicts, and only enter the bump stage when all PASS.
 
-Keep the **identity interlocks as preconditions** on every writing node: `gh`=JakubGawr,
-author=JakubGawr, base=`murmur`, identifier unchanged, sign-by-hash. The Mac-only stages stay a
+Keep the **identity interlocks as preconditions** on every writing node: `gh`=the releaser's own account,
+author=the releaser, base=`murmur`, identifier unchanged, sign-by-hash. The Mac-only stages stay a
 hard boundary — a headless orchestrator hands them to the user rather than faking them.
 
 ## Rules
@@ -295,7 +295,7 @@ hard boundary — a headless orchestrator hands them to the user rather than fak
 - **Never invent a green.** `lipo` must show both arches; `codesign --verify` must show
   `flags=0x10000(runtime)` + `Developer ID Application`; `spctl` must say accepted. If a
   check doesn't pass, STOP and report — do not "assume it worked."
-- **Identity is non-negotiable:** gh=JakubGawr, commit-author=JakubGawr (no Codex trailers),
+- **Identity is non-negotiable:** gh=the releaser's own account, commit-author=the releaser (no Codex trailers),
   base=`murmur` via PR, identifier=`com.meetnotes.app` unchanged, sign **by hash**.
 - **Headless honesty.** If there is no Mac / no cert / no notary creds, say so and hand the
   user the exact remaining commands — never claim a notarized DMG you didn't produce.

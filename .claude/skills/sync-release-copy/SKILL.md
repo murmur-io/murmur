@@ -30,10 +30,10 @@ not silently rewrite marketing.
 
 ## Hard constraints (each has bitten before — verify every one)
 
-1. **`gh` active account MUST be `JakubGawr`** (`gh auth status`). A second account
-   `jakub-united` may also be logged in — do not use it.
-2. **Commit/PR author MUST be `JakubGawr <63911380+JakubGawr@users.noreply.github.com>`. NO Claude trailers**, no
-   `Co-Authored-By: Claude`, anywhere. (Repo git config is already JakubGawr.)
+1. **`gh` active account MUST be your own** (`gh auth status`). If several accounts are
+   logged in, switch to yours (`gh auth switch`).
+2. **Commit/PR author MUST be the person actually opening the PR** (your own git identity).
+   **NO Claude trailers**, no `Co-Authored-By: Claude`, anywhere.
 3. **NEVER `git push origin murmur` directly** — the trunk is `murmur`; land landing
    edits via a PR (`gh pr create --base murmur` → `gh pr merge`). `block-bash.sh`
    rejects a direct trunk push anyway.
