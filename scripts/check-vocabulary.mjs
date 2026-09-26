@@ -76,7 +76,13 @@ function tracked(globs) {
     cwd: ROOT,
     encoding: "utf8",
   });
-  return out.split("\n").filter(Boolean);
+  // Storybook stories are developer documentation, never product copy: nothing reaches them
+  // from `src/main.ts` (tsconfig.app.json compiles from there alone), so a user can never read
+  // them. Their prose has to say "tokens", "IPC" and "MCP" to explain the design system.
+  return out
+    .split("\n")
+    .filter(Boolean)
+    .filter((file) => !file.endsWith(".stories.ts"));
 }
 
 /**

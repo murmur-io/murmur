@@ -6,8 +6,12 @@ import { Meta } from "@storybook/addon-docs/blocks";
 
 The living reference for Murmur’s UI: the **design tokens** in `src/design-tokens/`, the
 class-based **primitives** in `src/app/design-system/primitives.css`, and every **`mur-*`
-component** in `src/app/design-system/`. Stories render the real components, with the app’s real
-global stylesheet and fonts, zoneless — exactly as they run inside the Tauri WKWebView.
+component** in `src/app/design-system/`. Stories render the real components with the app’s real
+global stylesheet and fonts, zoneless, as in the app.
+
+Storybook is not the shipping engine. It builds with webpack, serves no Content-Security-Policy
+and runs in whatever browser you open it in — so a packaged-WKWebView-only failure (the `style-src`
+nonce trap, `angular-zoneless.md` T4) will not reproduce here. Verify those in the real build.
 
 ## How to read this
 

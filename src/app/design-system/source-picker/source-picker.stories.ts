@@ -70,6 +70,10 @@ const meta: Meta<SourcePickerComponent> = {
     selectionLimit: { control: "number" },
     allowDashboards: { control: "boolean" },
     dashboardMode: { control: "inline-radio", options: ["expand", "composite"] },
+    allowedKinds: {
+      control: "check",
+      options: ["meeting", "note", "document", "org", "container"],
+    },
     selectedChange: { action: "selectedChange" },
     dashboardChange: { action: "dashboardChange" },
   },
@@ -82,6 +86,7 @@ const meta: Meta<SourcePickerComponent> = {
     selectionLimit: null,
     allowDashboards: true,
     dashboardMode: "expand",
+    allowedKinds: ["meeting", "note", "document"],
   },
   render: (args) => ({
     props: args,
@@ -89,7 +94,7 @@ const meta: Meta<SourcePickerComponent> = {
       <div style="max-width: 520px; min-height: 360px">
         <mur-source-picker [(selected)]="selected" [(dashboard)]="dashboard" [placeholder]="placeholder"
           [triggerLabel]="triggerLabel" [disabled]="disabled" [selectionLimit]="selectionLimit"
-          [allowDashboards]="allowDashboards" [dashboardMode]="dashboardMode"
+          [allowDashboards]="allowDashboards" [dashboardMode]="dashboardMode" [allowedKinds]="allowedKinds"
           (selectedChange)="selectedChange($event)" (dashboardChange)="dashboardChange($event)" />
       </div>`,
   }),

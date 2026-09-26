@@ -57,6 +57,8 @@ const meta: Meta<MurModelPickerComponent> = {
     loading: false,
     disabled: false,
     canRefresh: true,
+    defaultLabel: "Default (provider's pick)",
+    placeholder: "Model id (blank = default)",
     ariaLabel: "Model",
   },
   render: (args) => ({
@@ -65,6 +67,7 @@ const meta: Meta<MurModelPickerComponent> = {
       <div style="max-width: 520px">
         <mur-model-picker [catalog]="catalog" [(value)]="value" [loading]="loading" [disabled]="disabled"
           [canRefresh]="canRefresh" [ariaLabel]="ariaLabel"
+          [defaultLabel]="defaultLabel" [placeholder]="placeholder"
           (refresh)="refresh()" (modelEdited)="modelEdited()" (valueChange)="valueChange($event)" />
       </div>`,
   }),

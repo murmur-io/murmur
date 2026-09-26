@@ -60,13 +60,13 @@
      toggle (NoteEditorComponent) overrides this to `min(1600px, 92%)` instead
      of introducing a second token, since that's a computed relationship
      (92% of the available pane), not a fixed design value. */
-  --note-state-border-width: 1px;
   --editor-max: 920px;
   --editor-wide-max: 1600px;
   --editor-wide-width: 92%;
   --editor-min-height: 60vh;
   --editor-focus-ring: 0 2px 0 var(--accent);
   --editor-selection: color-mix(in srgb, var(--accent) 42%, transparent);
+  --note-state-border-width: 1px;
 
   /* The EMBEDDED note editor's calm-notepad measure (Calm-Notepad recording
      redesign, 2026-07-19). While recording, the companion note is a centered
