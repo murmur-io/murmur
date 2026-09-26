@@ -293,7 +293,8 @@ export class DetailComponent implements OnInit {
   readonly saveError = signal("");
   /** Serializes preview checklist writes (see `toggleNoteTask`). */
   private taskSaveChain: Promise<void> = Promise.resolve();
-  private taskSaveGeneration = 0;
+  /** Per meeting, so a failure on one meeting never drops a toggle queued for another. */
+  private readonly taskSaveGeneration = new Map<string, number>();
   private taskSavesPending = 0;
   /** The last markdown `updateNote` confirmed for the meeting being toggled. */
   private taskConfirmed: { meetingId: string; markdown: string } | null = null;
@@ -1998,11 +1999,11 @@ export class DetailComponent implements OnInit {
       this.taskConfirmed = { meetingId, markdown: current.note.markdown };
     }
     this.detail.set({ ...current, note: { ...current.note, markdown } });
-    const generation = this.taskSaveGeneration;
+    const generation = this.taskSaveGeneration.get(meetingId) ?? 0;
     this.taskSavesPending += 1;
     this.taskSaveChain = this.taskSaveChain.then(async () => {
       try {
-        if (generation !== this.taskSaveGeneration) {
+        if (generation !== (this.taskSaveGeneration.get(meetingId) ?? 0)) {
           return; // an earlier toggle failed and was rolled back; never write this one
         }
         const updated = await this.ipc.updateNote(meetingId, markdown);
@@ -2016,7 +2017,7 @@ export class DetailComponent implements OnInit {
         }
         this.detail.set({ ...now, note: updated });
       } catch (e) {
-        this.taskSaveGeneration += 1;
+        this.taskSaveGeneration.set(meetingId, generation + 1);
         this.toast.danger(this.errorCopy.because("Couldn’t save the checklist", e));
         const now = this.detail();
         const confirmed = this.taskConfirmed;

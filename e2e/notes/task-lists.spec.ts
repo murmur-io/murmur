@@ -257,6 +257,39 @@ test("a failed meeting-note save drops the toggles queued behind it and rolls ba
   ]);
 });
 
+test("a checkbox faked with raw HTML in the source cannot toggle anything", async ({ page }) => {
+  // Verifier R2: a raw `md-task-box` span in front of a task the sanitizers drop from
+  // the DOM (inside <template>) kept the on-screen and source states equal, so clicking
+  // the fake box flipped the hidden line. Real boxes now carry a per-render class.
+  await mockNotes(page, {
+    get_note: (args: { id: string }) => ({
+      id: args.id,
+      title: "Todo",
+      folderId: "nf1",
+      markdown:
+        '<span class="md-task-box" role="checkbox" aria-checked="false" tabindex="0">fake</span>\n\n<template>\n\n- [ ] hidden\n\n</template>\n\n- [ ] real',
+      tags: [],
+      updatedAt: 1_720_000_000_000,
+      createdAt: 1_719_000_000_000,
+      exportedPath: null,
+      locked: false,
+      shared: false,
+    }),
+    save_note_text: (args: any) => {
+      const w = window as any;
+      w.__saved = [...(w.__saved ?? []), args.markdown];
+      return 1_720_000_200_000;
+    },
+  });
+  await page.goto("/notes/n1");
+  await page.getByRole("button", { name: "Preview", exact: true }).click();
+  const fake = page.locator(".note-preview").getByRole("checkbox", { name: "fake" });
+  await expect(fake).toHaveCount(1);
+  await fake.click();
+  await page.waitForTimeout(2_000); // past the autosave debounce
+  expect(await page.evaluate(() => (window as any).__saved ?? [])).toEqual([]);
+});
+
 test.describe("toggleTask (source mapping)", () => {
   test("flips exactly the Nth task, ignoring code fences", () => {
     expect(toggleTask(NOTE_BODY, 0)).toBe(NOTE_BODY.replace("- [ ] milk", "- [x] milk"));

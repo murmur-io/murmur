@@ -78,6 +78,12 @@ export class MarkdownComponent {
   private readonly docPreview = inject(DocumentPreviewService);
   private readonly toast = inject(ToastService);
   private readonly host = inject<ElementRef<HTMLElement>>(ElementRef);
+  /**
+   * Per-render class carried only by checkboxes the RENDERER emitted. Raw HTML in the
+   * (untrusted) source can copy `md-task-box`, but cannot guess this, so a fake box can
+   * neither be clicked nor pad the DOM count that the toggle guard compares.
+   */
+  private taskBoxClass = "";
 
   readonly markdown = input<string>("");
   readonly compact = input(false, { transform: booleanAttribute });
@@ -145,7 +151,12 @@ export class MarkdownComponent {
     if (!this.interactiveTasks()) {
       return true;
     }
-    const boxes = Array.from(this.host.nativeElement.querySelectorAll(".md-task-box"));
+    if (!this.taskBoxClass || !box.classList.contains(this.taskBoxClass)) {
+      return true;
+    }
+    const boxes = Array.from(
+      this.host.nativeElement.querySelectorAll(`.md-task-box.${this.taskBoxClass}`),
+    );
     const source = this.markdown() ?? "";
     // The DOM index is only meaningful if the rendered view of the source lexes to
     // exactly the boxes on screen (a raw-HTML `md-task-box` span would not).
@@ -229,12 +240,14 @@ export class MarkdownComponent {
       /<\s*\/?\s*(?:img|picture|source)\b/i.test(html)
         ? '<span class="md-image-blocked">External image blocked for privacy</span>'
         : html;
+    const boxClass = `md-tb-${crypto.randomUUID().slice(0, 8)}`;
+    this.taskBoxClass = boxClass;
     renderer.checkbox = ({ checked }: Tokens.Checkbox): string => {
       const state = checked ? "true" : "false";
       const label = checked ? "Mark as not done" : "Mark as done";
       return interactiveTasks
-        ? `<span class="md-task-box" role="checkbox" aria-checked="${state}" tabindex="0" aria-label="${label}"></span>`
-        : `<span class="md-task-box" role="checkbox" aria-checked="${state}" aria-disabled="true"></span>`;
+        ? `<span class="md-task-box ${boxClass}" role="checkbox" aria-checked="${state}" tabindex="0" aria-label="${label}"></span>`
+        : `<span class="md-task-box ${boxClass}" role="checkbox" aria-checked="${state}" aria-disabled="true"></span>`;
     };
     const baseListitem = renderer.listitem.bind(renderer);
     renderer.listitem = (item: Tokens.ListItem): string => {
