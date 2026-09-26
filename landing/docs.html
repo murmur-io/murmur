@@ -505,6 +505,7 @@
           <a class="docs-nav-link" data-doc="data-flow"><span class="dot"></span>What never leaves your Mac</a>
           <a class="docs-nav-link" data-doc="lock-model"><span class="dot"></span>The lock model</a>
           <a class="docs-nav-link" data-doc="redaction-firewall"><span class="dot"></span>Redaction firewall &amp; cloud egress</a>
+          <a class="docs-nav-link" data-doc="known-limitations"><span class="dot"></span>Known limitations</a>
         </div>
         <p class="doc-empty" id="docsEmpty">No pages match your search.</p>
       </nav>
@@ -641,7 +642,7 @@
           <p class="lede">Murmur hears both sides of the call, transcribes each independently, and merges them into one clean transcript.</p>
           <div class="doc-body">
             <h2 id="dual-stream-capture">Dual-stream capture</h2>
-            <p>Your microphone and the other side's system audio (via a ScreenCaptureKit sidecar) are recorded as two separate streams, then transcribed independently before being merged by wall-clock into a single <b>Me / Others</b> timeline. This avoids the echo and cross-talk problems of single-stream capture.</p>
+            <p>Your microphone and the other side's system audio (a Core Audio process tap on macOS 14.4+, a ScreenCaptureKit helper on 13&ndash;14.3) are recorded as two separate streams, then transcribed independently before being merged by wall-clock into a single <b>Me / Others</b> timeline. This avoids the echo and cross-talk problems of single-stream capture.</p>
             <h2 id="on-device-whisper">On-device Whisper</h2>
             <p>Transcription runs fully on-device via <code>whisper.cpp</code> with Metal acceleration. Pick a model from <code>tiny</code> to <code>large-v3</code> &mdash; including the faster turbo build and quantized variants &mdash; or just pick a rung: <b>Light</b>, <b>Balanced</b>, <b>Sharp</b> or <b>Maximum</b>. Murmur picks a sensible default for your Mac. Speaker diarization and voice-activity detection are optional on top.</p>
             <ul>
@@ -651,8 +652,10 @@
             </ul>
             <h2 id="live-caption-engine">The live-caption engine</h2>
             <p>Live captions run on Whisper by default. If you want them lighter, Settings offers a second engine you download once (about 600 MB, CPU-only). Either way the <b>saved</b> transcript is always Whisper's &mdash; the caption engine only changes what you see while you are still talking.</p>
+            <p>During the call, live captions (and the live <code>@brain</code> context) follow <b>your microphone</b>. The other side's audio is captured in parallel the whole time and folded into the full <b>Me / Others</b> transcript once you stop.</p>
             <h2 id="when-capture-goes-wrong">When capture goes wrong</h2>
             <p>If the system-audio helper dies mid-recording, Murmur says so on screen instead of quietly continuing with your microphone alone &mdash; a half-recorded call you know about beats a clean-looking one that is missing the other side. And a recording whose transcription failed offers <b>Transcribe again</b> rather than stranding the audio.</p>
+            <p>The microphone buffer is spilled to disk about once a second, so a crash, a force-quit or a power cut mid-recording still leaves a real transcript and note on the next launch. A single recording is capped at four hours.</p>
           </div>
           <div class="doc-pager">
             <a class="prev" data-doc-link="tasks"><span class="pager-label">Back</span><span class="pager-title">← Tasks &amp; reminders</span></a>
@@ -910,7 +913,7 @@
             <h2 id="apple-reminders">Apple Reminders</h2>
             <p>Action items extracted from a meeting note can push straight into Apple Reminders, so follow-ups don't have to live only inside Murmur.</p>
             <h2 id="feed-it-more">Feed it more than meetings</h2>
-            <p>Drop in PDFs, Office documents, web pages, and images — they're chunked into the same on-device brain and become searchable alongside your meetings, in the same encrypted store.</p>
+            <p>Drop in PDFs (scanned pages fall back to on-device Apple Vision OCR), Word, PowerPoint and Excel files, web pages, Markdown and images — they're chunked into the same on-device brain and become searchable alongside your meetings, in the same encrypted store.</p>
           </div>
           <div class="doc-pager">
             <a class="prev" data-doc-link="providers"><span class="pager-label">Back</span><span class="pager-title">← AI providers</span></a>
@@ -1080,6 +1083,28 @@
           </div>
           <div class="doc-pager">
             <a class="prev" data-doc-link="lock-model"><span class="pager-label">Back</span><span class="pager-title">← The lock model</span></a>
+            <a class="next" data-doc-link="known-limitations"><span class="pager-label">Next</span><span class="pager-title">Known limitations →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-known-limitations" data-keywords="known limitations gaps honest status signed build touch id screen share cloud transcription reranker router shadow">
+          <span class="eyebrow">Privacy &amp; security</span>
+          <h1>Known limitations</h1>
+          <p class="lede">What is not shipped yet, or not yet proven by an automated test — stated plainly rather than implied away.</p>
+          <div class="doc-body">
+            <h2 id="signed-build-only">Some guarantees only hold on a signed build</h2>
+            <p>Touch ID, lock-at-rest, live system-audio capture and screen-share auto-relock can only be fully exercised on a Developer-ID-signed build on a real Mac — the published releases. A development build can bypass the Keychain with a debug-only hatch; that is convenient for iteration, not a security guarantee.</p>
+            <h2 id="manual-validation">Validated by hand, per release</h2>
+            <p>A live, two-account round-trip of Shared Brain sharing on signed builds is still checked manually before each release rather than by an automated headless test.</p>
+            <h2 id="not-shipped">Not shipped</h2>
+            <ul>
+              <li><b>Cloud transcription.</b> All transcription is on-device. A cloud speech-to-text option exists only as a research note, not as code.</li>
+              <li><b>A retrieval router.</b> The module exists but runs in shadow mode only; it does not decide anything a user sees.</li>
+              <li><b>An on-device reranker.</b> The seam is wired, but it currently measures no improvement in retrieval quality, so treat it as plumbing.</li>
+            </ul>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="redaction-firewall"><span class="pager-label">Back</span><span class="pager-title">← Redaction firewall &amp; cloud egress</span></a>
             <span></span>
           </div>
         </article>
@@ -1111,7 +1136,7 @@
           <a href="https://github.com/murmur-io/murmur">GitHub</a>
         </nav>
       </div>
-      <p class="foot-legal">🍎 macOS-first · 🧠 on-device brain · 🔒 local-first · built with Tauri + Angular + Rust</p>
+      <p class="foot-legal">🍎 macOS-first · 🧠 on-device brain · 🔒 local-first · built with Tauri + Angular + Rust · open source under <a href="https://github.com/murmur-io/murmur/blob/murmur/LICENSE">AGPL-3.0</a></p>
     </div>
   </footer>
 
