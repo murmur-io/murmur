@@ -2742,6 +2742,12 @@ export interface NoteDoc {
   locked: boolean;
   /** Has an active outbound share. */
   shared: boolean;
+  /**
+   * Per-note edit-lock (the editor header's padlock): the note opens read-only
+   * and the editor refuses edits until it is toggled off. A UX guard against
+   * accidental edits — NOT the folder seal. Always false on the masked DTO.
+   */
+  editLocked: boolean;
 }
 
 /** Owner namespace used by the gated note-attachment commands. */

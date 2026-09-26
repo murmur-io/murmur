@@ -104,25 +104,43 @@
              "Preview" to assistive tech and to the suite), and `aria-pressed`
              carries the state that colour alone would otherwise be the only
              signal for. -->
+        <!-- Edit-lock padlock — makes THIS note read-only (persisted per note).
+             A guard against accidental edits, not the folder seal: the note stays
+             readable, shareable and movable; only its content can't change until
+             the padlock is opened again. `aria-pressed` carries the state. -->
+        <button
+          type="button"
+          class="btn btn-ghost head-btn head-icon-btn head-lock-btn"
+          [class.is-active]="editLocked()"
+          [attr.aria-pressed]="editLocked()"
+          [disabled]="editLockBusy()"
+          (click)="toggleEditLock()"
+          [attr.aria-label]="editLocked() ? 'Unlock editing' : 'Lock editing'"
+          [title]="editLocked() ? 'Editing locked — click to allow edits' : 'Lock editing'"
+        >
+          <mur-icon [icon]="editLocked() ? 'lock' : 'unlock'" />
+        </button>
+
         <div class="seg head-seg" role="group" aria-label="Edit or preview">
           <button
             type="button"
             class="seg-btn seg-btn-icon"
-            [class.is-active]="!preview()"
-            [attr.aria-pressed]="!preview()"
+            [class.is-active]="!preview() && !editLocked()"
+            [attr.aria-pressed]="!preview() && !editLocked()"
+            [disabled]="editLocked()"
             (click)="setPreview(false)"
             aria-label="Edit"
-            title="Edit"
+            [title]="editLocked() ? 'Editing is locked' : 'Edit'"
           >
             <mur-icon icon="edit" />
           </button>
           <button
             type="button"
             class="seg-btn seg-btn-icon"
-            [class.is-active]="preview()"
-            [attr.aria-pressed]="preview()"
+            [class.is-active]="preview() || editLocked()"
+            [attr.aria-pressed]="preview() || editLocked()"
             (click)="setPreview(true)"
-            [disabled]="importingImages() > 0"
+            [disabled]="importingImages() > 0 || editLocked()"
             aria-label="Preview"
             title="Preview"
           >
@@ -401,7 +419,7 @@
               }
         </ng-template>
         <app-note-document
-          [mode]="{ access: 'editable', view: previewActive() ? 'preview' : 'edit' }"
+          [mode]="documentMode()"
           [title]="title()"
           [showTitle]="!embedded()"
           [markdown]="previewMarkdown()"

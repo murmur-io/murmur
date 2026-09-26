@@ -1335,6 +1335,11 @@ impl Db {
         // `.md`. Refreshed on every vault (re)export; NULL for legacy rows (grandfathered). See the
         // `notes.exported_hash` migration comment for the full contract. Additive + guarded.
         Self::add_column_if_missing(&conn, "documents", "exported_hash", "TEXT")?;
+        // Note edit-lock (2026-09-26): a per-note "read-only" toggle the editor header exposes as a
+        // padlock icon. A UX guard against accidental edits — NOT a security boundary (that is the
+        // per-folder seal). Non-content, never sealed/blanked; rides the SQLCipher-at-rest layer.
+        // Additive + guarded; existing rows default to editable.
+        Self::add_column_if_missing(&conn, "documents", "edit_locked", "INTEGER NOT NULL DEFAULT 0")?;
         // NOTES feature — separate the Notes folder tree from the Meetings tree. `kind` defaults
         // 'meeting' so every existing folder + all meeting behavior stays byte-identical; note
         // folders are created with kind='note'. Lock/seal/CK machinery is folder-id-keyed and
@@ -9165,6 +9170,8 @@ pub struct NoteRow {
     pub updated_at: Option<i64>,
     pub exported_path: Option<String>,
     pub sealed: bool,
+    /// The per-note edit-lock toggle (`documents.edit_locked`).
+    pub edit_locked: bool,
 }
 
 /// One stored speaker voiceprint row (opt-in voice biometric for a diarized "others" cluster).

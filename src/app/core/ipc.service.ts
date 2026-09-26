@@ -3205,6 +3205,15 @@ export class IpcService {
   }
 
   /**
+   * Toggle a note's edit-lock (read-only padlock). Gated: rejects (`Locked`) for
+   * a sealed-and-not-session-unlocked note. Touches neither the body nor
+   * `updatedAt`. Returns the reconciled {@link NoteDoc}.
+   */
+  setNoteEditLocked(id: string, locked: boolean): Promise<NoteDoc> {
+    return invoke<NoteDoc>("set_note_edit_locked", { id, locked });
+  }
+
+  /**
    * Persist a note's title + FULL markdown (incl. front-matter), re-index it for
    * the brain, re-export the vault `.md`, and bump `updatedAt`. Write-gated:
    * rejects (`Locked`) for a sealed-and-not-session-unlocked note. Returns the

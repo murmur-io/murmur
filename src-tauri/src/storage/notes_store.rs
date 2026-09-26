@@ -399,7 +399,7 @@ impl Db {
         let conn = self.lock();
         conn.query_row(
             "SELECT id, folder_id, name, title, COALESCE(text, ''), created_at, updated_at,
-                    exported_path, (text_blob IS NOT NULL)
+                    exported_path, (text_blob IS NOT NULL), COALESCE(edit_locked, 0)
                FROM documents WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![id],
             row_to_note_row,
@@ -414,7 +414,7 @@ impl Db {
         let conn = self.lock();
         conn.query_row(
             "SELECT id, folder_id, name, title, COALESCE(text, ''), created_at, updated_at,
-                    exported_path, (text_blob IS NOT NULL)
+                    exported_path, (text_blob IS NOT NULL), COALESCE(edit_locked, 0)
                FROM documents WHERE id = ?1 AND kind IN ('note','document')",
             rusqlite::params![id],
             row_to_note_row,
@@ -434,6 +434,21 @@ impl Db {
         )
         .optional()
         .map_err(map_err)
+    }
+
+    /// Set the per-note edit-lock toggle. Returns `false` when the id is unknown or not an authored
+    /// note (`kind='note'`). Touches ONLY `edit_locked` — not `updated_at`, not `title`/`text` — so
+    /// it neither reorders the Notes list nor bumps an org-share source version. The COMMAND layer
+    /// gates the folder first.
+    pub fn set_note_edit_locked(&self, id: &str, locked: bool) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE documents SET edit_locked = ?2 WHERE id = ?1 AND kind = 'note'",
+                rusqlite::params![id, locked as i64],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
     }
 
     /// Recording-time COMPANION NOTE — set the STRUCTURED `documents.meeting_id` link on a
@@ -1403,7 +1418,8 @@ fn row_to_note(row: &Row<'_>) -> rusqlite::Result<NoteRecord> {
     })
 }
 
-/// Column order: `id, folder_id, name, title, text, created_at, updated_at, exported_path, sealed`.
+/// Column order: `id, folder_id, name, title, text, created_at, updated_at, exported_path, sealed,
+/// edit_locked`.
 fn row_to_note_row(row: &Row<'_>) -> rusqlite::Result<NoteRow> {
     Ok(NoteRow {
         id: row.get(0)?,
@@ -1415,6 +1431,7 @@ fn row_to_note_row(row: &Row<'_>) -> rusqlite::Result<NoteRow> {
         updated_at: row.get(6)?,
         exported_path: row.get(7)?,
         sealed: row.get::<_, i64>(8)? != 0,
+        edit_locked: row.get::<_, i64>(9)? != 0,
     })
 }
 
