@@ -1,0 +1,15 @@
+import { Meta, Story } from "@storybook/addon-docs/blocks";
+import * as Tokens from "./tokens.stories";
+
+<Meta title="Design tokens/Accents" />
+
+# Accents
+
+Source: `src/design-tokens/accents.css`. The default purple lives in `colors.css`; picking another
+accent in Settings → Appearance stamps `data-accent="<id>"` on `<html>` and these blocks re-tint
+the accent ramp and its derived tokens, for dark, explicit light and System-mode light. It is
+imported after `theme-light.css` on purpose, so a chosen accent wins the `--accent-soft` /
+`--shadow-accent` tie. The `--accent-option-*` swatches are skin-independent — the picker has to
+paint every option whichever one is active.
+
+<Story of={Tokens.Accents} />

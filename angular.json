@@ -88,6 +88,48 @@
               "src/**/*.html"
             ]
           }
+        },
+        "storybook": {
+          "builder": "@storybook/angular:start-storybook",
+          "options": {
+            "configDir": ".storybook",
+            "browserTarget": "meetnotes:build:development",
+            "tsConfig": ".storybook/tsconfig.json",
+            "compodoc": false,
+            "experimentalZoneless": true,
+            "styles": [
+              "src/styles.css"
+            ],
+            "assets": [
+              {
+                "glob": "**/*",
+                "input": "src/assets",
+                "output": "assets"
+              }
+            ],
+            "port": 6006
+          }
+        },
+        "build-storybook": {
+          "builder": "@storybook/angular:build-storybook",
+          "options": {
+            "configDir": ".storybook",
+            "browserTarget": "meetnotes:build:development",
+            "tsConfig": ".storybook/tsconfig.json",
+            "compodoc": false,
+            "experimentalZoneless": true,
+            "styles": [
+              "src/styles.css"
+            ],
+            "assets": [
+              {
+                "glob": "**/*",
+                "input": "src/assets",
+                "output": "assets"
+              }
+            ],
+            "outputDir": "dist/storybook"
+          }
         }
       }
     }

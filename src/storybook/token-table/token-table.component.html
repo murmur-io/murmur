@@ -1,0 +1,76 @@
+<div class="toolbar">
+  <input
+    type="search"
+    placeholder="Filter by name, value or note…"
+    aria-label="Filter tokens"
+    [value]="query()"
+    (input)="onQuery($event)"
+  />
+  <span class="total">{{ total() }} tokens</span>
+</div>
+
+@for (group of views(); track group.context) {
+  <section class="group">
+    <header class="group-head">
+      <code class="context">{{ group.context }}</code>
+      @if (!group.isBase) {
+        <span class="badge">override</span>
+      }
+      <span class="count">{{ group.count }}</span>
+    </header>
+
+    @for (section of group.sections; track section.key) {
+      @if (section.title) {
+        <h4 class="section-title">{{ section.title }}</h4>
+      }
+      <table class="tokens">
+        <thead>
+          <tr>
+            <th scope="col" class="col-preview"><span class="sr-only">Preview</span></th>
+            <th scope="col">Token</th>
+            <th scope="col">Declared</th>
+            <th scope="col">Live</th>
+          </tr>
+        </thead>
+        <tbody>
+          @for (row of section.rows; track row.name) {
+            <tr>
+              <td class="col-preview">
+                @switch (row.preview) {
+                  @case ("color") {
+                    <span class="swatch" [style.background]="row.paint"></span>
+                  }
+                  @case ("fill") {
+                    <span class="swatch swatch--wide" [style.background]="row.paint"></span>
+                  }
+                  @case ("radius") {
+                    <span class="radius" [style.border-radius]="row.paint"></span>
+                  }
+                  @case ("length") {
+                    <span class="length" [style.width]="row.paint"></span>
+                  }
+                  @case ("shadow") {
+                    <span class="shadow" [style.box-shadow]="row.paint"></span>
+                  }
+                  @case ("font") {
+                    <span class="font" [style.font-family]="row.paint">Aa</span>
+                  }
+                }
+              </td>
+              <td>
+                <code class="name">{{ row.name }}</code>
+                @if (row.note) {
+                  <p class="note">{{ row.note }}</p>
+                }
+              </td>
+              <td><code class="value">{{ row.value }}</code></td>
+              <td><code class="value live">{{ row.live }}</code></td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    }
+  </section>
+} @empty {
+  <p class="empty">No token matches “{{ query() }}”.</p>
+}

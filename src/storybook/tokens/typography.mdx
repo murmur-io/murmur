@@ -1,0 +1,16 @@
+import { Meta, Story } from "@storybook/addon-docs/blocks";
+import * as Tokens from "./tokens.stories";
+
+<Meta title="Design tokens/Typography" />
+
+# Typography
+
+Source: `src/design-tokens/typography.css`. `--font-sans` (Hanken Grotesk, self-hosted) is the UI
+face, `--font-mono` the code face, and `--font-reading` the long-form document face — it defaults
+to the UI face, and a skin can give reading its own face without touching a component.
+
+Body metrics (`--tracking-body`, `--tracking-heading`, `--leading-body`) are tokens so a skin can
+retune reading comfort; `--leading-body` stays at or above WCAG 1.4.8’s 1.5. The note document
+has its own `--note-*` surface and the shared markdown renderer its `--prose-*` pair.
+
+<Story of={Tokens.Typography} />

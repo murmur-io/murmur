@@ -1,0 +1,58 @@
+import { Meta } from "@storybook/addon-docs/blocks";
+
+<Meta title="Introduction" />
+
+# Murmur — Design System
+
+The living reference for Murmur’s UI: the **design tokens** in `src/design-tokens/`, the
+class-based **primitives** in `src/app/design-system/primitives.css`, and every **`mur-*`
+component** in `src/app/design-system/`. Stories render the real components with the app’s real
+global stylesheet and fonts, zoneless, as in the app.
+
+Storybook is not the shipping engine. It builds with webpack, serves no Content-Security-Policy
+and runs in whatever browser you open it in — so a packaged-WKWebView-only failure (the `style-src`
+nonce trap, `angular-zoneless.md` T4) will not reproduce here. Verify those in the real build.
+
+## How to read this
+
+- **Design tokens** — one page per token file. Each catalogue is read from the file’s *source*, so
+  names, values and the comments that explain them can never drift from the CSS.
+- **Primitives** — the shared control language (buttons, fields, menus, segmented, surfaces).
+- **Components** — every `mur-*` component and directive, grouped by role, each with a *Docs* page
+  and interactive controls.
+
+Use the toolbar to switch **Theme** (dark / light / system), **Accent** and **Skin** (Studio /
+Paper). They set the same `data-theme` / `data-accent` / `data-skin` attributes the app sets on
+`<html>`, so every story shows what a user with that setting sees.
+
+## Design model — Liquid Glass
+
+- **Glass is chrome, not content.** Floating rails and bars use `<mur-sidebar>` / the shell glass
+  tokens. In-flow content panels use `<mur-card>`. Glass never stacks on glass.
+- **Overlays are opaque.** Menus, popovers and dialogs paint `--surface-overlay` with no blur (T3).
+- **Neutral chrome, restrained accent.** Selected chrome is a neutral glass pill; the accent
+  colours only the glyph or label.
+- **Tokens only.** Components consume `var(--token)`; a value with no token means a new token, with
+  its light-theme override.
+
+## Adding to the catalogue
+
+1. Build the component in its own directory under `src/app/design-system/<name>/`
+   (`.ts` + `.html` + `.scss`), `mur-` selector, OnPush, signal inputs.
+2. Add `<name>.stories.ts` next to it with `tags: ["autodocs"]`, a `parameters.docs.description`
+   and a story per meaningful state.
+3. A component that talks to the Rust core goes through `IpcService`; declare the commands its
+   stories need as `parameters.tauri` (see `.storybook/tauri-mock.ts`). The mock stands in for the
+   transport only — it does not verify the backend payload shape.
+
+## Running it
+
+```bash
+npm run storybook
+```
+
+```bash
+npm run build-storybook
+```
+
+The first serves on http://localhost:6006; the second writes a static site to `dist/storybook`.
