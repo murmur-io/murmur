@@ -425,6 +425,7 @@
           (titleBlur)="onBlur()"
           [interactiveTasks]="!doc.locked"
           (tasksChange)="onPreviewTasksChange($event)"
+          (click)="onDocumentSurfaceClick($event)"
         />
       }
     }

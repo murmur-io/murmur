@@ -422,6 +422,8 @@ export class NoteEditorComponent {
   readonly brainOpen = signal(false);
 
   private readonly document = viewChild(NoteDocumentComponent);
+  /** The document surface's host node — the click-to-edit / click-away zone. */
+  private readonly documentHost = viewChild(NoteDocumentComponent, { read: ElementRef });
   private readonly bodyArea = computed(() => this.document()?.editorArea());
   private readonly imageFileInput =
     viewChild<ElementRef<HTMLInputElement>>("imageFileInput");
@@ -1838,13 +1840,24 @@ export class NoteEditorComponent {
 
   // ── Edit / Preview ───────────────────────────────────────────────────────
 
+  /**
+   * Bumped by every Edit intent (a pointerdown inside the note, Edit, click-to-edit)
+   * so a Preview flip still awaiting its save cannot land after the user returned.
+   */
+  private previewSeq = 0;
+
   async setPreview(on: boolean): Promise<void> {
+    const seq = ++this.previewSeq;
     if (!on) {
       this.preview.set(false);
       return;
     }
     await this.waitForAttachmentTasks();
     if (this.dirtyFull && !(await this.flushFull())) {
+      return;
+    }
+    // The user went back into the note (or asked for Edit) while the save ran.
+    if (seq !== this.previewSeq) {
       return;
     }
     if (this.saveState() === "error" || this.note()?.locked) {
@@ -2706,6 +2719,10 @@ export class NoteEditorComponent {
     if (!(target instanceof Element)) {
       return;
     }
+    const host = this.documentHost()?.nativeElement as HTMLElement | undefined;
+    if (host?.contains(target) || target.closest("[data-note-editor-overlay]")) {
+      this.previewSeq += 1;
+    }
     if (
       this.bodyArea()?.nativeElement === target ||
       target.closest("[data-note-editor-overlay]")
@@ -2727,6 +2744,150 @@ export class NoteEditorComponent {
     if (!insideHeaderMenu) {
       this.closeMenus();
     }
+    if (this.isClickAway(event, target)) {
+      void this.setPreview(true);
+    }
+  }
+
+  /**
+   * Click-away from Edit returns the note to Preview. "Away" is anything outside
+   * the document surface (title + toolbar + body + slash menu), its teleported
+   * overlays, and the note's own chrome — the header (Edit/Preview toggle, Move,
+   * Share, ⋯), its menu backdrop and the Share modal act ON the note being
+   * edited, so they keep Edit. Not either: the scroll region's own scrollbar, a note with no body yet (nothing to preview),
+   * or a tab-reused instance whose DOM is detached (its listener still hears
+   * clicks aimed at the visible tab).
+   */
+  private isClickAway(event: PointerEvent, target: Element): boolean {
+    const host = this.documentHost()?.nativeElement as HTMLElement | undefined;
+    if (
+      event.button !== 0 ||
+      event.ctrlKey ||
+      this.embedded() ||
+      this.preview() ||
+      !host?.isConnected ||
+      this.note()?.locked !== false ||
+      !this.body().trim()
+    ) {
+      return false;
+    }
+    if (
+      host.contains(target) ||
+      target.closest(".editor-head, .menu-backdrop, app-note-share-panel")
+    ) {
+      return false;
+    }
+    if (target instanceof HTMLElement && target.classList.contains("editor-body")) {
+      // Grabbing the scroll region's scrollbar is not a click away from the note.
+      // The slack covers overlay scrollbars, which take no layout width.
+      return event.offsetX < target.clientWidth - 16;
+    }
+    return true;
+  }
+
+  /**
+   * Click-to-edit: a plain click on the rendered Preview (body or title) flips
+   * the note into Edit with the caret at the clicked spot. Links, wikilink chips,
+   * buttons, the Related panel and a drag-to-copy text selection keep their own
+   * behaviour.
+   */
+  onDocumentSurfaceClick(event: MouseEvent): void {
+    const target = event.target;
+    if (
+      !this.previewActive() ||
+      event.button !== 0 ||
+      event.defaultPrevented ||
+      !(target instanceof Element)
+    ) {
+      return;
+    }
+    if (
+      target.closest(
+        "a, button, input, textarea, select, label, summary, [role='link'], [role='button'], [role='checkbox'], app-connections",
+      ) ||
+      !target.closest(".note-preview, .document-title")
+    ) {
+      return;
+    }
+    const selection = target.ownerDocument.defaultView?.getSelection();
+    if (selection && !selection.isCollapsed) {
+      return;
+    }
+    if (target.closest(".document-title")) {
+      this.enterEdit("title", null);
+    } else {
+      this.enterEdit("body", this.caretFromPreviewPoint(event, target));
+    }
+  }
+
+  private enterEdit(focus: "title" | "body", caret: number | null): void {
+    this.previewSeq += 1;
+    this.preview.set(false);
+    afterNextRender(
+      () => {
+        if (focus === "title") {
+          const host = this.documentHost()?.nativeElement as HTMLElement | undefined;
+          host?.querySelector<HTMLInputElement>(".note-title-input")?.focus({ preventScroll: true });
+          return;
+        }
+        const el = this.bodyArea()?.nativeElement;
+        if (!el) {
+          return;
+        }
+        const pos = Math.min(caret ?? el.value.length, el.value.length);
+        el.focus({ preventScroll: true });
+        el.setSelectionRange(pos, pos);
+      },
+      { injector: this.injector },
+    );
+  }
+
+  /**
+   * Best-effort map of a Preview click to a markdown offset: take the rendered
+   * text around the caret point and find it in the source. Rendering strips
+   * markers, so an anchor that spans one simply misses and the caret lands at
+   * the end. Both caret-from-point APIs are feature-checked (T5).
+   */
+  private caretFromPreviewPoint(event: MouseEvent, target: Element): number | null {
+    const doc = target.ownerDocument as Document & {
+      caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+      caretRangeFromPoint?: (x: number, y: number) => Range | null;
+    };
+    let node: Node | null = null;
+    let offset = 0;
+    try {
+      if (typeof doc.caretPositionFromPoint === "function") {
+        const pos = doc.caretPositionFromPoint(event.clientX, event.clientY);
+        node = pos?.offsetNode ?? null;
+        offset = pos?.offset ?? 0;
+      } else if (typeof doc.caretRangeFromPoint === "function") {
+        const range = doc.caretRangeFromPoint(event.clientX, event.clientY);
+        node = range?.startContainer ?? null;
+        offset = range?.startOffset ?? 0;
+      }
+    } catch {
+      return null;
+    }
+    if (!node || node.nodeType !== Node.TEXT_NODE) {
+      return null;
+    }
+    const text = node.textContent ?? "";
+    const body = this.body();
+    const before = text.slice(Math.max(0, offset - 24), offset);
+    if (before.trim().length >= 3) {
+      const at = body.indexOf(before);
+      if (at >= 0) {
+        return at + before.length;
+      }
+    }
+    const after = text.slice(offset, offset + 24);
+    if (after.trim().length >= 3) {
+      const at = body.indexOf(after);
+      if (at >= 0) {
+        return at;
+      }
+    }
+    return null;
   }
 
   /**
