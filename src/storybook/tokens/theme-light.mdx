@@ -1,0 +1,16 @@
+import { Meta, Story } from "@storybook/addon-docs/blocks";
+import * as Tokens from "./tokens.stories";
+
+<Meta title="Design tokens/Light theme" />
+
+# Light theme
+
+Source: `src/design-tokens/theme-light.css`. Derived from the dark palette with the same accent
+identity. Applies for `data-theme="light"` and — in System mode — when macOS prefers light. Only
+the tokens that must change are overridden; accent, live, radius, spacing, motion and type inherit
+from `:root`.
+
+Keep these in sync with the light block duplicated in `index.html` (painted before Angular
+boots). Switch the toolbar to **Light** to see the live column follow.
+
+<Story of={Tokens.LightTheme} />

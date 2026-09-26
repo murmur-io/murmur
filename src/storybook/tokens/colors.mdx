@@ -1,0 +1,20 @@
+import { Meta, Story } from "@storybook/addon-docs/blocks";
+import * as Tokens from "./tokens.stories";
+
+<Meta title="Design tokens/Colors" />
+
+# Colors
+
+Source: `src/design-tokens/colors.css`. The dark palette is the base `:root` ramp; the light theme,
+the Paper skin and the accent palettes override it.
+
+- **Surfaces** stack from `--surface-base` (the body) up. `--surface-raised` is the translucent
+  frosted card; `--surface-overlay` is the **opaque** ground every popover, menu and `<option>`
+  must use (T3).
+- **Text** has four tiers. Anything set at **12px or smaller** uses `--text-tertiary` —
+  `--text-muted` is below the legibility floor at that size and is for ≥13px only.
+- **Accent** is the one cool colour for calm states; `--accent-text` is the accent *as text*,
+  separate from `--accent-hover` (a button ground), because the two pull in opposite directions.
+- **Live** is the one warm colour, reserved for recording.
+
+<Story of={Tokens.Colors} />

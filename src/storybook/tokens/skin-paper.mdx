@@ -1,0 +1,19 @@
+import { Meta, Story } from "@storybook/addon-docs/blocks";
+import * as Tokens from "./tokens.stories";
+
+<Meta title="Design tokens/Paper skin" />
+
+# Paper skin
+
+Source: `src/design-tokens/skin-paper.css`. A **skin** is a second axis orthogonal to light/dark:
+`data-theme` decides how bright the app is, `data-skin` what it is made of. *Studio* (the default)
+stamps no attribute; *Paper* stamps `data-skin="paper"`.
+
+Paper is a quiet document skin — no glass, no aurora, no blur; opaque warm surfaces, hairline
+borders instead of shadows, tighter radii, the system serif for the document body and an ink-blue
+accent. Every text/background pair was measured to ≥ 4.5:1. It is imported after
+`theme-light.css` and before `accents.css`, so a chosen accent still wins over the skin’s default.
+
+Switch the toolbar to **Skin → Paper** to see it.
+
+<Story of={Tokens.PaperSkin} />

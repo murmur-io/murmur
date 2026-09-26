@@ -1,0 +1,142 @@
+:host {
+  display: block;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+.toolbar input {
+  flex: 1;
+  max-width: 420px;
+}
+.total {
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.group {
+  margin-bottom: var(--space-6);
+}
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.context {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--accent-text);
+}
+.badge {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.section-title {
+  margin: var(--space-4) 0 var(--space-2);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tokens {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.tokens th {
+  padding: var(--space-2);
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+}
+.tokens td {
+  padding: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.col-preview {
+  width: 88px;
+}
+
+.name,
+.value {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.name {
+  color: var(--text-primary);
+}
+.value {
+  color: var(--text-secondary);
+}
+.live {
+  color: var(--text-tertiary);
+}
+.note {
+  margin: var(--space-1) 0 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.swatch {
+  display: block;
+  width: 40px;
+  height: 28px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+.swatch--wide {
+  width: 72px;
+}
+.radius {
+  display: block;
+  width: 40px;
+  height: 28px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+}
+.length {
+  display: block;
+  max-width: 72px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+}
+.shadow {
+  display: block;
+  width: 40px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-overlay);
+}
+.font {
+  font-size: 20px;
+}
+
+.empty {
+  color: var(--text-tertiary);
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}

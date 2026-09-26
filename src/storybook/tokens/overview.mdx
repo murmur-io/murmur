@@ -1,0 +1,100 @@
+import { Meta, ColorPalette, ColorItem } from "@storybook/addon-docs/blocks";
+
+<Meta title="Design tokens/Overview" />
+
+# Design tokens
+
+Every design value Murmur uses — colour, radius, spacing, shadow, blur, motion, type — lives
+as a CSS custom property in **`src/design-tokens/`**, imported at the top of `src/styles.css`.
+Components consume `var(--token)` and nothing else.
+
+| File | What it holds |
+| --- | --- |
+| `colors.css` | Surfaces, text tiers, the cool accent, the warm *live* accent, borders, status colours |
+| `typography.css` | Font families, body metrics, the note/prose type surfaces |
+| `layout.css` | Radius, spacing (4px base), shadows, motion, layout widths, the sidebar rhythm, shell framing |
+| `glass.css` | The frosted treatment and the shell Liquid Glass layers, `--glass-user-alpha` |
+| `theme-light.css` | Overrides for `data-theme="light"` and System-mode light |
+| `skin-paper.css` | The *Paper* skin (`data-skin="paper"`) for both themes |
+| `accents.css` | User-selectable accent palettes (`data-accent`) |
+
+## Rules (binding — `.claude/rules/angular-zoneless.md` §6 / §6b)
+
+- **Tokens are the only source of design values.** No raw hex / px / rgba in component SCSS. A
+  one-off structural size (a `min-width`) is fine; anything the design language names is a token.
+- **A missing value means a new token** — added here, *with* its light-theme override in
+  `theme-light.css` (and the `prefers-color-scheme` System block).
+- **Overlays are opaque.** Anything floating over content uses `--surface-overlay` with no
+  backdrop blur, `--border-strong` and `--shadow-lg` (T3). The frosted `--surface-raised` /
+  `.card` is for in-flow panels only.
+- **Glass is chrome, not content.** Rails and bars use the `--shell-glass-*` layers; content
+  panels use the frosted card; glass never stacks on glass.
+- **`--glass-user-alpha` must keep working** — translucent chrome rides `--shell-glass-veil`, so
+  the Settings transparency slider and `prefers-reduced-transparency` can fade it to solid.
+
+## Three independent axes
+
+The toolbar above switches the same attributes the app stamps on `<html>`:
+
+| Toolbar | Attribute | Set by |
+| --- | --- | --- |
+| Theme | `data-theme="dark" \| "light" \| "system"` | `ThemeService` |
+| Accent | `data-accent="blue" \| …` (absent = purple) | `ChromeService` |
+| Skin | `data-skin="paper"` (absent = Studio) | `ChromeService` |
+
+`data-theme` decides how **bright** the app is, `data-skin` what it is **made of**, and
+`data-accent` its **tint**. Every catalogue page shows the *declared* value and the *live* value
+resolved under the current toolbar selection.
+
+## Semantic colours at a glance
+
+These swatches read the live tokens, so they follow the toolbar.
+
+<ColorPalette>
+  <ColorItem
+    title="Surfaces"
+    subtitle="base · raised · overlay · input · solid"
+    colors={{
+      base: "var(--surface-base)",
+      raised: "var(--surface-raised)",
+      overlay: "var(--surface-overlay)",
+      input: "var(--surface-input)",
+      solid: "var(--surface-solid)",
+    }}
+  />
+  <ColorItem
+    title="Text"
+    subtitle="primary · secondary · tertiary · muted"
+    colors={{
+      primary: "var(--text-primary)",
+      secondary: "var(--text-secondary)",
+      tertiary: "var(--text-tertiary)",
+      muted: "var(--text-muted)",
+    }}
+  />
+  <ColorItem
+    title="Accent"
+    subtitle="calm states — idle, nav, focus, links"
+    colors={{
+      accent: "var(--accent)",
+      hover: "var(--accent-hover)",
+      active: "var(--accent-active)",
+      soft: "var(--accent-soft)",
+      ring: "var(--accent-ring)",
+    }}
+  />
+  <ColorItem
+    title="Live"
+    subtitle="recording — the one warm accent"
+    colors={{ live: "var(--live)" }}
+  />
+  <ColorItem
+    title="Status"
+    subtitle="success · warning · danger"
+    colors={{
+      success: "var(--success)",
+      warning: "var(--warning)",
+      danger: "var(--danger)",
+    }}
+  />
+</ColorPalette>

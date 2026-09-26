@@ -1,0 +1,20 @@
+import { Meta, Story } from "@storybook/addon-docs/blocks";
+import * as Tokens from "./tokens.stories";
+
+<Meta title="Design tokens/Layout" />
+
+# Layout
+
+Source: `src/design-tokens/layout.css` — radius, spacing, shadows, motion, layout widths, the
+sidebar rhythm and how the shell frames its panels.
+
+- **Radius.** `--radius-pill` means *pill by nature* (switches, scrollbar thumbs, badges);
+  `--radius-control` means *pill by choice* (tabs, segmented) and is what a skin squares off.
+- **Spacing** is a 4px scale, `--space-1` (4px) … `--space-8`.
+- **Shadows** are soft and diffuse; `--shadow-lg` is the floating-overlay depth.
+- **Motion** — `--transition` / `--transition-fast` carry the curve; `prefers-reduced-motion` is
+  honoured globally.
+- **Sidebar rhythm** (`--sidebar-*`) is shared by the primary rail rows and `<mur-tree-row>`, so a
+  Browse row and a folder row align to the pixel.
+
+<Story of={Tokens.Layout} />
