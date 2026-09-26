@@ -1178,6 +1178,30 @@ export class NoteEditorComponent {
     this.scheduleSave();
   }
 
+  /**
+   * A task checkbox was ticked in Preview. `markdown` is `previewMarkdown()` with
+   * one marker flipped. The new body is taken as the SUFFIX of it relative to this
+   * editor's own front-matter prefix — never by re-splitting: a `---` block the
+   * user typed into the body this session is not `frontMatterPrefix()`, and a
+   * re-split would hand it to the prefix and silently drop it on save. A change
+   * that is not wholly inside the body is refused. Saves like a keystroke would.
+   */
+  onPreviewTasksChange(markdown: string): void {
+    if (this.note()?.locked) {
+      return;
+    }
+    const current = this.previewMarkdown();
+    const bodyStart = current.length - this.body().length;
+    if (
+      markdown.length !== current.length ||
+      markdown.slice(0, bodyStart) !== current.slice(0, bodyStart)
+    ) {
+      return;
+    }
+    this.body.set(markdown.slice(bodyStart));
+    this.scheduleSave();
+  }
+
   /** Preserve the exact caret before the explicit image button opens a picker. */
   rememberImageInsertion(): void {
     const el = this.bodyArea()?.nativeElement;
@@ -2779,7 +2803,7 @@ export class NoteEditorComponent {
     }
     if (
       target.closest(
-        "a, button, input, textarea, select, label, summary, [role='link'], [role='button'], app-connections",
+        "a, button, input, textarea, select, label, summary, [role='link'], [role='button'], [role='checkbox'], app-connections",
       ) ||
       !target.closest(".note-preview, .document-title")
     ) {

@@ -83,14 +83,61 @@
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
+/* GFM task lists. The box is a `role="checkbox"` span, never an `<input>` —
+   Angular's `[innerHTML]` sanitizer strips `<input>` (see MarkdownComponent). */
 .md-body li.task-list-item {
   list-style: none;
   margin-left: -1.2em;
 }
-.md-body input[type="checkbox"] {
-  accent-color: var(--accent);
-  margin-right: 0.45em;
-  transform: translateY(1px);
+.md-body li.task-list-item.is-done > .md-task-text {
+  color: var(--text-muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--border-strong);
+}
+/* Loose lists wrap the text in a <p>; keep it on the checkbox's line. */
+.md-task-text > p:first-child {
+  display: inline;
+}
+.md-task-box {
+  position: relative;
+  display: inline-block;
+  box-sizing: border-box;
+  width: 1.05em;
+  height: 1.05em;
+  margin-right: 0.5em;
+  vertical-align: -0.15em;
+  border: 1.5px solid var(--border-strong);
+  border-radius: var(--radius-xs);
+  background: var(--surface-input);
+  text-decoration: none;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast);
+}
+.md-task-box[tabindex] {
+  cursor: pointer;
+}
+.md-task-box[tabindex]:hover {
+  border-color: var(--accent);
+}
+.md-task-box:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.md-task-box[aria-checked="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.md-task-box[aria-checked="true"]::after {
+  content: "";
+  position: absolute;
+  left: 30%;
+  top: 8%;
+  width: 28%;
+  height: 58%;
+  border: solid var(--text-on-accent);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
 }
 .md-body blockquote {
   margin: 0.8em 0;

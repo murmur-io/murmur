@@ -1,11 +1,13 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  ElementRef,
   ViewEncapsulation,
   booleanAttribute,
   computed,
   inject,
   input,
+  output,
 } from "@angular/core";
 import { marked, type Tokens } from "marked";
 import DOMPurify from "dompurify";
@@ -14,6 +16,8 @@ import type { NoteAttachmentDto } from "../../core/models";
 import { TabsService } from "../../core/tabs.service";
 import { DocumentPreviewService } from "../../services/document-preview.service";
 import { ToastService } from "../../services/toast.service";
+import { escapeHtml, preprocessMarkdown } from "./preprocess";
+import { taskStates, toggleTask } from "./task-list";
 
 /**
  * Renders LLM / markdown text (transcript text AND model output) as beautifully formatted,
@@ -46,6 +50,13 @@ import { ToastService } from "../../services/toast.service";
  *   and looked like a no-op), or offers to create the note — so the chips are clickable like
  *   Obsidian links.
  * - A stray YAML front-matter block (some models leak one) is stripped defensively.
+ * - GFM task lists (`- [ ]` / `- [x]`) render as `<span class="md-task-box" role="checkbox">`,
+ *   NOT marked's default `<input type="checkbox">`: Angular's `[innerHTML]` sanitizer drops
+ *   `<input>` outright (it is not in its `VALID_ELEMENTS`), which is why checklists used to
+ *   render as plain bullets. `role` / `aria-checked` / `tabindex` survive both sanitizers.
+ *   With `interactiveTasks` set, clicking (or Space/Enter on) a box emits the whole markdown
+ *   with that one task flipped via `tasksChange` — the host owns persistence. The flip is
+ *   verified against marked's lexer (`task-list.ts`); an unprovable one is a no-op.
  *
  * Encapsulation is None with a `.md-body` scope so the styles reach the injected HTML.
  */
@@ -58,6 +69,7 @@ import { ToastService } from "../../services/toast.service";
   host: {
     "(click)": "onClick($event)",
     "(keydown.enter)": "onEnter($event)",
+    "(keydown.space)": "onSpace($event)",
   },
 })
 export class MarkdownComponent {
@@ -65,18 +77,32 @@ export class MarkdownComponent {
   private readonly tabsService = inject(TabsService);
   private readonly docPreview = inject(DocumentPreviewService);
   private readonly toast = inject(ToastService);
+  private readonly host = inject<ElementRef<HTMLElement>>(ElementRef);
+  /**
+   * Per-render class carried only by checkboxes the RENDERER emitted. Raw HTML in the
+   * (untrusted) source can copy `md-task-box`, but cannot guess this, so a fake box can
+   * neither be clicked nor pad the DOM count that the toggle guard compares.
+   */
+  private taskBoxClass = "";
 
   readonly markdown = input<string>("");
   readonly compact = input(false, { transform: booleanAttribute });
   /** Gated attachment DTOs for the current content owner. */
   readonly attachments = input<readonly NoteAttachmentDto[]>([]);
+  /** Task checkboxes are clickable and report changes through {@link tasksChange}. */
+  readonly interactiveTasks = input(false, { transform: booleanAttribute });
+  /** The full markdown with one task toggled (only when {@link interactiveTasks}). */
+  readonly tasksChange = output<string>();
 
   readonly html = computed(() =>
-    this.render(this.markdown() ?? "", this.attachments()),
+    this.render(this.markdown() ?? "", this.attachments(), this.interactiveTasks()),
   );
 
-  /** Click anywhere in the rendered markdown — act only when a `.md-wikilink` chip was hit. */
+  /** Click anywhere in the rendered markdown — act on a task box or a `.md-wikilink` chip. */
   onClick(ev: Event): void {
+    if (this.maybeToggleTask(ev)) {
+      return;
+    }
     const chip = (ev.target as HTMLElement | null)?.closest?.(".md-wikilink") as
       | HTMLElement
       | null
@@ -93,6 +119,9 @@ export class MarkdownComponent {
 
   /** Enter on a focused wikilink chip (it carries `tabindex="0"`) opens it — keyboard parity. */
   onEnter(ev: Event): void {
+    if (this.maybeToggleTask(ev)) {
+      return;
+    }
     const chip = ev.target as HTMLElement | null;
     if (!chip?.classList?.contains("md-wikilink")) {
       return;
@@ -102,6 +131,45 @@ export class MarkdownComponent {
     if (title) {
       void this.openWikilink(title);
     }
+  }
+
+  /** Space on a focused task box toggles it (native checkbox parity). */
+  onSpace(ev: Event): void {
+    this.maybeToggleTask(ev);
+  }
+
+  /** Toggle the task whose box was the event target. Returns true when the event was a box. */
+  private maybeToggleTask(ev: Event): boolean {
+    const box = (ev.target as HTMLElement | null)?.closest?.(".md-task-box") as
+      | HTMLElement
+      | null
+      | undefined;
+    if (!box) {
+      return false;
+    }
+    ev.preventDefault();
+    if (!this.interactiveTasks()) {
+      return true;
+    }
+    if (!this.taskBoxClass || !box.classList.contains(this.taskBoxClass)) {
+      return true;
+    }
+    const boxes = Array.from(
+      this.host.nativeElement.querySelectorAll(`.md-task-box.${this.taskBoxClass}`),
+    );
+    const source = this.markdown() ?? "";
+    // The DOM index is only meaningful if the rendered view of the source lexes to
+    // exactly the boxes on screen (a raw-HTML `md-task-box` span would not).
+    const onScreen = boxes.map((b) => b.getAttribute("aria-checked") === "true");
+    const rendered = taskStates(preprocessMarkdown(source));
+    if (onScreen.length !== rendered.length || onScreen.some((c, i) => c !== rendered[i])) {
+      return true;
+    }
+    const next = toggleTask(source, boxes.indexOf(box), preprocessMarkdown);
+    if (next !== null) {
+      this.tasksChange.emit(next);
+    }
+    return true;
   }
 
   /**
@@ -158,25 +226,9 @@ export class MarkdownComponent {
   private render(
     src: string,
     attachments: readonly NoteAttachmentDto[],
+    interactiveTasks: boolean,
   ): string {
-    let text = this.stripFrontMatter(src);
-    // Raw HTML image/picture/source tags never reach the DOM. The only renderable
-    // image route is a gated opaque attachment id below.
-    text = text.replace(
-      /<\s*\/?\s*(?:img|picture|source)\b[^>]*>/gi,
-      '<span class="md-image-blocked">External image blocked for privacy</span>',
-    );
-    // [[Wikilink]] / [[Wikilink|alias]] → clickable accent chip (marked passes raw HTML through).
-    // The chip's TEXT is the title — no `data-*` attribute (Angular's `[innerHTML]` sanitizer
-    // strips those; see the class doc's ROOT-CAUSE FIX note), so `chipTitle()` reads `textContent`.
-    // Capture the preceding character so `![[embed]]` is not corrupted on older WKWebView.
-    text = text.replace(
-      /(^|[^!])\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g,
-      (_m, prefix: string, title: string) => {
-        const safe = this.escapeHtml(title.trim());
-        return `${prefix}<span class="md-wikilink" role="link" tabindex="0">${safe}</span>`;
-      },
-    );
+    const text = preprocessMarkdown(src);
 
     const byId = new Map(
       attachments.map((attachment) => [attachment.id.toLowerCase(), attachment]),
@@ -188,6 +240,30 @@ export class MarkdownComponent {
       /<\s*\/?\s*(?:img|picture|source)\b/i.test(html)
         ? '<span class="md-image-blocked">External image blocked for privacy</span>'
         : html;
+    const boxClass = `md-tb-${crypto.randomUUID().slice(0, 8)}`;
+    this.taskBoxClass = boxClass;
+    renderer.checkbox = ({ checked }: Tokens.Checkbox): string => {
+      const state = checked ? "true" : "false";
+      const label = checked ? "Mark as not done" : "Mark as done";
+      return interactiveTasks
+        ? `<span class="md-task-box ${boxClass}" role="checkbox" aria-checked="${state}" tabindex="0" aria-label="${label}"></span>`
+        : `<span class="md-task-box ${boxClass}" role="checkbox" aria-checked="${state}" aria-disabled="true"></span>`;
+    };
+    const baseListitem = renderer.listitem.bind(renderer);
+    renderer.listitem = (item: Tokens.ListItem): string => {
+      if (!item.task) {
+        return baseListitem(item);
+      }
+      const cls = item.checked ? "task-list-item is-done" : "task-list-item";
+      // Wrap the item's own text (everything before a nested list) so a done item can be
+      // struck through without also striking its sub-items — `text-decoration` on the
+      // `<li>` would propagate into them and cannot be undone by a descendant.
+      const split = item.tokens.findIndex((t) => t.type === "list");
+      const head = split === -1 ? item.tokens : item.tokens.slice(0, split);
+      const tail = split === -1 ? [] : item.tokens.slice(split);
+      const parser = renderer.parser;
+      return `<li class="${cls}"><span class="md-task-text">${parser.parse(head)}</span>${parser.parse(tail)}</li>\n`;
+    };
 
     const out = marked.parse(text, {
       async: false,
@@ -216,15 +292,15 @@ export class MarkdownComponent {
     );
     const alt = token.text.trim() || "Image";
     if (!match) {
-      return `<span class="md-image-blocked">${this.escapeHtml(alt)} — external image blocked for privacy</span>`;
+      return `<span class="md-image-blocked">${escapeHtml(alt)} — external image blocked for privacy</span>`;
     }
     const attachment = byId.get(match[1].toLowerCase());
     if (!attachment || !this.isSafeDataUrl(attachment)) {
-      return `<span class="md-image-unavailable" role="status">${this.escapeHtml(alt)} — image unavailable</span>`;
+      return `<span class="md-image-unavailable" role="status">${escapeHtml(alt)} — image unavailable</span>`;
     }
-    const safeAlt = this.escapeHtml(alt);
+    const safeAlt = escapeHtml(alt);
     const caption = (token.title?.trim() || alt).trim();
-    const safeCaption = this.escapeHtml(caption);
+    const safeCaption = escapeHtml(caption);
     return `<span class="md-attachment" role="figure" aria-label="${safeCaption}"><img src="${attachment.dataUrl}" alt="${safeAlt}" loading="lazy" decoding="async"><span class="md-attachment-caption">${safeCaption}</span></span>`;
   }
 
@@ -240,18 +316,5 @@ export class MarkdownComponent {
     }
     const payload = attachment.dataUrl.slice(prefix.length);
     return payload.length > 0 && /^[a-z0-9+/]+={0,2}$/i.test(payload);
-  }
-
-  private escapeHtml(s: string): string {
-    return s.replace(/[&<>"]/g, (c) =>
-      c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;",
-    );
-  }
-
-  private stripFrontMatter(src: string): string {
-    let s = src.trimStart();
-    s = s.replace(/^```ya?ml\s*[\s\S]*?```/i, "").trimStart(); // fenced front-matter
-    s = s.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, "").trimStart(); // --- front-matter ---
-    return s;
   }
 }

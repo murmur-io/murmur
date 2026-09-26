@@ -411,6 +411,7 @@
             (preview)="showNotePreview()"
             (saveNote)="saveNote()"
             (draftInput)="draft.set($event)"
+            (toggleTask)="toggleNoteTask($event)"
             (attachmentAdded)="onMeetingAttachmentAdded($event)"
             (attachmentBusyChange)="meetingAttachmentBusy.set($event)"
             (copyPath)="copy(d.note?.exportedPath ?? '')"
