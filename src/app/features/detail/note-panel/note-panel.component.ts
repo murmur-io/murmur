@@ -239,6 +239,8 @@ export class NotePanelComponent {
   readonly preview = output<void>();
   readonly saveNote = output<void>();
   readonly draftInput = output<string>();
+  /** A task checkbox was ticked in the note preview — the full new markdown. */
+  readonly toggleTask = output<string>();
   readonly attachmentAdded = output<NoteAttachmentDto>();
   readonly attachmentBusyChange = output<boolean>();
   readonly copyPath = output<void>();

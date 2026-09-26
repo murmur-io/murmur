@@ -14,6 +14,7 @@
      which is not a restyle, it is a bug. The split is the whole point: this
      token means "pill by choice", `--radius-pill` means "pill by nature". */
   --radius-control: var(--radius-pill);
+  --radius-xs: 4px;
   --radius-sm: 9px;
   --radius-md: 13px;
   --radius-lg: 18px;
