@@ -945,6 +945,10 @@ pub struct NoteDoc {
     /// Masked (no markdown) when true.
     pub locked: bool,
     pub shared: bool,
+    /// Per-note edit-lock: the editor opens read-only and refuses edits until toggled off. A UX
+    /// guard, not a seal. Always `false` on the masked DTO.
+    #[serde(default)]
+    pub edit_locked: bool,
 }
 
 /// A note folder — reuses the [`Folder`] shape with the `kind` discriminator surfaced (always

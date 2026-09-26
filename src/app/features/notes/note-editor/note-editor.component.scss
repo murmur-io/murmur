@@ -233,6 +233,11 @@
   background: var(--surface-hover);
   color: var(--accent-text);
 }
+/* Edit-lock padlock: the open glyph is quiet (the default, editable state);
+   locked reuses the pressed pill above so "on" reads the same as the drawers. */
+.head-lock-btn:not(.is-active) {
+  color: var(--text-tertiary);
+}
 /* Ask Brain toggle: the glyph adopts the accent, and the active (drawer-open)
    state reads as a pressed neutral pill with the accent glyph/label. */
 .head-chat-btn {

@@ -48,7 +48,10 @@ import {
   type AttachmentPastePlan,
   type MarkdownEdit,
 } from "../../../services/note-attachment.service";
-import { NoteDocumentComponent } from "../../../shared/note-document/note-document.component";
+import {
+  NoteDocumentComponent,
+  type NoteViewMode,
+} from "../../../shared/note-document/note-document.component";
 import { LinkPickerComponent } from "../link-picker/link-picker.component";
 import { NOTE_ASSIST_CATALOG } from "../note-brain-popover/note-assist-catalog";
 import {
@@ -488,6 +491,22 @@ export class NoteEditorComponent {
    * read-only pane). On the route (`embedded()===false`) this is just `preview()`.
    */
   readonly previewActive = computed(() => this.preview() && !this.embedded());
+
+  /**
+   * The note's edit-lock (header padlock). While on, the document renders
+   * view-only in EVERY mode — embedded included — and {@link scheduleSave}
+   * refuses to write, so no path (typing, paste, Brain accept) can edit it.
+   */
+  readonly editLocked = computed(() => this.note()?.editLocked === true);
+  /** A lock/unlock round-trip is in flight (disables the padlock). */
+  readonly editLockBusy = signal(false);
+
+  /** The mode handed to `<app-note-document>`. */
+  readonly documentMode = computed<NoteViewMode>(() =>
+    this.editLocked()
+      ? { access: "view-only", view: "preview", reason: "Editing is locked" }
+      : { access: "editable", view: this.previewActive() ? "preview" : "edit" },
+  );
 
   /** The rendered preview HTML source — a cached `computed` off title + doc markdown. */
   readonly previewMarkdown = computed(() =>
@@ -1191,7 +1210,7 @@ export class NoteEditorComponent {
   /** Open the hidden local-only raster picker without webview filesystem paths. */
   openImagePicker(): void {
     const doc = this.note();
-    if (!doc || doc.locked || this.importingImages() > 0) {
+    if (!doc || doc.locked || doc.editLocked || this.importingImages() > 0) {
       return;
     }
     if (!this.imageInsertion) {
@@ -1275,7 +1294,7 @@ export class NoteEditorComponent {
     selectionEnd: number,
   ): void {
     const doc = this.note();
-    if (!doc || doc.locked) {
+    if (!doc || doc.locked || doc.editLocked) {
       return;
     }
     const pending = this.attachmentService.pendingPlan(plan);
@@ -1428,7 +1447,7 @@ export class NoteEditorComponent {
    */
   private scheduleSave(): void {
     const doc = this.note();
-    if (this.hydrating || !doc || doc.locked) {
+    if (this.hydrating || !doc || doc.locked || doc.editLocked) {
       return;
     }
     this.editRevision += 1;
@@ -2328,6 +2347,40 @@ export class NoteEditorComponent {
   toggleMenu(which: "more"): void {
     this.menu.update((cur) => (cur === which ? "none" : which));
     this.confirmingDelete.set(false);
+  }
+
+  /**
+   * Header padlock — toggle the note's edit-lock. Locking first settles any
+   * in-flight image import and flushes the pending save, so the last keystrokes
+   * land BEFORE the editor goes read-only (a lock must never drop an edit).
+   */
+  async toggleEditLock(): Promise<void> {
+    const doc = this.note();
+    if (!doc || doc.locked || this.editLockBusy()) {
+      return;
+    }
+    const lock = !doc.editLocked;
+    this.editLockBusy.set(true);
+    try {
+      if (lock) {
+        await this.waitForAttachmentTasks();
+        if (this.dirtyFull && !(await this.flushFull())) {
+          return;
+        }
+        this.clearSelection();
+        this.closeLinkPicker();
+        this.slashOpen.set(false);
+      }
+      const fresh = await this.ipc.setNoteEditLocked(doc.id, lock);
+      if (this.note()?.id !== doc.id) {
+        return;
+      }
+      this.note.update((cur) => (cur ? { ...cur, editLocked: fresh.editLocked } : cur));
+    } catch (e) {
+      this.toast.danger(this.errorCopy.humanize(e));
+    } finally {
+      this.editLockBusy.set(false);
+    }
   }
 
   closeMenus(): void {

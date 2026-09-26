@@ -398,6 +398,46 @@ pub async fn list_notes(
     .await
 }
 
+/// Toggle a note's edit-lock (the editor header's padlock). GATED: a sealed-and-not-session-unlocked
+/// note is refused — its masked view has no editor to lock, and a toggle must not confirm the row's
+/// existence behind the seal beyond what `get_note` already does. Returns the fresh editor DTO.
+#[tauri::command]
+pub fn set_note_edit_locked(
+    state: State<'_, AppState>,
+    id: String,
+    locked: bool,
+) -> Result<NoteDoc, AppError> {
+    set_note_edit_locked_inner(state.inner(), &id, locked)
+}
+
+/// Inner of [`set_note_edit_locked`] taking `&AppState` (unit-testable gate).
+pub(crate) fn set_note_edit_locked_inner(
+    state: &AppState,
+    id: &str,
+    locked: bool,
+) -> Result<NoteDoc, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    state.db.ensure_container_move_ready()?;
+    let Some((folder_id, _, _)) = state.db.note_gate_anchor(id)? else {
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_MISSING,
+            format!("no note {id}"),
+        )));
+    };
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Err(AppError::Locked(
+            "this note's folder is locked — unlock it first".into(),
+        ));
+    }
+    if !state.db.set_note_edit_locked(id, locked)? {
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_MISSING,
+            format!("no note {id}"),
+        )));
+    }
+    get_note_under_lifecycle_authorized(state, id)
+}
+
 /// Inner of [`list_notes`] taking `&AppState` (unit-testable gate).
 pub(crate) fn list_notes_inner(
     state: &AppState,

@@ -4450,6 +4450,7 @@ fn note_doc_from_row(row: &crate::storage::db::NoteRow) -> NoteDoc {
         exported_path: row.exported_path.clone(),
         locked: false,
         shared: false, // WP6 wires this.
+        edit_locked: row.edit_locked,
     }
 }
 
@@ -4467,6 +4468,7 @@ fn masked_note_doc(id: &str, folder_id: &str, created_at: i64, updated_at: Optio
         exported_path: None,
         locked: true,
         shared: false,
+        edit_locked: false,
     }
 }
 

@@ -11778,6 +11778,54 @@
         .unwrap();
     }
 
+    /// Note edit-lock — defaults editable, the toggle persists across a re-read, it does NOT bump
+    /// `updated_at` (no list reorder) or touch the body, and it crosses IPC as camelCase
+    /// `editLocked` (the FE reads that key — rust-tauri §2b).
+    #[test]
+    fn note_edit_lock_round_trips_without_touching_content() {
+        let state = build_state("note-edit-lock");
+        let id = create_note_inner(&state, None, "Frozen").unwrap();
+        update_note_doc_inner(&state, &id, "Frozen", "Body stays.").unwrap();
+        let before = get_note_inner(&state, &id).unwrap();
+        assert!(!before.edit_locked, "a note starts editable");
+
+        let locked = set_note_edit_locked_inner(&state, &id, true).unwrap();
+        assert!(locked.edit_locked);
+        assert_eq!(locked.markdown, before.markdown, "toggling never touches the body");
+        assert_eq!(locked.updated_at, before.updated_at, "toggling never bumps updated_at");
+        assert!(get_note_inner(&state, &id).unwrap().edit_locked, "the lock persists");
+
+        let wire = serde_json::to_value(&locked).unwrap();
+        assert_eq!(wire["editLocked"], serde_json::Value::Bool(true));
+        assert!(wire.get("edit_locked").is_none(), "no snake_case key on the wire");
+
+        let unlocked = set_note_edit_locked_inner(&state, &id, false).unwrap();
+        assert!(!unlocked.edit_locked);
+        assert!(!get_note_inner(&state, &id).unwrap().edit_locked);
+
+        let err = set_note_edit_locked_inner(&state, "no-such-note", true).unwrap_err();
+        assert!(matches!(err, AppError::InvalidArg(_)), "unknown id refused, got {err:?}");
+    }
+
+    /// Note edit-lock gate — a note in a sealed-not-unlocked folder cannot be toggled (refused as
+    /// `Locked`), and its masked DTO never reports an edit-lock.
+    #[test]
+    fn note_edit_lock_is_refused_behind_a_sealed_folder() {
+        let state = build_state("note-edit-lock-sealed");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Hidden").unwrap();
+        update_note_doc_inner(&state, &id, "Hidden", "secret body").unwrap();
+        set_note_edit_locked_inner(&state, &id, true).unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        let err = set_note_edit_locked_inner(&state, &id, false).unwrap_err();
+        assert!(matches!(err, AppError::Locked(_)), "sealed note toggle refused, got {err:?}");
+        let masked = get_note_inner(&state, &id).unwrap();
+        assert!(masked.locked);
+        assert!(!masked.edit_locked, "masked DTO carries no edit-lock state");
+        assert_eq!(masked.markdown, "");
+    }
+
     /// WP0 gate — a note in a SEALED-and-not-session-unlocked folder MUST be MASKED: `get_note`
     /// returns locked:true, title "🔒 Locked", NO markdown/tags (and therefore none of the
     /// front-matter scalars, which now travel ONLY inside `markdown`); `list_notes` EXCLUDES it

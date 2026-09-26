@@ -531,6 +531,7 @@ pub fn run() {
             commands::create_note,
             commands::suggest_note_title,
             commands::get_note,
+            commands::set_note_edit_locked,
             commands::update_note_doc,
             commands::save_note_text,
             commands::list_notes,
