@@ -19,13 +19,31 @@
    ONE cool accent for calm states, ONE warm "live" accent for recording.
    ============================================================================ */
 
-/* --- Distinctive self-hosted type (variable woff2; no runtime fetch) -------- */
+/* --- Distinctive self-hosted type (variable woff2; no runtime fetch) --------
+   Each family is TWO Google Fonts subsets of the SAME release (Hanken Grotesk
+   3.013, JetBrains Mono 2.211 — identical metrics): `latin` and `latin-ext`.
+   The latin subset alone has no ą ć ę ł ń ś ź ż, so WebKit drew those glyphs
+   from the system face mid-word. The ranges are Google's own, so the browser
+   picks the right file per character and loads latin-ext only when needed. */
 @font-face {
   font-family: "Hanken Grotesk";
   font-style: normal;
   font-weight: 100 900;
   font-display: swap;
   src: url("/assets/fonts/hanken-grotesk.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Hanken Grotesk";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/assets/fonts/hanken-grotesk-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0,
+    U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 @font-face {
   font-family: "JetBrains Mono";
@@ -33,6 +51,19 @@
   font-weight: 100 800;
   font-display: swap;
   src: url("/assets/fonts/jetbrains-mono.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url("/assets/fonts/jetbrains-mono-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0,
+    U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 
 /* Non-token :root properties (the tokens themselves live in src/design-tokens/). */
@@ -484,6 +515,59 @@ app-shell.sidebar-collapsed {
   border-radius: var(--shell-panel-radius);
   box-shadow: var(--shell-panel-shadow), var(--shell-glass-inner);
   overflow: hidden;
+}
+
+/* The drag handle on the expanded sidebar's right edge. It is a SIBLING of the
+   panel, not a child: the panel clips (`overflow: hidden`) and its own right
+   edge is where the workspace tree's scrollbar sits, so a handle inside it
+   would steal the scrollbar's drag. It straddles the panel's border and runs
+   over the gutter; the visible cue is a hairline on that border that only
+   appears on hover, focus and drag, so the resting edge looks as before. */
+.sb-resize-handle {
+  position: fixed;
+  top: var(--shell-gutter);
+  bottom: var(--shell-gutter);
+  left: calc(var(--shell-gutter) + var(--shell-sidebar-w) - 2px);
+  z-index: 10;
+  width: var(--space-2);
+  cursor: col-resize;
+  touch-action: none;
+  -webkit-app-region: no-drag;
+}
+
+.sb-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: var(--shell-panel-radius);
+  bottom: var(--shell-panel-radius);
+  left: 0;
+  width: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.sb-resize-handle:hover::after,
+.sb-resize-handle:focus-visible::after,
+app-shell.sidebar-resizing .sb-resize-handle::after {
+  opacity: 1;
+}
+
+.sb-resize-handle:focus-visible {
+  outline: none;
+}
+
+/* While dragging, the width follows the pointer 1:1 — an eased transition
+   would make it lag behind — and nothing under the pointer gets selected. */
+app-shell.sidebar-resizing .app-sidebar.primary-sidebar {
+  transition: none;
+}
+
+app-shell.sidebar-resizing {
+  cursor: col-resize;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 /* ── The one sidebar ───────────────────────────────────────────────────────

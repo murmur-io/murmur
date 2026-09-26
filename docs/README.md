@@ -8,8 +8,9 @@ of them describe a product that no longer exists; all of them read as though the
 confirm the symbol still exists. That is not a caveat, it is the standing instruction in `CLAUDE.md`,
 and it is why some agent definitions name `docs/STATUS.md` as a file to distrust.
 
-For the current product, read [`README.md`](../README.md) in the repo root, and
-[`landing/docs.html`](../landing/docs.html) for the user-facing guide.
+For the current product, read [`STATUS.md`](STATUS.md) for the shipped-feature list, and
+[`landing/docs.html`](../landing/docs.html) for the user-facing guide. The root
+[`README.md`](../README.md) is a short front door that links to both.
 
 ---
 
@@ -21,7 +22,7 @@ For the current product, read [`README.md`](../README.md) in the repo root, and
 | [`RAG-BAKEOFF.md`](RAG-BAKEOFF.md) | The turnkey protocol for measuring retrieval quality on a real Mac with a real vault. Referenced by the retrieval skills as the re-run command. |
 | [`DIARIZATION-EVAL.md`](DIARIZATION-EVAL.md) | The same, for speaker diarization and voiceprint recall. Cited from `src-tauri/src/eval/diarization.rs`. |
 | [`USE-WITH-YOUR-AGENT.md`](USE-WITH-YOUR-AGENT.md) | Pointing your own AI agent at your vault, and the `vault-skills/` pack. |
-| [`screenshots/`](screenshots) | The product screenshots the README uses. Generated — never hand-edited. See [`scripts/screenshots/README.md`](../scripts/screenshots/README.md) for the capture runbook. |
+| [`screenshots/`](screenshots) | The product screenshots the README and the landing page use. Generated — never hand-edited. See [`scripts/screenshots/README.md`](../scripts/screenshots/README.md) for the capture runbook. |
 | [`research/`](research) | Dated, cited research briefs. Each one is a snapshot of its own date and says so; that is the format working as intended, not staleness. |
 | [`research/2026-09-02-full-app-analysis.md`](research/2026-09-02-full-app-analysis.md) | The whole-app audit of 2.3.1 — brain and entity connections, MCP, memory, recording, stability, org sharing. Every `file:line` in it was opened during the audit; anchors drift with the tree, so grep the symbol, not the line number. |
 | [`research/2026-09-02-prod-ready-tasks.md`](research/2026-09-02-prod-ready-tasks.md) | The task list that audit produced, with acceptance criteria per task. Unlike its neighbours this is a **live plan, not a snapshot**: execution state lives outside the repo, in `../.murmur-agent-tasks/prod-ready/STATUS.md`, and lands here only when the work closes. |
@@ -35,7 +36,7 @@ For the current product, read [`README.md`](../README.md) in the repo root, and
 | File | Superseded by |
 | --- | --- |
 | [`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md) | The `release-murmur` skill. Carries its own SUPERSEDED banner and predates the rename; the skills reference it by name as *the stale doc*. Kept only for its first-run / mic / system-audio manual checks. |
-| [`KILLER-FEATURES.md`](KILLER-FEATURES.md) | `README.md` → Status. A 2026-06 batch write-up: everything in it did ship, but it is a snapshot of that batch, not the shipped set. |
+| [`KILLER-FEATURES.md`](KILLER-FEATURES.md) | `STATUS.md` → What has shipped. A 2026-06 batch write-up: everything in it did ship, but it is a snapshot of that batch, not the shipped set. |
 | [`DESIGN.md`](DESIGN.md) | The whole product. The original v1 design, partly in Polish, still titled "MeetNotes". |
 | [`ARCHITECTURE-LOCAL-CLOUD.md`](ARCHITECTURE-LOCAL-CLOUD.md) | `docs/superpowers/specs/2026-07-04-murmur-server-spec.md` for the parts that shipped. Its Feature 5 (`TeamBrainProvider`, hosted MCP) remains deferred, and later research briefs cite it by section — which is why it stays put. |
 | [`DESIGN-local-brain-orchestration.md`](DESIGN-local-brain-orchestration.md), [`PLAN-brain2-rag-voice.md`](PLAN-brain2-rag-voice.md), [`PLAN-finished-product.md`](PLAN-finished-product.md) | The brain that shipped. Historical blueprints, cited by name from `docs/research/`. |

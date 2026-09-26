@@ -87,7 +87,12 @@
       }
     } @else {
       <div class="note-preview">
-        <app-markdown [markdown]="document().body" [attachments]="attachments()" />
+        <app-markdown
+          [markdown]="document().body"
+          [attachments]="attachments()"
+          [interactiveTasks]="previewTasksInteractive()"
+          (tasksChange)="onTasksChange($event)"
+        />
       </div>
     }
   </div>

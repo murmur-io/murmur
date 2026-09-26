@@ -81,4 +81,16 @@ export class NoteDocumentComponent {
   readonly titleChange = output<string>();
   readonly titleBlur = output<void>();
   readonly markdownChange = output<string>();
+  /** Task checkboxes in PREVIEW are clickable (editable access only). */
+  readonly interactiveTasks = input(false);
+  /** The full note markdown (front-matter preserved) with one task toggled in preview. */
+  readonly tasksChange = output<string>();
+
+  readonly previewTasksInteractive = computed(
+    () => this.interactiveTasks() && this.mode().access === "editable",
+  );
+
+  onTasksChange(body: string): void {
+    this.tasksChange.emit(joinNoteDocument(this.document().frontMatterPrefix, body));
+  }
 }

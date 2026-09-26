@@ -441,6 +441,8 @@
           [related]="!embedded() ? { kind: 'note', id: doc.id, locked: doc.locked, inlineWikilinkTitles: inlineWikilinkTitles() } : null"
           (titleChange)="onTitleValue($event)"
           (titleBlur)="onBlur()"
+          [interactiveTasks]="!doc.locked"
+          (tasksChange)="onPreviewTasksChange($event)"
         />
       }
     }

@@ -626,6 +626,10 @@
     /// required words into an HTML comment elsewhere on the page, and the test went green on the
     /// exact bug it exists to catch. A whole-file `contains` in a large, growing document proves
     /// nothing — some other section will eventually mention `Bearer` for unrelated reasons.
+    ///
+    /// README is deliberately NOT in the list: it is a front door that links to the landing docs
+    /// and carries no MCP config of its own. If a snippet ever goes back into README, add README
+    /// back here.
     #[test]
     fn the_documented_mcp_snippets_carry_what_the_server_requires() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -662,12 +666,6 @@
         }
 
         for (relative, open, close, needles) in [
-            (
-                "README.md",
-                "```",
-                "```",
-                vec!["\"type\": \"http\"", "\"Authorization\": \"Bearer"],
-            ),
             (
                 "docs/USE-WITH-YOUR-AGENT.md",
                 "```",

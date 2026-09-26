@@ -101,7 +101,13 @@
   overflow: hidden;
 }
 .document-editor::placeholder { color: var(--text-muted); }
-.document-editor:focus-visible { outline-color: var(--accent); }
+/* The textarea has zero padding so its text lines up with Preview; the focus frame is pushed
+   outward instead of padding the text inward, so entering edit mode never shifts a line. */
+.document-editor:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: var(--editor-focus-offset);
+  border-radius: var(--radius-sm);
+}
 .document-editor::selection { background: var(--editor-selection); }
 .document-print { display: none; }
 @media print {
