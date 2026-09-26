@@ -1,6 +1,6 @@
 ---
 name: ship-feature
-description: Ship a Murmur feature through scope, isolated implementation, fresh adversarial and required security review, project gates, a JakubGawr commit, and a PR to `murmur`. Use the verifier-only Harness for risky, multi-step, or explicitly requested work; ordinary low-risk fixes keep the normal isolated-worktree route.
+description: Ship a Murmur feature through scope, isolated implementation, fresh adversarial and required security review, project gates, a commit authored by whoever ships it, and a PR to `murmur`. Use the verifier-only Harness for risky, multi-step, or explicitly requested work; ordinary low-risk fixes keep the normal isolated-worktree route.
 ---
 
 # /ship-feature — ship a Murmur feature end-to-end
@@ -33,7 +33,7 @@ builder and whether the lock-security review is mandatory:
 
 The harness is opt-in. A small docs/chore/mechanical/low-risk fix uses a normal
 isolated feature worktree, fresh independent review, the relevant project gates,
-and a normal JakubGawr commit. Do not add a Harness receipt merely because this
+and a normal commit under your own identity. Do not add a Harness receipt merely because this
 skill was invoked.
 
 Use the Harness for lock/crypto/egress/protocol work, multi-step changes, or
@@ -175,18 +175,18 @@ append ONE `## Run journal` entry to the relevant `.claude/learnings/<agent>.md`
 promotes repeat offenders into `## Recurring patterns`. This is what makes "every bug a permanent
 lesson" instead of a re-paid one.
 
-### 6. Commit as JakubGawr
+### 6. Commit as yourself
 ```bash
 # V2 route: commit through the runner; its durable intent survives a crash.
 git -C <worktree> commit -m \"<type>(<scope>): <subject>\"
 git -C ../.murmur-agent-tasks/v2/<task-id>/meetnotes log -1 --format='%an <%ae>'
-# MUST be JakubGawr <63911380+JakubGawr@users.noreply.github.com>
+# MUST be YOU — the person opening the PR (your own git identity)
 ```
 Never use `git add -A` in a shared repository. **No AI co-author trailers.** Conventional-commit style
 (`feat`/`fix`/`chore(scope)`), matching the existing log.
 
 For the normal low-risk route, stage only the explicit owned files and create a
-normal JakubGawr commit without Harness trailers. Use a conventional `fix/<slug>`,
+normal commit under your own identity without Harness trailers. Use a conventional `fix/<slug>`,
 `feat/<slug>`, or `chore/<slug>` branch so the remote `agent/*` receipt gate does
 not mistake it for a harness task. If an operator deliberately keeps a
 non-harness commit on an `agent/*` branch, the PR description must declare the
@@ -210,7 +210,7 @@ gh pr create -R murmur-io/murmur --base murmur --head agent/v2/<task-id> \
 # (or the operator explicitly accepts an archived handoff), clean it:
 scripts/h clean <task-id>
 ```
-`gh` active account MUST be `JakubGawr`. Base is `murmur` (the trunk) via PR — direct
+`gh` active account MUST be your own (the PR author's). Base is `murmur` (the trunk) via PR — direct
 `git push origin murmur` is blocked by the environment guard. If this feature is a release,
 hand off to **`/release-murmur`**.
 
@@ -222,7 +222,7 @@ hand off to **`/release-murmur`**.
 - **Conventions are binding** — the Rust (AppError/Result, additive migrations,
   verify-before-destroy, gated reads, crash-safe FFI) and Angular-zoneless (signals/`@if`/
   `toSignal`/no-`setTimeout`/no-new-deps) rules above are non-negotiable.
-- **Identity interlocks:** commit author=JakubGawr (no AI trailers), gh=JakubGawr, PR base
+- **Identity interlocks:** commit author=the PR author (no AI trailers), gh=the PR author's own account, PR base
   =`murmur`, `com.meetnotes.app` immutable.
 - **Honest about the signed-build boundary.** A dev run cannot prove Touch ID / lock-at-rest /
   screen-share — say so; only a Developer-ID build verifies them (`/release-murmur`).
